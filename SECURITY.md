@@ -20,7 +20,11 @@ Credentials are read from a named environment variable and are not written into 
 
 ## Release checks
 
-The public fixture is synthetic. The release checker rejects known private-fixture identifiers, suspicious credential patterns, unexpected exports, symlinks, and unapproved binary assets. It does not replace a professional secret scanner or a human review of publication scope. CI uses read-only default permissions and does not expose repository secrets to pull-request jobs.
+The example code and data were written for Diffstory; they were not copied from a private repository.
+
+Before a release, an automatic check looks for names from known private samples, common access-token or private-key text, extra files, and images or other file types that are not approved. It can miss sensitive information and cannot tell whether we have permission to publish every file, so a person still needs to review the code, data, and screenshots.
+
+GitHub runs the project's tests automatically. Those jobs can read project files, but the workflow does not pass saved API keys or passwords to its pull-request tests.
 
 ## Supported versions
 
