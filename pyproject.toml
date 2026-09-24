@@ -24,7 +24,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["build>=1.2,<2", "twine>=6,<7", "playwright>=1.50,<2"]
+dev = ["build>=1.2,<2", "twine>=7.0.0,<8", "playwright>=1.50,<2"]
 
 [project.urls]
 Homepage = "https://www.epistemic.ai"
