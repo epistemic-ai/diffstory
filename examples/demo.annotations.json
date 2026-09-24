@@ -1,0 +1,261 @@
+{
+  "schema": "diffstory.annotations.v1",
+  "base_sha": "44912524610170cef73861796b05188a13b7e1b0",
+  "head_sha": "2ac82c2ba3bffd4500379bc1fced0900a12bb2ba",
+  "document": {
+    "lead": "A module extraction is easiest to understand as a sequence of ideas, not a list of files. Follow the small rules, the query boundary, and the callers—with each explanation next to its source.",
+    "closing": "The search entry point now composes focused modules. Several declarations moved without structural changes; the query limit contract deliberately changed. Those are different review tasks. The source and tests stay together so the distinction remains visible."
+  },
+  "steps": [
+    {
+      "group_id": "bfa9c2423d8dd34e",
+      "title": "A move can also change the contract",
+      "evidence_change_ids": [
+        "aa655bcd417f3a21"
+      ],
+      "passages": [
+        {
+          "text": "The query builder moves out of the search module, but this is **not an unchanged extraction**. It now rejects page sizes outside 1–100, non-integers, and booleans. The SQL still uses bound parameters. Read the actual delta before treating the new module as a mechanical move.",
+          "change_ids": [
+            "aa655bcd417f3a21"
+          ],
+          "view": "diff"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "69ff67a5cbc9f803",
+      "title": "Give labels one small, predictable rule",
+      "evidence_change_ids": [
+        "909d421caece8249"
+      ],
+      "passages": [
+        {
+          "text": "One of the smallest dependencies is the label rule. `normalize_label` collapses whitespace and preserves case. The declaration moves unchanged to `catalog/labels.py`. Showing it once makes the rule easier to inspect than a deletion followed by an identical addition.",
+          "change_ids": [
+            "909d421caece8249"
+          ],
+          "view": "definition"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "055292b902457fb5",
+      "title": "Preserve which duplicate wins",
+      "evidence_change_ids": [
+        "6cb0f770165fbc77"
+      ],
+      "passages": [
+        {
+          "text": "This generator moves intact into `catalog/merge.py`. Its rule is first-record-wins, not last-record-wins. Encounter order therefore remains part of the API even though the function now lives in a different module.",
+          "change_ids": [
+            "6cb0f770165fbc77"
+          ],
+          "view": "definition"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "925f2b53dbe84aaf",
+      "title": "Extract a rule with observable edge cases",
+      "evidence_change_ids": [
+        "749cab67bd2c6504"
+      ],
+      "passages": [
+        {
+          "text": "The click-rate calculation is now a shared helper. A missing or zero view count leaves the existing result unchanged. A nonzero view count produces a ratio rounded to four decimal places. This helper is newly declared; its calculation was previously inline, so “new definition” does not mean “new behavior.”",
+          "change_ids": [
+            "749cab67bd2c6504"
+          ],
+          "view": "definition"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "d970addaf2694ce2",
+      "title": "Build one parsing boundary",
+      "evidence_change_ids": [
+        "2df2308a41a0a306",
+        "d3dec5cc1a2d0ac6",
+        "9b8438c727c24ffd"
+      ],
+      "passages": [
+        {
+          "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
+          "change_ids": [
+            "2df2308a41a0a306"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "`split_tags` becomes `parse_tags` in the parsing module. Empty fields disappear, tags become lowercase, and source order—including duplicates—survives. Only the declaration name changes; internal names and literal values still participate in the structural comparison.",
+          "change_ids": [
+            "d3dec5cc1a2d0ac6"
+          ],
+          "view": "definition"
+        },
+        {
+          "text": "The parsing boundary brings those rules together. It still returns the same four fields, but delegates label normalization, tag parsing, and metrics. Compare the helper calls as well as the output keys: an unchanged shape is not sufficient evidence of unchanged values.",
+          "change_ids": [
+            "9b8438c727c24ffd"
+          ],
+          "view": "diff"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "2571f99a5cf1d735",
+      "title": "Follow the boundary beyond the main caller",
+      "evidence_change_ids": [
+        "0e3fa555970820b6"
+      ],
+      "passages": [
+        {
+          "text": "The export utility must follow the renamed parser. Its separator is still a semicolon, and tag normalization comes from the same implementation as the catalog path. This is the kind of small consumer update that can be missed when review stops at the new modules.",
+          "change_ids": [
+            "0e3fa555970820b6"
+          ],
+          "view": "diff"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "35701946bdbc9a3e",
+      "title": "Return to the search entry point",
+      "evidence_change_ids": [
+        "d2f5bacb5e03490d",
+        "d7ea39d8954cab6b"
+      ],
+      "passages": [
+        {
+          "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
+          "change_ids": [
+            "d2f5bacb5e03490d"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "Now the entry point is readable as a sequence: construct a query, execute it, interpret each row, and merge duplicates. It still materializes the parsed rows before merging. The tighter page-size rule reaches users through this call; it must not be hidden under the refactor label.",
+          "change_ids": [
+            "d7ea39d8954cab6b"
+          ],
+          "view": "definition"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "b0172c7ae33102bc",
+      "title": "Point imports at the defining modules",
+      "evidence_change_ids": [
+        "c8c8225325973641"
+      ],
+      "passages": [
+        {
+          "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
+          "change_ids": [
+            "c8c8225325973641"
+          ],
+          "view": "diff"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "f39dc80267e3d52d",
+      "title": "Make the preserved rules executable",
+      "evidence_change_ids": [
+        "fd323c917ce3337c",
+        "ec92156828e995bb",
+        "189601f74b8680b9",
+        "a3331c56ed891d8c",
+        "6fab283d650e6f28"
+      ],
+      "passages": [
+        {
+          "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
+          "change_ids": [
+            "fd323c917ce3337c"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "A representative row checks the complete display record: identifier, normalized label, ordered tags, and the rounded click rate. Delegation should not change those values.",
+          "change_ids": [
+            "ec92156828e995bb"
+          ],
+          "view": "definition"
+        },
+        {
+          "text": "Both absent and zero view counts must keep the rate unset. The explicit cases protect against introducing a division-by-zero path during extraction.",
+          "change_ids": [
+            "189601f74b8680b9"
+          ],
+          "view": "definition"
+        },
+        {
+          "text": "Case normalization and empty-tag removal must not turn the list into a set. The assertion preserves duplicates and source order.",
+          "change_ids": [
+            "a3331c56ed891d8c"
+          ],
+          "view": "definition"
+        },
+        {
+          "text": "Two records share an identifier. The earlier record must win, so this assertion checks values as well as deduplication.",
+          "change_ids": [
+            "6fab283d650e6f28"
+          ],
+          "view": "definition"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "c69d5a4b8ba28a37",
+      "title": "Check the contract at its boundary",
+      "evidence_change_ids": [
+        "026672cb30fc46d7",
+        "a7badff14d18e6f6",
+        "e5b7162fc4b0a209",
+        "6fda0fd2afd4b3ab"
+      ],
+      "passages": [
+        {
+          "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
+          "change_ids": [
+            "026672cb30fc46d7"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "The default case locks down the 25-row page size and the shape of the parameter tuple. This test calls the extracted query module directly.",
+          "change_ids": [
+            "a7badff14d18e6f6"
+          ],
+          "view": "definition"
+        },
+        {
+          "text": "A quote in the search term must remain data rather than changing the SQL statement. Inspect both the SQL and the bound value; checking only that the call succeeds would miss the contract.",
+          "change_ids": [
+            "e5b7162fc4b0a209"
+          ],
+          "view": "definition"
+        },
+        {
+          "text": "These are the boundary cases for the intentional behavior change. Accept 1 and 100; reject 0, 101, booleans, and other non-integer values. This is test source, not a recorded passing run.",
+          "change_ids": [
+            "6fda0fd2afd4b3ab"
+          ],
+          "view": "definition"
+        }
+      ],
+      "transition": "The source trail now reaches the tests as well as the callers."
+    }
+  ]
+}

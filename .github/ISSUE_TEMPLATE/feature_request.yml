@@ -1,0 +1,14 @@
+name: Feature request
+description: Suggest an improvement to the reading or analysis workflow.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to understand or review?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe how it preserves a simple reading experience and traceable evidence.

@@ -1,0 +1,15 @@
+Diffstory
+Copyright (c) 2026 Epistemic AI Inc. and Diffstory contributors.
+
+The software, documentation, and original synthetic examples are distributed
+under the MIT license in LICENSE.
+
+Epistemic AI's name and logo identify the upstream project. Trademark rights
+are reserved; the software license does not grant a right to imply endorsement.
+The supplied logo in diffstory/assets/epistemic-mark.svg is a first-party brand
+asset, not a third-party software dependency. It may accompany distributions of
+this project to identify the original publisher; this is not a general license
+to use the logo as the identity of another product. See docs/BRANDING.md.
+
+No private repository source, customer data, authentication credentials,
+external font files, or vendored runtime libraries are intentionally included.

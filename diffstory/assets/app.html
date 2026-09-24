@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Diffstory · A literate diff</title>
+<style>/*__CSS__*/</style>
+</head>
+<body>
+<a class="skip-link" href="#story">Skip to the walkthrough</a>
+<header class="topbar">
+  <a class="brand" href="#top" aria-label="Diffstory, back to top"><span class="brandmark" aria-hidden="true">__BRAND_MARK__</span> diffstory<span class="edition">Epistemic AI</span></a>
+  <span class="reading-position" id="readingPosition" aria-live="off"></span>
+  <div class="topactions">
+    <button id="contentsBtn" class="plain-button" aria-expanded="false" aria-controls="contentsPanel">Contents <span aria-hidden="true">⌄</span></button>
+    <button id="moreBtn" class="more-button" aria-label="Reader options" aria-expanded="false" aria-controls="morePanel">•••</button>
+  </div>
+  <div class="reading-track" aria-hidden="true"><span id="readingProgress"></span></div>
+</header>
+<div id="contentsPanel" class="popover contents-panel" hidden>
+  <div class="popover-heading"><strong>In this reading</strong><span id="sectionCount"></span></div>
+  <label class="search-label"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="Find a section or symbol" aria-label="Find a section or symbol" autocomplete="off"><kbd>/</kbd></label>
+  <nav id="contentsList" aria-label="Document contents"></nav>
+  <div class="contents-foot"><a href="#source-hunks">Source hunks</a><a href="#evidence">Evidence & scope</a><span id="reviewProgress"></span></div>
+</div>
+<div id="morePanel" class="popover more-panel" hidden>
+  <button id="auditBtn" aria-pressed="false">Show review details <span id="auditStatus">Off</span></button>
+  <button id="collapseBtn">Collapse expanded code</button>
+  <div class="menu-rule"></div>
+  <a href="#source-hunks">Original source hunks</a>
+  <a href="#evidence">Evidence & scope</a>
+  <div class="menu-rule"></div>
+  <button id="exportBtn">Export review notes <span>↓</span></button>
+  <button id="importBtn">Import review notes <span>↑</span></button>
+  <button id="downloadReport">Download analysis JSON <span>↓</span></button>
+</div>
+<main id="top">
+  <header id="documentHeader" class="document-header"></header>
+  <article id="story" aria-label="Continuous code walkthrough"></article>
+  <footer id="documentFooter" class="document-footer"></footer>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="importFile" accept="application/json,.json" hidden>
+<noscript><p class="noscript">This offline reader needs JavaScript to display its embedded source and narrative. No network connection is needed.</p></noscript>
+<script type="application/json" id="report-data">__REPORT_JSON__</script>
+<script>/*__JS__*/</script>
+</body>
+</html>

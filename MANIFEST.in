@@ -1,0 +1,11 @@
+include LICENSE NOTICE README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md
+recursive-include diffstory/assets *.html *.css *.js *.svg
+recursive-include tests *.py
+recursive-include examples *.py *.json *.html
+recursive-include docs *.md *.png
+exclude PUBLICATION.json
+prune dist
+prune build
+global-exclude *.pyc
+
+recursive-include scripts *.py *.sh

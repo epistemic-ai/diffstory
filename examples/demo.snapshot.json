@@ -1,0 +1,88 @@
+{
+  "schema": "diffstory.snapshot.v1",
+  "meta": {
+    "title": "One search module. Three clear responsibilities.",
+    "repository": "Synthetic catalog",
+    "base_sha": "44912524610170cef73861796b05188a13b7e1b0",
+    "head_sha": "2ac82c2ba3bffd4500379bc1fced0900a12bb2ba",
+    "scope": "changed files",
+    "input": "synthetic example",
+    "comparison": "original synthetic before/after sources",
+    "changed_files": 8,
+    "description": "An original catalog-search example for this open-source project. No private source or real customer data. The query page-size validation is an intentional behavior change.",
+    "validation": "Test source is provided for explanation. Diffstory does not execute or assert results for those tests."
+  },
+  "fragments": [
+    {
+      "path": "catalog/search.py",
+      "side": "base",
+      "text": "def normalize_label(value: str) -> str:\n    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"\n    return \" \".join(value.split())\n\n\ndef split_tags(value: str) -> list[str]:\n    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"\n    tags = []\n    for part in value.split(\",\"):\n        if part.strip():\n            tags.append(part.strip().lower())\n    return tags\n\n\ndef merge_records(records):\n    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"\n    seen = set()\n    for record in records:\n        key = record[\"id\"]\n        if key in seen:\n            continue\n        seen.add(key)\n        yield record\n\n\ndef construct_query(term: str, limit: int = 25):\n    \"\"\"Select a page of catalog items using bound parameters.\n\n    The caller provides a database connection. This helper only produces\n    a statement and its parameters; it never executes a query itself.\n    LIKE wildcard semantics are intentionally left to the database.\n    \"\"\"\n    statement = (\n        \"SELECT id, label, tags, views, clicks FROM items \"\n        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"\n    )\n    return statement, (f\"%{term}%\", limit)\n\n\ndef parse_record(row):\n    \"\"\"Turn a database row into a display record.\"\"\"\n    result = {\n        \"id\": str(row[\"id\"]),\n        \"label\": normalize_label(row[\"label\"]),\n        \"tags\": split_tags(row.get(\"tags\", \"\")),\n        \"click_rate\": None,\n    }\n    if row.get(\"views\"):\n        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)\n    return result\n\n\ndef get_records(connection, term: str, limit: int = 25):\n    statement, parameters = construct_query(term, limit)\n    rows = connection.execute(statement, parameters)\n    parsed = [parse_record(row) for row in rows]\n    return list(merge_records(parsed))\n",
+      "start_line": 1,
+      "scope": "full"
+    },
+    {
+      "path": "tools/export.py",
+      "side": "base",
+      "text": "from catalog.search import split_tags\n\n\ndef export_tags(value):\n    return \";\".join(split_tags(value))\n",
+      "start_line": 1,
+      "scope": "full"
+    },
+    {
+      "path": "catalog/labels.py",
+      "side": "head",
+      "text": "def normalize_label(value: str) -> str:\n    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"\n    return \" \".join(value.split())\n",
+      "start_line": 1,
+      "scope": "full"
+    },
+    {
+      "path": "catalog/merge.py",
+      "side": "head",
+      "text": "def merge_records(records):\n    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"\n    seen = set()\n    for record in records:\n        key = record[\"id\"]\n        if key in seen:\n            continue\n        seen.add(key)\n        yield record\n",
+      "start_line": 1,
+      "scope": "full"
+    },
+    {
+      "path": "catalog/parsing.py",
+      "side": "head",
+      "text": "from catalog.labels import normalize_label\n\n\ndef parse_tags(value: str) -> list[str]:\n    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"\n    tags = []\n    for part in value.split(\",\"):\n        if part.strip():\n            tags.append(part.strip().lower())\n    return tags\n\n\ndef populate_metrics(row, result):\n    \"\"\"Add a click rate only when views are present and nonzero.\"\"\"\n    if row.get(\"views\"):\n        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)\n\n\ndef parse_record(row):\n    \"\"\"Turn a database row into a display record.\n\n    Output fields:\n        id: stable string representation of the source identifier.\n        label: whitespace-normalized title with original capitalization.\n        tags: lower-case tags in their original encounter order.\n        click_rate: clicks divided by views, rounded to four places.\n\n    Absent or zero views leave click_rate as None. Missing required\n    identifiers and labels still raise KeyError; we do not silently\n    invent identifiers or descriptions in a normalization step.\n\n    The metrics calculation is now shared, but its rounding precision\n    and missing-value rule are not intended to change. Test those rules\n    at the public parse_record boundary, not just on the helper.\n    \"\"\"\n    result = {\n        \"id\": str(row[\"id\"]),\n        \"label\": normalize_label(row[\"label\"]),\n        \"tags\": parse_tags(row.get(\"tags\", \"\")),\n        \"click_rate\": None,\n    }\n    populate_metrics(row, result)\n    return result\n",
+      "start_line": 1,
+      "scope": "full"
+    },
+    {
+      "path": "catalog/query.py",
+      "side": "head",
+      "text": "def construct_query(term: str, limit: int = 25):\n    \"\"\"Select a bounded page of catalog items using bound parameters.\n\n    Query construction is independent of connection management and row\n    interpretation. It returns two values: SQL and the parameter tuple.\n    The caller passes both directly to connection.execute().\n\n    Contract:\n        * Only integer page sizes from 1 through 100 are accepted.\n        * Booleans are rejected even though bool is an int subclass.\n        * Search terms remain parameters, never SQL fragments.\n        * ORDER BY id keeps the page ordering deterministic.\n        * The default page size remains 25.\n\n    LIKE wildcards inside a search term are not escaped by this function.\n    The caller should not interpret the search as a literal substring\n    match when the input contains SQL wildcard characters.\n\n    This extraction intentionally introduces a page-size restriction.\n    That is a behavioral edit, not an unchanged move. Callers that used\n    zero, a negative value, or more than 100 now receive ValueError.\n    \"\"\"\n    if type(limit) is not int or not 1 <= limit <= 100:\n        raise ValueError(\"limit must be an integer between 1 and 100\")\n\n    statement = (\n        \"SELECT id, label, tags, views, clicks FROM items \"\n        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"\n    )\n    parameters = (f\"%{term}%\", limit)\n    return statement, parameters\n",
+      "start_line": 1,
+      "scope": "full"
+    },
+    {
+      "path": "catalog/search.py",
+      "side": "head",
+      "text": "from catalog.query import construct_query\nfrom catalog.parsing import parse_record\nfrom catalog.merge import merge_records\n\n\ndef get_records(connection, term: str, limit: int = 25):\n    \"\"\"Build, execute, interpret, then deduplicate a single catalog page.\"\"\"\n    statement, parameters = construct_query(term, limit)\n    rows = connection.execute(statement, parameters)\n    # Materialize rows before merging, as before this extraction.\n    records = [parse_record(row) for row in rows]\n    return list(merge_records(records))\n",
+      "start_line": 1,
+      "scope": "full"
+    },
+    {
+      "path": "tests/test_parsing.py",
+      "side": "head",
+      "text": "from catalog.parsing import parse_record, parse_tags\nfrom catalog.merge import merge_records\n\n\ndef test_record_preserves_display_contract():\n    assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {\n        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,\n    }\n\n\ndef test_missing_and_zero_views():\n    for row in ({\"id\": 7, \"label\": \"Pen\"}, {\"id\": 7, \"label\": \"Pen\", \"views\": 0}):\n        assert parse_record(row)[\"click_rate\"] is None\n\n\ndef test_tag_order_and_duplicates():\n    assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]\n\n\ndef test_first_record_wins():\n    first = {\"id\": \"7\", \"label\": \"First\"}\n    later = {\"id\": \"7\", \"label\": \"Later\"}\n    assert list(merge_records([first, later])) == [first]\n",
+      "start_line": 1,
+      "scope": "full"
+    },
+    {
+      "path": "tests/test_query.py",
+      "side": "head",
+      "text": "from catalog.query import construct_query\n\n\ndef test_query_default():\n    statement, parameters = construct_query(\"notebook\")\n    assert \"ORDER BY id LIMIT ?\" in statement\n    assert parameters == (\"%notebook%\", 25)\n\n\ndef test_term_stays_a_parameter():\n    term = \"paper' OR 1=1 --\"\n    statement, parameters = construct_query(term)\n    assert term not in statement\n    assert parameters[0] == f\"%{term}%\"\n\n\ndef test_page_size_boundaries():\n    for limit in (1, 100):\n        assert construct_query(\"pen\", limit)[1][1] == limit\n    for limit in (0, -1, 101, True, 2.5):\n        try:\n            construct_query(\"pen\", limit)\n        except ValueError:\n            continue\n        raise AssertionError(f\"unexpectedly accepted {limit!r}\")\n",
+      "start_line": 1,
+      "scope": "full"
+    },
+    {
+      "path": "tools/export.py",
+      "side": "head",
+      "text": "from catalog.parsing import parse_tags\n\n\ndef export_tags(value):\n    return \";\".join(parse_tags(value))\n",
+      "start_line": 1,
+      "scope": "full"
+    }
+  ],
+  "warnings": []
+}

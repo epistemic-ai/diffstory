@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffstory"
+version = "0.3.0"
+description = "Read code changes as a story: a local-first, source-linked literate diff reader"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "Epistemic AI"}]
+keywords = ["code-review", "diff", "literate-programming", "git", "static-analysis"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Version Control :: Git",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["build>=1.2,<2", "twine>=6,<7", "playwright>=1.50,<2"]
+
+[project.urls]
+Homepage = "https://www.epistemic.ai"
+Repository = "https://github.com/epistemic-ai/diffstory"
+Issues = "https://github.com/epistemic-ai/diffstory/issues"
+Changelog = "https://github.com/epistemic-ai/diffstory/blob/main/CHANGELOG.md"
+
+[project.scripts]
+diffstory = "diffstory.cli:main"
+
+[tool.setuptools.package-data]
+diffstory = ["assets/*.html", "assets/*.css", "assets/*.js", "assets/*.svg"]
+
+[tool.setuptools.packages.find]
+include = ["diffstory*"]
+exclude = ["tests*", "examples*", "docs*", "scripts*"]

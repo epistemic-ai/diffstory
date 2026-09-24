@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Diffstory · A literate diff</title>
+<style>:root {
+  --paper: #ffffff; --card: #fff; --ink: #0f172a; --body: #475569;
+  --muted: #64748b; --soft: #94a3b8; --line: #e2e8f0; --accent: #2563eb;
+  --code-bg: #f8fafc; --add: #e9f4e9; --del: #faece8;
+  --add-ink: #376846; --del-ink: #98504a; --edited: #8a6130;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --serif: Georgia, "Times New Roman", serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --prose-width: 696px; --code-width: 936px;
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 90px; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 14px/1.6 var(--sans); }
+button, input, textarea { font: inherit; }
+button { color: inherit; cursor: pointer; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+[hidden] { display: none !important; }
+.skip-link { position: fixed; top: -70px; left: 20px; padding: 12px 18px; background: var(--card); z-index: 100; }
+.skip-link:focus { top: 10px; }
+.topbar { height: 60px; padding: 0 34px; position: sticky; top: 0; z-index: 30; display: flex; align-items: center; gap: 24px; background: var(--paper); border-bottom: 1px solid var(--line); }
+.brand { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-size: 18px; font-weight: 650; letter-spacing: -.5px; white-space: nowrap; }
+.brand:hover { text-decoration: none; }
+.brandmark { color: var(--accent); font-size: 27px; line-height: 1; font-weight: 400; margin-right: 2px; }
+.edition { font-size: 12px; font-weight: 400; letter-spacing: 0; color: var(--muted); margin-left: 5px; }
+.reading-position { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46vw; margin: auto; }
+.topactions { display: flex; align-items: center; gap: 18px; margin-left: auto; }
+.plain-button, .more-button { background: none; border: 0; padding: 8px 1px; color: var(--body); font-size: 12px; }
+.plain-button span { margin-left: 5px; color: var(--muted); }
+.more-button { letter-spacing: 2px; font-size: 10px; min-width: 26px; }
+.reading-track { position: absolute; bottom: -1px; left: 0; width: 100%; height: 2px; pointer-events: none; }
+.reading-track span { display: block; height: 100%; background: var(--accent); width: 0; }
+.popover { position: fixed; top: 68px; right: 24px; z-index: 50; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 12px 45px #0f172a17; }
+.contents-panel { width: 416px; max-width: calc(100vw - 28px); padding: 21px; }
+.popover-heading { display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin-bottom: 15px; }
+.popover-heading strong { font-weight: 600; }
+.popover-heading span { font: 10px var(--mono); color: var(--muted); }
+.search-label { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); padding: 0 0 9px; margin-bottom: 8px; color: var(--muted); }
+.search-label>span { font-size: 21px; line-height: 1; }
+.search-label input { background: none; min-width: 0; width: 100%; font-size: 12px; border: 0; color: var(--ink); padding: 5px; outline-offset: 0; }
+kbd { font: 10px var(--mono); border: 1px solid var(--line); border-radius: 3px; padding: 1px 4px; }
+#contentsList { max-height: calc(100vh - 252px); overflow-y: auto; }
+.contents-item { display: flex; align-items: flex-start; gap: 12px; padding: 9px 4px; font-size: 12px; color: var(--body); border-radius: 4px; }
+.contents-item:hover { background: var(--code-bg); text-decoration: none; }
+.contents-item[aria-current="location"] { color: var(--accent); font-weight: 600; }
+.contents-number { font: 10px/1.9 var(--mono); color: var(--muted); }
+.contents-check { color: var(--accent); margin-left: auto; font-size: 11px; }
+.contents-foot { border-top: 1px solid var(--line); padding-top: 13px; margin-top: 10px; display: flex; gap: 16px; flex-wrap: wrap; font-size: 10px; }
+.contents-foot>span { margin-left: auto; color: var(--muted); }
+.more-panel { padding: 8px; width: 244px; }
+.more-panel>button, .more-panel>a { border: 0; background: none; display: flex; justify-content: space-between; width: 100%; font-size: 12px; text-align: left; color: var(--body); padding: 9px 12px; border-radius: 5px; }
+.more-panel>button:hover, .more-panel>a:hover { background: var(--code-bg); text-decoration: none; }
+.more-panel span { color: var(--muted); font-size: 10px; }
+.menu-rule { height: 1px; background: var(--line); margin: 6px 10px; }
+main { padding: 0 26px; }
+.document-header, .section-heading, .prose, .section-end, .review-details, .section-extra, .document-footer { width: 100%; max-width: var(--prose-width); margin-left: auto; margin-right: auto; }
+.document-header { padding: 67px 0 42px; }
+.document-kicker { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font: 10px/1.7 var(--mono); color: var(--muted); margin-bottom: 21px; }
+.document-kicker a { color: var(--muted); }
+.kicker-dot { color: var(--soft); }
+h1 { font: 400 45px/1.13 var(--serif); letter-spacing: -1.4px; margin: 0 0 20px; color: #0f172a; text-wrap: balance; }
+.lead { font: 18px/1.72 var(--serif); color: var(--body); margin: 0 0 23px; }
+.document-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; margin-bottom: 13px; }
+.document-meta .sep { color: #cbd5e1; padding: 0 3px; }
+.revisions { font: 10px/1.7 var(--mono); color: var(--muted); }
+.document-scope { font-size: 11px; line-height: 1.7; color: var(--muted); margin: 12px 0 0; }
+.document-scope a { text-decoration: underline; text-underline-offset: 3px; color: inherit; }
+.header-rule { width: 36px; height: 2px; background: var(--accent); margin-top: 36px; }
+.story-section { padding: 16px 0 42px; scroll-margin-top: 87px; }
+.section-heading { display: flex; align-items: baseline; position: relative; margin-top: 0; margin-bottom: 19px; gap: 13px; }
+.section-number { font: 11px var(--mono); color: var(--accent); position: absolute; right: calc(100% + 22px); top: 7px; }
+h2 { font: 600 23px/1.33 var(--sans); letter-spacing: -.65px; margin: 0; }
+.section-anchor { opacity: 0; font-size: 15px; font-weight: 400; margin-left: 9px; color: var(--soft); }
+h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
+.prose { font: 17px/1.78 var(--serif); color: var(--body); }
+.prose p { margin: 0 0 18px; }
+.prose code, .lead code, .closing code { font: .79em/1.7 var(--mono); color: #1e40af; background: #eff6ff; padding: 2px 4px; border-radius: 3px; overflow-wrap: anywhere; }
+.prose strong { color: var(--ink); font-weight: 700; }
+.passage { margin-bottom: 29px; }
+.code-block { width: 100%; max-width: var(--code-width); margin: 19px auto 26px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: var(--card); }
+.code-header { display: flex; align-items: center; gap: 12px; padding: 11px 16px; font: 10px/1.7 var(--mono); border-bottom: 1px solid var(--line); background: var(--card); }
+.code-header .filename { font-weight: 600; color: #475569; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.code-header .symbol-name { margin-left: 6px; color: var(--muted); font-weight: 400; }
+.code-header .classification { margin-left: auto; white-space: nowrap; font: 10px var(--sans); color: var(--muted); }
+.classification.move { color: var(--accent); }
+.classification.edited { color: var(--edited); }
+.classification.rename { color: #526e92; }
+.classification.removed { color: var(--del-ink); }
+.code-region { overflow-x: auto; overscroll-behavior-x: contain; background: var(--code-bg); }
+.code-lines { min-width: 100%; width: max-content; }
+.code-line { display: flex; min-width: 100%; font: 11.5px/1.95 var(--mono); }
+.line-no { width: 51px; min-width: 51px; padding-right: 15px; color: #64748b; text-align: right; user-select: none; background: #f1f5f9; }
+.line-no.dual { min-width: 35px; width: 35px; padding-right: 8px; }
+.code-sign { min-width: 19px; width: 19px; text-align: center; color: var(--muted); user-select: none; }
+.code-text { white-space: pre; padding: 0 20px 0 13px; }
+.code-line.add { background: var(--add); }
+.code-line.delete { background: var(--del); }
+.code-line.add .line-no { background: #dfeede; color: #5c785e; }
+.code-line.delete .line-no { background: #f1dfd9; color: #9c7167; }
+.code-line.add .code-sign { color: var(--add-ink); }
+.code-line.delete .code-sign { color: var(--del-ink); }
+.hunk-label { font: 10px/1.7 var(--mono); padding: 5px 16px; background: #edf1f5; color: #6b8192; white-space: pre; }
+.source-gap { font: 10px/1.7 var(--mono); color: var(--muted); background: #f1f5f9; padding: 5px 14px 5px 64px; }
+.token-keyword { color: #426b86; }
+.token-string { color: #94634c; }
+.token-comment { color: #64748b; }
+.token-number { color: #797090; }
+.code-footer { border-top: 1px solid var(--line); display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; padding: 9px 16px; font-size: 10px; color: var(--muted); background: var(--card); }
+.code-footer .code-location { margin-right: auto; overflow-wrap: anywhere; }
+.text-button { border: 0; padding: 1px 0; background: none; color: var(--accent); font-size: 10px; text-align: left; }
+.text-button:hover { text-decoration: underline; text-underline-offset: 3px; }
+.code-source-link { font-size: 10px; }
+.load-bar { display: flex; width: 100%; justify-content: center; align-items: center; gap: 9px; padding: 10px 16px; border: 0; border-top: 1px solid var(--line); color: var(--accent); background: #eff6ff; font-size: 11px; }
+.load-bar:hover { background: #dbeafe; }
+.load-count { color: var(--muted); font-size: 10px; }
+.code-note { padding: 15px 18px; font-size: 12px; color: var(--muted); }
+.lazy-shell { padding: 20px; text-align: center; }
+.lazy-shell button { border: 0; background: none; color: var(--accent); font-size: 11px; }
+.section-end { font: italic 15px/1.8 var(--serif); color: #778073; margin-top: 20px; margin-bottom: 16px; }
+.section-end code { font-size: .8em; font-family: var(--mono); font-style: normal; }
+.review-details, .section-extra { font-size: 12px; color: var(--body); margin-top: 15px; margin-bottom: 12px; }
+.review-details>summary, .section-extra>summary { cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 7px; font: 11px/1.7 var(--sans); color: var(--muted); }
+.review-details>summary::-webkit-details-marker, .section-extra>summary::-webkit-details-marker { display: none; }
+.review-details>summary:before, .section-extra>summary:before { content: '+'; font: 14px var(--mono); width: 12px; color: var(--accent); }
+.review-details[open]>summary:before, .section-extra[open]>summary:before { content: '−'; }
+.review-details>summary:hover, .section-extra>summary:hover { color: var(--accent); }
+.review-details[open] { border-top: 1px solid var(--line); padding-top: 14px; }
+.review-check-indicator { color: var(--accent); font-size: 10px; }
+.audit-content { padding: 20px 0 0; }
+.audit-content h3 { font-size: 11px; font-weight: 650; margin: 0 0 8px; color: var(--ink); }
+.audit-content ul { margin: 0 0 20px; padding-left: 18px; font-size: 12px; line-height: 1.8; }
+.audit-content li { margin-bottom: 5px; }
+.audit-content code { font-family: var(--mono); font-size: .88em; overflow-wrap: anywhere; }
+.audit-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+.audit-source { margin: 9px 0; font-size: 11px; }
+.audit-source>summary { cursor: pointer; font-size: 11px; color: var(--muted); }
+.audit-source-body { margin: 10px 0 18px; padding-left: 13px; border-left: 2px solid var(--line); line-height: 1.8; }
+.audit-source-body p { margin: 6px 0; }
+.test-reference { margin: 9px 0; }
+.test-reference>summary { color: var(--accent); cursor: pointer; font: 10px/1.75 var(--mono); overflow-wrap: anywhere; }
+.test-reference .code-block { margin-top: 9px; }
+.test-run-note { font-size: 10px; color: var(--muted); margin: 7px 0 16px; }
+.review-form { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 15px; }
+.review-form label { display: flex; align-items: center; gap: 7px; font-size: 11px; }
+.review-form input { accent-color: var(--accent); }
+.review-form textarea { width: 100%; display: block; min-height: 80px; background: var(--card); border: 1px solid var(--line); border-radius: 5px; font-size: 12px; line-height: 1.8; padding: 10px 12px; resize: vertical; margin: 10px 0 6px; color: var(--body); }
+.review-local-note { font-size: 10px; color: var(--muted); }
+.section-extra .code-block { margin-top: 14px; margin-bottom: 15px; }
+.document-footer { padding: 0 0 90px; margin-top: 8px; }
+.closing { font: 17px/1.8 var(--serif); color: var(--body); border-top: 1px solid var(--line); padding-top: 28px; margin: 0 0 42px; }
+.closing-label { display: block; color: var(--accent); font: 10px var(--mono); text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 13px; }
+.appendix { border-top: 1px solid var(--line); margin: 0; scroll-margin-top: 80px; }
+.appendix>summary { padding: 18px 0; font-size: 12px; list-style: none; cursor: pointer; display: flex; justify-content: space-between; gap: 14px; color: var(--body); }
+.appendix>summary::-webkit-details-marker { display: none; }
+.appendix>summary:after { content: '+'; color: var(--muted); }
+.appendix[open]>summary:after { content: '−'; }
+.appendix-content { padding: 8px 0 22px; font-size: 12px; line-height: 1.8; }
+.appendix-content p { margin: 0 0 16px; color: var(--body); }
+.appendix-content h3 { font: 600 12px var(--sans); margin: 23px 0 11px; }
+.appendix-content dl { display: grid; grid-template-columns: 110px minmax(0,1fr); gap: 9px 18px; font-size: 11px; }
+.appendix-content dt { color: var(--muted); }
+.appendix-content dd { margin: 0; overflow-wrap: anywhere; }
+.appendix-content dd.mono { font: 10px/1.8 var(--mono); }
+.appendix-content ul { padding-left: 17px; }
+.appendix-content li { margin-bottom: 7px; }
+.appendix-content pre { white-space: pre-wrap; font: 11px/1.8 var(--mono); }
+.raw-file { margin: 9px 0; }
+.raw-file>summary { font: 10px/1.8 var(--mono); cursor: pointer; color: var(--accent); overflow-wrap: anywhere; padding: 7px 0; }
+.raw-file .code-block { margin: 8px auto 17px; }
+.raw-file .region-label { font-size: 10px; color: var(--muted); }
+.bottom-line { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; font-size: 10px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 20px; margin-top: 0; }
+.bottom-line a { color: var(--muted); }
+.empty { font-size: 12px; padding: 18px 0; color: var(--muted); }
+.noscript { max-width: var(--prose-width); margin: 50px auto; }
+#toast { position: fixed; bottom: 23px; left: 50%; transform: translate(-50%, 15px); max-width: calc(100vw - 32px); background: #0f172a; color: #fff; border-radius: 5px; padding: 10px 16px; font-size: 11px; z-index: 80; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .15s, transform .15s; }
+#toast.show { transform: translate(-50%,0); opacity: 1; visibility: visible; }
+@media (min-width: 1440px) {
+  .document-header { padding-top: 78px; }
+}
+@media (max-width: 940px) {
+  .section-number { position: static; top: auto; font-size: 10px; }
+  .reading-position { max-width: 40vw; }
+  .code-header .symbol-name { display: none; }
+}
+@media (max-width: 620px) {
+  main { padding: 0 20px; }
+  .topbar { height: 56px; padding: 0 20px; gap: 8px; }
+  .edition, .reading-position { display: none; }
+  .topactions { gap: 16px; }
+  .document-header { padding: 40px 0 27px; }
+  .document-kicker { font-size: 9px; gap: 5px; margin-bottom: 18px; }
+  h1 { font-size: 34px; line-height: 1.14; letter-spacing: -.9px; }
+  .lead { font-size: 17px; }
+  .document-meta { font-size: 9px; }
+  .document-scope { font-size: 10px; }
+  .header-rule { margin-top: 29px; }
+  .story-section { padding-top: 17px; padding-bottom: 29px; }
+  .section-heading { gap: 9px; margin-bottom: 16px; }
+  .section-number { align-self: flex-start; margin-top: 5px; }
+  h2 { font-size: 21px; letter-spacing: -.5px; }
+  .section-anchor { display: none; }
+  .prose { font-size: 16px; line-height: 1.8; }
+  .passage { margin-bottom: 24px; }
+  .code-block { border-radius: 5px; margin-top: 17px; }
+  .code-header { padding: 9px 10px; gap: 8px; }
+  .code-header .classification { font-size: 9px; }
+  .code-line { font-size: 10px; line-height: 2; }
+  .line-no { width: 35px; min-width: 35px; padding-right: 8px; }
+  .line-no.dual { width: 27px; min-width: 27px; padding-right: 5px; }
+  .code-sign { width: 13px; min-width: 13px; }
+  .code-text { padding-left: 9px; }
+  .source-gap { padding-left: 44px; font-size: 9px; }
+  .code-footer { padding: 9px 11px; font-size: 9px; gap: 6px 12px; }
+  .code-footer .code-location { width: 100%; }
+  .load-bar { flex-wrap: wrap; gap: 5px; font-size: 10px; }
+  .load-count { font-size: 9px; }
+  .contents-panel { right: 14px; top: 65px; padding: 17px; }
+  .more-panel { right: 14px; top: 65px; }
+  .audit-columns { grid-template-columns: 1fr; gap: 0; }
+  .appendix-content dl { grid-template-columns: 85px minmax(0,1fr); gap: 8px 9px; }
+  .bottom-line { font-size: 9px; }
+  .document-footer { padding-bottom: 60px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *:before, *:after { scroll-behavior: auto !important; transition: none !important; }
+}
+@media print {
+  .topbar, .popover, .review-details, .section-extra, .code-footer, .load-bar, .section-anchor, #toast, .skip-link { display: none !important; }
+  body { background: #fff; color: #000; }
+  main { padding: 0; }
+  .document-header { padding-top: 0; }
+  .code-region { overflow: visible; }
+  .code-lines { width: 100%; min-width: 0; }
+  .code-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .code-line { min-width: 0; font-size: 9px; }
+  .code-text { min-width: 0; }
+  .code-block { break-inside: auto; }
+  .section-heading { break-after: avoid; }
+  .appendix { display: none; }
+  .section-number { position: static; }
+}
+
+/* Epistemic AI identity: quiet product endorsement, not another toolbar. */
+.brand { gap: 11px; letter-spacing: -.4px; }
+.brandmark { display: inline-flex; align-items: center; width: 27px; height: 27px; margin: 0; }
+.brandmark svg { display: block; width: 100%; height: 100%; }
+.edition { font-size: 10px; text-transform: uppercase; letter-spacing: 1.2px; padding-left: 13px; border-left: 1px solid var(--line); margin-left: 3px; }
+.document-kicker { color: var(--accent); }
+.document-kicker a { color: var(--accent); }
+.brand-credit { color: var(--muted); }
+@media (max-width: 560px) { .edition { display: none; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<a class="skip-link" href="#story">Skip to the walkthrough</a>
+<header class="topbar">
+  <a class="brand" href="#top" aria-label="Diffstory, back to top"><span class="brandmark" aria-hidden="true"><svg width="102" height="102" viewBox="0 0 102 102" fill="none" xmlns="http://www.w3.org/2000/svg">
+<path d="M59.5314 52.0809C59.5314 56.9422 55.5914 60.8822 50.73 60.8822C45.8687 60.8822 41.9274 56.9422 41.9274 52.0809C41.9274 47.2195 45.8687 43.2795 50.73 43.2795C55.5914 43.2795 59.5314 47.2195 59.5314 52.0809Z" fill="#2563EB"/>
+<path d="M85.6407 54.0808V50.0808H50.7296V54.0808H85.6407Z" fill="#2563EB"/>
+<path d="M101.459 52.0809C101.459 56.9422 97.5186 60.8822 92.6573 60.8822C87.7959 60.8822 83.8546 56.9422 83.8546 52.0809C83.8546 47.2195 87.7959 43.2795 92.6573 43.2795C97.5186 43.2795 101.459 47.2195 101.459 52.0809Z" fill="#2563EB"/>
+<path d="M59.5314 8.80133C59.5314 13.6627 55.5914 17.6027 50.73 17.6027C45.8687 17.6027 41.9274 13.6627 41.9274 8.80133C41.9274 3.94 45.8687 -3.8147e-06 50.73 -3.8147e-06C55.5914 -3.8147e-06 59.5314 3.94 59.5314 8.80133Z" fill="#2563EB"/>
+<path d="M59.5314 92.6559C59.5314 97.5172 55.5914 101.457 50.73 101.457C45.8687 101.457 41.9274 97.5172 41.9274 92.6559C41.9274 87.7945 45.8687 83.8545 50.73 83.8545C55.5914 83.8545 59.5314 87.7945 59.5314 92.6559Z" fill="#2563EB"/>
+<path d="M17.604 50.7286C17.604 55.5899 13.664 59.5299 8.80267 59.5299C3.94133 59.5299 0 55.5899 0 50.7286C0 45.8672 3.94133 41.9272 8.80267 41.9272C13.664 41.9272 17.604 45.8672 17.604 50.7286Z" fill="#2563EB"/>
+<path d="M27.3064 14.8577C30.7437 18.295 30.7437 23.8683 27.3064 27.3057C23.8691 30.743 18.2957 30.743 14.8584 27.3057C11.4211 23.8683 11.4211 18.295 14.8584 14.8577C18.2957 11.4203 23.8691 11.4203 27.3064 14.8577Z" fill="#2563EB"/>
+<path d="M27.3062 74.152C30.7435 77.5893 30.7435 83.1626 27.3062 86.6C23.8688 90.0373 18.2955 90.0373 14.8582 86.6C11.4208 83.1626 11.4208 77.5893 14.8582 74.152C18.2955 70.7146 23.8688 70.7146 27.3062 74.152Z" fill="#2563EB"/>
+<path d="M86.6005 14.8577C90.0378 18.295 90.0378 23.8683 86.6005 27.3057C83.1631 30.743 77.5898 30.743 74.1525 27.3057C70.7151 23.8683 70.7151 18.295 74.1525 14.8577C77.5898 11.4203 83.1631 11.4203 86.6005 14.8577Z" fill="#2563EB"/>
+<path d="M35.3467 11.7132C40.1093 9.8332 45.2987 8.8012 50.7293 8.8012Z" fill="#2563EB"/>
+<path d="M33.4863 12.4475C33.8919 13.475 35.0536 13.9791 36.081 13.5735C40.6135 11.7844 45.5541 10.8011 50.7295 10.8011C51.834 10.801 52.7295 9.90558 52.7295 8.80106C52.7294 7.69659 51.8339 6.80114 50.7295 6.80106C45.0435 6.80106 39.6051 7.88196 34.6123 9.85282C33.5849 10.2584 33.0807 11.4201 33.4863 12.4475Z" fill="#2563EB"/>
+<path d="M11.3096 36.4139C13.4562 30.5019 16.8962 25.2112 21.2856 20.8805Z" fill="#2563EB"/>
+<path d="M10.627 38.2938C11.6652 38.6708 12.8125 38.1348 13.1895 37.0965C15.2328 31.4692 18.5085 26.4306 22.6905 22.3045C23.4767 21.5288 23.4848 20.2617 22.709 19.4754C21.9332 18.6895 20.667 18.6812 19.8809 19.4569C15.2842 23.9921 11.6797 29.5346 9.42972 35.7313C9.05273 36.7695 9.58876 37.9168 10.627 38.2938Z" fill="#2563EB"/>
+<path d="M65.3083 11.4054C71.023 13.5241 76.1483 16.8534 80.3763 21.0814Z" fill="#2563EB"/>
+<path d="M78.9617 22.4955C79.7428 23.2766 81.0098 23.2766 81.7908 22.4955C82.5716 21.7145 82.5716 20.4484 81.7908 19.6674C77.363 15.2395 71.9934 11.7503 66.0037 9.52969C64.9681 9.14579 63.8174 9.6747 63.4334 10.7104C63.0495 11.746 63.5775 12.8967 64.6131 13.2807C70.0526 15.2973 74.9336 18.4675 78.9617 22.4955Z" fill="#2563EB"/>
+<path d="M89.8003 33.6277C92.3416 39.1663 93.6136 45.145 93.6136 51.125Z" fill="#2563EB"/>
+<path d="M91.6138 51.125C91.6138 52.2296 92.5092 53.125 93.6138 53.125C94.7183 53.1249 95.6138 52.2295 95.6138 51.125C95.6138 44.862 94.2811 38.5986 91.6177 32.7939C91.1571 31.7901 89.9702 31.3491 88.9663 31.8096C87.9624 32.2702 87.5223 33.458 87.9829 34.4619C90.4021 39.7345 91.6138 45.4282 91.6138 51.125Z" fill="#2563EB"/>
+<path d="M12.0972 67.0487C9.97582 62.0327 8.80249 56.518 8.80249 50.7287Z" fill="#2563EB"/>
+<path d="M6.80249 50.7284C6.80249 56.7902 8.03097 62.57 10.2546 67.828C10.6849 68.8452 11.8585 69.3205 12.8757 68.8905C13.8931 68.4602 14.3695 67.2867 13.9392 66.2694C11.9203 61.4954 10.8025 56.2451 10.8025 50.7284C10.8023 49.6239 9.90696 48.7284 8.80249 48.7284C7.69802 48.7284 6.80266 49.6239 6.80249 50.7284Z" fill="#2563EB"/>
+<path d="M37.1372 90.4036C31.0252 88.3103 25.5492 84.8436 21.0785 80.3716Z" fill="#2563EB"/>
+<path d="M36.4887 92.2962C37.5336 92.6541 38.6717 92.0969 39.0297 91.0521C39.3876 90.0071 38.8305 88.869 37.7856 88.511C31.9677 86.5184 26.7518 83.2178 22.4926 78.9573C21.7116 78.1765 20.4455 78.1765 19.6645 78.9573C18.8834 79.7383 18.8836 81.0043 19.6645 81.7855C24.3465 86.4689 30.0827 90.1021 36.4887 92.2962Z" fill="#2563EB"/>
+</svg>
+</span> diffstory<span class="edition">Epistemic AI</span></a>
+  <span class="reading-position" id="readingPosition" aria-live="off"></span>
+  <div class="topactions">
+    <button id="contentsBtn" class="plain-button" aria-expanded="false" aria-controls="contentsPanel">Contents <span aria-hidden="true">⌄</span></button>
+    <button id="moreBtn" class="more-button" aria-label="Reader options" aria-expanded="false" aria-controls="morePanel">•••</button>
+  </div>
+  <div class="reading-track" aria-hidden="true"><span id="readingProgress"></span></div>
+</header>
+<div id="contentsPanel" class="popover contents-panel" hidden>
+  <div class="popover-heading"><strong>In this reading</strong><span id="sectionCount"></span></div>
+  <label class="search-label"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="Find a section or symbol" aria-label="Find a section or symbol" autocomplete="off"><kbd>/</kbd></label>
+  <nav id="contentsList" aria-label="Document contents"></nav>
+  <div class="contents-foot"><a href="#source-hunks">Source hunks</a><a href="#evidence">Evidence & scope</a><span id="reviewProgress"></span></div>
+</div>
+<div id="morePanel" class="popover more-panel" hidden>
+  <button id="auditBtn" aria-pressed="false">Show review details <span id="auditStatus">Off</span></button>
+  <button id="collapseBtn">Collapse expanded code</button>
+  <div class="menu-rule"></div>
+  <a href="#source-hunks">Original source hunks</a>
+  <a href="#evidence">Evidence & scope</a>
+  <div class="menu-rule"></div>
+  <button id="exportBtn">Export review notes <span>↓</span></button>
+  <button id="importBtn">Import review notes <span>↑</span></button>
+  <button id="downloadReport">Download analysis JSON <span>↓</span></button>
+</div>
+<main id="top">
+  <header id="documentHeader" class="document-header"></header>
+  <article id="story" aria-label="Continuous code walkthrough"></article>
+  <footer id="documentFooter" class="document-footer"></footer>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="importFile" accept="application/json,.json" hidden>
+<noscript><p class="noscript">This offline reader needs JavaScript to display its embedded source and narrative. No network connection is needed.</p></noscript>
+<script type="application/json" id="report-data">{"schema":"diffstory.report.v1","meta":{"title":"One search module. Three clear responsibilities.","repository":"Synthetic catalog","base_sha":"44912524610170cef73861796b05188a13b7e1b0","head_sha":"2ac82c2ba3bffd4500379bc1fced0900a12bb2ba","scope":"changed files","input":"synthetic example","comparison":"original synthetic before/after sources","changed_files":8,"description":"An original catalog-search example for this open-source project. No private source or real customer data. The query page-size validation is an intentional behavior change.","validation":"Test source is provided for explanation. Diffstory does not execute or assert results for those tests."},"changes":[{"id":"d7ea39d8954cab6b","kind":"modified","label":"Edited · review behavior","before":{"id":"5173d8eed2459d11","side":"base","path":"catalog/search.py","name":"get_records","node_type":"FunctionDef","start":53,"end":57,"source":"def get_records(connection, term: str, limit: int = 25):\n    statement, parameters = construct_query(term, limit)\n    rows = connection.execute(statement, parameters)\n    parsed = [parse_record(row) for row in rows]\n    return list(merge_records(parsed))","doc":null,"calls":[{"name":"construct_query","line":54},{"name":"connection.execute","line":55},{"name":"list","line":57},{"name":"parse_record","line":56},{"name":"merge_records","line":57}],"references":[{"name":"str","line":53},{"name":"int","line":53},{"name":"construct_query","line":54},{"name":"term","line":54},{"name":"limit","line":54},{"name":"connection.execute","line":55},{"name":"statement","line":55},{"name":"parameters","line":55},{"name":"list","line":57},{"name":"connection","line":55},{"name":"parse_record","line":56},{"name":"row","line":56},{"name":"rows","line":56},{"name":"merge_records","line":57},{"name":"parsed","line":57}],"assertions":[],"raises":[],"local_bindings":["connection","limit","parameters","parsed","row","rows","statement","term"],"is_test":false,"signature":"connection, term: str, limit: int=25","url":null,"scope":"full"},"after":{"id":"0d29f6c32cc0d31e","side":"head","path":"catalog/search.py","name":"get_records","node_type":"FunctionDef","start":6,"end":12,"source":"def get_records(connection, term: str, limit: int = 25):\n    \"\"\"Build, execute, interpret, then deduplicate a single catalog page.\"\"\"\n    statement, parameters = construct_query(term, limit)\n    rows = connection.execute(statement, parameters)\n    # Materialize rows before merging, as before this extraction.\n    records = [parse_record(row) for row in rows]\n    return list(merge_records(records))","doc":"Build, execute, interpret, then deduplicate a single catalog page.","calls":[{"name":"construct_query","line":8},{"name":"connection.execute","line":9},{"name":"list","line":12},{"name":"parse_record","line":11},{"name":"merge_records","line":12}],"references":[{"name":"str","line":6},{"name":"int","line":6},{"name":"construct_query","line":8},{"name":"term","line":8},{"name":"limit","line":8},{"name":"connection.execute","line":9},{"name":"statement","line":9},{"name":"parameters","line":9},{"name":"list","line":12},{"name":"connection","line":9},{"name":"parse_record","line":11},{"name":"row","line":11},{"name":"rows","line":11},{"name":"merge_records","line":12},{"name":"records","line":12}],"assertions":[],"raises":[],"local_bindings":["connection","limit","parameters","records","row","rows","statement","term"],"is_test":false,"signature":"connection, term: str, limit: int=25","url":null,"scope":"full"},"basis":"same declaration location","hunks":[{"old_start":53,"new_start":6,"old_count":5,"new_count":7,"rows":[{"tag":"context","old":53,"new":6,"text":"def get_records(connection, term: str, limit: int = 25):"},{"tag":"add","old":null,"new":7,"text":"    \"\"\"Build, execute, interpret, then deduplicate a single catalog page.\"\"\""},{"tag":"context","old":54,"new":8,"text":"    statement, parameters = construct_query(term, limit)"},{"tag":"context","old":55,"new":9,"text":"    rows = connection.execute(statement, parameters)"},{"tag":"delete","old":56,"new":null,"text":"    parsed = [parse_record(row) for row in rows]"},{"tag":"delete","old":57,"new":null,"text":"    return list(merge_records(parsed))"},{"tag":"add","old":null,"new":10,"text":"    # Materialize rows before merging, as before this extraction."},{"tag":"add","old":null,"new":11,"text":"    records = [parse_record(row) for row in rows]"},{"tag":"add","old":null,"new":12,"text":"    return list(merge_records(records))"}]}],"signature_changed":false,"docstring_changed":true},{"id":"0e3fa555970820b6","kind":"modified","label":"Edited · review behavior","before":{"id":"9607bc04d206152b","side":"base","path":"tools/export.py","name":"export_tags","node_type":"FunctionDef","start":4,"end":5,"source":"def export_tags(value):\n    return \";\".join(split_tags(value))","doc":null,"calls":[{"name":"split_tags","line":5}],"references":[{"name":"split_tags","line":5},{"name":"value","line":5}],"assertions":[],"raises":[],"local_bindings":["value"],"is_test":false,"signature":"value","url":null,"scope":"full"},"after":{"id":"2ea80861607ea62e","side":"head","path":"tools/export.py","name":"export_tags","node_type":"FunctionDef","start":4,"end":5,"source":"def export_tags(value):\n    return \";\".join(parse_tags(value))","doc":null,"calls":[{"name":"parse_tags","line":5}],"references":[{"name":"parse_tags","line":5},{"name":"value","line":5}],"assertions":[],"raises":[],"local_bindings":["value"],"is_test":false,"signature":"value","url":null,"scope":"full"},"basis":"same declaration location","hunks":[{"old_start":4,"new_start":4,"old_count":2,"new_count":2,"rows":[{"tag":"context","old":4,"new":4,"text":"def export_tags(value):"},{"tag":"delete","old":5,"new":null,"text":"    return \";\".join(split_tags(value))"},{"tag":"add","old":null,"new":5,"text":"    return \";\".join(parse_tags(value))"}]}],"signature_changed":false,"docstring_changed":false},{"id":"6cb0f770165fbc77","kind":"moved","label":"Moved · identical AST","before":{"id":"e7b1b29c2b62d5d7","side":"base","path":"catalog/search.py","name":"merge_records","node_type":"FunctionDef","start":15,"end":23,"source":"def merge_records(records):\n    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"\n    seen = set()\n    for record in records:\n        key = record[\"id\"]\n        if key in seen:\n            continue\n        seen.add(key)\n        yield record","doc":"Keep the first occurrence of each identifier, in encounter order.","calls":[{"name":"set","line":17},{"name":"seen.add","line":22}],"references":[{"name":"records","line":18},{"name":"set","line":17},{"name":"record","line":19},{"name":"key","line":20},{"name":"seen","line":20},{"name":"seen.add","line":22},{"name":"key","line":22},{"name":"record","line":23},{"name":"seen","line":22}],"assertions":[],"raises":[],"local_bindings":["key","record","records","seen"],"is_test":false,"signature":"records","url":null,"scope":"full"},"after":{"id":"7ef992f83fb42315","side":"head","path":"catalog/merge.py","name":"merge_records","node_type":"FunctionDef","start":1,"end":9,"source":"def merge_records(records):\n    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"\n    seen = set()\n    for record in records:\n        key = record[\"id\"]\n        if key in seen:\n            continue\n        seen.add(key)\n        yield record","doc":"Keep the first occurrence of each identifier, in encounter order.","calls":[{"name":"set","line":3},{"name":"seen.add","line":8}],"references":[{"name":"records","line":4},{"name":"set","line":3},{"name":"record","line":5},{"name":"key","line":6},{"name":"seen","line":6},{"name":"seen.add","line":8},{"name":"key","line":8},{"name":"record","line":9},{"name":"seen","line":8}],"assertions":[],"raises":[],"local_bindings":["key","record","records","seen"],"is_test":false,"signature":"records","url":null,"scope":"full"},"basis":"unique name + identical AST","hunks":[],"signature_changed":false,"docstring_changed":false},{"id":"909d421caece8249","kind":"moved","label":"Moved · identical AST","before":{"id":"f5e655abd3026e56","side":"base","path":"catalog/search.py","name":"normalize_label","node_type":"FunctionDef","start":1,"end":3,"source":"def normalize_label(value: str) -\u003e str:\n    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"\n    return \" \".join(value.split())","doc":"Collapse incidental whitespace without changing case or punctuation.","calls":[{"name":"value.split","line":3}],"references":[{"name":"str","line":1},{"name":"str","line":1},{"name":"value.split","line":3},{"name":"value","line":3}],"assertions":[],"raises":[],"local_bindings":["value"],"is_test":false,"signature":"value: str","url":null,"scope":"full"},"after":{"id":"9a354024ec622592","side":"head","path":"catalog/labels.py","name":"normalize_label","node_type":"FunctionDef","start":1,"end":3,"source":"def normalize_label(value: str) -\u003e str:\n    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"\n    return \" \".join(value.split())","doc":"Collapse incidental whitespace without changing case or punctuation.","calls":[{"name":"value.split","line":3}],"references":[{"name":"str","line":1},{"name":"str","line":1},{"name":"value.split","line":3},{"name":"value","line":3}],"assertions":[],"raises":[],"local_bindings":["value"],"is_test":false,"signature":"value: str","url":null,"scope":"full"},"basis":"unique name + identical AST","hunks":[],"signature_changed":false,"docstring_changed":false},{"id":"d3dec5cc1a2d0ac6","kind":"moved_renamed","label":"Moved + renamed","before":{"id":"1418ac2adc1a1d4e","side":"base","path":"catalog/search.py","name":"split_tags","node_type":"FunctionDef","start":6,"end":12,"source":"def split_tags(value: str) -\u003e list[str]:\n    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"\n    tags = []\n    for part in value.split(\",\"):\n        if part.strip():\n            tags.append(part.strip().lower())\n    return tags","doc":"Preserve source order while dropping empty, whitespace-only tags.","calls":[{"name":"value.split","line":9},{"name":"part.strip","line":10},{"name":"tags.append","line":11},{"name":"part.strip","line":11}],"references":[{"name":"tags","line":12},{"name":"list","line":6},{"name":"str","line":6},{"name":"str","line":6},{"name":"value.split","line":9},{"name":"value","line":9},{"name":"part.strip","line":10},{"name":"part","line":10},{"name":"tags.append","line":11},{"name":"tags","line":11},{"name":"part.strip","line":11},{"name":"part","line":11}],"assertions":[],"raises":[],"local_bindings":["part","tags","value"],"is_test":false,"signature":"value: str","url":null,"scope":"full"},"after":{"id":"6b568c92db6c5511","side":"head","path":"catalog/parsing.py","name":"parse_tags","node_type":"FunctionDef","start":4,"end":10,"source":"def parse_tags(value: str) -\u003e list[str]:\n    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"\n    tags = []\n    for part in value.split(\",\"):\n        if part.strip():\n            tags.append(part.strip().lower())\n    return tags","doc":"Preserve source order while dropping empty, whitespace-only tags.","calls":[{"name":"value.split","line":7},{"name":"part.strip","line":8},{"name":"tags.append","line":9},{"name":"part.strip","line":9}],"references":[{"name":"tags","line":10},{"name":"list","line":4},{"name":"str","line":4},{"name":"str","line":4},{"name":"value.split","line":7},{"name":"value","line":7},{"name":"part.strip","line":8},{"name":"part","line":8},{"name":"tags.append","line":9},{"name":"tags","line":9},{"name":"part.strip","line":9},{"name":"part","line":9}],"assertions":[],"raises":[],"local_bindings":["part","tags","value"],"is_test":false,"signature":"value: str","url":null,"scope":"full"},"basis":"unique declaration-name/docstring-normalized AST; internal names and literals preserved","hunks":[{"old_start":6,"new_start":4,"old_count":4,"new_count":4,"rows":[{"tag":"delete","old":6,"new":null,"text":"def split_tags(value: str) -\u003e list[str]:"},{"tag":"add","old":null,"new":4,"text":"def parse_tags(value: str) -\u003e list[str]:"},{"tag":"context","old":7,"new":5,"text":"    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\""},{"tag":"context","old":8,"new":6,"text":"    tags = []"},{"tag":"context","old":9,"new":7,"text":"    for part in value.split(\",\"):"}]}],"signature_changed":false,"docstring_changed":false},{"id":"aa655bcd417f3a21","kind":"moved_modified","label":"Moved + edited · candidate","before":{"id":"cd72e9e8cb69a6f6","side":"base","path":"catalog/search.py","name":"construct_query","node_type":"FunctionDef","start":26,"end":37,"source":"def construct_query(term: str, limit: int = 25):\n    \"\"\"Select a page of catalog items using bound parameters.\n\n    The caller provides a database connection. This helper only produces\n    a statement and its parameters; it never executes a query itself.\n    LIKE wildcard semantics are intentionally left to the database.\n    \"\"\"\n    statement = (\n        \"SELECT id, label, tags, views, clicks FROM items \"\n        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"\n    )\n    return statement, (f\"%{term}%\", limit)","doc":"Select a page of catalog items using bound parameters.\n\nThe caller provides a database connection. This helper only produces\na statement and its parameters; it never executes a query itself.\nLIKE wildcard semantics are intentionally left to the database.","calls":[],"references":[{"name":"str","line":26},{"name":"int","line":26},{"name":"statement","line":37},{"name":"limit","line":37},{"name":"term","line":37}],"assertions":[],"raises":[],"local_bindings":["limit","statement","term"],"is_test":false,"signature":"term: str, limit: int=25","url":null,"scope":"full"},"after":{"id":"79926ff73f6a3c95","side":"head","path":"catalog/query.py","name":"construct_query","node_type":"FunctionDef","start":1,"end":31,"source":"def construct_query(term: str, limit: int = 25):\n    \"\"\"Select a bounded page of catalog items using bound parameters.\n\n    Query construction is independent of connection management and row\n    interpretation. It returns two values: SQL and the parameter tuple.\n    The caller passes both directly to connection.execute().\n\n    Contract:\n        * Only integer page sizes from 1 through 100 are accepted.\n        * Booleans are rejected even though bool is an int subclass.\n        * Search terms remain parameters, never SQL fragments.\n        * ORDER BY id keeps the page ordering deterministic.\n        * The default page size remains 25.\n\n    LIKE wildcards inside a search term are not escaped by this function.\n    The caller should not interpret the search as a literal substring\n    match when the input contains SQL wildcard characters.\n\n    This extraction intentionally introduces a page-size restriction.\n    That is a behavioral edit, not an unchanged move. Callers that used\n    zero, a negative value, or more than 100 now receive ValueError.\n    \"\"\"\n    if type(limit) is not int or not 1 \u003c= limit \u003c= 100:\n        raise ValueError(\"limit must be an integer between 1 and 100\")\n\n    statement = (\n        \"SELECT id, label, tags, views, clicks FROM items \"\n        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"\n    )\n    parameters = (f\"%{term}%\", limit)\n    return statement, parameters","doc":"Select a bounded page of catalog items using bound parameters.\n\nQuery construction is independent of connection management and row\ninterpretation. It returns two values: SQL and the parameter tuple.\nThe caller passes both directly to connection.execute().\n\nContract:\n    * Only integer page sizes from 1 through 100 are accepted.\n    * Booleans are rejected even though bool is an int subclass.\n    * Search terms remain parameters, never SQL fragments.\n    * ORDER BY id keeps the page ordering deterministic.\n    * The default page size remains 25.\n\nLIKE wildcards inside a search term are not escaped by this function.\nThe caller should not interpret the search as a literal substring\nmatch when the input contains SQL wildcard characters.\n\nThis extraction intentionally introduces a page-size restriction.\nThat is a behavioral edit, not an unchanged move. Callers that used\nzero, a negative value, or more than 100 now receive ValueError.","calls":[{"name":"ValueError","line":24},{"name":"type","line":23}],"references":[{"name":"str","line":1},{"name":"int","line":1},{"name":"limit","line":30},{"name":"statement","line":31},{"name":"parameters","line":31},{"name":"int","line":23},{"name":"ValueError","line":24},{"name":"type","line":23},{"name":"limit","line":23},{"name":"limit","line":23},{"name":"term","line":30}],"assertions":[],"raises":[],"local_bindings":["limit","parameters","statement","term"],"is_test":false,"signature":"term: str, limit: int=25","url":null,"scope":"full"},"basis":"unique matching name (ignoring leading underscores)/type + AST-text similarity 0.527; candidate correspondence, not an equivalence proof","hunks":[{"old_start":26,"new_start":1,"old_count":12,"new_count":31,"rows":[{"tag":"context","old":26,"new":1,"text":"def construct_query(term: str, limit: int = 25):"},{"tag":"delete","old":27,"new":null,"text":"    \"\"\"Select a page of catalog items using bound parameters."},{"tag":"add","old":null,"new":2,"text":"    \"\"\"Select a bounded page of catalog items using bound parameters."},{"tag":"context","old":28,"new":3,"text":""},{"tag":"delete","old":29,"new":null,"text":"    The caller provides a database connection. This helper only produces"},{"tag":"delete","old":30,"new":null,"text":"    a statement and its parameters; it never executes a query itself."},{"tag":"delete","old":31,"new":null,"text":"    LIKE wildcard semantics are intentionally left to the database."},{"tag":"add","old":null,"new":4,"text":"    Query construction is independent of connection management and row"},{"tag":"add","old":null,"new":5,"text":"    interpretation. It returns two values: SQL and the parameter tuple."},{"tag":"add","old":null,"new":6,"text":"    The caller passes both directly to connection.execute()."},{"tag":"add","old":null,"new":7,"text":""},{"tag":"add","old":null,"new":8,"text":"    Contract:"},{"tag":"add","old":null,"new":9,"text":"        * Only integer page sizes from 1 through 100 are accepted."},{"tag":"add","old":null,"new":10,"text":"        * Booleans are rejected even though bool is an int subclass."},{"tag":"add","old":null,"new":11,"text":"        * Search terms remain parameters, never SQL fragments."},{"tag":"add","old":null,"new":12,"text":"        * ORDER BY id keeps the page ordering deterministic."},{"tag":"add","old":null,"new":13,"text":"        * The default page size remains 25."},{"tag":"add","old":null,"new":14,"text":""},{"tag":"add","old":null,"new":15,"text":"    LIKE wildcards inside a search term are not escaped by this function."},{"tag":"add","old":null,"new":16,"text":"    The caller should not interpret the search as a literal substring"},{"tag":"add","old":null,"new":17,"text":"    match when the input contains SQL wildcard characters."},{"tag":"add","old":null,"new":18,"text":""},{"tag":"add","old":null,"new":19,"text":"    This extraction intentionally introduces a page-size restriction."},{"tag":"add","old":null,"new":20,"text":"    That is a behavioral edit, not an unchanged move. Callers that used"},{"tag":"add","old":null,"new":21,"text":"    zero, a negative value, or more than 100 now receive ValueError."},{"tag":"context","old":32,"new":22,"text":"    \"\"\""},{"tag":"add","old":null,"new":23,"text":"    if type(limit) is not int or not 1 \u003c= limit \u003c= 100:"},{"tag":"add","old":null,"new":24,"text":"        raise ValueError(\"limit must be an integer between 1 and 100\")"},{"tag":"add","old":null,"new":25,"text":""},{"tag":"context","old":33,"new":26,"text":"    statement = ("},{"tag":"context","old":34,"new":27,"text":"        \"SELECT id, label, tags, views, clicks FROM items \""},{"tag":"context","old":35,"new":28,"text":"        \"WHERE label LIKE ? ORDER BY id LIMIT ?\""},{"tag":"context","old":36,"new":29,"text":"    )"},{"tag":"delete","old":37,"new":null,"text":"    return statement, (f\"%{term}%\", limit)"},{"tag":"add","old":null,"new":30,"text":"    parameters = (f\"%{term}%\", limit)"},{"tag":"add","old":null,"new":31,"text":"    return statement, parameters"}]}],"signature_changed":false,"docstring_changed":true},{"id":"9b8438c727c24ffd","kind":"moved_modified","label":"Moved + edited · candidate","before":{"id":"d7176ea1de6b694c","side":"base","path":"catalog/search.py","name":"parse_record","node_type":"FunctionDef","start":40,"end":50,"source":"def parse_record(row):\n    \"\"\"Turn a database row into a display record.\"\"\"\n    result = {\n        \"id\": str(row[\"id\"]),\n        \"label\": normalize_label(row[\"label\"]),\n        \"tags\": split_tags(row.get(\"tags\", \"\")),\n        \"click_rate\": None,\n    }\n    if row.get(\"views\"):\n        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)\n    return result","doc":"Turn a database row into a display record.","calls":[{"name":"row.get","line":48},{"name":"str","line":43},{"name":"normalize_label","line":44},{"name":"split_tags","line":45},{"name":"round","line":49},{"name":"row.get","line":45},{"name":"row.get","line":49}],"references":[{"name":"result","line":50},{"name":"row.get","line":48},{"name":"str","line":43},{"name":"normalize_label","line":44},{"name":"split_tags","line":45},{"name":"row","line":48},{"name":"result","line":49},{"name":"round","line":49},{"name":"row","line":43},{"name":"row","line":44},{"name":"row.get","line":45},{"name":"row","line":45},{"name":"row.get","line":49},{"name":"row","line":49},{"name":"row","line":49}],"assertions":[],"raises":[],"local_bindings":["result","row"],"is_test":false,"signature":"row","url":null,"scope":"full"},"after":{"id":"e251bf265e4cc54a","side":"head","path":"catalog/parsing.py","name":"parse_record","node_type":"FunctionDef","start":19,"end":43,"source":"def parse_record(row):\n    \"\"\"Turn a database row into a display record.\n\n    Output fields:\n        id: stable string representation of the source identifier.\n        label: whitespace-normalized title with original capitalization.\n        tags: lower-case tags in their original encounter order.\n        click_rate: clicks divided by views, rounded to four places.\n\n    Absent or zero views leave click_rate as None. Missing required\n    identifiers and labels still raise KeyError; we do not silently\n    invent identifiers or descriptions in a normalization step.\n\n    The metrics calculation is now shared, but its rounding precision\n    and missing-value rule are not intended to change. Test those rules\n    at the public parse_record boundary, not just on the helper.\n    \"\"\"\n    result = {\n        \"id\": str(row[\"id\"]),\n        \"label\": normalize_label(row[\"label\"]),\n        \"tags\": parse_tags(row.get(\"tags\", \"\")),\n        \"click_rate\": None,\n    }\n    populate_metrics(row, result)\n    return result","doc":"Turn a database row into a display record.\n\nOutput fields:\n    id: stable string representation of the source identifier.\n    label: whitespace-normalized title with original capitalization.\n    tags: lower-case tags in their original encounter order.\n    click_rate: clicks divided by views, rounded to four places.\n\nAbsent or zero views leave click_rate as None. Missing required\nidentifiers and labels still raise KeyError; we do not silently\ninvent identifiers or descriptions in a normalization step.\n\nThe metrics calculation is now shared, but its rounding precision\nand missing-value rule are not intended to change. Test those rules\nat the public parse_record boundary, not just on the helper.","calls":[{"name":"populate_metrics","line":42},{"name":"str","line":37},{"name":"normalize_label","line":38},{"name":"parse_tags","line":39},{"name":"row.get","line":39}],"references":[{"name":"result","line":43},{"name":"populate_metrics","line":42},{"name":"row","line":42},{"name":"result","line":42},{"name":"str","line":37},{"name":"normalize_label","line":38},{"name":"parse_tags","line":39},{"name":"row","line":37},{"name":"row","line":38},{"name":"row.get","line":39},{"name":"row","line":39}],"assertions":[],"raises":[],"local_bindings":["result","row"],"is_test":false,"signature":"row","url":null,"scope":"full"},"basis":"unique matching name (ignoring leading underscores)/type + AST-text similarity 0.598; candidate correspondence, not an equivalence proof","hunks":[{"old_start":40,"new_start":19,"old_count":11,"new_count":25,"rows":[{"tag":"context","old":40,"new":19,"text":"def parse_record(row):"},{"tag":"delete","old":41,"new":null,"text":"    \"\"\"Turn a database row into a display record.\"\"\""},{"tag":"add","old":null,"new":20,"text":"    \"\"\"Turn a database row into a display record."},{"tag":"add","old":null,"new":21,"text":""},{"tag":"add","old":null,"new":22,"text":"    Output fields:"},{"tag":"add","old":null,"new":23,"text":"        id: stable string representation of the source identifier."},{"tag":"add","old":null,"new":24,"text":"        label: whitespace-normalized title with original capitalization."},{"tag":"add","old":null,"new":25,"text":"        tags: lower-case tags in their original encounter order."},{"tag":"add","old":null,"new":26,"text":"        click_rate: clicks divided by views, rounded to four places."},{"tag":"add","old":null,"new":27,"text":""},{"tag":"add","old":null,"new":28,"text":"    Absent or zero views leave click_rate as None. Missing required"},{"tag":"add","old":null,"new":29,"text":"    identifiers and labels still raise KeyError; we do not silently"},{"tag":"add","old":null,"new":30,"text":"    invent identifiers or descriptions in a normalization step."},{"tag":"add","old":null,"new":31,"text":""},{"tag":"add","old":null,"new":32,"text":"    The metrics calculation is now shared, but its rounding precision"},{"tag":"add","old":null,"new":33,"text":"    and missing-value rule are not intended to change. Test those rules"},{"tag":"add","old":null,"new":34,"text":"    at the public parse_record boundary, not just on the helper."},{"tag":"add","old":null,"new":35,"text":"    \"\"\""},{"tag":"context","old":42,"new":36,"text":"    result = {"},{"tag":"context","old":43,"new":37,"text":"        \"id\": str(row[\"id\"]),"},{"tag":"context","old":44,"new":38,"text":"        \"label\": normalize_label(row[\"label\"]),"},{"tag":"delete","old":45,"new":null,"text":"        \"tags\": split_tags(row.get(\"tags\", \"\")),"},{"tag":"add","old":null,"new":39,"text":"        \"tags\": parse_tags(row.get(\"tags\", \"\")),"},{"tag":"context","old":46,"new":40,"text":"        \"click_rate\": None,"},{"tag":"context","old":47,"new":41,"text":"    }"},{"tag":"delete","old":48,"new":null,"text":"    if row.get(\"views\"):"},{"tag":"delete","old":49,"new":null,"text":"        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)"},{"tag":"add","old":null,"new":42,"text":"    populate_metrics(row, result)"},{"tag":"context","old":50,"new":43,"text":"    return result"}]}],"signature_changed":false,"docstring_changed":true},{"id":"749cab67bd2c6504","kind":"added","label":"New definition","before":null,"after":{"id":"91503651c0a47fae","side":"head","path":"catalog/parsing.py","name":"populate_metrics","node_type":"FunctionDef","start":13,"end":16,"source":"def populate_metrics(row, result):\n    \"\"\"Add a click rate only when views are present and nonzero.\"\"\"\n    if row.get(\"views\"):\n        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)","doc":"Add a click rate only when views are present and nonzero.","calls":[{"name":"row.get","line":15},{"name":"round","line":16},{"name":"row.get","line":16}],"references":[{"name":"row.get","line":15},{"name":"row","line":15},{"name":"result","line":16},{"name":"round","line":16},{"name":"row.get","line":16},{"name":"row","line":16},{"name":"row","line":16}],"assertions":[],"raises":[],"local_bindings":["result","row"],"is_test":false,"signature":"row, result","url":null,"scope":"full"},"basis":"Unmatched in the supplied source set; not a repository-wide identity proof.","hunks":[{"old_start":1,"new_start":13,"old_count":0,"new_count":4,"rows":[{"tag":"add","old":null,"new":13,"text":"def populate_metrics(row, result):"},{"tag":"add","old":null,"new":14,"text":"    \"\"\"Add a click rate only when views are present and nonzero.\"\"\""},{"tag":"add","old":null,"new":15,"text":"    if row.get(\"views\"):"},{"tag":"add","old":null,"new":16,"text":"        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)"}]}]},{"id":"ec92156828e995bb","kind":"added","label":"New definition","before":null,"after":{"id":"addb9b9ed7101a1a","side":"head","path":"tests/test_parsing.py","name":"test_record_preserves_display_contract","node_type":"FunctionDef","start":5,"end":8,"source":"def test_record_preserves_display_contract():\n    assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {\n        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,\n    }","doc":null,"calls":[{"name":"parse_record","line":6}],"references":[{"name":"parse_record","line":6}],"assertions":["assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {\n        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,\n    }"],"raises":[],"local_bindings":[],"is_test":true,"signature":"","url":null,"scope":"full"},"basis":"Unmatched in the supplied source set; not a repository-wide identity proof.","hunks":[{"old_start":1,"new_start":5,"old_count":0,"new_count":4,"rows":[{"tag":"add","old":null,"new":5,"text":"def test_record_preserves_display_contract():"},{"tag":"add","old":null,"new":6,"text":"    assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {"},{"tag":"add","old":null,"new":7,"text":"        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,"},{"tag":"add","old":null,"new":8,"text":"    }"}]}]},{"id":"189601f74b8680b9","kind":"added","label":"New definition","before":null,"after":{"id":"2b4431a78f24bb49","side":"head","path":"tests/test_parsing.py","name":"test_missing_and_zero_views","node_type":"FunctionDef","start":11,"end":13,"source":"def test_missing_and_zero_views():\n    for row in ({\"id\": 7, \"label\": \"Pen\"}, {\"id\": 7, \"label\": \"Pen\", \"views\": 0}):\n        assert parse_record(row)[\"click_rate\"] is None","doc":null,"calls":[{"name":"parse_record","line":13}],"references":[{"name":"parse_record","line":13},{"name":"row","line":13}],"assertions":["assert parse_record(row)[\"click_rate\"] is None"],"raises":[],"local_bindings":["row"],"is_test":true,"signature":"","url":null,"scope":"full"},"basis":"Unmatched in the supplied source set; not a repository-wide identity proof.","hunks":[{"old_start":1,"new_start":11,"old_count":0,"new_count":3,"rows":[{"tag":"add","old":null,"new":11,"text":"def test_missing_and_zero_views():"},{"tag":"add","old":null,"new":12,"text":"    for row in ({\"id\": 7, \"label\": \"Pen\"}, {\"id\": 7, \"label\": \"Pen\", \"views\": 0}):"},{"tag":"add","old":null,"new":13,"text":"        assert parse_record(row)[\"click_rate\"] is None"}]}]},{"id":"a3331c56ed891d8c","kind":"added","label":"New definition","before":null,"after":{"id":"dc33bfbcccfa55b6","side":"head","path":"tests/test_parsing.py","name":"test_tag_order_and_duplicates","node_type":"FunctionDef","start":16,"end":17,"source":"def test_tag_order_and_duplicates():\n    assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]","doc":null,"calls":[{"name":"parse_tags","line":17}],"references":[{"name":"parse_tags","line":17}],"assertions":["assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]"],"raises":[],"local_bindings":[],"is_test":true,"signature":"","url":null,"scope":"full"},"basis":"Unmatched in the supplied source set; not a repository-wide identity proof.","hunks":[{"old_start":1,"new_start":16,"old_count":0,"new_count":2,"rows":[{"tag":"add","old":null,"new":16,"text":"def test_tag_order_and_duplicates():"},{"tag":"add","old":null,"new":17,"text":"    assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]"}]}]},{"id":"6fab283d650e6f28","kind":"added","label":"New definition","before":null,"after":{"id":"80536d493b015b1a","side":"head","path":"tests/test_parsing.py","name":"test_first_record_wins","node_type":"FunctionDef","start":20,"end":23,"source":"def test_first_record_wins():\n    first = {\"id\": \"7\", \"label\": \"First\"}\n    later = {\"id\": \"7\", \"label\": \"Later\"}\n    assert list(merge_records([first, later])) == [first]","doc":null,"calls":[{"name":"list","line":23},{"name":"merge_records","line":23}],"references":[{"name":"list","line":23},{"name":"first","line":23},{"name":"merge_records","line":23},{"name":"first","line":23},{"name":"later","line":23}],"assertions":["assert list(merge_records([first, later])) == [first]"],"raises":[],"local_bindings":["first","later"],"is_test":true,"signature":"","url":null,"scope":"full"},"basis":"Unmatched in the supplied source set; not a repository-wide identity proof.","hunks":[{"old_start":1,"new_start":20,"old_count":0,"new_count":4,"rows":[{"tag":"add","old":null,"new":20,"text":"def test_first_record_wins():"},{"tag":"add","old":null,"new":21,"text":"    first = {\"id\": \"7\", \"label\": \"First\"}"},{"tag":"add","old":null,"new":22,"text":"    later = {\"id\": \"7\", \"label\": \"Later\"}"},{"tag":"add","old":null,"new":23,"text":"    assert list(merge_records([first, later])) == [first]"}]}]},{"id":"a7badff14d18e6f6","kind":"added","label":"New definition","before":null,"after":{"id":"5097b82a20a56ba8","side":"head","path":"tests/test_query.py","name":"test_query_default","node_type":"FunctionDef","start":4,"end":7,"source":"def test_query_default():\n    statement, parameters = construct_query(\"notebook\")\n    assert \"ORDER BY id LIMIT ?\" in statement\n    assert parameters == (\"%notebook%\", 25)","doc":null,"calls":[{"name":"construct_query","line":5}],"references":[{"name":"construct_query","line":5},{"name":"statement","line":6},{"name":"parameters","line":7}],"assertions":["assert \"ORDER BY id LIMIT ?\" in statement","assert parameters == (\"%notebook%\", 25)"],"raises":[],"local_bindings":["parameters","statement"],"is_test":true,"signature":"","url":null,"scope":"full"},"basis":"Unmatched in the supplied source set; not a repository-wide identity proof.","hunks":[{"old_start":1,"new_start":4,"old_count":0,"new_count":4,"rows":[{"tag":"add","old":null,"new":4,"text":"def test_query_default():"},{"tag":"add","old":null,"new":5,"text":"    statement, parameters = construct_query(\"notebook\")"},{"tag":"add","old":null,"new":6,"text":"    assert \"ORDER BY id LIMIT ?\" in statement"},{"tag":"add","old":null,"new":7,"text":"    assert parameters == (\"%notebook%\", 25)"}]}]},{"id":"e5b7162fc4b0a209","kind":"added","label":"New definition","before":null,"after":{"id":"8ce250d333db724d","side":"head","path":"tests/test_query.py","name":"test_term_stays_a_parameter","node_type":"FunctionDef","start":10,"end":14,"source":"def test_term_stays_a_parameter():\n    term = \"paper' OR 1=1 --\"\n    statement, parameters = construct_query(term)\n    assert term not in statement\n    assert parameters[0] == f\"%{term}%\"","doc":null,"calls":[{"name":"construct_query","line":12}],"references":[{"name":"construct_query","line":12},{"name":"term","line":12},{"name":"term","line":13},{"name":"statement","line":13},{"name":"parameters","line":14},{"name":"term","line":14}],"assertions":["assert term not in statement","assert parameters[0] == f\"%{term}%\""],"raises":[],"local_bindings":["parameters","statement","term"],"is_test":true,"signature":"","url":null,"scope":"full"},"basis":"Unmatched in the supplied source set; not a repository-wide identity proof.","hunks":[{"old_start":1,"new_start":10,"old_count":0,"new_count":5,"rows":[{"tag":"add","old":null,"new":10,"text":"def test_term_stays_a_parameter():"},{"tag":"add","old":null,"new":11,"text":"    term = \"paper' OR 1=1 --\""},{"tag":"add","old":null,"new":12,"text":"    statement, parameters = construct_query(term)"},{"tag":"add","old":null,"new":13,"text":"    assert term not in statement"},{"tag":"add","old":null,"new":14,"text":"    assert parameters[0] == f\"%{term}%\""}]}]},{"id":"6fda0fd2afd4b3ab","kind":"added","label":"New definition","before":null,"after":{"id":"0a90355d661697f0","side":"head","path":"tests/test_query.py","name":"test_page_size_boundaries","node_type":"FunctionDef","start":17,"end":25,"source":"def test_page_size_boundaries():\n    for limit in (1, 100):\n        assert construct_query(\"pen\", limit)[1][1] == limit\n    for limit in (0, -1, 101, True, 2.5):\n        try:\n            construct_query(\"pen\", limit)\n        except ValueError:\n            continue\n        raise AssertionError(f\"unexpectedly accepted {limit!r}\")","doc":null,"calls":[{"name":"AssertionError","line":25},{"name":"construct_query","line":22},{"name":"construct_query","line":19}],"references":[{"name":"limit","line":19},{"name":"ValueError","line":23},{"name":"AssertionError","line":25},{"name":"construct_query","line":22},{"name":"limit","line":22},{"name":"limit","line":25},{"name":"construct_query","line":19},{"name":"limit","line":19}],"assertions":["assert construct_query(\"pen\", limit)[1][1] == limit"],"raises":[],"local_bindings":["limit"],"is_test":true,"signature":"","url":null,"scope":"full"},"basis":"Unmatched in the supplied source set; not a repository-wide identity proof.","hunks":[{"old_start":1,"new_start":17,"old_count":0,"new_count":9,"rows":[{"tag":"add","old":null,"new":17,"text":"def test_page_size_boundaries():"},{"tag":"add","old":null,"new":18,"text":"    for limit in (1, 100):"},{"tag":"add","old":null,"new":19,"text":"        assert construct_query(\"pen\", limit)[1][1] == limit"},{"tag":"add","old":null,"new":20,"text":"    for limit in (0, -1, 101, True, 2.5):"},{"tag":"add","old":null,"new":21,"text":"        try:"},{"tag":"add","old":null,"new":22,"text":"            construct_query(\"pen\", limit)"},{"tag":"add","old":null,"new":23,"text":"        except ValueError:"},{"tag":"add","old":null,"new":24,"text":"            continue"},{"tag":"add","old":null,"new":25,"text":"        raise AssertionError(f\"unexpectedly accepted {limit!r}\")"}]}]},{"id":"d2f5bacb5e03490d","kind":"wiring","label":"Import wiring","before":null,"after":{"id":"5811a4ae864694a6","path":"catalog/search.py","name":"module imports / context","side":"head","start":1,"end":3,"source":"from catalog.query import construct_query\nfrom catalog.parsing import parse_record\nfrom catalog.merge import merge_records","url":null,"calls":[],"references":[],"is_test":false},"basis":"11 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":3,"rows":[{"tag":"add","old":null,"new":1,"text":"from catalog.query import construct_query"},{"tag":"add","old":null,"new":2,"text":"from catalog.parsing import parse_record"},{"tag":"add","old":null,"new":3,"text":"from catalog.merge import merge_records"}]}],"raw_id":"9be9092f1c5cb908"},{"id":"c8c8225325973641","kind":"wiring","label":"Import wiring","before":{"id":"adc99fc47246fbdc","path":"tools/export.py","name":"module imports / context","side":"base","start":1,"end":1,"source":"from catalog.search import split_tags","url":null,"calls":[],"references":[],"is_test":false},"after":{"id":"7ea59ea9e79df617","path":"tools/export.py","name":"module imports / context","side":"head","start":1,"end":1,"source":"from catalog.parsing import parse_tags","url":null,"calls":[],"references":[],"is_test":false},"basis":"2 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.","hunks":[{"old_start":1,"new_start":1,"old_count":1,"new_count":1,"rows":[{"tag":"delete","old":1,"new":null,"text":"from catalog.search import split_tags"},{"tag":"add","old":null,"new":1,"text":"from catalog.parsing import parse_tags"}]}],"signature_changed":false,"docstring_changed":false,"raw_id":"2e5b153e1fa85543"},{"id":"2df2308a41a0a306","kind":"wiring","label":"Import wiring","before":null,"after":{"id":"5a7b6e0f6d0511ff","path":"catalog/parsing.py","name":"module imports / context","side":"head","start":1,"end":1,"source":"from catalog.labels import normalize_label","url":null,"calls":[],"references":[],"is_test":false},"basis":"7 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":1,"rows":[{"tag":"add","old":null,"new":1,"text":"from catalog.labels import normalize_label"}]}],"raw_id":"20c0b99366424327"},{"id":"fd323c917ce3337c","kind":"wiring","label":"Import wiring","before":null,"after":{"id":"7999c417882b2b81","path":"tests/test_parsing.py","name":"module imports / context","side":"head","start":1,"end":2,"source":"from catalog.parsing import parse_record, parse_tags\nfrom catalog.merge import merge_records","url":null,"calls":[],"references":[],"is_test":false},"basis":"10 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":2,"rows":[{"tag":"add","old":null,"new":1,"text":"from catalog.parsing import parse_record, parse_tags"},{"tag":"add","old":null,"new":2,"text":"from catalog.merge import merge_records"}]}],"raw_id":"f124e8484c649024"},{"id":"026672cb30fc46d7","kind":"wiring","label":"Import wiring","before":null,"after":{"id":"98b4d9e3367b2904","path":"tests/test_query.py","name":"module imports / context","side":"head","start":1,"end":1,"source":"from catalog.query import construct_query","url":null,"calls":[],"references":[],"is_test":false},"basis":"7 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":1,"rows":[{"tag":"add","old":null,"new":1,"text":"from catalog.query import construct_query"}]}],"raw_id":"e6a5939255d0ce93"}],"groups":[{"id":"bfa9c2423d8dd34e","path":"catalog/query.py","theme":"query construction","title":"A move can also change the contract","change_ids":["aa655bcd417f3a21"],"prerequisites":[],"test_links":[{"test_id":"5097b82a20a56ba8","symbol_id":"79926ff73f6a3c95","relationship":"test_calls","url":null,"status":"referenced, not run"},{"test_id":"8ce250d333db724d","symbol_id":"79926ff73f6a3c95","relationship":"test_calls","url":null,"status":"referenced, not run"},{"test_id":"0a90355d661697f0","symbol_id":"79926ff73f6a3c95","relationship":"test_calls","url":null,"status":"referenced, not run"}],"number":1,"narrative":{"intent":"Follow the relocation of query construction, pairing the old and new definitions instead of reading deletion and addition separately.","why_now":"Start with this foundational change, before reading the definitions and callers that depend on it.","before":"catalog/search.py","after":"catalog/query.py","takeaway":"You have inspected 1 change unit(s) concerning construct_query.","invariants":["Check the expected inputs, outputs and failure cases against both revisions."],"questions":["Are observable outputs, exceptions and calling conventions preserved or intentionally changed?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"Follow the next dependency without leaving this document.","passages":[{"text":"The query builder moves out of the search module, but this is **not an unchanged extraction**. It now rejects page sizes outside 1–100, non-integers, and booleans. The SQL still uses bound parameters. Read the actual delta before treating the new module as a mechanical move.","change_ids":["aa655bcd417f3a21"],"view":"diff"}],"evidence_change_ids":["aa655bcd417f3a21"]},"next_id":"69ff67a5cbc9f803"},{"id":"69ff67a5cbc9f803","path":"catalog/labels.py","theme":"label normalization","title":"Give labels one small, predictable rule","change_ids":["909d421caece8249"],"prerequisites":[],"test_links":[],"number":2,"narrative":{"intent":"Follow the relocation of label normalization, pairing the old and new definitions instead of reading deletion and addition separately.","why_now":"This is another foundation for the walkthrough. No prerequisite among the other changed units was resolved statically.","before":"catalog/search.py","after":"catalog/labels.py","takeaway":"You have inspected 1 change unit(s) concerning normalize_label.","invariants":["The compared ASTs are identical, including literals, signatures and decorators."],"questions":["Do imported globals, relative imports, initialization order or serialization depend on the previous module location?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"Follow the next dependency without leaving this document.","passages":[{"text":"One of the smallest dependencies is the label rule. `normalize_label` collapses whitespace and preserves case. The declaration moves unchanged to `catalog/labels.py`. Showing it once makes the rule easier to inspect than a deletion followed by an identical addition.","change_ids":["909d421caece8249"],"view":"definition"}],"evidence_change_ids":["909d421caece8249"]},"next_id":"055292b902457fb5"},{"id":"055292b902457fb5","path":"catalog/merge.py","theme":"record merging","title":"Preserve which duplicate wins","change_ids":["6cb0f770165fbc77"],"prerequisites":[],"test_links":[{"test_id":"80536d493b015b1a","symbol_id":"7ef992f83fb42315","relationship":"test_calls","url":null,"status":"referenced, not run"}],"number":3,"narrative":{"intent":"Follow the relocation of record merging, pairing the old and new definitions instead of reading deletion and addition separately.","why_now":"This is another foundation for the walkthrough. No prerequisite among the other changed units was resolved statically.","before":"catalog/search.py","after":"catalog/merge.py","takeaway":"You have inspected 1 change unit(s) concerning merge_records.","invariants":["The compared ASTs are identical, including literals, signatures and decorators."],"questions":["Do imported globals, relative imports, initialization order or serialization depend on the previous module location?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"Follow the next dependency without leaving this document.","passages":[{"text":"This generator moves intact into `catalog/merge.py`. Its rule is first-record-wins, not last-record-wins. Encounter order therefore remains part of the API even though the function now lives in a different module.","change_ids":["6cb0f770165fbc77"],"view":"definition"}],"evidence_change_ids":["6cb0f770165fbc77"]},"next_id":"925f2b53dbe84aaf"},{"id":"925f2b53dbe84aaf","path":"catalog/parsing.py","theme":"value conversion","title":"Extract a rule with observable edge cases","change_ids":["749cab67bd2c6504"],"prerequisites":[],"test_links":[],"number":4,"narrative":{"intent":"Follow value conversion in parsing.py.","why_now":"This is another foundation for the walkthrough. No prerequisite among the other changed units was resolved statically.","before":"No base definition in this unit","after":"catalog/parsing.py","takeaway":"You have inspected 1 change unit(s) concerning populate_metrics.","invariants":["Check the expected inputs, outputs and failure cases against both revisions."],"questions":["Are observable outputs, exceptions and calling conventions preserved or intentionally changed?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"Follow the next dependency without leaving this document.","passages":[{"text":"The click-rate calculation is now a shared helper. A missing or zero view count leaves the existing result unchanged. A nonzero view count produces a ratio rounded to four decimal places. This helper is newly declared; its calculation was previously inline, so “new definition” does not mean “new behavior.”","change_ids":["749cab67bd2c6504"],"view":"definition"}],"evidence_change_ids":["749cab67bd2c6504"]},"next_id":"d970addaf2694ce2"},{"id":"d970addaf2694ce2","path":"catalog/parsing.py","theme":"result parsing","title":"Build one parsing boundary","change_ids":["2df2308a41a0a306","d3dec5cc1a2d0ac6","9b8438c727c24ffd"],"prerequisites":["69ff67a5cbc9f803","925f2b53dbe84aaf"],"test_links":[{"test_id":"addb9b9ed7101a1a","symbol_id":"e251bf265e4cc54a","relationship":"test_calls","url":null,"status":"referenced, not run"},{"test_id":"2b4431a78f24bb49","symbol_id":"e251bf265e4cc54a","relationship":"test_calls","url":null,"status":"referenced, not run"},{"test_id":"dc33bfbcccfa55b6","symbol_id":"6b568c92db6c5511","relationship":"test_calls","url":null,"status":"referenced, not run"}],"number":5,"narrative":{"intent":"Follow the relocation of result parsing, pairing the old and new definitions instead of reading deletion and addition separately.","why_now":"Build on Label normalization · labels.py; Value conversion · parsing.py. The source links show why these definitions are prerequisites.","before":"No base definition in this unit; catalog/search.py","after":"catalog/parsing.py","takeaway":"You have inspected 3 change unit(s) concerning module imports / context, parse_tags, parse_record.","invariants":["Check the expected inputs, outputs and failure cases against both revisions.","The rename match preserves internal identifiers and literals; declaration name and leading docstring are excluded only for this explicitly labeled match."],"questions":["Are observable outputs, exceptions and calling conventions preserved or intentionally changed?","Are imports, reflective lookups, doctests and references to the old name updated?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"Follow the next dependency without leaving this document.","passages":[{"text":"These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.","change_ids":["2df2308a41a0a306"],"view":"diff"},{"text":"`split_tags` becomes `parse_tags` in the parsing module. Empty fields disappear, tags become lowercase, and source order—including duplicates—survives. Only the declaration name changes; internal names and literal values still participate in the structural comparison.","change_ids":["d3dec5cc1a2d0ac6"],"view":"definition"},{"text":"The parsing boundary brings those rules together. It still returns the same four fields, but delegates label normalization, tag parsing, and metrics. Compare the helper calls as well as the output keys: an unchanged shape is not sufficient evidence of unchanged values.","change_ids":["9b8438c727c24ffd"],"view":"diff"}],"evidence_change_ids":["2df2308a41a0a306","d3dec5cc1a2d0ac6","9b8438c727c24ffd"]},"next_id":"2571f99a5cf1d735"},{"id":"2571f99a5cf1d735","path":"tools/export.py","theme":"implementation","title":"Follow the boundary beyond the main caller","change_ids":["0e3fa555970820b6"],"prerequisites":["d970addaf2694ce2"],"test_links":[],"number":6,"narrative":{"intent":"Follow implementation in export.py.","why_now":"Build on Result parsing · parsing.py. The source links show why these definitions are prerequisites.","before":"tools/export.py","after":"tools/export.py","takeaway":"You have inspected 1 change unit(s) concerning export_tags.","invariants":["Check the expected inputs, outputs and failure cases against both revisions."],"questions":["Are observable outputs, exceptions and calling conventions preserved or intentionally changed?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"Follow the next dependency without leaving this document.","passages":[{"text":"The export utility must follow the renamed parser. Its separator is still a semicolon, and tag normalization comes from the same implementation as the catalog path. This is the kind of small consumer update that can be missed when review stops at the new modules.","change_ids":["0e3fa555970820b6"],"view":"diff"}],"evidence_change_ids":["0e3fa555970820b6"]},"next_id":"35701946bdbc9a3e"},{"id":"35701946bdbc9a3e","path":"catalog/search.py","theme":"orchestration","title":"Return to the search entry point","change_ids":["d2f5bacb5e03490d","d7ea39d8954cab6b"],"prerequisites":["055292b902457fb5","bfa9c2423d8dd34e","d970addaf2694ce2"],"test_links":[],"number":7,"narrative":{"intent":"Follow orchestration in search.py.","why_now":"Build on Record merging · merge.py; Query construction · query.py; Result parsing · parsing.py. The source links show why these definitions are prerequisites.","before":"No base definition in this unit; catalog/search.py","after":"catalog/search.py","takeaway":"You have inspected 2 change unit(s) concerning module imports / context, get_records.","invariants":["Check the expected inputs, outputs and failure cases against both revisions."],"questions":["Are observable outputs, exceptions and calling conventions preserved or intentionally changed?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"Follow the next dependency without leaving this document.","passages":[{"text":"These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.","change_ids":["d2f5bacb5e03490d"],"view":"diff"},{"text":"Now the entry point is readable as a sequence: construct a query, execute it, interpret each row, and merge duplicates. It still materializes the parsed rows before merging. The tighter page-size rule reaches users through this call; it must not be hidden under the refactor label.","change_ids":["d7ea39d8954cab6b"],"view":"definition"}],"evidence_change_ids":["d2f5bacb5e03490d","d7ea39d8954cab6b"]},"next_id":"b0172c7ae33102bc"},{"id":"b0172c7ae33102bc","path":"tools/export.py","theme":"wiring","title":"Point imports at the defining modules","change_ids":["c8c8225325973641"],"prerequisites":["d970addaf2694ce2"],"test_links":[],"number":8,"narrative":{"intent":"Trace how this module resolves its imports after the implementation changes.","why_now":"Build on Result parsing · parsing.py. The source links show why these definitions are prerequisites.","before":"tools/export.py","after":"tools/export.py","takeaway":"You have inspected 1 change unit(s) concerning module imports / context.","invariants":["Each imported symbol must resolve at the new module path in the deployed build."],"questions":["Are old import paths intentionally retired or still needed by callers outside these changed files?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"Follow the next dependency without leaving this document.","passages":[{"text":"These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.","change_ids":["c8c8225325973641"],"view":"diff"}],"evidence_change_ids":["c8c8225325973641"]},"next_id":"f39dc80267e3d52d"},{"id":"f39dc80267e3d52d","path":"tests/test_parsing.py","theme":"tests","title":"Make the preserved rules executable","change_ids":["fd323c917ce3337c","ec92156828e995bb","189601f74b8680b9","a3331c56ed891d8c","6fab283d650e6f28"],"prerequisites":["055292b902457fb5","d970addaf2694ce2"],"test_links":[],"number":9,"narrative":{"intent":"Read the assertions as executable design claims. Their presence is evidence of test intent, not a passing run.","why_now":"Build on Record merging · merge.py; Result parsing · parsing.py. The source links show why these definitions are prerequisites.","before":"No base definition in this unit","after":"tests/test_parsing.py","takeaway":"You have inspected 5 change unit(s) concerning module imports / context, test_record_preserves_display_contract, test_missing_and_zero_views, test_tag_order_and_duplicates and related symbols.","invariants":["Assertions should express the intended contract, not merely repeat the implementation."],"questions":["Do these assertions exercise the changed behavior, including negative and boundary cases?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"Follow the next dependency without leaving this document.","passages":[{"text":"These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.","change_ids":["fd323c917ce3337c"],"view":"diff"},{"text":"A representative row checks the complete display record: identifier, normalized label, ordered tags, and the rounded click rate. Delegation should not change those values.","change_ids":["ec92156828e995bb"],"view":"definition"},{"text":"Both absent and zero view counts must keep the rate unset. The explicit cases protect against introducing a division-by-zero path during extraction.","change_ids":["189601f74b8680b9"],"view":"definition"},{"text":"Case normalization and empty-tag removal must not turn the list into a set. The assertion preserves duplicates and source order.","change_ids":["a3331c56ed891d8c"],"view":"definition"},{"text":"Two records share an identifier. The earlier record must win, so this assertion checks values as well as deduplication.","change_ids":["6fab283d650e6f28"],"view":"definition"}],"evidence_change_ids":["fd323c917ce3337c","ec92156828e995bb","189601f74b8680b9","a3331c56ed891d8c","6fab283d650e6f28"]},"next_id":"c69d5a4b8ba28a37"},{"id":"c69d5a4b8ba28a37","path":"tests/test_query.py","theme":"tests","title":"Check the contract at its boundary","change_ids":["026672cb30fc46d7","a7badff14d18e6f6","e5b7162fc4b0a209","6fda0fd2afd4b3ab"],"prerequisites":["bfa9c2423d8dd34e"],"test_links":[],"number":10,"narrative":{"intent":"Read the assertions as executable design claims. Their presence is evidence of test intent, not a passing run.","why_now":"Build on Query construction · query.py. The source links show why these definitions are prerequisites.","before":"No base definition in this unit","after":"tests/test_query.py","takeaway":"You have inspected 4 change unit(s) concerning module imports / context, test_query_default, test_term_stays_a_parameter, test_page_size_boundaries.","invariants":["Assertions should express the intended contract, not merely repeat the implementation."],"questions":["Do these assertions exercise the changed behavior, including negative and boundary cases?"],"provenance":"authored interpretation, linked to source; not machine-verified semantics","transition":"The source trail now reaches the tests as well as the callers.","passages":[{"text":"These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.","change_ids":["026672cb30fc46d7"],"view":"diff"},{"text":"The default case locks down the 25-row page size and the shape of the parameter tuple. This test calls the extracted query module directly.","change_ids":["a7badff14d18e6f6"],"view":"definition"},{"text":"A quote in the search term must remain data rather than changing the SQL statement. Inspect both the SQL and the bound value; checking only that the call succeeds would miss the contract.","change_ids":["e5b7162fc4b0a209"],"view":"definition"},{"text":"These are the boundary cases for the intentional behavior change. Accept 1 and 100; reject 0, 101, booleans, and other non-integer values. This is test source, not a recorded passing run.","change_ids":["6fda0fd2afd4b3ab"],"view":"definition"}],"evidence_change_ids":["026672cb30fc46d7","a7badff14d18e6f6","e5b7162fc4b0a209","6fda0fd2afd4b3ab"]},"next_id":null}],"edges":[{"from":"925f2b53dbe84aaf","to":"d970addaf2694ce2","type":"calls","url":null,"label":"prerequisite → consumer"},{"from":"69ff67a5cbc9f803","to":"d970addaf2694ce2","type":"calls","url":null,"label":"prerequisite → consumer"},{"from":"bfa9c2423d8dd34e","to":"35701946bdbc9a3e","type":"calls","url":null,"label":"prerequisite → consumer"},{"from":"d970addaf2694ce2","to":"35701946bdbc9a3e","type":"calls","url":null,"label":"prerequisite → consumer"},{"from":"055292b902457fb5","to":"35701946bdbc9a3e","type":"calls","url":null,"label":"prerequisite → consumer"},{"from":"d970addaf2694ce2","to":"f39dc80267e3d52d","type":"test_calls","url":null,"label":"prerequisite → consumer"},{"from":"055292b902457fb5","to":"f39dc80267e3d52d","type":"test_calls","url":null,"label":"prerequisite → consumer"},{"from":"bfa9c2423d8dd34e","to":"c69d5a4b8ba28a37","type":"test_calls","url":null,"label":"prerequisite → consumer"},{"from":"d970addaf2694ce2","to":"2571f99a5cf1d735","type":"calls","url":null,"label":"prerequisite → consumer"},{"from":"d970addaf2694ce2","to":"b0172c7ae33102bc","type":"imports","url":null,"label":"definition → importer"}],"symbol_edges":[{"from":"e251bf265e4cc54a","to":"91503651c0a47fae","type":"calls","path":"catalog/parsing.py","line":42,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"e251bf265e4cc54a","to":"9a354024ec622592","type":"calls","path":"catalog/parsing.py","line":38,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"e251bf265e4cc54a","to":"6b568c92db6c5511","type":"calls","path":"catalog/parsing.py","line":39,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"0d29f6c32cc0d31e","to":"79926ff73f6a3c95","type":"calls","path":"catalog/search.py","line":8,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"0d29f6c32cc0d31e","to":"e251bf265e4cc54a","type":"calls","path":"catalog/search.py","line":11,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"0d29f6c32cc0d31e","to":"7ef992f83fb42315","type":"calls","path":"catalog/search.py","line":12,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"addb9b9ed7101a1a","to":"e251bf265e4cc54a","type":"test_calls","path":"tests/test_parsing.py","line":6,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"2b4431a78f24bb49","to":"e251bf265e4cc54a","type":"test_calls","path":"tests/test_parsing.py","line":13,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"dc33bfbcccfa55b6","to":"6b568c92db6c5511","type":"test_calls","path":"tests/test_parsing.py","line":17,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"80536d493b015b1a","to":"7ef992f83fb42315","type":"test_calls","path":"tests/test_parsing.py","line":23,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"5097b82a20a56ba8","to":"79926ff73f6a3c95","type":"test_calls","path":"tests/test_query.py","line":5,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"8ce250d333db724d","to":"79926ff73f6a3c95","type":"test_calls","path":"tests/test_query.py","line":12,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"0a90355d661697f0","to":"79926ff73f6a3c95","type":"test_calls","path":"tests/test_query.py","line":22,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."},{"from":"2ea80861607ea62e","to":"6b568c92db6c5511","type":"calls","path":"tools/export.py","line":5,"url":null,"evidence":"Static source relationship; not execution or coverage evidence."}],"tests":[{"id":"addb9b9ed7101a1a","side":"head","path":"tests/test_parsing.py","name":"test_record_preserves_display_contract","node_type":"FunctionDef","start":5,"end":8,"source":"def test_record_preserves_display_contract():\n    assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {\n        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,\n    }","doc":null,"calls":[{"name":"parse_record","line":6}],"references":[{"name":"parse_record","line":6}],"assertions":["assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {\n        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,\n    }"],"raises":[],"local_bindings":[],"is_test":true,"signature":"","url":null,"scope":"full"},{"id":"2b4431a78f24bb49","side":"head","path":"tests/test_parsing.py","name":"test_missing_and_zero_views","node_type":"FunctionDef","start":11,"end":13,"source":"def test_missing_and_zero_views():\n    for row in ({\"id\": 7, \"label\": \"Pen\"}, {\"id\": 7, \"label\": \"Pen\", \"views\": 0}):\n        assert parse_record(row)[\"click_rate\"] is None","doc":null,"calls":[{"name":"parse_record","line":13}],"references":[{"name":"parse_record","line":13},{"name":"row","line":13}],"assertions":["assert parse_record(row)[\"click_rate\"] is None"],"raises":[],"local_bindings":["row"],"is_test":true,"signature":"","url":null,"scope":"full"},{"id":"dc33bfbcccfa55b6","side":"head","path":"tests/test_parsing.py","name":"test_tag_order_and_duplicates","node_type":"FunctionDef","start":16,"end":17,"source":"def test_tag_order_and_duplicates():\n    assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]","doc":null,"calls":[{"name":"parse_tags","line":17}],"references":[{"name":"parse_tags","line":17}],"assertions":["assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]"],"raises":[],"local_bindings":[],"is_test":true,"signature":"","url":null,"scope":"full"},{"id":"80536d493b015b1a","side":"head","path":"tests/test_parsing.py","name":"test_first_record_wins","node_type":"FunctionDef","start":20,"end":23,"source":"def test_first_record_wins():\n    first = {\"id\": \"7\", \"label\": \"First\"}\n    later = {\"id\": \"7\", \"label\": \"Later\"}\n    assert list(merge_records([first, later])) == [first]","doc":null,"calls":[{"name":"list","line":23},{"name":"merge_records","line":23}],"references":[{"name":"list","line":23},{"name":"first","line":23},{"name":"merge_records","line":23},{"name":"first","line":23},{"name":"later","line":23}],"assertions":["assert list(merge_records([first, later])) == [first]"],"raises":[],"local_bindings":["first","later"],"is_test":true,"signature":"","url":null,"scope":"full"},{"id":"5097b82a20a56ba8","side":"head","path":"tests/test_query.py","name":"test_query_default","node_type":"FunctionDef","start":4,"end":7,"source":"def test_query_default():\n    statement, parameters = construct_query(\"notebook\")\n    assert \"ORDER BY id LIMIT ?\" in statement\n    assert parameters == (\"%notebook%\", 25)","doc":null,"calls":[{"name":"construct_query","line":5}],"references":[{"name":"construct_query","line":5},{"name":"statement","line":6},{"name":"parameters","line":7}],"assertions":["assert \"ORDER BY id LIMIT ?\" in statement","assert parameters == (\"%notebook%\", 25)"],"raises":[],"local_bindings":["parameters","statement"],"is_test":true,"signature":"","url":null,"scope":"full"},{"id":"8ce250d333db724d","side":"head","path":"tests/test_query.py","name":"test_term_stays_a_parameter","node_type":"FunctionDef","start":10,"end":14,"source":"def test_term_stays_a_parameter():\n    term = \"paper' OR 1=1 --\"\n    statement, parameters = construct_query(term)\n    assert term not in statement\n    assert parameters[0] == f\"%{term}%\"","doc":null,"calls":[{"name":"construct_query","line":12}],"references":[{"name":"construct_query","line":12},{"name":"term","line":12},{"name":"term","line":13},{"name":"statement","line":13},{"name":"parameters","line":14},{"name":"term","line":14}],"assertions":["assert term not in statement","assert parameters[0] == f\"%{term}%\""],"raises":[],"local_bindings":["parameters","statement","term"],"is_test":true,"signature":"","url":null,"scope":"full"},{"id":"0a90355d661697f0","side":"head","path":"tests/test_query.py","name":"test_page_size_boundaries","node_type":"FunctionDef","start":17,"end":25,"source":"def test_page_size_boundaries():\n    for limit in (1, 100):\n        assert construct_query(\"pen\", limit)[1][1] == limit\n    for limit in (0, -1, 101, True, 2.5):\n        try:\n            construct_query(\"pen\", limit)\n        except ValueError:\n            continue\n        raise AssertionError(f\"unexpectedly accepted {limit!r}\")","doc":null,"calls":[{"name":"AssertionError","line":25},{"name":"construct_query","line":22},{"name":"construct_query","line":19}],"references":[{"name":"limit","line":19},{"name":"ValueError","line":23},{"name":"AssertionError","line":25},{"name":"construct_query","line":22},{"name":"limit","line":22},{"name":"limit","line":25},{"name":"construct_query","line":19},{"name":"limit","line":19}],"assertions":["assert construct_query(\"pen\", limit)[1][1] == limit"],"raises":[],"local_bindings":["limit"],"is_test":true,"signature":"","url":null,"scope":"full"}],"raw_files":[{"id":"9be9092f1c5cb908","path":"catalog/search.py","old_path":"catalog/search.py","region":"catalog/search.py","scope":"full","hunks":[{"old_start":1,"new_start":1,"old_count":57,"new_count":12,"rows":[{"tag":"delete","old":1,"new":null,"text":"def normalize_label(value: str) -\u003e str:"},{"tag":"delete","old":2,"new":null,"text":"    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\""},{"tag":"delete","old":3,"new":null,"text":"    return \" \".join(value.split())"},{"tag":"delete","old":4,"new":null,"text":""},{"tag":"delete","old":5,"new":null,"text":""},{"tag":"delete","old":6,"new":null,"text":"def split_tags(value: str) -\u003e list[str]:"},{"tag":"delete","old":7,"new":null,"text":"    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\""},{"tag":"delete","old":8,"new":null,"text":"    tags = []"},{"tag":"delete","old":9,"new":null,"text":"    for part in value.split(\",\"):"},{"tag":"delete","old":10,"new":null,"text":"        if part.strip():"},{"tag":"delete","old":11,"new":null,"text":"            tags.append(part.strip().lower())"},{"tag":"delete","old":12,"new":null,"text":"    return tags"},{"tag":"delete","old":13,"new":null,"text":""},{"tag":"delete","old":14,"new":null,"text":""},{"tag":"delete","old":15,"new":null,"text":"def merge_records(records):"},{"tag":"delete","old":16,"new":null,"text":"    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\""},{"tag":"delete","old":17,"new":null,"text":"    seen = set()"},{"tag":"delete","old":18,"new":null,"text":"    for record in records:"},{"tag":"delete","old":19,"new":null,"text":"        key = record[\"id\"]"},{"tag":"delete","old":20,"new":null,"text":"        if key in seen:"},{"tag":"delete","old":21,"new":null,"text":"            continue"},{"tag":"delete","old":22,"new":null,"text":"        seen.add(key)"},{"tag":"delete","old":23,"new":null,"text":"        yield record"},{"tag":"delete","old":24,"new":null,"text":""},{"tag":"delete","old":25,"new":null,"text":""},{"tag":"delete","old":26,"new":null,"text":"def construct_query(term: str, limit: int = 25):"},{"tag":"delete","old":27,"new":null,"text":"    \"\"\"Select a page of catalog items using bound parameters."},{"tag":"delete","old":28,"new":null,"text":""},{"tag":"delete","old":29,"new":null,"text":"    The caller provides a database connection. This helper only produces"},{"tag":"delete","old":30,"new":null,"text":"    a statement and its parameters; it never executes a query itself."},{"tag":"delete","old":31,"new":null,"text":"    LIKE wildcard semantics are intentionally left to the database."},{"tag":"delete","old":32,"new":null,"text":"    \"\"\""},{"tag":"delete","old":33,"new":null,"text":"    statement = ("},{"tag":"delete","old":34,"new":null,"text":"        \"SELECT id, label, tags, views, clicks FROM items \""},{"tag":"delete","old":35,"new":null,"text":"        \"WHERE label LIKE ? ORDER BY id LIMIT ?\""},{"tag":"delete","old":36,"new":null,"text":"    )"},{"tag":"delete","old":37,"new":null,"text":"    return statement, (f\"%{term}%\", limit)"},{"tag":"delete","old":38,"new":null,"text":""},{"tag":"delete","old":39,"new":null,"text":""},{"tag":"delete","old":40,"new":null,"text":"def parse_record(row):"},{"tag":"delete","old":41,"new":null,"text":"    \"\"\"Turn a database row into a display record.\"\"\""},{"tag":"delete","old":42,"new":null,"text":"    result = {"},{"tag":"delete","old":43,"new":null,"text":"        \"id\": str(row[\"id\"]),"},{"tag":"delete","old":44,"new":null,"text":"        \"label\": normalize_label(row[\"label\"]),"},{"tag":"delete","old":45,"new":null,"text":"        \"tags\": split_tags(row.get(\"tags\", \"\")),"},{"tag":"delete","old":46,"new":null,"text":"        \"click_rate\": None,"},{"tag":"delete","old":47,"new":null,"text":"    }"},{"tag":"delete","old":48,"new":null,"text":"    if row.get(\"views\"):"},{"tag":"delete","old":49,"new":null,"text":"        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)"},{"tag":"delete","old":50,"new":null,"text":"    return result"},{"tag":"add","old":null,"new":1,"text":"from catalog.query import construct_query"},{"tag":"add","old":null,"new":2,"text":"from catalog.parsing import parse_record"},{"tag":"add","old":null,"new":3,"text":"from catalog.merge import merge_records"},{"tag":"context","old":51,"new":4,"text":""},{"tag":"context","old":52,"new":5,"text":""},{"tag":"context","old":53,"new":6,"text":"def get_records(connection, term: str, limit: int = 25):"},{"tag":"add","old":null,"new":7,"text":"    \"\"\"Build, execute, interpret, then deduplicate a single catalog page.\"\"\""},{"tag":"context","old":54,"new":8,"text":"    statement, parameters = construct_query(term, limit)"},{"tag":"context","old":55,"new":9,"text":"    rows = connection.execute(statement, parameters)"},{"tag":"delete","old":56,"new":null,"text":"    parsed = [parse_record(row) for row in rows]"},{"tag":"delete","old":57,"new":null,"text":"    return list(merge_records(parsed))"},{"tag":"add","old":null,"new":10,"text":"    # Materialize rows before merging, as before this extraction."},{"tag":"add","old":null,"new":11,"text":"    records = [parse_record(row) for row in rows]"},{"tag":"add","old":null,"new":12,"text":"    return list(merge_records(records))"}]}],"before_url":null,"after_url":null},{"id":"2e5b153e1fa85543","path":"tools/export.py","old_path":"tools/export.py","region":"tools/export.py","scope":"full","hunks":[{"old_start":1,"new_start":1,"old_count":5,"new_count":5,"rows":[{"tag":"delete","old":1,"new":null,"text":"from catalog.search import split_tags"},{"tag":"add","old":null,"new":1,"text":"from catalog.parsing import parse_tags"},{"tag":"context","old":2,"new":2,"text":""},{"tag":"context","old":3,"new":3,"text":""},{"tag":"context","old":4,"new":4,"text":"def export_tags(value):"},{"tag":"delete","old":5,"new":null,"text":"    return \";\".join(split_tags(value))"},{"tag":"add","old":null,"new":5,"text":"    return \";\".join(parse_tags(value))"}]}],"before_url":null,"after_url":null},{"id":"cc512b9b5a225125","path":"catalog/labels.py","old_path":null,"region":"catalog/labels.py","scope":"full","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":3,"rows":[{"tag":"add","old":null,"new":1,"text":"def normalize_label(value: str) -\u003e str:"},{"tag":"add","old":null,"new":2,"text":"    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\""},{"tag":"add","old":null,"new":3,"text":"    return \" \".join(value.split())"}]}],"before_url":null,"after_url":null},{"id":"31e0447af555e438","path":"catalog/merge.py","old_path":null,"region":"catalog/merge.py","scope":"full","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":9,"rows":[{"tag":"add","old":null,"new":1,"text":"def merge_records(records):"},{"tag":"add","old":null,"new":2,"text":"    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\""},{"tag":"add","old":null,"new":3,"text":"    seen = set()"},{"tag":"add","old":null,"new":4,"text":"    for record in records:"},{"tag":"add","old":null,"new":5,"text":"        key = record[\"id\"]"},{"tag":"add","old":null,"new":6,"text":"        if key in seen:"},{"tag":"add","old":null,"new":7,"text":"            continue"},{"tag":"add","old":null,"new":8,"text":"        seen.add(key)"},{"tag":"add","old":null,"new":9,"text":"        yield record"}]}],"before_url":null,"after_url":null},{"id":"20c0b99366424327","path":"catalog/parsing.py","old_path":null,"region":"catalog/parsing.py","scope":"full","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":43,"rows":[{"tag":"add","old":null,"new":1,"text":"from catalog.labels import normalize_label"},{"tag":"add","old":null,"new":2,"text":""},{"tag":"add","old":null,"new":3,"text":""},{"tag":"add","old":null,"new":4,"text":"def parse_tags(value: str) -\u003e list[str]:"},{"tag":"add","old":null,"new":5,"text":"    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\""},{"tag":"add","old":null,"new":6,"text":"    tags = []"},{"tag":"add","old":null,"new":7,"text":"    for part in value.split(\",\"):"},{"tag":"add","old":null,"new":8,"text":"        if part.strip():"},{"tag":"add","old":null,"new":9,"text":"            tags.append(part.strip().lower())"},{"tag":"add","old":null,"new":10,"text":"    return tags"},{"tag":"add","old":null,"new":11,"text":""},{"tag":"add","old":null,"new":12,"text":""},{"tag":"add","old":null,"new":13,"text":"def populate_metrics(row, result):"},{"tag":"add","old":null,"new":14,"text":"    \"\"\"Add a click rate only when views are present and nonzero.\"\"\""},{"tag":"add","old":null,"new":15,"text":"    if row.get(\"views\"):"},{"tag":"add","old":null,"new":16,"text":"        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)"},{"tag":"add","old":null,"new":17,"text":""},{"tag":"add","old":null,"new":18,"text":""},{"tag":"add","old":null,"new":19,"text":"def parse_record(row):"},{"tag":"add","old":null,"new":20,"text":"    \"\"\"Turn a database row into a display record."},{"tag":"add","old":null,"new":21,"text":""},{"tag":"add","old":null,"new":22,"text":"    Output fields:"},{"tag":"add","old":null,"new":23,"text":"        id: stable string representation of the source identifier."},{"tag":"add","old":null,"new":24,"text":"        label: whitespace-normalized title with original capitalization."},{"tag":"add","old":null,"new":25,"text":"        tags: lower-case tags in their original encounter order."},{"tag":"add","old":null,"new":26,"text":"        click_rate: clicks divided by views, rounded to four places."},{"tag":"add","old":null,"new":27,"text":""},{"tag":"add","old":null,"new":28,"text":"    Absent or zero views leave click_rate as None. Missing required"},{"tag":"add","old":null,"new":29,"text":"    identifiers and labels still raise KeyError; we do not silently"},{"tag":"add","old":null,"new":30,"text":"    invent identifiers or descriptions in a normalization step."},{"tag":"add","old":null,"new":31,"text":""},{"tag":"add","old":null,"new":32,"text":"    The metrics calculation is now shared, but its rounding precision"},{"tag":"add","old":null,"new":33,"text":"    and missing-value rule are not intended to change. Test those rules"},{"tag":"add","old":null,"new":34,"text":"    at the public parse_record boundary, not just on the helper."},{"tag":"add","old":null,"new":35,"text":"    \"\"\""},{"tag":"add","old":null,"new":36,"text":"    result = {"},{"tag":"add","old":null,"new":37,"text":"        \"id\": str(row[\"id\"]),"},{"tag":"add","old":null,"new":38,"text":"        \"label\": normalize_label(row[\"label\"]),"},{"tag":"add","old":null,"new":39,"text":"        \"tags\": parse_tags(row.get(\"tags\", \"\")),"},{"tag":"add","old":null,"new":40,"text":"        \"click_rate\": None,"},{"tag":"add","old":null,"new":41,"text":"    }"},{"tag":"add","old":null,"new":42,"text":"    populate_metrics(row, result)"},{"tag":"add","old":null,"new":43,"text":"    return result"}]}],"before_url":null,"after_url":null},{"id":"6836bf83ac60715c","path":"catalog/query.py","old_path":null,"region":"catalog/query.py","scope":"full","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":31,"rows":[{"tag":"add","old":null,"new":1,"text":"def construct_query(term: str, limit: int = 25):"},{"tag":"add","old":null,"new":2,"text":"    \"\"\"Select a bounded page of catalog items using bound parameters."},{"tag":"add","old":null,"new":3,"text":""},{"tag":"add","old":null,"new":4,"text":"    Query construction is independent of connection management and row"},{"tag":"add","old":null,"new":5,"text":"    interpretation. It returns two values: SQL and the parameter tuple."},{"tag":"add","old":null,"new":6,"text":"    The caller passes both directly to connection.execute()."},{"tag":"add","old":null,"new":7,"text":""},{"tag":"add","old":null,"new":8,"text":"    Contract:"},{"tag":"add","old":null,"new":9,"text":"        * Only integer page sizes from 1 through 100 are accepted."},{"tag":"add","old":null,"new":10,"text":"        * Booleans are rejected even though bool is an int subclass."},{"tag":"add","old":null,"new":11,"text":"        * Search terms remain parameters, never SQL fragments."},{"tag":"add","old":null,"new":12,"text":"        * ORDER BY id keeps the page ordering deterministic."},{"tag":"add","old":null,"new":13,"text":"        * The default page size remains 25."},{"tag":"add","old":null,"new":14,"text":""},{"tag":"add","old":null,"new":15,"text":"    LIKE wildcards inside a search term are not escaped by this function."},{"tag":"add","old":null,"new":16,"text":"    The caller should not interpret the search as a literal substring"},{"tag":"add","old":null,"new":17,"text":"    match when the input contains SQL wildcard characters."},{"tag":"add","old":null,"new":18,"text":""},{"tag":"add","old":null,"new":19,"text":"    This extraction intentionally introduces a page-size restriction."},{"tag":"add","old":null,"new":20,"text":"    That is a behavioral edit, not an unchanged move. Callers that used"},{"tag":"add","old":null,"new":21,"text":"    zero, a negative value, or more than 100 now receive ValueError."},{"tag":"add","old":null,"new":22,"text":"    \"\"\""},{"tag":"add","old":null,"new":23,"text":"    if type(limit) is not int or not 1 \u003c= limit \u003c= 100:"},{"tag":"add","old":null,"new":24,"text":"        raise ValueError(\"limit must be an integer between 1 and 100\")"},{"tag":"add","old":null,"new":25,"text":""},{"tag":"add","old":null,"new":26,"text":"    statement = ("},{"tag":"add","old":null,"new":27,"text":"        \"SELECT id, label, tags, views, clicks FROM items \""},{"tag":"add","old":null,"new":28,"text":"        \"WHERE label LIKE ? ORDER BY id LIMIT ?\""},{"tag":"add","old":null,"new":29,"text":"    )"},{"tag":"add","old":null,"new":30,"text":"    parameters = (f\"%{term}%\", limit)"},{"tag":"add","old":null,"new":31,"text":"    return statement, parameters"}]}],"before_url":null,"after_url":null},{"id":"f124e8484c649024","path":"tests/test_parsing.py","old_path":null,"region":"tests/test_parsing.py","scope":"full","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":23,"rows":[{"tag":"add","old":null,"new":1,"text":"from catalog.parsing import parse_record, parse_tags"},{"tag":"add","old":null,"new":2,"text":"from catalog.merge import merge_records"},{"tag":"add","old":null,"new":3,"text":""},{"tag":"add","old":null,"new":4,"text":""},{"tag":"add","old":null,"new":5,"text":"def test_record_preserves_display_contract():"},{"tag":"add","old":null,"new":6,"text":"    assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {"},{"tag":"add","old":null,"new":7,"text":"        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,"},{"tag":"add","old":null,"new":8,"text":"    }"},{"tag":"add","old":null,"new":9,"text":""},{"tag":"add","old":null,"new":10,"text":""},{"tag":"add","old":null,"new":11,"text":"def test_missing_and_zero_views():"},{"tag":"add","old":null,"new":12,"text":"    for row in ({\"id\": 7, \"label\": \"Pen\"}, {\"id\": 7, \"label\": \"Pen\", \"views\": 0}):"},{"tag":"add","old":null,"new":13,"text":"        assert parse_record(row)[\"click_rate\"] is None"},{"tag":"add","old":null,"new":14,"text":""},{"tag":"add","old":null,"new":15,"text":""},{"tag":"add","old":null,"new":16,"text":"def test_tag_order_and_duplicates():"},{"tag":"add","old":null,"new":17,"text":"    assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]"},{"tag":"add","old":null,"new":18,"text":""},{"tag":"add","old":null,"new":19,"text":""},{"tag":"add","old":null,"new":20,"text":"def test_first_record_wins():"},{"tag":"add","old":null,"new":21,"text":"    first = {\"id\": \"7\", \"label\": \"First\"}"},{"tag":"add","old":null,"new":22,"text":"    later = {\"id\": \"7\", \"label\": \"Later\"}"},{"tag":"add","old":null,"new":23,"text":"    assert list(merge_records([first, later])) == [first]"}]}],"before_url":null,"after_url":null},{"id":"e6a5939255d0ce93","path":"tests/test_query.py","old_path":null,"region":"tests/test_query.py","scope":"full","hunks":[{"old_start":1,"new_start":1,"old_count":0,"new_count":25,"rows":[{"tag":"add","old":null,"new":1,"text":"from catalog.query import construct_query"},{"tag":"add","old":null,"new":2,"text":""},{"tag":"add","old":null,"new":3,"text":""},{"tag":"add","old":null,"new":4,"text":"def test_query_default():"},{"tag":"add","old":null,"new":5,"text":"    statement, parameters = construct_query(\"notebook\")"},{"tag":"add","old":null,"new":6,"text":"    assert \"ORDER BY id LIMIT ?\" in statement"},{"tag":"add","old":null,"new":7,"text":"    assert parameters == (\"%notebook%\", 25)"},{"tag":"add","old":null,"new":8,"text":""},{"tag":"add","old":null,"new":9,"text":""},{"tag":"add","old":null,"new":10,"text":"def test_term_stays_a_parameter():"},{"tag":"add","old":null,"new":11,"text":"    term = \"paper' OR 1=1 --\""},{"tag":"add","old":null,"new":12,"text":"    statement, parameters = construct_query(term)"},{"tag":"add","old":null,"new":13,"text":"    assert term not in statement"},{"tag":"add","old":null,"new":14,"text":"    assert parameters[0] == f\"%{term}%\""},{"tag":"add","old":null,"new":15,"text":""},{"tag":"add","old":null,"new":16,"text":""},{"tag":"add","old":null,"new":17,"text":"def test_page_size_boundaries():"},{"tag":"add","old":null,"new":18,"text":"    for limit in (1, 100):"},{"tag":"add","old":null,"new":19,"text":"        assert construct_query(\"pen\", limit)[1][1] == limit"},{"tag":"add","old":null,"new":20,"text":"    for limit in (0, -1, 101, True, 2.5):"},{"tag":"add","old":null,"new":21,"text":"        try:"},{"tag":"add","old":null,"new":22,"text":"            construct_query(\"pen\", limit)"},{"tag":"add","old":null,"new":23,"text":"        except ValueError:"},{"tag":"add","old":null,"new":24,"text":"            continue"},{"tag":"add","old":null,"new":25,"text":"        raise AssertionError(f\"unexpectedly accepted {limit!r}\")"}]}],"before_url":null,"after_url":null}],"cycles":[],"unresolved":[],"stats":{"groups":10,"units":20,"by_kind":{"modified":2,"moved":2,"moved_renamed":1,"moved_modified":2,"added":8,"wiring":5},"identical_ast_moves":2,"supplied_paths":8,"supplied_additions":143,"supplied_deletions":54,"test_definitions":7,"test_runs":0},"warnings":[],"method":{"version":"0.3.0","matching":"Conservative Python AST matching; no literal or internal-identifier normalization.","order":"Static prerequisites, SCC condensation, deterministic topic priority. A heuristic reading order, not a mathematically optimal one.","tests":"Static calls/references in supplied changed files only. No repository tests were executed.","scope":"Classes are atomic; dynamic dispatch, reflection, generated code, unchanged callers and unprovided source are not fully resolved.","security":"Source is data: never imported or executed. Standalone report makes no network requests."},"document":{"lead":"A module extraction is easiest to understand as a sequence of ideas, not a list of files. Follow the small rules, the query boundary, and the callers—with each explanation next to its source.","closing":"The search entry point now composes focused modules. Several declarations moved without structural changes; the query limit contract deliberately changed. Those are different review tasks. The source and tests stay together so the distinction remains visible."}}</script>
+<script>'use strict';
+(() => {
+  // The report is inert data, never repository code to execute. All prose/source is escaped.
+  const R = JSON.parse(document.getElementById('report-data').textContent);
+  const $ = (selector, parent = document) => parent.querySelector(selector);
+  const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+  // Only code spans and emphasis are supported. An annotation cannot supply arbitrary HTML.
+  const inline = value => String(value ?? '').split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g).map(part =>
+    part.startsWith('`') && part.endsWith('`') ? `<code>${esc(part.slice(1, -1))}</code>` :
+      part.startsWith('**') && part.endsWith('**') ? `<strong>${esc(part.slice(2, -2))}</strong>` : esc(part)
+  ).join('');
+  const prose = value => String(value ?? '').split(/\n\s*\n/).filter(Boolean)
+    .map(p => `<p>${inline(p)}</p>`).join('');
+  const G = new Map(R.groups.map(g => [g.id, g]));
+  const C = new Map(R.changes.map(c => [c.id, c]));
+  const T = new Map(R.tests.map(t => [t.id, t]));
+  const basename = path => String(path || '').split('/').pop();
+  const safeURL = value => {
+    try { const u = new URL(value); return u.protocol === 'https:' && u.hostname === 'github.com' ? u.href : null; }
+    catch (_) { return null; }
+  };
+  const link = (url, label, cls = '') => safeURL(url)
+    ? `<a href="${esc(safeURL(url))}" class="${cls}" target="_blank" rel="noopener noreferrer">${esc(label)} ↗</a>` : '';
+  const revision = `${R.meta.repository || 'local'}:${R.meta.base_sha || ''}:${R.meta.head_sha || ''}`;
+  const storageKey = `diffstory.review.v1:${revision}`;
+  let review = {notes: {}, checked: {}};
+  let canPersist = true;
+  let activeSection = null;
+  let showAudit = false;
+  let blockCounter = 0;
+  let toastTimer;
+  const blocks = new Map();
+  const anchors = new Set();
+  const PREVIEW_LIMIT = 34;
+  const PREVIEW_HEAD = 19;
+  const PREVIEW_TAIL = 5;
+  const CHUNK = 160;
+
+  function sanitizeReview(data) {
+    const out = {notes: {}, checked: {}};
+    if (!data || typeof data !== 'object') return out;
+    for (const g of R.groups) {
+      if (typeof data.notes?.[g.id] === 'string') out.notes[g.id] = data.notes[g.id].slice(0, 50000);
+      if (data.checked?.[g.id] === true) out.checked[g.id] = true;
+    }
+    return out;
+  }
+  try { review = sanitizeReview(JSON.parse(localStorage.getItem(storageKey) || '{}')); }
+  catch (_) { canPersist = false; }
+
+  function notify(text) {
+    clearTimeout(toastTimer);
+    $('#toast').textContent = text;
+    $('#toast').classList.add('show');
+    toastTimer = setTimeout(() => $('#toast').classList.remove('show'), 3400);
+  }
+  function saveReview() {
+    try { localStorage.setItem(storageKey, JSON.stringify(review)); }
+    catch (_) { canPersist = false; }
+    updateReviewMarkers();
+  }
+  function updateReviewMarkers() {
+    const count = R.groups.filter(g => review.checked[g.id] === true).length;
+    $('#reviewProgress').textContent = count ? `${count}/${R.groups.length} reviewed` : '';
+    $$('[data-reviewed-indicator]').forEach(node => {
+      node.textContent = review.checked[node.dataset.reviewedIndicator] ? '✓ Reviewed' : '';
+    });
+    $$('.contents-item').forEach(node => {
+      const marker = $('.contents-check', node);
+      if (marker) marker.textContent = review.checked[node.dataset.section] ? '✓' : '';
+    });
+  }
+  function classification(c) {
+    if ((c.after || c.before)?.is_test) return ['Test source', ''];
+    const kinds = {
+      moved: ['Moved · same AST', 'move'],
+      moved_renamed: ['Moved + renamed', 'rename'],
+      renamed: ['Renamed', 'rename'],
+      moved_modified: ['Moved + edited', 'edited'],
+      modified: ['Edited', 'edited'],
+      source_only: ['Source-only edit', ''],
+      observed_head: ['Head excerpt', ''],
+      observed_base: ['Base excerpt', ''],
+      added: ['Added', 'move'],
+      removed: ['Removed', 'removed'],
+      wiring: ['Wiring', ''],
+      text: ['Source change', '']
+    };
+    return kinds[c.kind] || [c.label || c.kind, ''];
+  }
+
+  // A deliberately small lexer: colors aid reading, not semantic classification.
+  function highlight(line) {
+    const re = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|#[^\n]*|\b(?:async|await|def|class|return|from|import|as|if|elif|else|for|in|not|and|or|is|None|True|False|with|raise|try|except|finally|pass|lambda|yield|while|break|continue|assert)\b|\b\d+(?:\.\d+)?\b)/g;
+    let result = '', previous = 0;
+    for (const match of line.matchAll(re)) {
+      result += esc(line.slice(previous, match.index));
+      const t = match[0];
+      const cls = t[0] === '#' ? 'comment' : /["']/.test(t[0]) ? 'string' : /^\d/.test(t) ? 'number' : 'keyword';
+      result += `<span class="token-${cls}">${esc(t)}</span>`;
+      previous = match.index + t.length;
+    }
+    return result + esc(line.slice(previous));
+  }
+  function definitionRows(source) {
+    return source ? source.source.split('\n').map((text, i) => ({type: 'line', tag: 'context', new: source.start + i, old: null, text})) : [];
+  }
+  function diffRows(hunks) {
+    const rows = [];
+    for (const h of hunks || []) {
+      rows.push({type: 'hunk', text: `@@ −${h.old_start},${h.old_count} +${h.new_start},${h.new_count} @@`});
+      for (const row of h.rows) rows.push({type: 'line', ...row});
+    }
+    return rows;
+  }
+  function allRows(spec) {
+    if (spec.cache[spec.view]) return spec.cache[spec.view];
+    let rows = [];
+    if (spec.raw) rows = diffRows(spec.raw.hunks);
+    else if (spec.test) rows = definitionRows(spec.test);
+    else {
+      for (const c of spec.changes) {
+        const source = c.after || c.before;
+        if (spec.view === 'diff') {
+          const r = diffRows(c.hunks);
+          rows.push(...(r.length ? r : [{type: 'note', text: `${source.name}: no textual edits in this paired definition.`}]));
+        } else {
+          const prior = rows.filter(r => r.type === 'line').at(-1);
+          if (prior && prior.new + 1 !== source.start) rows.push({type: 'gap', text: '… between declarations'});
+          rows.push(...definitionRows(source));
+        }
+      }
+    }
+    spec.cache[spec.view] = rows;
+    return rows;
+  }
+  const countLines = rows => rows.filter(r => r.type === 'line').length;
+  function previewRows(spec) {
+    const rows = allRows(spec);
+    if (spec.expanded) return rows.slice(0, spec.loaded);
+    if (spec.focus && spec.view === 'definition') {
+      const selected = rows.filter(r => r.type === 'line' && r.new >= spec.focus.start && r.new <= spec.focus.end);
+      if (selected.length) {
+        const nAbove = rows.filter(r => r.type === 'line' && r.new < spec.focus.start).length;
+        const nBelow = rows.filter(r => r.type === 'line' && r.new > spec.focus.end).length;
+        return [...(nAbove ? [{type: 'gap', text: `… ${nAbove} lines above this excerpt`}] : []), ...(selected.length <= PREVIEW_LIMIT ? selected : [...selected.slice(0, PREVIEW_HEAD), {type: 'gap', text: `… ${selected.length - PREVIEW_HEAD - PREVIEW_TAIL} lines folded inside this excerpt`}, ...selected.slice(-PREVIEW_TAIL)]),
+          ...(nBelow ? [{type: 'gap', text: `… ${nBelow} lines below this excerpt`}] : [])];
+      }
+    }
+    if (rows.length <= PREVIEW_LIMIT) return rows;
+    const shown = rows.slice(0, PREVIEW_HEAD);
+    const tail = rows.slice(-PREVIEW_TAIL);
+    const omitted = countLines(rows) - countLines(shown) - countLines(tail);
+    return [...shown, {type: 'gap', text: `… ${omitted} lines folded`}, ...tail];
+  }
+  function rowsHTML(rows, isDiff) {
+    return rows.map(r => {
+      if (r.type === 'gap') return `<div class="source-gap">${esc(r.text)}</div>`;
+      if (r.type === 'hunk') return `<div class="hunk-label">${esc(r.text)}</div>`;
+      if (r.type === 'note') return `<div class="code-note">${esc(r.text)}</div>`;
+      const gutters = isDiff
+        ? `<span class="line-no dual">${r.old ?? ''}</span><span class="line-no dual">${r.new ?? ''}</span><span class="code-sign">${r.tag === 'add' ? '+' : r.tag === 'delete' ? '−' : ' '}</span>`
+        : `<span class="line-no">${r.new ?? r.old ?? ''}</span>`;
+      return `<div class="code-line ${isDiff ? esc(r.tag) : ''}">${gutters}<span class="code-text">${highlight(r.text)}</span></div>`;
+    }).join('');
+  }
+
+  function blockHTML(changeIds, options = {}) {
+    const cs = (changeIds || []).map(id => C.get(id)).filter(Boolean);
+    const first = cs[0];
+    const source = options.test || (first && (first.after || first.before));
+    const primaryPath = options.raw?.path || source?.path || '';
+    const spec = {
+      id: `block-${++blockCounter}`, changes: cs, test: options.test || null,
+      raw: options.raw || null, focus: options.focus || null, label: options.label || '',
+      view: options.view || (options.raw ? 'diff' : first?.kind === 'wiring' || first?.kind === 'text' || first?.kind === 'modified' ? 'diff' : 'definition'),
+      expanded: false, loaded: 0, materialized: false, cache: {}, primaryPath,
+      baseURL: options.raw?.before_url || first?.before?.url,
+      headURL: options.raw?.after_url || options.test?.url || first?.after?.url,
+    };
+    blocks.set(spec.id, spec);
+    let badge = options.raw ? ['Source hunk', ''] : options.test ? ['Test source', ''] : cs.length > 1 ? [`${cs.length} moved declarations`, 'move'] : classification(first);
+    const name = options.label || (cs.length > 1 ? 'graph constants' : source?.name === 'module imports / context' ? 'imports' : source?.name === 'file context' ? '' : source?.name || '');
+    const symbol = name ? `<span class="symbol-name">· ${esc(name)}</span>` : '';
+    const estimated = spec.focus ? Math.min(PREVIEW_LIMIT, spec.focus.end - spec.focus.start + 3) : Math.min(PREVIEW_LIMIT, options.raw ? options.raw.hunks.reduce((n, h) => n + h.rows.length + 1, 0) : cs.reduce((n, c) => n + (spec.view === 'diff' ? c.hunks.reduce((v, h) => v + h.rows.length + 1, 0) : (c.after || c.before).end - (c.after || c.before).start + 1), options.test ? options.test.end - options.test.start + 1 : 0));
+    const beforeAnchors = cs.filter(c => !anchors.has(c.id)).map(c => { anchors.add(c.id); return `<span id="unit-${c.id}" class="change-anchor"></span>`; }).join('');
+    return `${beforeAnchors}<figure class="code-block" id="${spec.id}" data-block="${spec.id}" data-changes="${cs.map(c => c.id).join(' ')}"><figcaption class="code-header"><span class="filename" title="${esc(primaryPath)}">${esc(basename(primaryPath))}${symbol}</span><span class="classification ${badge[1]}">${esc(badge[0])}</span></figcaption><div class="code-body"><div class="lazy-shell" style="min-height:${Math.max(58, Math.min(430, estimated * 22))}px"><button data-load-preview="${spec.id}">Load ${spec.view === 'diff' ? 'diff' : 'code'} ↓</button></div></div><div class="code-footer"></div></figure>`;
+  }
+  function blockFooter(spec, shown, total) {
+    const first = spec.changes[0];
+    const a = spec.test || first?.after || first?.before;
+    const b = first?.before;
+    let location = spec.view === 'diff' ? 'Paired diff' : a ? `L${spec.focus && !spec.expanded ? spec.focus.start : a.start}–${spec.focus && !spec.expanded ? spec.focus.end : (spec.changes.at(-1)?.after || spec.changes.at(-1)?.before || a).end}` : 'Source';
+    if (first?.before && first?.after && first.before.path !== first.after.path) location = `${basename(b.path)} → ${basename(first.after.path)} · ${location}`;
+    const modeButton = !spec.raw && !spec.test && spec.changes.length === 1
+      ? `<button class="text-button" data-switch="${spec.id}">${spec.view === 'diff' ? 'Read definition' : 'View diff'}</button>` : '';
+    const collapse = spec.expanded ? `<button class="text-button" data-collapse="${spec.id}">Collapse</button>` : '';
+    const base = spec.baseURL ? link(spec.baseURL, 'Base', 'code-source-link') : '';
+    const head = spec.headURL ? link(spec.headURL, 'Source', 'code-source-link') : '';
+    return `<span class="code-location">${esc(location)}</span>${modeButton}${collapse}${base}${head}`;
+  }
+  function paintBlock(spec) {
+    const element = document.getElementById(spec.id);
+    if (!element) return;
+    spec.materialized = true;
+    const full = allRows(spec), shown = previewRows(spec);
+    const total = countLines(full), visible = countLines(shown);
+    const isDiff = spec.view === 'diff';
+    let load = '';
+    if (!spec.expanded && visible < total) {
+      const label = spec.focus && !isDiff ? 'Read full definition' : isDiff ? 'Load full diff' : 'Load full code';
+      load = `<button class="load-bar" data-expand="${spec.id}"><span aria-hidden="true">↓</span> ${label} <span class="load-count">· ${total - visible} more lines${total > CHUNK ? ' · loaded in chunks' : ''}</span></button>`;
+    } else if (spec.expanded && spec.loaded < full.length) {
+      load = `<button class="load-bar" data-expand="${spec.id}">Load next ${Math.min(CHUNK, full.length - spec.loaded)} rows <span class="load-count">· ${total - visible} lines remaining</span></button>`;
+    }
+    $('.code-body', element).innerHTML = `<div class="code-region" tabindex="0" role="region" aria-label="${esc(basename(spec.primaryPath))} ${isDiff ? 'diff' : 'code'}"><div class="code-lines">${shown.length ? rowsHTML(shown, isDiff) : '<div class="code-note">No textual edits between these paired definitions. Module paths and bindings still matter.</div>'}</div></div>${load}`;
+    $('.code-footer', element).innerHTML = blockFooter(spec, visible, total);
+    element.dataset.loaded = 'true';
+  }
+  const observer = 'IntersectionObserver' in window ? new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting || entry.target.closest('details:not([open])')) continue;
+      const spec = blocks.get(entry.target.dataset.block);
+      if (spec && !spec.materialized) paintBlock(spec);
+      observer.unobserve(entry.target);
+    }
+  }, {rootMargin: '500px 0px'}) : null;
+  function observeBlocks(parent = document) {
+    $$('[data-block]', parent).forEach(el => {
+      const spec = blocks.get(el.dataset.block);
+      if (!spec || spec.materialized) return;
+      if (observer) observer.observe(el);
+      else if (!el.closest('details:not([open])')) paintBlock(spec);
+    });
+  }
+
+  function defaultPassages(g) {
+    // Full-PR reports without authored passages still alternate explanation and evidence.
+    const cs = g.change_ids.map(id => C.get(id));
+    return cs.map((c, i) => {
+      const a = c.after || c.before;
+      let text = i === 0 ? g.narrative.intent : `Next, inspect \`${a.name}\` in \`${basename(a.path)}\`.`;
+      if (c.kind === 'moved') text += ' The declaration has an identical AST at its new location; its surrounding bindings still deserve review.';
+      else if (c.kind === 'moved_renamed') text += ` \`${c.before.name}\` becomes \`${c.after.name}\`. The comparison excludes the declaration name and leading docstring, not internal identifiers or literals.`;
+      else if (c.kind === 'moved_modified') text += ' This pair contains edits, not just a relocation. Compare its definition and paired diff.';
+      else if (c.kind === 'observed_head') text += ' Only the head-side definition is supplied here; a missing counterpart is not proof of new behavior.';
+      return {text, change_ids: [c.id]};
+    });
+  }
+  function passageHTML(p) {
+    const code = p.change_ids.length > 1 && p.change_ids.every(id => C.get(id)?.kind === 'moved')
+      ? blockHTML(p.change_ids, {view: p.view || 'definition', label: p.label, focus: p.focus})
+      : p.change_ids.map(id => blockHTML([id], {view: p.view, focus: p.focus, label: p.label})).join('');
+    return `<div class="passage"><div class="prose">${prose(p.text)}</div>${code}</div>`;
+  }
+  function sectionHTML(g) {
+    const n = g.narrative;
+    const passages = Array.isArray(n.passages) && n.passages.length ? n.passages : defaultPassages(g);
+    const used = new Set(passages.flatMap(p => p.change_ids));
+    const extra = g.change_ids.filter(id => !used.has(id));
+    return `<section class="story-section" id="${g.id}" data-story-section="${g.id}" aria-labelledby="heading-${g.id}"><header class="section-heading"><span class="section-number">${String(g.number).padStart(2, '0')}</span><h2 id="heading-${g.id}">${esc(g.title)}<a class="section-anchor" href="#${g.id}" aria-label="Link to ${esc(g.title)}">#</a></h2></header>${passages.map(passageHTML).join('')}${n.transition ? `<div class="section-end">${inline(n.transition)}</div>` : ''}${extra.length ? `<details class="section-extra" data-extra="${g.id}"><summary>Supporting changes <span>· ${extra.length}</span></summary><div class="extra-body"></div></details>` : ''}<details class="review-details" data-audit="${g.id}"><summary>Invariants, tests & notes <span data-reviewed-indicator="${g.id}" class="review-check-indicator"></span></summary><div class="audit-content"></div></details></section>`;
+  }
+  function buildHeader() {
+    const m = R.meta, doc = R.document || {};
+    const title = m.title || 'Read the change, one idea at a time';
+    document.title = `Diffstory · ${m.number ? '#' + m.number : title} · Reader`;
+    const lead = doc.lead || 'Read the change in one continuous thread: the idea, its code, then what follows from it. Source stays close to the explanation.';
+    $('#documentHeader').innerHTML = `<div class="document-kicker">${link(m.url, m.repository || 'Local repository') || esc(m.repository || 'Local repository')}<span class="kicker-dot">/</span><span>${m.number ? 'PR ' + m.number : m.input === 'synthetic example' ? 'SYNTHETIC EXAMPLE' : 'COMMITTED COMPARISON'}</span></div><h1>${esc(title)}</h1><p class="lead">${inline(lead)}</p><div class="document-meta"><span>${R.groups.length} sections</span><span class="sep">·</span><span>${R.stats.supplied_paths} source paths</span><span class="sep">·</span><span class="revisions">${esc((m.base_sha || 'base').slice(0, 7))} → ${esc((m.head_sha || 'head').slice(0, 7))}</span></div><p class="document-scope">${m.input === 'synthetic example' ? 'Original synthetic example. No private repository source.' : m.scope === 'selected excerpts' ? 'Selected source excerpts, not the complete PR.' : 'Committed, changed-file snapshot.'} <a href="#evidence">Evidence & scope</a></p><div class="header-rule"></div>`;
+  }
+  function buildFooter() {
+    const closing = R.document?.closing || 'The definitions, their callers, and the available tests are now in one reading path. Structural matches and test references guide review; they do not substitute for execution evidence.';
+    $('#documentFooter').innerHTML = `<div class="closing"><span class="closing-label">The shape of the change</span>${inline(closing)}</div><details id="source-hunks" class="appendix" data-appendix="raw"><summary>Original source hunks</summary><div class="appendix-content"></div></details><details id="evidence" class="appendix" data-appendix="evidence"><summary>Evidence, revisions & scope</summary><div class="appendix-content"></div></details><div class="bottom-line"><span>Diffstory 0.3 · by Epistemic AI · stored locally</span><a href="#top">Back to top ↑</a></div>`;
+  }
+  function contents() {
+    const q = $('#search').value.trim().toLowerCase();
+    $('#sectionCount').textContent = `${R.groups.length} sections`;
+    const filtered = R.groups.filter(g => [g.title, g.path, g.theme, g.narrative.intent, ...g.change_ids.map(id => {
+      const c = C.get(id); return [c.before?.name, c.after?.name, c.before?.path, c.after?.path].join(' ');
+    })].join(' ').toLowerCase().includes(q));
+    $('#contentsList').innerHTML = filtered.map(g => `<a class="contents-item" href="#${g.id}" data-section="${g.id}" ${activeSection === g.id ? 'aria-current="location"' : ''}><span class="contents-number">${String(g.number).padStart(2, '0')}</span><span>${esc(g.title)}</span><span class="contents-check">${review.checked[g.id] ? '✓' : ''}</span></a>`).join('') || '<p class="empty">No matching section or symbol.</p>';
+    updateReviewMarkers();
+  }
+
+  function ensureAudit(details) {
+    if (details.dataset.ready) return;
+    const g = G.get(details.dataset.audit), n = g.narrative;
+    const ids = [...new Set(g.test_links.map(x => x.test_id))];
+    const tests = ids.map(id => T.get(id)).filter(Boolean);
+    $('.audit-content', details).innerHTML = `<div class="audit-columns"><div><h3>Keep these invariants</h3><ul>${n.invariants.map(x => `<li>${inline(x)}</li>`).join('')}</ul></div><div><h3>Questions worth checking</h3><ul>${n.questions.map(x => `<li>${inline(x)}</li>`).join('')}</ul></div></div><h3>Test evidence</h3>${tests.length ? tests.map(t => `<details class="test-reference" data-test="${t.id}"><summary>${esc(t.name)}</summary><div class="test-body"></div></details>`).join('') : `<p class="test-run-note">${g.theme === 'tests' ? 'The test definitions are in the reading above.' : 'No test relationship was resolved in the supplied changed files.'}</p>`}<p class="test-run-note">Source references only. No repository tests were executed by this analyzer.</p><details class="audit-source"><summary>Classification evidence & reading dependencies</summary><div class="audit-source-body">${g.change_ids.map(id => { const c = C.get(id); return `<p><code>${esc((c.after || c.before).name)}</code> — ${esc(c.label)}. ${esc(c.basis)}${c.signature_changed ? ' Signature differs.' : ''}</p>`; }).join('')}${g.prerequisites.length ? `<p>Builds on: ${g.prerequisites.map(id => `<a href="#${id}">${esc(G.get(id).title)}</a>`).join('; ')}.</p>` : ''}<p>${esc(n.provenance)}</p></div></details><div class="review-form"><label><input type="checkbox" data-review="${g.id}" ${review.checked[g.id] ? 'checked' : ''}> I reviewed this section</label><textarea data-note="${g.id}" aria-label="Review notes for ${esc(g.title)}" placeholder="What did you verify? What still needs checking?" maxlength="50000">${esc(review.notes[g.id] || '')}</textarea><div class="review-local-note">${canPersist ? 'Saved in this browser when storage is available.' : 'Local storage unavailable here.'} Export a portable copy from the ••• menu.</div></div>`;
+    details.dataset.ready = 'true';
+  }
+  function ensureExtra(details) {
+    if (details.dataset.ready) return;
+    const g = G.get(details.dataset.extra);
+    const used = new Set((g.narrative.passages || []).flatMap(p => p.change_ids));
+    $('.extra-body', details).innerHTML = g.change_ids.filter(id => !used.has(id)).map(id => blockHTML([id])).join('');
+    details.dataset.ready = 'true';
+    observeBlocks(details);
+  }
+  function ensureTest(details) {
+    if (details.dataset.ready) return;
+    const t = T.get(details.dataset.test);
+    $('.test-body', details).innerHTML = blockHTML([], {test: t, view: 'definition'});
+    details.dataset.ready = 'true'; observeBlocks(details);
+  }
+  function ensureAppendix(details) {
+    if (details.dataset.ready) return;
+    const body = $('.appendix-content', details);
+    if (details.dataset.appendix === 'raw') {
+      const files = new Map();
+      R.raw_files.forEach(f => { if (!files.has(f.path)) files.set(f.path, []); files.get(f.path).push(f); });
+      body.innerHTML = `<p>${R.meta.scope === 'selected excerpts' ? 'These are diffs of the supplied excerpts, not the full GitHub patch.' : 'Hunks computed from the supplied before/after file snapshots.'} Open a file to load its hunks. Nothing below changes the reading order above.</p>${[...files.entries()].map(([path, fs], i) => `<details class="raw-file" data-raw="${i}"><summary>${esc(path)} <span class="region-label">· ${fs.length} region${fs.length === 1 ? '' : 's'}</span></summary><div class="raw-body"></div></details>`).join('')}`;
+    } else {
+      const m = R.meta;
+      body.innerHTML = `<dl><dt>Repository</dt><dd>${link(m.url, m.repository || 'Local Git') || esc(m.repository || 'Local Git')}</dd><dt>Base revision</dt><dd class="mono">${esc(m.base_sha)}</dd><dt>Head revision</dt><dd class="mono">${esc(m.head_sha)}</dd><dt>Scope</dt><dd>${esc(m.scope)}</dd><dt>Captured</dt><dd>${esc(m.captured_at || 'Not recorded')}</dd><dt>Supplied source</dt><dd>${R.stats.supplied_paths} paths · ${R.stats.units} analysis units</dd><dt>Test runs</dt><dd>0 runs verified by this analyzer</dd></dl><h3>What the matches establish</h3><p>An identical AST is structural evidence, not a proof that a move preserves behavior. Changed global bindings, import paths, initialization order and external consumers still need review. An edited pair is not automatically a confirmed behavioral change.</p><h3>Provenance</h3><p>${esc(m.validation || 'No execution evidence was attached.')}</p><p>Narrative paragraphs are authored interpretations linked to immutable source ranges. They cannot override the compiler’s source, structural classifications or test status.</p>${R.warnings.length ? `<h3>Limits of this input</h3><ul>${R.warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}<details><summary>Compiler methods</summary><dl>${Object.entries(R.method).map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('')}</dl></details>${m.description ? `<details><summary>PR description, as captured</summary><pre>${esc(m.description)}</pre></details>` : ''}<h3>Local by design</h3><p>No external fonts, libraries, analytics or network requests are needed. The HTML embeds the source snapshot; keep it private for a private repository. Diffs are rendered lazily from that embedded data, not fetched from a server. Clicking a source link opens GitHub.</p><p>Review notes are bound to these exact revisions. Browser-local storage is best effort; export notes from the ••• menu for a portable record.</p>`;
+    }
+    details.dataset.ready = 'true';
+  }
+  function ensureRaw(details) {
+    if (details.dataset.ready) return;
+    const paths = [...new Set(R.raw_files.map(f => f.path))];
+    const files = R.raw_files.filter(f => f.path === paths[Number(details.dataset.raw)]);
+    $('.raw-body', details).innerHTML = files.map(f => blockHTML([], {raw: f, view: 'diff'})).join('');
+    details.dataset.ready = 'true'; observeBlocks(details);
+  }
+  document.addEventListener('toggle', event => {
+    const d = event.target;
+    if (d.tagName !== 'DETAILS' || !d.open) return;
+    if (d.dataset.audit) ensureAudit(d);
+    else if (d.dataset.extra) ensureExtra(d);
+    else if (d.dataset.test) ensureTest(d);
+    else if (d.dataset.appendix) ensureAppendix(d);
+    else if ('raw' in d.dataset) ensureRaw(d);
+    observeBlocks(d);
+  }, true);
+
+  function closePopovers(returnFocus = false) {
+    let trigger = null;
+    if (!$('#contentsPanel').hidden) trigger = $('#contentsBtn');
+    if (!$('#morePanel').hidden) trigger = $('#moreBtn');
+    $('#contentsPanel').hidden = true; $('#morePanel').hidden = true;
+    $('#contentsBtn').setAttribute('aria-expanded', 'false'); $('#moreBtn').setAttribute('aria-expanded', 'false');
+    if (returnFocus && trigger) trigger.focus();
+  }
+  function openPopover(name, focusSearch = false) {
+    const panel = $('#' + name + 'Panel'), wasOpen = !panel.hidden;
+    closePopovers();
+    if (wasOpen && !focusSearch) return;
+    panel.hidden = false; $('#' + name + 'Btn').setAttribute('aria-expanded', 'true');
+    if (name === 'contents') { contents(); if (focusSearch) $('#search').focus(); }
+  }
+  function navigateTo(hash, push = true) {
+    let id;
+    try { id = decodeURIComponent(hash.replace(/^#/, '')); } catch (_) { return; }
+    const target = document.getElementById(id);
+    if (!target) return;
+    if (target.tagName === 'DETAILS') {
+      target.open = true;
+      if (target.dataset.appendix) ensureAppendix(target);
+    }
+    let parent = target.parentElement;
+    while (parent) { if (parent.tagName === 'DETAILS') parent.open = true; parent = parent.parentElement; }
+    closePopovers();
+    if (push) { try { history.pushState(null, '', '#' + id); } catch (_) { location.hash = id; } }
+    target.scrollIntoView({behavior: 'auto', block: 'start'});
+    updateScroll(); observeBlocks(target);
+  }
+  function updateScroll() {
+    const sections = $$('.story-section');
+    const start = $('#story').offsetTop;
+    const end = $('#documentFooter').offsetTop;
+    const percent = end > start ? Math.max(0, Math.min(100, (window.scrollY + 140 - start) / (end - start) * 100)) : 0;
+    $('#readingProgress').style.width = percent + '%';
+    let current = null;
+    for (const s of sections) { if (s.getBoundingClientRect().top <= 180) current = s.dataset.storySection; else break; }
+    if (current !== activeSection) {
+      activeSection = current;
+      const g = G.get(current);
+      $('#readingPosition').textContent = g ? `${String(g.number).padStart(2, '0')} / ${R.groups.length}  ·  ${g.title}` : '';
+      $$('.contents-item').forEach(el => { if (el.dataset.section === current) el.setAttribute('aria-current', 'location'); else el.removeAttribute('aria-current'); });
+    }
+  }
+  let scrollScheduled = false;
+  window.addEventListener('scroll', () => {
+    if (scrollScheduled) return;
+    scrollScheduled = true;
+    requestAnimationFrame(() => { updateScroll(); scrollScheduled = false; });
+  }, {passive: true});
+  window.addEventListener('resize', updateScroll);
+  window.addEventListener('hashchange', () => navigateTo(location.hash, false));
+  window.addEventListener('popstate', () => navigateTo(location.hash || '#top', false));
+
+  function download(name, value) {
+    const blob = new Blob([JSON.stringify(value, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 3000);
+  }
+  document.addEventListener('click', event => {
+    const anchor = event.target.closest('a[href^="#"]');
+    if (anchor) { event.preventDefault(); navigateTo(anchor.getAttribute('href')); return; }
+    const button = event.target.closest('button');
+    if (!button) { if (!event.target.closest('.popover')) closePopovers(); return; }
+    if (button.id === 'contentsBtn') { openPopover('contents'); return; }
+    if (button.id === 'moreBtn') { openPopover('more'); return; }
+    if (button.dataset.loadPreview) { paintBlock(blocks.get(button.dataset.loadPreview)); return; }
+    if (button.dataset.expand) {
+      const s = blocks.get(button.dataset.expand);
+      s.loaded = Math.min(allRows(s).length, (s.expanded ? s.loaded : 0) + CHUNK);
+      s.expanded = true; paintBlock(s); return;
+    }
+    if (button.dataset.collapse) {
+      const s = blocks.get(button.dataset.collapse), element = document.getElementById(s.id);
+      const above = element.getBoundingClientRect().top < 60;
+      s.expanded = false; s.loaded = 0; paintBlock(s);
+      if (above) element.scrollIntoView({block: 'start'});
+      return;
+    }
+    if (button.dataset.switch) {
+      const s = blocks.get(button.dataset.switch);
+      const element = document.getElementById(s.id), above = element.getBoundingClientRect().top < 60;
+      s.view = s.view === 'diff' ? 'definition' : 'diff'; s.expanded = false; s.loaded = 0;
+      paintBlock(s); if (above) element.scrollIntoView({block: 'start'}); return;
+    }
+    if (button.id === 'auditBtn') {
+      showAudit = !showAudit;
+      button.setAttribute('aria-pressed', String(showAudit)); $('#auditStatus').textContent = showAudit ? 'On' : 'Off';
+      button.firstChild.textContent = showAudit ? 'Hide review details ' : 'Show review details ';
+      $$('[data-audit]').forEach(d => { if (showAudit) ensureAudit(d); d.open = showAudit; });
+      closePopovers(); return;
+    }
+    if (button.id === 'collapseBtn') {
+      const active = activeSection;
+      for (const s of blocks.values()) if (s.materialized && s.expanded) { s.expanded = false; s.loaded = 0; paintBlock(s); }
+      closePopovers(); if (active) navigateTo('#' + active, false); return;
+    }
+    if (button.id === 'exportBtn') {
+      download(`diffstory-${(R.meta.head_sha || 'review').slice(0, 12)}-review.json`, {schema: 'diffstory.review.v1', revision, exported_at: new Date().toISOString(), ...review});
+      closePopovers(); notify('Review notes exported for these exact revisions.'); return;
+    }
+    if (button.id === 'importBtn') { closePopovers(); $('#importFile').click(); return; }
+    if (button.id === 'downloadReport') { download('diffstory-report.json', R); closePopovers(); return; }
+  });
+  document.addEventListener('input', event => {
+    if (event.target.dataset.note) { review.notes[event.target.dataset.note] = event.target.value; saveReview(); }
+  });
+  document.addEventListener('change', event => {
+    if (event.target.dataset.review) { review.checked[event.target.dataset.review] = event.target.checked; saveReview(); }
+  });
+  $('#search').addEventListener('input', contents);
+  $('#importFile').addEventListener('change', async event => {
+    const file = event.target.files[0]; event.target.value = ''; if (!file) return;
+    try {
+      if (file.size > 5000000) throw new Error('Review file exceeds 5 MB.');
+      const data = JSON.parse(await file.text());
+      if (data.schema !== 'diffstory.review.v1' || data.revision !== revision) throw new Error('Review belongs to a different report revision.');
+      if (!data.notes || typeof data.notes !== 'object' || Array.isArray(data.notes) || !data.checked || typeof data.checked !== 'object' || Array.isArray(data.checked)) throw new Error('Invalid review schema.');
+      review = sanitizeReview(data); saveReview();
+      $$('[data-note]').forEach(input => { input.value = review.notes[input.dataset.note] || ''; });
+      $$('[data-review]').forEach(input => { input.checked = !!review.checked[input.dataset.review]; });
+      contents(); notify('Review imported for these exact revisions.');
+    } catch (err) { notify(err.message || 'Could not import review.'); }
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') { closePopovers(true); return; }
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName) || event.target.isContentEditable || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.key === '/') { event.preventDefault(); openPopover('contents', true); }
+    // Deliberately leave arrow keys, Page Down, Space and browser Find alone.
+  });
+
+  buildHeader();
+  $('#story').innerHTML = R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>';
+  buildFooter(); contents(); updateReviewMarkers(); observeBlocks(); updateScroll();
+  if (location.hash) requestAnimationFrame(() => navigateTo(location.hash, false));
+})();
+</script>
+</body>
+</html>

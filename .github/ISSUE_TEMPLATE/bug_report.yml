@@ -1,0 +1,25 @@
+name: Bug report
+description: Report a reproducible problem using synthetic or public source.
+body:
+  - type: markdown
+    attributes:
+      value: "Do not attach private reports, tokens, customer data, or unapproved source. Report security vulnerabilities privately using SECURITY.md."
+  - type: input
+    id: version
+    attributes:
+      label: Diffstory version and Python version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include a small synthetic before/after example and the command used.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
