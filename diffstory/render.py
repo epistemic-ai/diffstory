@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from .analysis import SCHEMA, validate_passages
+from .analysis import SCHEMA, validate_generated_report, validate_passages
 
 
 def validate_report(report: dict) -> None:
@@ -13,7 +13,7 @@ def validate_report(report: dict) -> None:
         if not isinstance(report.get(name),list): raise ValueError(f'Report {name} must be a list')
     ids = re.compile(r'[a-f0-9]{16}')
     numeric = {'number','start','end','old_start','new_start','old_count','new_count','old','new',
-               'changed_files','additions','deletions'}
+               'changed_files','additions','deletions','source_bytes'}
     def walk(value):
         if isinstance(value,dict):
             for key,item in value.items():
@@ -43,6 +43,8 @@ def validate_report(report: dict) -> None:
         if not set(g['change_ids'])<=changes:raise ValueError('Unknown group change ID')
         if not set(g['prerequisites'])<=groups:raise ValueError('Unknown prerequisite group ID')
         if g.get('next_id') is not None and g['next_id'] not in groups:raise ValueError('Unknown next group ID')
+    if 'generation' in report:
+        validate_generated_report(report)
 
 
 def render(report: dict) -> str:

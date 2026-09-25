@@ -61,6 +61,8 @@ main { padding: 0 26px; }
 .kicker-dot { color: var(--soft); }
 h1 { font: 400 45px/1.13 var(--serif); letter-spacing: -1.4px; margin: 0 0 20px; color: #0f172a; text-wrap: balance; }
 .lead { font: 18px/1.72 var(--serif); color: var(--body); margin: 0 0 23px; }
+.generation-notice { border-left: 3px solid #c27a22; background: #fff8eb; color: #704515; padding: 10px 14px; margin: 0 0 22px; font-size: 12px; line-height: 1.6; }
+.generation-step-notice { width: 100%; max-width: var(--prose-width); margin: -8px auto 16px; color: #80521e; font-size: 10px; font-weight: 650; letter-spacing: .5px; text-transform: uppercase; }
 .document-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; margin-bottom: 13px; }
 .document-meta .sep { color: #cbd5e1; padding: 0 3px; }
 .revisions { font: 10px/1.7 var(--mono); color: var(--muted); }

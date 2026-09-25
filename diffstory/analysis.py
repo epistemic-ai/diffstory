@@ -19,6 +19,7 @@ from . import __version__
 
 SCHEMA = "diffstory.report.v1"
 MAX_SOURCE_BYTES = 8_000_000
+MAX_SNAPSHOT_SOURCE_BYTES = 64_000_000
 LABELS = {
     "moved": "Moved · identical AST", "renamed": "Renamed · matching statements",
     "moved_renamed": "Moved + renamed", "moved_modified": "Moved + edited · candidate",
@@ -344,7 +345,16 @@ def compile_snapshot(snapshot: dict) -> dict:
     if snapshot.get("schema") != "diffstory.snapshot.v1": raise ValueError("Expected diffstory.snapshot.v1")
     meta = dict(snapshot.get("meta", {}))
     fragments = snapshot.get("fragments", [])
+    if not isinstance(fragments, list): raise ValueError("Snapshot fragments must be a list")
+    source_bytes = 0
+    for fragment in fragments:
+        if not isinstance(fragment, dict) or not isinstance(fragment.get("text"), str):
+            raise ValueError("Snapshot fragment text must be a string")
+        source_bytes += len(fragment["text"].encode("utf-8"))
+        if source_bytes > MAX_SNAPSHOT_SOURCE_BYTES:
+            raise ValueError(f"Snapshot source exceeds the {MAX_SNAPSHOT_SOURCE_BYTES} byte aggregate limit")
     if not fragments and meta.get("changed_files") != 0: raise ValueError("Snapshot contains no source fragments")
+    meta["source_bytes"] = source_bytes
     all_symbols = {"base": [], "head": []}; imports = {"base": defaultdict(list), "head": defaultdict(list)}
     warnings = list(snapshot.get("warnings", [])); frag_map = {}; parse_notes = {}; files = []
     occupied = defaultdict(list)
@@ -550,13 +560,144 @@ def evidence_packet(report: dict) -> dict:
             "groups": report["groups"], "changes": report["changes"], "tests": report["tests"], "warnings": report["warnings"]}
 
 
+def validate_generation(report: dict, generation: dict) -> None:
+    """Validate the persisted origin and complete coverage for generated prose."""
+    required = {
+        "schema", "origin", "verification", "provider", "model", "base_sha", "head_sha",
+        "limits", "usage", "expected_groups", "completed_groups", "expected_changes",
+        "covered_changes", "expected_chunks", "chunk_coverage", "errors",
+    }
+    if not isinstance(generation, dict) or set(generation) != required:
+        raise ValueError("Invalid generated narration manifest")
+    if (generation.get("schema") != "diffstory.generation.v1"
+            or generation.get("origin") != "model_generated"
+            or generation.get("verification") != "unverified"):
+        raise ValueError("Invalid generated narration provenance")
+    if generation.get("base_sha") != report.get("meta", {}).get("base_sha") or generation.get("head_sha") != report.get("meta", {}).get("head_sha"):
+        raise ValueError("Generated narration belongs to different revisions")
+    if (not isinstance(generation.get("provider"), str) or not generation["provider"]
+            or len(generation["provider"]) > 80 or not isinstance(generation.get("model"), str)
+            or not generation["model"] or len(generation["model"]) > 160):
+        raise ValueError("Invalid generated narration provider metadata")
+
+    def ids(name: str) -> list[str]:
+        value = generation.get(name)
+        if (not isinstance(value, list) or any(not isinstance(item, str) or not re.fullmatch(r"[a-f0-9]{16}", item) for item in value)
+                or len(value) != len(set(value))):
+            raise ValueError(f"Invalid generated narration {name}")
+        return value
+
+    expected_groups = ids("expected_groups"); completed_groups = ids("completed_groups")
+    expected_changes = ids("expected_changes"); covered_changes = ids("covered_changes")
+    expected_chunks = ids("expected_chunks")
+    report_groups = [group["id"] for group in report.get("groups", [])]
+    report_changes = [change["id"] for change in report.get("changes", [])]
+    if expected_groups != report_groups or completed_groups != report_groups:
+        raise ValueError("Generated narration does not cover every report group")
+    if expected_changes != report_changes or set(covered_changes) != set(report_changes):
+        raise ValueError("Generated narration does not cover every report change")
+
+    limits = generation.get("limits")
+    limit_keys = {"context_tokens", "request_input_tokens", "request_output_tokens", "total_input_tokens",
+                  "total_output_tokens", "calls", "seconds", "input_bound"}
+    if not isinstance(limits, dict) or set(limits) != limit_keys:
+        raise ValueError("Invalid generated narration limits")
+    for key in limit_keys - {"seconds", "input_bound"}:
+        if type(limits[key]) is not int or limits[key] <= 0:
+            raise ValueError("Invalid generated narration token or call limit")
+    if (isinstance(limits["seconds"], bool) or not isinstance(limits["seconds"], (int, float)) or limits["seconds"] <= 0
+            or limits["input_bound"] != "serialized UTF-8 request bytes plus framing margin"):
+        raise ValueError("Invalid generated narration time or input limit")
+    usage = generation.get("usage")
+    if not isinstance(usage, dict) or set(usage) != {"input_tokens", "output_tokens", "calls", "elapsed_seconds"}:
+        raise ValueError("Invalid generated narration usage")
+    for key in ("input_tokens", "output_tokens", "calls"):
+        if type(usage[key]) is not int or usage[key] < 0:
+            raise ValueError("Invalid generated narration usage")
+    if (isinstance(usage["elapsed_seconds"], bool) or not isinstance(usage["elapsed_seconds"], (int, float))
+            or usage["elapsed_seconds"] < 0 or usage["input_tokens"] > limits["total_input_tokens"]
+            or usage["output_tokens"] > limits["total_output_tokens"] or usage["calls"] > limits["calls"]
+            or usage["elapsed_seconds"] > limits["seconds"] + 1):
+        raise ValueError("Generated narration usage exceeds its recorded limits")
+
+    groups = {group["id"]: group for group in report.get("groups", [])}
+    change_map = {change["id"]: change for change in report.get("changes", [])}
+    changes = set(change_map)
+    chunks = generation.get("chunk_coverage")
+    if not isinstance(chunks, list) or len(chunks) != len(expected_chunks):
+        raise ValueError("Invalid generated narration chunk coverage")
+    seen_chunks: set[str] = set(); seen_changes: set[str] = set()
+    for chunk in chunks:
+        if not isinstance(chunk, dict) or set(chunk) != {"id", "group_id", "change_ids", "source_slices", "status"}:
+            raise ValueError("Invalid generated narration chunk entry")
+        chunk_id = chunk["id"]; gid = chunk["group_id"]
+        if not isinstance(chunk_id, str) or not re.fullmatch(r"[a-f0-9]{16}", chunk_id) or chunk_id in seen_chunks:
+            raise ValueError("Invalid or duplicate generated chunk ID")
+        if gid not in groups or chunk["status"] != "complete":
+            raise ValueError("Generated narration has an incomplete or unknown chunk")
+        refs = chunk["change_ids"]
+        if (not isinstance(refs, list) or not refs or any(not isinstance(ref, str) for ref in refs)
+                or len(refs) != len(set(refs)) or not set(refs) <= set(groups[gid]["change_ids"])):
+            raise ValueError("Generated chunk cites changes outside its group")
+        slices = chunk["source_slices"]
+        if not isinstance(slices, list):
+            raise ValueError("Invalid generated source-slice coverage")
+        for source_slice in slices:
+            if not isinstance(source_slice, dict) or set(source_slice) != {"change_id", "side", "start", "end"}:
+                raise ValueError("Invalid generated source-slice coverage")
+            if (source_slice["change_id"] not in refs or source_slice["side"] not in {"base", "head"}
+                    or type(source_slice["start"]) is not int or type(source_slice["end"]) is not int
+                    or source_slice["start"] < 1 or source_slice["end"] < source_slice["start"]):
+                raise ValueError("Invalid generated source-slice range")
+            source = change_map[source_slice["change_id"]].get("after" if source_slice["side"] == "head" else "before")
+            if not source or not source.get("start", 1) <= source_slice["start"] <= source_slice["end"] <= source.get("end", 0):
+                raise ValueError("Generated source-slice range is outside its report change")
+        seen_chunks.add(chunk_id); seen_changes.update(refs)
+    if seen_chunks != set(expected_chunks) or seen_changes != changes:
+        raise ValueError("Generated narration chunk manifest is incomplete")
+    errors = generation.get("errors")
+    if errors != []:
+        raise ValueError("A completed generated report cannot contain generation errors")
+
+
+def validate_generated_report(report: dict) -> None:
+    """Check that persisted generated reports keep their label and full evidence."""
+    generation = report.get("generation")
+    validate_generation(report, generation)
+    document = report.get("document")
+    if not isinstance(document, dict) or any(not isinstance(document.get(key), str) or not document[key].strip() for key in ("lead", "closing")):
+        raise ValueError("Generated report is missing its document narration")
+    changes = {change["id"]: change for change in report["changes"]}
+    for group in report["groups"]:
+        narrative = group.get("narrative", {})
+        if narrative.get("provenance") != "model-generated · unverified":
+            raise ValueError("Generated report lost its model-generated provenance label")
+        refs = narrative.get("evidence_change_ids")
+        if (not isinstance(refs, list) or len(refs) != len(set(refs))
+                or set(refs) != set(group["change_ids"])):
+            raise ValueError("Generated step does not cover its expected changes")
+        passages = narrative.get("passages")
+        if not isinstance(passages, list) or not passages:
+            raise ValueError("Generated step is missing source-bound passages")
+        validate_passages(passages, group, changes)
+        covered = {change_id for passage in passages for change_id in passage["change_ids"]}
+        if covered != set(group["change_ids"]):
+            raise ValueError("Generated passages do not cover every change in the group")
+
+
 def apply_annotations(report: dict, annotations: dict) -> dict:
     """Validate provenance and revision. Narrative cannot override analysis facts."""
     if annotations.get("schema") != "diffstory.annotations.v1": raise ValueError("Expected diffstory.annotations.v1")
     if annotations.get("head_sha") != report["meta"].get("head_sha"): raise ValueError("Narrative belongs to a different head revision")
     if annotations.get("base_sha") != report["meta"].get("base_sha"): raise ValueError("Narrative belongs to a different base revision")
+    generated = "generation" in annotations
+    if "generation" in report and not generated:
+        raise ValueError("Reapplying annotations to a generated report requires its generation manifest")
     result = copy.deepcopy(report); groups = {g["id"]: g for g in result["groups"]}
     changes = {c["id"]: c for c in result["changes"]}
+    if generated:
+        validate_generation(report, annotations["generation"])
+        result["generation"] = copy.deepcopy(annotations["generation"])
     if "document" in annotations:
         document = annotations["document"]
         if not isinstance(document, dict) or any(k not in {"lead", "closing"} for k in document):
@@ -564,11 +705,25 @@ def apply_annotations(report: dict, annotations: dict) -> dict:
         if any(not isinstance(v, str) or len(v) > 6000 for v in document.values()):
             raise ValueError("Invalid document narrative text")
         result["document"] = copy.deepcopy(document)
-    for step in annotations.get("steps", []):
+    if generated and (not isinstance(annotations.get("document"), dict)
+                     or any(not isinstance(annotations["document"].get(key), str) or not annotations["document"][key].strip()
+                            for key in ("lead", "closing"))):
+        raise ValueError("Generated narration requires a nonempty document opening and closing")
+    steps = annotations.get("steps", [])
+    if not isinstance(steps, list): raise ValueError("Narrative steps must be a list")
+    seen_groups: set[str] = set()
+    for step in steps:
+        if not isinstance(step, dict): raise ValueError("Invalid narrative step")
         gid = step.get("group_id")
         if gid not in groups: raise ValueError(f"Unknown narrative group: {gid}")
+        if generated and gid in seen_groups: raise ValueError(f"Duplicate generated narrative step: {gid}")
+        seen_groups.add(gid)
         g = groups[gid]; refs = step.get("evidence_change_ids", [])
-        if not refs or not set(refs) <= set(g["change_ids"]): raise ValueError(f"Narrative evidence is missing or outside its group: {gid}")
+        if (not isinstance(refs, list) or not refs or any(not isinstance(ref, str) for ref in refs)
+                or len(refs) != len(set(refs)) or not set(refs) <= set(g["change_ids"])):
+            raise ValueError(f"Narrative evidence is missing or outside its group: {gid}")
+        if generated and set(refs) != set(g["change_ids"]):
+            raise ValueError(f"Generated narrative step does not cite every change in group {gid}")
         for key in ("intent", "why_now", "takeaway", "transition"):
             if key in step:
                 if not isinstance(step[key], str) or len(step[key]) > 6000: raise ValueError(f"Invalid narrative {key}")
@@ -577,12 +732,23 @@ def apply_annotations(report: dict, annotations: dict) -> dict:
             if key in step:
                 if not isinstance(step[key], list) or any(not isinstance(x, str) or len(x) > 2000 for x in step[key]): raise ValueError(f"Invalid narrative {key}")
                 g["narrative"][key] = step[key]
+        if generated and ("passages" not in step or not isinstance(step["passages"], list) or not step["passages"]):
+            raise ValueError(f"Generated narrative step is missing source-bound passages: {gid}")
         if "passages" in step:
             validate_passages(step["passages"], g, changes)
+            if generated:
+                covered = {ref for passage in step["passages"] for ref in passage["change_ids"]}
+                if covered != set(g["change_ids"]):
+                    raise ValueError(f"Generated passages do not cover every change in group {gid}")
             g["narrative"]["passages"] = copy.deepcopy(step["passages"])
         if "title" in step:
             if not isinstance(step["title"], str) or len(step["title"]) > 200: raise ValueError("Invalid narrative title")
             g["title"] = step["title"]
-        g["narrative"]["provenance"] = "authored interpretation, linked to source; not machine-verified semantics"
+        g["narrative"]["provenance"] = ("model-generated · unverified" if generated
+                                            else "authored interpretation, linked to source; not machine-verified semantics")
         g["narrative"]["evidence_change_ids"] = refs
+    if generated:
+        if seen_groups != set(groups):
+            raise ValueError("Generated narration must include exactly one step for every report group")
+        validate_generated_report(result)
     return result
