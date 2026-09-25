@@ -48,12 +48,12 @@ report correctly records zero test runs verified by the analyzer.
 
 ## Human review for generated narration
 
-The API-backed generation path is opt-in and is not exercised by the offline
+The model-backed generation path is opt-in and is not exercised by the offline
 test suite. Before accepting a provider, model, or prompt change, generate a
-walkthrough from the synthetic fixture and from a source snapshot approved for
-that use. Review every generated passage beside its rendered code. Score each
-dimension from 0 to 2: 0 means incorrect or missing, 1 means partly useful or
-too vague, and 2 means accurate and useful.
+walkthrough with each changed provider from the synthetic fixture and from a
+source snapshot approved for that use. Review every generated passage beside
+its rendered code. Score each dimension from 0 to 2: 0 means incorrect or
+missing, 1 means partly useful or too vague, and 2 means accurate and useful.
 
 | Dimension | Review question |
 |---|---|

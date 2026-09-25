@@ -18,8 +18,9 @@ from .analysis import (
 from .budget import BudgetLimits
 from .ingest import from_git, from_github
 from .narrative import (
-    MODEL_CONTEXT_TOKENS,
     OPENAI_MODEL,
+    CodexCLIProvider,
+    NarrativeProvider,
     Narrator,
     OpenAIResponsesProvider,
 )
@@ -47,14 +48,19 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--narrate",
         action="store_true",
-        help="Generate model-written source explanations (sends PR source to OpenAI)",
+        help="Generate model-written source explanations (sends PR source to the selected provider)",
     )
-    parser.add_argument("--provider", choices=["openai"], default="openai")
-    parser.add_argument("--model", choices=[OPENAI_MODEL], default=OPENAI_MODEL)
+    parser.add_argument(
+        "--provider", choices=["openai", "codex"], default="openai"
+    )
+    parser.add_argument(
+        "--model",
+        help="Optional model override (OpenAI: gpt-6-astra; Codex: CLI model ID)",
+    )
     parser.add_argument(
         "--api-key-env",
         default="OPENAI_API_KEY",
-        help="Environment variable holding the OpenAI API key",
+        help="Environment variable holding the OpenAI API key (OpenAI provider only)",
     )
     parser.add_argument(
         "--yes",
@@ -182,9 +188,12 @@ def _load_snapshot(args: argparse.Namespace) -> dict | None:
     return None
 
 
-def _budget_limits(args: argparse.Namespace) -> BudgetLimits:
+def _budget_limits(
+    args: argparse.Namespace,
+    provider: NarrativeProvider,
+) -> BudgetLimits:
     return BudgetLimits(
-        context_tokens=MODEL_CONTEXT_TOKENS,
+        context_tokens=provider.context_tokens,
         request_input_tokens=args.max_request_input_tokens,
         request_output_tokens=args.max_request_output_tokens,
         total_input_tokens=args.max_input_tokens,
@@ -195,7 +204,7 @@ def _budget_limits(args: argparse.Namespace) -> BudgetLimits:
 
 
 def _print_narration_preview(
-    provider: OpenAIResponsesProvider,
+    provider: NarrativeProvider,
     limits: BudgetLimits,
     report: dict,
     preview: dict,
@@ -226,7 +235,10 @@ def _print_narration_preview(
     )
 
 
-def _confirm_source_transfer(assume_yes: bool) -> None:
+def _confirm_source_transfer(
+    assume_yes: bool,
+    provider: NarrativeProvider,
+) -> None:
     if assume_yes:
         return
     if not sys.stdin.isatty():
@@ -235,8 +247,9 @@ def _confirm_source_transfer(assume_yes: bool) -> None:
         )
 
     try:
+        provider_name = getattr(provider, "consent_name", provider.name)
         answer = input(
-            "Send source evidence to OpenAI and generate narration? [y/N] "
+            f"Send source evidence to {provider_name} and generate narration? [y/N] "
         ).strip().lower()
     except EOFError:
         raise ValueError(
@@ -250,14 +263,21 @@ def _generate_narration(
     args: argparse.Namespace,
     report: dict,
 ) -> tuple[dict, dict, Path]:
-    provider = OpenAIResponsesProvider(token_env=args.api_key_env)
+    if args.provider == "openai":
+        if args.model not in {None, OPENAI_MODEL}:
+            raise ValueError(f"OpenAI narration currently supports only {OPENAI_MODEL}")
+        provider: NarrativeProvider = OpenAIResponsesProvider(
+            token_env=args.api_key_env
+        )
+    else:
+        provider = CodexCLIProvider(model=args.model)
     provider.require_credentials()
 
-    limits = _budget_limits(args)
+    limits = _budget_limits(args, provider)
     narrator = Narrator(provider, limits=limits)
     preview = narrator.preview(report)
     _print_narration_preview(provider, limits, report, preview)
-    _confirm_source_transfer(args.yes)
+    _confirm_source_transfer(args.yes, provider)
 
     annotations = narrator.generate(report)
     annotated_report = apply_annotations(report, annotations)

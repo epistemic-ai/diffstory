@@ -1,9 +1,9 @@
 """Conservative request sizing and a run-wide model-call budget.
 
 The byte count is deliberately an upper bound, not a tokenizer estimate: a
-token cannot encode more UTF-8 bytes than the payload contains. The additional
-framing margin covers API message framing that is not present in the JSON body.
-Usage reported by a provider replaces the reservation when it is known.
+token cannot encode more UTF-8 bytes than the payload contains. Framing and
+provider-specific overhead cover prompt structure that is not in the JSON
+body. Usage reported by a provider replaces the reservation when it is known.
 """
 from __future__ import annotations
 
@@ -77,12 +77,25 @@ class RunBudget:
             raise ValueError("Narration time budget exhausted")
         return remaining
 
-    def estimate_input(self, request_body: bytes) -> int:
+    def estimate_input(
+        self,
+        request_body: bytes,
+        *,
+        overhead_bytes: int = 0,
+    ) -> int:
         if not isinstance(request_body, bytes):
             raise TypeError("The serialized provider request must be bytes")
-        return len(request_body) + INPUT_FRAMING_MARGIN
+        if type(overhead_bytes) is not int or overhead_bytes < 0:
+            raise ValueError("Input overhead must be a non-negative integer")
+        return len(request_body) + INPUT_FRAMING_MARGIN + overhead_bytes
 
-    def authorize(self, request_body: bytes, max_output_tokens: int) -> Reservation:
+    def authorize(
+        self,
+        request_body: bytes,
+        max_output_tokens: int,
+        *,
+        input_overhead_bytes: int = 0,
+    ) -> Reservation:
         """Reserve the complete input bound and maximum output before a call.
 
         Each retry or repair is a new invocation and therefore needs a new
@@ -90,7 +103,10 @@ class RunBudget:
         """
         if type(max_output_tokens) is not int or max_output_tokens <= 0:
             raise ValueError("Maximum output tokens must be a positive integer")
-        request_input_tokens = self.estimate_input(request_body)
+        request_input_tokens = self.estimate_input(
+            request_body,
+            overhead_bytes=input_overhead_bytes,
+        )
         if request_input_tokens > self.limits.request_input_tokens:
             raise ValueError(
                 "Request input exceeds the per-request budget "
