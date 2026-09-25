@@ -28,16 +28,24 @@ class BudgetLimits:
 
     def __post_init__(self) -> None:
         for name in (
-            "context_tokens", "request_input_tokens", "request_output_tokens",
-            "total_input_tokens", "total_output_tokens", "calls",
+            "context_tokens",
+            "request_input_tokens",
+            "request_output_tokens",
+            "total_input_tokens",
+            "total_output_tokens",
+            "calls",
         ):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
         if self.request_input_tokens + self.request_output_tokens > self.context_tokens:
             raise ValueError("Per-request token limits exceed the model context")
-        if (isinstance(self.seconds, bool) or not isinstance(self.seconds, (int, float))
-                or not math.isfinite(self.seconds) or self.seconds <= 0):
+        if (
+            isinstance(self.seconds, bool)
+            or not isinstance(self.seconds, (int, float))
+            or not math.isfinite(self.seconds)
+            or self.seconds <= 0
+        ):
             raise ValueError("seconds must be positive")
 
 
@@ -63,7 +71,8 @@ class RunBudget:
         self._calls = 0
 
     def remaining_seconds(self) -> float:
-        remaining = self.limits.seconds - (self._clock() - self._started)
+        elapsed = self._clock() - self._started
+        remaining = self.limits.seconds - elapsed
         if remaining <= 0:
             raise ValueError("Narration time budget exhausted")
         return remaining
@@ -81,28 +90,35 @@ class RunBudget:
         """
         if type(max_output_tokens) is not int or max_output_tokens <= 0:
             raise ValueError("Maximum output tokens must be a positive integer")
-        input_tokens = self.estimate_input(request_body)
-        if input_tokens > self.limits.request_input_tokens:
+        request_input_tokens = self.estimate_input(request_body)
+        if request_input_tokens > self.limits.request_input_tokens:
             raise ValueError(
-                f"Request input exceeds the per-request budget ({input_tokens} > "
+                "Request input exceeds the per-request budget "
+                f"({request_input_tokens} > "
                 f"{self.limits.request_input_tokens} conservative tokens)"
             )
-        if max_output_tokens > self.limits.request_output_tokens:
+        request_output_tokens = max_output_tokens
+        if request_output_tokens > self.limits.request_output_tokens:
             raise ValueError("Requested output exceeds the per-request output budget")
-        if input_tokens + max_output_tokens > self.limits.context_tokens:
+        if request_input_tokens + request_output_tokens > self.limits.context_tokens:
             raise ValueError("Request exceeds the selected model's context limit")
         if self._calls >= self.limits.calls:
             raise ValueError("Narration call budget exhausted")
-        if self._input_tokens + input_tokens > self.limits.total_input_tokens:
+        if self._input_tokens + request_input_tokens > self.limits.total_input_tokens:
             raise ValueError("Narration input-token budget exhausted")
-        if self._output_tokens + max_output_tokens > self.limits.total_output_tokens:
+        if self._output_tokens + request_output_tokens > self.limits.total_output_tokens:
             raise ValueError("Narration output-token budget exhausted")
-        timeout = self.remaining_seconds()
-        reservation = Reservation(self._next_id, input_tokens, max_output_tokens, timeout)
+        timeout_seconds = self.remaining_seconds()
+        reservation = Reservation(
+            self._next_id,
+            request_input_tokens,
+            request_output_tokens,
+            timeout_seconds,
+        )
         self._next_id += 1
         self._reservations[reservation.id] = reservation
-        self._input_tokens += input_tokens
-        self._output_tokens += max_output_tokens
+        self._input_tokens += request_input_tokens
+        self._output_tokens += request_output_tokens
         self._calls += 1
         return reservation
 
@@ -116,8 +132,12 @@ class RunBudget:
             return
         input_tokens = usage.get("input_tokens")
         output_tokens = usage.get("output_tokens")
-        if (type(input_tokens) is not int or input_tokens < 0
-                or type(output_tokens) is not int or output_tokens < 0):
+        if (
+            type(input_tokens) is not int
+            or input_tokens < 0
+            or type(output_tokens) is not int
+            or output_tokens < 0
+        ):
             raise ValueError("Provider usage must contain non-negative input and output token counts")
         del self._reservations[reservation.id]
         self._input_tokens += input_tokens - reservation.input_tokens
@@ -135,9 +155,10 @@ class RunBudget:
         self._calls -= 1
 
     def usage(self) -> dict[str, int | float]:
+        elapsed = self._clock() - self._started
         return {
             "input_tokens": self._input_tokens,
             "output_tokens": self._output_tokens,
             "calls": self._calls,
-            "elapsed_seconds": round(min(self.limits.seconds, self._clock() - self._started), 3),
+            "elapsed_seconds": round(min(self.limits.seconds, elapsed), 3),
         }
