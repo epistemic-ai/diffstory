@@ -45,3 +45,25 @@ installation checks instead.
 Tests above validate Diffstory itself, not the tests in a repository being
 analyzed. The synthetic example's test definitions are source evidence; its
 report correctly records zero test runs verified by the analyzer.
+
+## Human review for generated narration
+
+The model-backed generation path is opt-in and is not exercised by the offline
+test suite. Before accepting a provider, model, or prompt change, generate a
+walkthrough with each changed provider from the synthetic fixture and from a
+source snapshot approved for that use. Review every generated passage beside
+its rendered code. Score each dimension from 0 to 2: 0 means incorrect or
+missing, 1 means partly useful or too vague, and 2 means accurate and useful.
+
+| Dimension | Review question |
+|---|---|
+| Evidence fidelity | Does each prose claim follow from its cited change and visible source range? |
+| Coverage | Does every expected group and change have a useful explanation, without unsupported steps? |
+| Coherence | Do the opening, sections, transitions, and closing form a clear walkthrough? |
+| Uncertainty | Does the prose distinguish static references from executed tests or verified behavior? |
+| Reading order | Do explanations follow the compiler's dependency order and explain why the next group follows? |
+
+Reject a candidate for any invented test result, unsupported behavior claim, or
+prose citation that does not support the claim, regardless of the total score.
+This review assesses readability and evidence fidelity; it does not certify
+the model's prose as true.

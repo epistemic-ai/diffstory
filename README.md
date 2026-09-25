@@ -75,7 +75,50 @@ diffstory render walkthrough.report.json \
   --annotations annotations.json --out narrated.html
 ```
 
-Evidence packets contain source code. Send them only to an approved model or environment. No model provider is called automatically, no API key is needed, and no billing integration is included. Annotation validation locks revisions and evidence IDs; it cannot establish that every prose claim is true. See [the annotation contract](docs/ARCHITECTURE.md#annotation-handoff).
+Evidence packets contain source code. Send them only to an approved model or environment. The manual annotation workflow makes no provider call and needs no API key. Annotation validation locks revisions and evidence IDs; it cannot establish that every prose claim is true. See [the annotation contract](docs/ARCHITECTURE.md#annotation-handoff).
+
+### Opt in to model narration
+
+The `git` and `github` commands accept `--narrate` to generate candidate annotations. By default, `--provider openai` calls the OpenAI Responses API with GPT-6 Astra. This is a separate API integration; a ChatGPT subscription does not supply an API key. Set `OPENAI_API_KEY` with your credential manager, or select another environment variable with `--api-key-env`. Diffstory never accepts the key as a command argument or writes it to generated files.
+
+```bash
+diffstory github 'OWNER/REPO#NUMBER' \
+  --narrate \
+  --out walkthrough.html
+```
+
+To use your signed-in Codex CLI account instead, install and sign in to the
+[Codex CLI](https://developers.openai.com/codex/cli) with `codex login`, then
+select `--provider codex`:
+
+```bash
+diffstory github 'OWNER/REPO#NUMBER' \
+  --narrate \
+  --provider codex \
+  --out walkthrough.html
+```
+
+This route runs `codex exec` with the Codex CLI's saved sign-in and default
+model. You can pass `--model MODEL_ID` to choose a Codex model. It does
+not need an OpenAI API key; access and usage follow the signed-in ChatGPT or
+workspace account. The CLI receives only the prepared evidence request, runs
+from a temporary directory with read-only access, and has local shell, browser,
+app, and plugin tools disabled. See the [Codex non-interactive mode
+documentation](https://developers.openai.com/codex/non-interactive-mode) for
+how `codex exec` uses saved authentication and structured output.
+
+Codex CLI does not expose a per-call output-token cap. Diffstory includes the
+reserved output target in the prompt and reconciles the usage reported by the
+CLI. If a completed call exceeds its reservation, Diffstory rejects the result;
+that call may still have consumed Codex account usage.
+
+Before the first model request, Diffstory displays the destination, PR revisions and source scope, planned request count, conservative input bound, and reserved output tokens. It asks for confirmation. Use `--yes` only when you have already approved that transfer, such as in an automation job. Without `--narrate`, GitHub ingestion still reads the PR over the network but no model request is made.
+
+Narration uses bounded evidence chunks, multi-level summaries, and a run-wide limit for input tokens, output tokens, provider calls, and time. Defaults can be lowered with `--max-request-input-tokens`, `--max-request-output-tokens`, `--max-input-tokens`, `--max-output-tokens`, `--max-provider-calls`, and `--narration-timeout`. `--max-source-bytes` can lower the hard 64 MB cap on captured source across both revisions. Excess source is rejected before narration, and the GitHub reader stops fetching files once the configured cap is exceeded. A limit failure does not produce a narrated report.
+
+Successful runs write HTML, `.report.json`, and candidate `.annotations.json` files. Each generated passage is tied to a change ID and checked against its group and source range. The generated report preserves its provider/model, revisions, limits, usage, and chunk coverage, and displays a visible **model-generated · unverified** warning. It does not validate whether prose is true.
+
+The OpenAI API request sets `store: false`, but this is not a zero-retention promise. OpenAI's API data controls, abuse-monitoring retention, organization settings, and applicable exceptions govern what the API retains; check the current [OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data) before sending confidential source. The API calls are documented in the [Responses API](https://developers.openai.com/api/docs/guides/structured-outputs) documentation. Codex CLI runs follow the signed-in ChatGPT or workspace account's current data and retention controls.
 
 ## Develop and verify
 

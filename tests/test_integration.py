@@ -10,7 +10,7 @@ from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
-from diffstory.analysis import compile_snapshot, apply_annotations
+from diffstory.analysis import MAX_SNAPSHOT_SOURCE_BYTES, compile_snapshot, apply_annotations
 from diffstory.cli import main
 from diffstory.ingest import from_git, from_github
 
@@ -134,6 +134,18 @@ class GitHubTransportTests(unittest.TestCase):
         fake,_=self.fake(2,returned=1)
         with patch('diffstory.ingest.GitHubClient.get',new=fake),self.assertRaisesRegex(ValueError,'complete file list'):
             from_github('org/repo#1')
+
+    def test_aggregate_source_limit_stops_before_fetching_remaining_files(self):
+        fake, paths = self.fake(3)
+        with patch('diffstory.ingest.GitHubClient.get', new=fake), self.assertRaisesRegex(ValueError, 'max-source-bytes'):
+            from_github('org/repo#1', max_source_bytes=7)
+        content_requests = [path for path in paths if '/contents/' in path]
+        self.assertEqual(len(content_requests), 2)
+
+    def test_source_limit_cannot_raise_hard_cap_before_api_access(self):
+        with patch('diffstory.ingest.GitHubClient.get', side_effect=AssertionError('unexpected GitHub request')):
+            with self.assertRaisesRegex(ValueError, 'hard limit'):
+                from_github('org/repo#1', max_source_bytes=MAX_SNAPSHOT_SOURCE_BYTES + 1)
 
     def test_changing_revision_rejected(self):
         fake,_=self.fake(changed_mid_read=True)
