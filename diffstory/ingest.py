@@ -7,16 +7,23 @@ import os
 import re
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from . import __version__
+from .analysis import MAX_SNAPSHOT_SOURCE_BYTES
 
 MAX_FILE = 8_000_000
 MAX_FILES = 500
+
+
+def _validate_source_limit(max_source_bytes: int) -> None:
+    if type(max_source_bytes) is not int or max_source_bytes <= 0:
+        raise ValueError("--max-source-bytes must be a positive integer")
+    if max_source_bytes > MAX_SNAPSHOT_SOURCE_BYTES:
+        raise ValueError(f"--max-source-bytes cannot exceed the {MAX_SNAPSHOT_SOURCE_BYTES}-byte hard limit")
 
 
 def _git(repo: Path, *args: str, limit: int = MAX_FILE) -> bytes:
@@ -37,7 +44,9 @@ def _resolve(repo: Path, ref: str) -> str:
     return sha
 
 
-def from_git(repo: str, base: str, head: str, *, two_dot: bool = False, max_files: int = MAX_FILES) -> dict:
+def from_git(repo: str, base: str, head: str, *, two_dot: bool = False, max_files: int = MAX_FILES,
+             max_source_bytes: int = MAX_SNAPSHOT_SOURCE_BYTES) -> dict:
+    _validate_source_limit(max_source_bytes)
     root = Path(repo).resolve()
     base_sha, head_sha = _resolve(root, base), _resolve(root, head)
     effective = base_sha if two_dot else _git(root, "merge-base", base_sha, head_sha).decode().strip()
@@ -47,6 +56,7 @@ def from_git(repo: str, base: str, head: str, *, two_dot: bool = False, max_file
     items = [(names[i].decode(), names[i+1].decode("utf-8")) for i in range(0, len(names)-1, 2)]
     if len(items) > max_files: raise ValueError(f"{len(items)} changed files exceeds --max-files {max_files}; no partial report was written")
     fragments, warnings = [], []
+    source_bytes = 0
     for status, path in items:
         for side, sha, present in (("base", effective, status != "A"), ("head", head_sha, status != "D")):
             if not present: continue
@@ -59,6 +69,9 @@ def from_git(repo: str, base: str, head: str, *, two_dot: bool = False, max_file
             if mode not in {"100644", "100755"} or kind != "blob":
                 warnings.append(f"Skipped {side} {path}: mode {mode}, object type {kind}"); continue
             size = int(_git(root, "cat-file", "-s", oid).decode())
+            source_bytes += size
+            if source_bytes > max_source_bytes:
+                raise ValueError(f"Snapshot source exceeds --max-source-bytes {max_source_bytes}; no report was written")
             if size > MAX_FILE:
                 warnings.append(f"Skipped {side} {path}: {size} bytes exceeds {MAX_FILE}"); continue
             data = _git(root, "cat-file", "blob", oid)
@@ -71,7 +84,7 @@ def from_git(repo: str, base: str, head: str, *, two_dot: bool = False, max_file
     return {"schema": "diffstory.snapshot.v1", "meta": {
         "title": f"{base} → {head}", "repository": "", "base_sha": effective, "requested_base_sha": base_sha,
         "head_sha": head_sha, "scope": "changed files", "input": "local git", "comparison": "two-dot" if two_dot else "merge-base to head",
-        "changed_files": len(items), "captured_at": datetime.now(timezone.utc).isoformat(),
+        "changed_files": len(items), "source_bytes": source_bytes, "captured_at": datetime.now(timezone.utc).isoformat(),
         "description": "Source was read from committed Git objects, not the working tree. Untracked and uncommitted edits are excluded."},
         "fragments": fragments, "warnings": warnings}
 
@@ -114,7 +127,9 @@ def parse_pr(value: str) -> tuple[str, int]:
     return m.group(1), int(m.group(2))
 
 
-def from_github(value: str, *, token_env: str = "GITHUB_TOKEN", max_files: int = MAX_FILES) -> dict:
+def from_github(value: str, *, token_env: str = "GITHUB_TOKEN", max_files: int = MAX_FILES,
+                max_source_bytes: int = MAX_SNAPSHOT_SOURCE_BYTES) -> dict:
+    _validate_source_limit(max_source_bytes)
     repo, number = parse_pr(value); api = GitHubClient(os.getenv(token_env))
     pr = api.get(f"/repos/{repo}/pulls/{number}")
     # GitHub PR changes are relative to merge-base, not necessarily the current base tip.
@@ -141,23 +156,28 @@ def from_github(value: str, *, token_env: str = "GITHUB_TOKEN", max_files: int =
     def read(task):
         owner, path, side, sha, region = task
         obj = api.get(f"/repos/{owner}/contents/{quote(path, safe='/')}?ref={sha}")
-        if not isinstance(obj, dict) or obj.get("type") != "file": return None, f"Skipped {side} {path}: not a regular file"
-        if obj.get("size", 0) > MAX_FILE: return None, f"Skipped {side} {path}: exceeds {MAX_FILE} bytes"
+        if not isinstance(obj, dict) or obj.get("type") != "file": return None, f"Skipped {side} {path}: not a regular file", 0
+        declared_size = obj.get("size", 0)
+        if type(declared_size) is not int or declared_size < 0: return None, f"Skipped {side} {path}: invalid content size", 0
+        if declared_size > MAX_FILE: return None, f"Skipped {side} {path}: exceeds {MAX_FILE} bytes", declared_size
         if obj.get("encoding") == "base64": data = base64.b64decode(obj["content"])
         else:
             blob = api.get(f"/repos/{owner}/git/blobs/{obj['sha']}")
-            if blob.get("encoding") != "base64": return None, f"Skipped {side} {path}: unsupported blob encoding"
+            if blob.get("encoding") != "base64": return None, f"Skipped {side} {path}: unsupported blob encoding", declared_size
             data = base64.b64decode(blob["content"])
-        if len(data) > MAX_FILE: return None, f"Skipped {side} {path}: exceeds {MAX_FILE} bytes"
+        if len(data) > MAX_FILE: return None, f"Skipped {side} {path}: exceeds {MAX_FILE} bytes", len(data)
         try:
             if b"\0" in data: raise UnicodeError("NUL byte")
             text = data.decode("utf-8")
-        except UnicodeError: return None, f"Skipped {side} {path}: binary or non-UTF-8 source"
-        return {"path": path, "side": side, "text": text, "start_line": 1, "scope": "full", "region": region}, None
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(read, tasks))
+        except UnicodeError: return None, f"Skipped {side} {path}: binary or non-UTF-8 source", len(data)
+        return {"path": path, "side": side, "text": text, "start_line": 1, "scope": "full", "region": region}, None, len(data)
     fragments = []
-    for f, warning in results:
+    source_bytes = 0
+    for task in tasks:
+        f, warning, size = read(task)
+        source_bytes += size
+        if source_bytes > max_source_bytes:
+            raise ValueError(f"Snapshot source exceeds --max-source-bytes {max_source_bytes}; no report was written")
         if f: fragments.append(f)
         if warning: warnings.append(warning)
     # Fail if the PR changed during the read; don't silently mix multiple revisions.
@@ -166,7 +186,8 @@ def from_github(value: str, *, token_env: str = "GITHUB_TOKEN", max_files: int =
         raise ValueError("PR revisions changed while fetching. Retry to capture a consistent snapshot.")
     meta = {"title": pr["title"], "repository": repo, "number": number, "url": pr["html_url"],
             "base_sha": base, "requested_base_sha": base_tip, "head_sha": head, "head_repository": head_repo, "scope": "changed files", "input": "GitHub REST",
-            "comparison": "merge-base to head", "changed_files": len(files), "additions": pr.get("additions"), "deletions": pr.get("deletions"),
+            "comparison": "merge-base to head", "changed_files": len(files), "source_bytes": source_bytes,
+            "additions": pr.get("additions"), "deletions": pr.get("deletions"),
             "description": pr.get("body") or "", "draft": pr.get("draft", False), "state": pr.get("state"),
             "captured_at": datetime.now(timezone.utc).isoformat(), "validation": "PR description is author-reported evidence. No test run was executed or verified by this compiler."}
     return {"schema": "diffstory.snapshot.v1", "meta": meta, "fragments": fragments, "warnings": warnings}

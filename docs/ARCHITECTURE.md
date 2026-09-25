@@ -82,6 +82,10 @@ The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_
 
 The compiler rejects a revision mismatch, missing/out-of-group evidence IDs, oversized prose and invalid field types. Annotation fields cannot replace structural matches or claim test execution. The current validator does not prove that a natural-language claim follows from the source. Human review remains necessary.
 
+Manually authored annotations remain backward compatible: passages and group coverage are optional. Generated annotations add a top-level `generation` object with schema `diffstory.generation.v1`. It records `origin: "model_generated"`, `verification: "unverified"`, provider/model, exact revisions, limits, usage, expected/completed group and change IDs, chunk coverage, and sanitized errors. It contains no credentials. Generated annotations must have exactly one step for every group, cite every group change, and include nonempty source-bound passages covering every change. Passage focus ranges must fit both the inspected source slice and the report's original source lines. Incomplete generated candidates are rejected; existing manual annotation behavior is unchanged.
+
+When generated annotations are applied, the validated `generation` object is copied into the report JSON. Each generated group receives `provenance: "model-generated · unverified"`. Rendering checks the generation revisions, usage limits, chunk completion, group/change coverage, passages, and provenance label again. The reader displays both a document-level warning naming the provider/model and a per-step generated label. Re-rendering a generated report preserves this warning.
+
 ## Continuous reader
 
 `document`, `passages` and `transition` are optional, backward-compatible annotation fields. A focus range must fall inside one supplied head definition (or base when no head exists); ranges refer to original source lines, not snippet-relative offsets. A diff view cannot accept a definition focus. Repeated references in different passages are allowed for discussing a signature and body separately. Missing references do not remove units: the reader exposes them under Supporting changes. The renderer also validates annotations in a precompiled report.
@@ -94,13 +98,15 @@ Per-section audit material, linked test source, supporting units and original ra
 
 Python AST support is implemented with the standard library, so parse support follows the interpreter running the CLI. A newer-syntax file falls back to textual evidence. Classes are atomic. Static resolution respects common import aliases and avoids simple local/parameter shadows, but does not claim whole-program completeness.
 
-The default narrative uses deterministic templates. The demo adds authored domain-specific annotations. The evidence/annotation interface permits an LLM-assisted step, but automatic provider integration, API billing, model retries and model evals are not implemented.
+The default narrative uses deterministic templates. The demo adds authored domain-specific annotations. The opt-in `--narrate` path uses the OpenAI Responses API with GPT-6 Astra and structured output. It stays downstream of the deterministic report, sends only bounded evidence chunks, and assembles validated source-bound passages with hierarchical summaries. There are no automatic retries. The standard-library adapter has no additional runtime dependency. Every request reserves the serialized UTF-8 body size plus a framing margin and the maximum output before dispatch; one run-wide controller caps request size, total input/output tokens, calls, and elapsed time. A conservative whole-run preflight rejects jobs that cannot fit before the first model request.
+
+Git and GitHub ingestion enforce a 64 MB aggregate source limit by default, and snapshot compilation enforces the same limit. The annotation manifest and report retain revisions, configured limits, API-reported usage, and chunk coverage without storing credentials. The model-generated warning states that prose remains unverified.
 
 There is no background agent, GitHub write access, production deployment, formal equivalence engine, live coverage ingestion, or automatic merge recommendation. The UI does not execute supplied repository source. JavaScript executes only the local report interface.
 
 ## High-value next increments
 
-First add full-repository symbol indexing with explicit resolution confidence and unchanged callers. Then add statement-level extraction matching (for shared helpers cut out of larger functions), followed by test-run artifact ingestion tied to exact revisions. An automated narrative provider should remain downstream of evidence analysis and must not be allowed to rewrite classifications or validation status.
+First add full-repository symbol indexing with explicit resolution confidence and unchanged callers. Then add statement-level extraction matching (for shared helpers cut out of larger functions), followed by test-run artifact ingestion tied to exact revisions. Additional narrative adapters may be added later, but must remain downstream of evidence analysis and must not rewrite classifications or validation status.
 
 ## Primary implementation references
 

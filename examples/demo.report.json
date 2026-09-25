@@ -10,7 +10,8 @@
     "comparison": "original synthetic before/after sources",
     "changed_files": 8,
     "description": "An original catalog-search example for this open-source project. No private source or real customer data. The query page-size validation is an intentional behavior change.",
-    "validation": "Test source is provided for explanation. Diffstory does not execute or assert results for those tests."
+    "validation": "Test source is provided for explanation. Diffstory does not execute or assert results for those tests.",
+    "source_bytes": 7449
   },
   "changes": [
     {
