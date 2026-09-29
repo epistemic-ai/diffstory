@@ -71,12 +71,20 @@ def main():
         code = section.locator(f'[data-changes~="{change("parse_tags")["id"]}"]')
         code.scroll_into_view_if_needed()
         page.wait_for_function('(id)=>document.getElementById(id).dataset.loaded === "true"', arg=code.get_attribute('id'))
-        check('return tags' in code.inner_text(), 'actual implementation readable')
+        check(
+            code.locator('.code-line.delete').count() > 0
+            and code.locator('.code-line.add').count() > 0,
+            'paired diff is the default view',
+        )
         code.locator('[data-switch]').click(no_wait_after=True)
-        check(code.locator('.code-line.delete').count() > 0 and code.locator('.code-line.add').count() > 0, 'inline paired diff')
+        check('return tags' in code.inner_text(), 'definition view shows the implementation')
         check(page.locator('.story-section').count() == 10, 'changing code view does not navigate')
         code.locator('[data-switch]').click(no_wait_after=True)
-        check('return tags' in code.inner_text(), 'return to definition')
+        check(
+            code.locator('.code-line.delete').count() > 0
+            and code.locator('.code-line.add').count() > 0,
+            'return to paired diff',
+        )
 
         large = page.locator('.story-section').first.locator('.code-block').first
         large.scroll_into_view_if_needed(); page.wait_for_timeout(100)

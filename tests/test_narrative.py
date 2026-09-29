@@ -97,7 +97,12 @@ class NarrativeTests(unittest.TestCase):
         self.assertEqual(generated["generation"]["verification"], "unverified")
         self.assertEqual(generated["generation"]["base_sha"], report["meta"]["base_sha"])
         self.assertIn("Model-generated narration · unverified.", render(generated))
-        self.assertIn("Model generated · unverified", render(generated))
+        self.assertTrue(
+            all(
+                group["narrative"]["provenance"] == "model-generated · unverified"
+                for group in generated["groups"]
+            )
+        )
         saved = json.loads(json.dumps(generated))
         self.assertIn("Model-generated narration · unverified.", render(saved))
 
