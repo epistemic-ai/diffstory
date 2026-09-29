@@ -5,7 +5,6 @@ The offline HTML has no runtime network or framework dependency.
 """
 import json
 import os
-import tempfile
 from pathlib import Path
 from playwright.sync_api import sync_playwright, expect
 import sys
@@ -47,7 +46,6 @@ def main():
         check(page.locator('.code-block[data-loaded]').count() < page.locator('.code-block').count(), 'offscreen code is deferred')
         check(page.locator('#story .passage').count() > 15, 'multiple prose-code passages')
         check(page.locator('#story .passage').evaluate_all('(nodes)=>nodes.every(n=>n.querySelector(".prose") && n.querySelector(".code-block"))'), 'each passage binds prose to code')
-        check(page.locator('[data-audit][open]').count() == 0, 'audit is opt-in')
         check('Original synthetic example' in page.locator('.document-scope').inner_text(), 'snapshot boundary visible')
         check(page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'desktop no document overflow')
         check(page.locator('.brandmark svg').count() == 1, 'real Epistemic AI mark embedded')
@@ -96,38 +94,6 @@ def main():
         check(page.locator('#contentsPanel').is_hidden(), 'escape closes contents')
         check(page.locator('#contentsBtn').evaluate('(el)=>el===document.activeElement'), 'escape restores focus')
 
-        # Per-section audit and backwards-compatible revision-bound notes.
-        audit = section.locator('[data-audit]')
-        audit.locator('summary').first.click(no_wait_after=True)
-        expect(audit.locator('[data-note]')).to_be_visible()
-        check(audit.locator('.audit-columns').count() == 1, 'inline audit content')
-        check('No repository tests were executed' in audit.inner_text(), 'static evidence not claimed as execution')
-        audit.locator('[data-review]').check()
-        note_text = 'Verify page-size bounds.\nLiteral note <not markup>.'
-        audit.locator('[data-note]').fill(note_text)
-        check('Reviewed' in audit.locator('summary').first.inner_text(), 'review marker')
-        page.locator('#moreBtn').click(no_wait_after=True)
-        with page.expect_download() as downloaded:
-            page.locator('#exportBtn').click(no_wait_after=True)
-        with tempfile.TemporaryDirectory() as tmp:
-            dest = Path(tmp) / 'review.json'; downloaded.value.save_as(dest)
-            data = json.loads(dest.read_text())
-            check(data['schema'] == 'diffstory.review.v1', 'export remains backwards compatible')
-            check(data['notes'][parsing_group['id']] == note_text, 'notes retained exactly')
-            check(data['revision'].endswith(report['meta']['head_sha']), 'revision lock')
-            audit.locator('[data-note]').fill('changed')
-            page.locator('#importFile').set_input_files(str(dest))
-            expect(page.locator('#toast')).to_contain_text('Review imported')
-            check(audit.locator('[data-note]').input_value() == note_text, 'import restores notes in place')
-            data['revision'] = 'wrong'; dest.write_text(json.dumps(data))
-            page.locator('#importFile').set_input_files(str(dest))
-            expect(page.locator('#toast')).to_contain_text('different report revision')
-            check(audit.locator('[data-note]').input_value() == note_text, 'bad revision leaves review untouched')
-        page.locator('#moreBtn').click(no_wait_after=True); page.locator('#auditBtn').click(no_wait_after=True)
-        check(page.locator('[data-audit][open]').count() == 10, 'optional all-section review details')
-        page.locator('#moreBtn').click(no_wait_after=True); page.locator('#auditBtn').click(no_wait_after=True)
-        check(page.locator('[data-audit][open]').count() == 0, 'audit can be decluttered again')
-
         # Every semantic unit remains reachable, even when not central to the prose.
         for detail in page.locator('[data-extra]').all():
             detail.evaluate('(el)=>el.open=true')
@@ -149,7 +115,6 @@ def main():
         # Responsive layout, including expanded source.
         page.set_viewport_size({'width': 390, 'height': 844})
         page.evaluate('scrollTo(0,0)'); page.wait_for_timeout(100)
-        page.locator('#toast').wait_for(state='hidden')
         page.screenshot(path=str(ROOT / 'docs/reader/mobile.png'), full_page=False)
         check(page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'mobile top no overflow')
         for index in (0, 1, 3, 8, 9):

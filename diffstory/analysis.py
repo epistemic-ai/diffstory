@@ -519,7 +519,7 @@ def compile_snapshot(snapshot: dict) -> dict:
                       "test_definitions": len(tests), "test_runs": 0},
             "warnings": list(dict.fromkeys(warnings)),
             "method": {"version": __version__, "matching": "Conservative Python AST matching; no literal or internal-identifier normalization.",
-                       "order": "Static prerequisites, SCC condensation, deterministic topic priority. A heuristic reading order, not a mathematically optimal one.",
+        "order": "Static prerequisites, SCC condensation and deterministic topic priority produce a baseline reading order. Narrated reports may choose another order while keeping dependencies before consumers and cycle members together. Both are heuristics, not an optimal order.",
                        "tests": "Static calls/references in supplied changed files only. No repository tests were executed.",
                        "scope": "Classes are atomic; dynamic dispatch, reflection, generated code, unchanged callers and unprovided source are not fully resolved.",
                        "security": "Source is data: never imported or executed. Standalone report makes no network requests."}}
@@ -586,10 +586,18 @@ def evidence_packet(report: dict) -> dict:
         "Return diffstory.annotations.v1 with base_sha, head_sha, "
         "steps[{group_id,title,intent,why_now,takeaway,invariants,questions,"
         "evidence_change_ids,transition,passages:[{text,change_ids,view,focus}]}]. "
+        "When every group has a step, their array order is the reading order; "
+        "choose a coherent order that puts prerequisites before dependents "
+        "and keeps groups in a reported cycle adjacent. "
         "Optional document {lead,closing} supplies the opening and closing "
         "paragraphs. "
         "Each passage alternates plain prose with the referenced code. "
-        "Use backticks for inline code. "
+        "In every prose field, wrap code identifiers (including one-letter "
+        "variables), paths, filenames, branch names, commands, API names, and "
+        "literal code values in single backticks, for example `main`, `m`, "
+        "`src/module.py`, and `--provider`; leave ordinary English "
+        "unformatted. Backticks are markup delimiters only; the reader hides "
+        "them and renders the enclosed term in monospaced code styling. "
         "view is definition or diff; optional focus {start,end} uses original "
         "line numbers of one head definition (or base if no head). "
         "Do not rewrite source or fabricate lines. "
@@ -624,60 +632,85 @@ def _generation_ids(generation: dict, field: str) -> list[str]:
     return value
 
 
-def _validate_generation_limits(limits: dict) -> None:
-    limit_fields = {
-        "context_tokens",
-        "request_input_tokens",
-        "request_output_tokens",
-        "total_input_tokens",
-        "total_output_tokens",
-        "calls",
-        "seconds",
-        "input_bound",
-    }
-    if not isinstance(limits, dict) or set(limits) != limit_fields:
-        raise ValueError("Invalid generated narration limits")
-
-    integer_limits = limit_fields - {"seconds", "input_bound"}
-    for field in integer_limits:
-        if type(limits[field]) is not int or limits[field] <= 0:
-            raise ValueError("Invalid generated narration token or call limit")
-
-    seconds = limits["seconds"]
+def _validate_group_order(group_order: list[str], groups: list[dict]) -> None:
+    group_ids = [group["id"] for group in groups]
     if (
-        isinstance(seconds, bool)
-        or not isinstance(seconds, (int, float))
-        or seconds <= 0
-        or limits["input_bound"]
-        != "serialized UTF-8 request bytes plus framing margin"
+        not isinstance(group_order, list)
+        or len(group_order) != len(group_ids)
+        or len(set(group_order)) != len(group_order)
+        or set(group_order) != set(group_ids)
+        or len(set(group_ids)) != len(group_ids)
     ):
-        raise ValueError("Invalid generated narration time or input limit")
+        raise ValueError("Narrative order must contain each report group exactly once")
+
+    group_map = {group["id"]: group for group in groups}
+    prerequisites = {
+        group_id: set(group_map[group_id].get("prerequisites", []))
+        for group_id in group_ids
+    }
+    if any(not dependencies <= set(group_ids) for dependencies in prerequisites.values()):
+        raise ValueError("Narrative order contains an unknown prerequisite group")
+
+    _, cycles = ordered_components(group_ids, prerequisites, lambda group_id: group_id)
+    component_by_group = {group_id: group_id for group_id in group_ids}
+    for cycle in cycles:
+        component = tuple(cycle)
+        for group_id in cycle:
+            component_by_group[group_id] = component
+
+    position = {group_id: index for index, group_id in enumerate(group_order)}
+    for group_id, dependencies in prerequisites.items():
+        for dependency in dependencies:
+            if component_by_group[group_id] == component_by_group[dependency]:
+                continue
+            if position[dependency] >= position[group_id]:
+                raise ValueError(
+                    "Narrative order places a group before its prerequisite"
+                )
+
+    for cycle in cycles:
+        cycle_positions = [position[group_id] for group_id in cycle]
+        if max(cycle_positions) - min(cycle_positions) + 1 != len(cycle):
+            raise ValueError("Groups in a dependency cycle must stay adjacent")
 
 
-def _validate_generation_usage(usage: dict, limits: dict) -> None:
-    usage_fields = {"input_tokens", "output_tokens", "calls", "elapsed_seconds"}
-    if not isinstance(usage, dict) or set(usage) != usage_fields:
+def _validate_generation_usage(usage: dict) -> None:
+    legacy_fields = {"input_tokens", "output_tokens", "calls", "elapsed_seconds"}
+    measured_fields = {
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "calls",
+        "unreported_calls",
+    }
+    if not isinstance(usage, dict) or frozenset(usage) not in {
+        frozenset(legacy_fields),
+        frozenset(measured_fields),
+    }:
         raise ValueError("Invalid generated narration usage")
 
     for field in ("input_tokens", "output_tokens", "calls"):
         if type(usage[field]) is not int or usage[field] < 0:
             raise ValueError("Invalid generated narration usage")
 
-    elapsed_seconds = usage["elapsed_seconds"]
+    cached_input_tokens = usage.get("cached_input_tokens", 0)
+    unreported_calls = usage.get("unreported_calls", 0)
     if (
-        isinstance(elapsed_seconds, bool)
-        or not isinstance(elapsed_seconds, (int, float))
-        or elapsed_seconds < 0
+        type(cached_input_tokens) is not int
+        or not 0 <= cached_input_tokens <= usage["input_tokens"]
+        or type(unreported_calls) is not int
+        or not 0 <= unreported_calls <= usage["calls"]
     ):
-        raise ValueError("Generated narration usage exceeds its recorded limits")
-    exceeds_limits = (
-        usage["input_tokens"] > limits["total_input_tokens"]
-        or usage["output_tokens"] > limits["total_output_tokens"]
-        or usage["calls"] > limits["calls"]
-        or elapsed_seconds > limits["seconds"] + 1
-    )
-    if exceeds_limits:
-        raise ValueError("Generated narration usage exceeds its recorded limits")
+        raise ValueError("Invalid generated narration usage")
+
+    if "elapsed_seconds" in usage:
+        elapsed_seconds = usage["elapsed_seconds"]
+        if (
+            isinstance(elapsed_seconds, bool)
+            or not isinstance(elapsed_seconds, (int, float))
+            or elapsed_seconds < 0
+        ):
+            raise ValueError("Invalid generated narration elapsed time")
 
 
 def _validate_chunk_coverage(
@@ -771,7 +804,6 @@ def validate_generation(report: dict, generation: dict) -> None:
         "model",
         "base_sha",
         "head_sha",
-        "limits",
         "usage",
         "expected_groups",
         "completed_groups",
@@ -781,7 +813,10 @@ def validate_generation(report: dict, generation: dict) -> None:
         "chunk_coverage",
         "errors",
     }
-    if not isinstance(generation, dict) or set(generation) != required_fields:
+    if not isinstance(generation, dict) or frozenset(generation) not in {
+        frozenset(required_fields),
+        frozenset(required_fields | {"limits"}),
+    }:
         raise ValueError("Invalid generated narration manifest")
 
     has_generated_provenance = (
@@ -820,17 +855,21 @@ def validate_generation(report: dict, generation: dict) -> None:
 
     report_groups = [group["id"] for group in report.get("groups", [])]
     report_changes = [change["id"] for change in report.get("changes", [])]
-    if expected_groups != report_groups or completed_groups != report_groups:
+    if (
+        set(expected_groups) != set(report_groups)
+        or set(completed_groups) != set(report_groups)
+    ):
         raise ValueError("Generated narration does not cover every report group")
+    _validate_group_order(report_groups, report.get("groups", []))
     if (
         expected_changes != report_changes
         or set(covered_changes) != set(report_changes)
     ):
         raise ValueError("Generated narration does not cover every report change")
 
-    limits = generation.get("limits")
-    _validate_generation_limits(limits)
-    _validate_generation_usage(generation.get("usage"), limits)
+    # Older annotations may contain a `limits` record. Treat it as historical
+    # metadata; measured provider usage must not be rejected against old caps.
+    _validate_generation_usage(generation.get("usage"))
 
     groups_by_id = {group["id"]: group for group in report.get("groups", [])}
     changes_by_id = {change["id"]: change for change in report.get("changes", [])}
@@ -930,6 +969,7 @@ def apply_annotations(report: dict, annotations: dict) -> dict:
     if not isinstance(steps, list):
         raise ValueError("Narrative steps must be a list")
     seen_groups: set[str] = set()
+    step_order = []
     for step in steps:
         if not isinstance(step, dict):
             raise ValueError("Invalid narrative step")
@@ -939,6 +979,7 @@ def apply_annotations(report: dict, annotations: dict) -> dict:
         if generated and group_id in seen_groups:
             raise ValueError(f"Duplicate generated narrative step: {group_id}")
         seen_groups.add(group_id)
+        step_order.append(group_id)
 
         group = groups[group_id]
         evidence_ids = step.get("evidence_change_ids", [])
@@ -1015,5 +1056,16 @@ def apply_annotations(report: dict, annotations: dict) -> dict:
     if generated:
         if seen_groups != set(groups):
             raise ValueError("Generated narration must include exactly one step for every report group")
+    if steps and len(step_order) == len(groups) and seen_groups == set(groups):
+        _validate_group_order(step_order, result["groups"])
+        result["groups"] = [groups[group_id] for group_id in step_order]
+        for index, group in enumerate(result["groups"]):
+            group["number"] = index + 1
+            group["next_id"] = (
+                result["groups"][index + 1]["id"]
+                if index + 1 < len(result["groups"])
+                else None
+            )
+    if generated:
         validate_generated_report(result)
     return result

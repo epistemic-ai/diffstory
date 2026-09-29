@@ -226,7 +226,10 @@ class GitHubClient:
                     time.sleep(1 + attempt)
                     continue
                 if error.code in (401, 403, 404):
-                    explanation = "Check repository access and GITHUB_TOKEN."
+                    explanation = (
+                        "Check repository access and GitHub CLI sign-in (`gh auth status`) "
+                        "or GITHUB_TOKEN."
+                    )
                 else:
                     explanation = "Request failed."
                 raise ValueError(f"GitHub HTTP {error.code}. {explanation}") from None
@@ -235,6 +238,29 @@ class GitHubClient:
                     f"GitHub connection failed: {error.reason}"
                 ) from None
         raise ValueError("GitHub request exhausted retries")
+
+
+def _github_token(token_env: str) -> str | None:
+    """Prefer the configured environment token, then the signed-in gh account."""
+    token = os.getenv(token_env)
+    if token and token.strip():
+        return token.strip()
+
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token", "--hostname", "github.com"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    token = result.stdout.decode("utf-8", errors="replace").strip()
+    return token or None
 
 
 def parse_pr(value: str) -> tuple[str, int]:

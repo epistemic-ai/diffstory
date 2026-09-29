@@ -20,9 +20,9 @@ Node.js 22.16.0, Playwright 1.57.0, and system Chromium.
 The browser checks cover desktop, 390px mobile, and 320px narrow layouts;
 continuous prose/code sections; keyboard contents navigation; inline code/diff
 switching; lazy rendering and incremental expansion; all 802 lines of a large
-synthetic definition; 800 added and 800 removed diff rows; source/test disclosures;
-revision-bound notes and invalid-import rejection. No page JavaScript errors or
-runtime network requests occurred in the demo test. Screenshots are in `reader/`.
+synthetic definition; 800 added and 800 removed diff rows; and source/test
+disclosures. No page JavaScript errors or runtime network requests occurred in
+the demo test. Screenshots are in `reader/`.
 
 The installed CLI and source checkout use the same parser, templates and embedded
 brand asset. The release ZIP contains the reviewed source file set and a

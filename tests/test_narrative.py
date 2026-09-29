@@ -9,7 +9,6 @@ from urllib.error import HTTPError
 from unittest.mock import MagicMock, patch
 
 from diffstory.analysis import apply_annotations, compile_snapshot
-from diffstory.budget import BudgetLimits
 from diffstory.cli import main
 from diffstory.narrative import Narrator, OPENAI_MODEL, OPENAI_URL, OpenAIResponsesProvider
 from diffstory.render import render
@@ -70,6 +69,8 @@ class FakeProvider:
             response = {"summary": "The function transforms the supplied value.", "questions": [], "passages": passages}
         elif request["name"] == "diffstory_summary":
             response = {"summary": "The change updates the value transformation."}
+        elif request["name"] == "diffstory_story_order":
+            response = {"group_ids": [group["id"] for group in data["groups"]]}
         elif request["name"] == "diffstory_step":
             group = data["group"]
             response = {"title": "Transform the value", "intent": "Update the value transformation.",
@@ -84,20 +85,13 @@ class FakeProvider:
         return response, {"input_tokens": 120, "output_tokens": 60}
 
 
-def limits(**updates):
-    values = {"context_tokens": 100_000, "request_input_tokens": 20_000, "request_output_tokens": 3_000,
-              "total_input_tokens": 100_000, "total_output_tokens": 20_000, "calls": 40, "seconds": 30}
-    values.update(updates)
-    return BudgetLimits(**values)
-
-
 class NarrativeTests(unittest.TestCase):
     def test_generation_and_report_roundtrip_keep_provenance(self):
         report = compile_snapshot(snapshot())
         provider = FakeProvider()
-        narrator = Narrator(provider, limits=limits())
+        narrator = Narrator(provider)
         preview = narrator.preview(report)
-        self.assertEqual(preview["calls"], len(report["groups"]) + preview["chunks"] + 1)
+        self.assertEqual(preview["calls"], len(report["groups"]) + preview["chunks"] + 2)
         annotations = narrator.generate(report)
         generated = apply_annotations(report, annotations)
         self.assertEqual(generated["generation"]["verification"], "unverified")
@@ -110,11 +104,11 @@ class NarrativeTests(unittest.TestCase):
     def test_large_single_group_is_split_into_stable_bounded_slices(self):
         source = "def calculate(value):\n" + "".join(f"    value = value + {n}\n" for n in range(1600)) + "    return value\n"
         report = compile_snapshot(snapshot(source))
-        narrator = Narrator(FakeProvider(), limits=limits(request_input_tokens=20_000))
+        narrator = Narrator(FakeProvider())
         chunks = narrator._chunks(report)
-        self.assertGreater(len(chunks), 1)
         self.assertEqual(len(chunks), len({chunk.id for chunk in chunks}))
         pieces = [piece for chunk in chunks for piece in chunk.pieces]
+        self.assertGreater(len(pieces), 1)
         self.assertTrue(all(len(piece["source"]["source"].encode()) <= 12_000 for piece in pieces if piece.get("source")))
         ranges = sorted((piece["source"]["start"], piece["source"]["end"]) for piece in pieces if piece.get("source"))
         self.assertEqual(ranges[0][0], 1)
@@ -126,55 +120,60 @@ class NarrativeTests(unittest.TestCase):
         generated = apply_annotations(report, annotations)
         self.assertEqual(generated["generation"]["covered_changes"], [report["changes"][0]["id"]])
 
-    def test_oversized_single_line_fails_before_provider_calls(self):
+    def test_oversized_single_line_is_split_without_losing_source(self):
         source = "def calculate(): return '" + ("x" * 13_000) + "'\n"
         report = compile_snapshot(snapshot(source))
         provider = FakeProvider()
-        with self.assertRaisesRegex(ValueError, "source line.*no provider request was sent"):
-            Narrator(provider, limits=limits()).generate(report)
-        self.assertEqual(provider.calls, [])
+        Narrator(provider).generate(report)
+        head_fragments = [
+            piece["source"]["source"]
+            for call in provider.calls
+            if call["name"] == "diffstory_chunk"
+            for piece in call["data"]["pieces"]
+            if piece.get("source") and piece["source"].get("side") == "head"
+        ]
+        self.assertEqual("".join(head_fragments), report["changes"][0]["after"]["source"])
 
-    def test_over_budget_preflight_makes_zero_provider_calls(self):
+    def test_preview_has_no_run_token_or_call_ceilings(self):
         report = compile_snapshot(snapshot())
-        provider = FakeProvider()
-        narrator = Narrator(provider, limits=limits(total_output_tokens=100))
-        with self.assertRaisesRegex(ValueError, "output tokens"):
-            narrator.generate(report)
-        self.assertEqual(provider.calls, [])
+        preview = Narrator(FakeProvider()).preview(report)
+        self.assertGreater(preview["calls"], 0)
+        self.assertNotIn("reserved_input_tokens", preview)
+        self.assertNotIn("max_calls", preview)
 
-    def test_model_specific_limits_are_enforced(self):
+    def test_request_capacity_tracks_model_context(self):
         provider = FakeProvider()
-        with self.assertRaisesRegex(ValueError, "context budget exceeds"):
-            Narrator(provider, limits=limits(context_tokens=provider.context_tokens + 1))
-        with self.assertRaisesRegex(ValueError, "output budget exceeds"):
-            Narrator(provider, limits=limits(context_tokens=200_000, request_input_tokens=1000,
-                                             request_output_tokens=provider.max_output_tokens + 1))
+        narrator = Narrator(provider)
+        self.assertEqual(
+            narrator.capacity.input_upper_bound,
+            provider.context_tokens - provider.max_output_tokens,
+        )
 
     def test_malformed_provider_response_does_not_create_annotation(self):
         report = compile_snapshot(snapshot())
         provider = FakeProvider(mode="malformed")
-        narrator = Narrator(provider, limits=limits())
+        narrator = Narrator(provider)
         with self.assertRaisesRegex(ValueError, "no source-bound passages"):
             narrator.generate(report)
         self.assertEqual(len(provider.calls), 1)
 
     def test_generated_annotations_reject_wrong_revision(self):
         report = compile_snapshot(snapshot())
-        annotations = Narrator(FakeProvider(), limits=limits()).generate(report)
+        annotations = Narrator(FakeProvider()).generate(report)
         annotations["head_sha"] = "c" * 40
         with self.assertRaisesRegex(ValueError, "different head revision"):
             apply_annotations(report, annotations)
 
     def test_generated_annotations_require_all_groups_and_passages(self):
         report = compile_snapshot(snapshot())
-        annotations = Narrator(FakeProvider(), limits=limits()).generate(report)
+        annotations = Narrator(FakeProvider()).generate(report)
         annotations["steps"][0]["passages"] = []
         with self.assertRaisesRegex(ValueError, "missing source-bound passages"):
             apply_annotations(report, annotations)
 
     def test_generated_report_rejects_stale_coverage_on_render(self):
         report = compile_snapshot(snapshot())
-        generated = apply_annotations(report, Narrator(FakeProvider(), limits=limits()).generate(report))
+        generated = apply_annotations(report, Narrator(FakeProvider()).generate(report))
         generated["generation"]["completed_groups"] = []
         with self.assertRaisesRegex(ValueError, "every report group"):
             render(generated)
@@ -252,7 +251,11 @@ class NarrativeTests(unittest.TestCase):
             def read(self, _limit):
                 return json.dumps({"status": "completed", "output": [{"type": "message", "content": [
                     {"type": "output_text", "text": '{"summary":"ok"}'}]}],
-                    "usage": {"input_tokens": 8, "output_tokens": 3}}).encode()
+                    "usage": {
+                        "input_tokens": 8,
+                        "input_tokens_details": {"cached_tokens": 2},
+                        "output_tokens": 3,
+                    }}).encode()
         opener = MagicMock()
         opener.open.return_value = Response()
         with patch("diffstory.narrative.build_opener", return_value=opener):
@@ -265,7 +268,10 @@ class NarrativeTests(unittest.TestCase):
         self.assertEqual(opener.open.call_args.kwargs["timeout"], 5)
         self.assertEqual(request.get_header("Authorization"), "Bearer test-secret")
         self.assertEqual(result, {"summary": "ok"})
-        self.assertEqual(usage, {"input_tokens": 8, "output_tokens": 3})
+        self.assertEqual(
+            usage,
+            {"input_tokens": 8, "cached_input_tokens": 2, "output_tokens": 3},
+        )
         self.assertEqual(json.loads(body)["store"], False)
 
     def test_openai_http_error_is_sanitized(self):

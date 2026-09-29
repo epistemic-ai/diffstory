@@ -34,9 +34,9 @@ No third-party runtime dependencies. Build and browser-test tools are developmen
 
 ## A reading path, not a dashboard
 
-The reader alternates an explanation with the exact code that supports it, preserving original line numbers. **View diff** and **Read definition** switch one block in place. Long code starts with an excerpt; **Load full diff** and **Read full definition** progressively reveal the rest, at most 160 display rows per expansion. Code scrolls with the document, not inside a second vertical viewport.
+The reader alternates an explanation with the paired diff that supports it, preserving original line numbers. Diffs open by default; **Read definition** switches a block in place. Code identifiers, paths, commands, and literal values use inline code styling. Long code starts with an excerpt; **Load full diff** and **Read full definition** progressively reveal the rest, at most 160 display rows per expansion. Code scrolls with the document, not inside a second vertical viewport.
 
-**Contents** searches sections and symbols without filtering the document away. **Invariants, tests & notes** opens review details beneath a section. Notes and reviewed markers can be exported and imported with an exact base/head revision lock. Browser storage is best effort; export important notes.
+**Contents** searches sections and symbols without filtering the document away. Reader options collapse expanded code or download the analysis JSON.
 
 “Lazy loading” means deferred rendering from embedded data. The complete supplied snapshot is still inside the HTML. Treat reports, snapshots, and exported evidence as source-code-bearing files.
 
@@ -48,7 +48,7 @@ diffstory github 'OWNER/REPO#NUMBER' \
   --save-snapshot walkthrough.snapshot.json
 ```
 
-Replace `OWNER/REPO#NUMBER` with a real PR. Public PRs can be read without credentials, subject to GitHub rate limits. For private repositories, Diffstory first uses `GITHUB_TOKEN` (or the variable selected by `--token-env NAME`); if that variable is unset, it reuses an authenticated GitHub CLI session via `gh auth token` when available. Do not paste tokens into issues, commits, commands saved to a shared history, or reports.
+Replace `OWNER/REPO#NUMBER` with a real PR. For private repositories, Diffstory first uses `GITHUB_TOKEN` (or the variable selected by `--token-env NAME`); if that variable is unset, it reuses the signed-in GitHub CLI account through `gh auth token`. Run `gh auth login` once if needed. Public PRs can be read without credentials, subject to GitHub rate limits. Do not paste tokens into issues, commits, commands saved to a shared history, or reports.
 
 The CLI performs read-only requests, paginates changed files, pins both revisions, and rejects a PR that changes during retrieval. It does not inherit credentials from a chat application. The local Git comparison defaults to **merge-base(base, head) → head**; use `--two-dot` for an endpoint comparison. Uncommitted and untracked work is not included.
 
@@ -58,7 +58,7 @@ Every compilation writes standalone HTML plus an adjacent `.report.json`. Binary
 
 Python functions, async functions, classes, and assignments are compared using the standard-library AST. Pairing distinguishes identical ASTs, declaration renames, edited move candidates, ordinary edits, additions, removals, and unresolved counterparts. Literals, internal names, defaults, decorators, and string whitespace are not erased to obtain a convenient match.
 
-Static calls, references, import aliases, and test references form a dependency graph. Strongly connected components handle cycles; deterministic priorities produce a reproducible reading order. This is a comprehension heuristic, not a proof of an optimal order.
+Static calls, references, import aliases, and test references form a dependency graph. Strongly connected components handle cycles; deterministic priorities produce a reproducible baseline order. Narrated reports may choose a different story order while keeping prerequisites ahead of their dependents. This is a comprehension heuristic, not a proof of an optimal order.
 
 Other languages, newer Python syntax unsupported by your interpreter, and unclassified module-level code remain available as textual hunks. Classes are atomic units. Dynamic dispatch, reflection, unchanged external callers, and whole-program behavior are not fully resolved.
 
@@ -107,16 +107,15 @@ app, and plugin tools disabled. See the [Codex non-interactive mode
 documentation](https://developers.openai.com/codex/non-interactive-mode) for
 how `codex exec` uses saved authentication and structured output.
 
-Codex CLI does not expose a per-call output-token cap. Diffstory includes the
-reserved output target in the prompt and reconciles the usage reported by the
-CLI. If a completed call exceeds its reservation, Diffstory rejects the result;
-that call may still have consumed Codex account usage.
+Codex CLI does not expose a per-call output-token cap. Diffstory lets Codex
+complete each request, validates its structured response, and records the
+input, cached input, and output token counts reported by the CLI.
 
-Before the first model request, Diffstory displays the destination, PR revisions and source scope, planned request count, conservative input bound, and reserved output tokens. It asks for confirmation. Use `--yes` only when you have already approved that transfer, such as in an automation job. Without `--narrate`, GitHub ingestion still reads the PR over the network but no model request is made.
+Before the first model request, Diffstory displays the destination, PR revisions, source scope, and planned request count. It asks for confirmation. Use `--yes` only when you have already approved that transfer, such as in an automation job. Without `--narrate`, GitHub ingestion still reads the PR over the network but no model request is made.
 
-Narration uses bounded evidence chunks, multi-level summaries, and a run-wide limit for input tokens, output tokens, provider calls, and time. Defaults can be lowered with `--max-request-input-tokens`, `--max-request-output-tokens`, `--max-input-tokens`, `--max-output-tokens`, `--max-provider-calls`, and `--narration-timeout`. `--max-source-bytes` can lower the hard 64 MB cap on captured source across both revisions. Excess source is rejected before narration, and the GitHub reader stops fetching files once the configured cap is exceeded. A limit failure does not produce a narrated report.
+Narration packs bounded evidence chunks to fit the selected model's context and uses multi-level summaries for larger changes. Long source lines are split into slices without dropping source text. After a successful run, the CLI prints provider-reported input tokens, cached input tokens, and output tokens; these totals are also stored in the annotations and report. `--max-source-bytes` can lower the hard 64 MB cap on captured source across both revisions. Excess source is rejected before narration, and the GitHub reader stops fetching files once the configured cap is exceeded.
 
-Successful runs write HTML, `.report.json`, and candidate `.annotations.json` files. Each generated passage is tied to a change ID and checked against its group and source range. The generated report preserves its provider/model, revisions, limits, usage, and chunk coverage, and displays a visible **model-generated · unverified** warning. It does not validate whether prose is true.
+Successful runs write HTML, `.report.json`, and candidate `.annotations.json` files. Each generated passage is tied to a change ID and checked against its group and source range. The generated report preserves its provider/model, revisions, measured usage, and chunk coverage, and displays a visible **model-generated · unverified** warning. It does not validate whether prose is true.
 
 The OpenAI API request sets `store: false`, but this is not a zero-retention promise. OpenAI's API data controls, abuse-monitoring retention, organization settings, and applicable exceptions govern what the API retains; check the current [OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data) before sending confidential source. The API calls are documented in the [Responses API](https://developers.openai.com/api/docs/guides/structured-outputs) documentation. Codex CLI runs follow the signed-in ChatGPT or workspace account's current data and retention controls.
 
@@ -133,7 +132,7 @@ python -m build
 python -m twine check dist/*
 ```
 
-For a system Chromium installation, set `DIFFSTORY_CHROMIUM` to its executable path. Browser tests exercise rendering, navigation, expansion, notes, responsive layout, and offline behavior. They do not claim tests passed in the analyzed repository. See [verification](docs/VERIFICATION.md) for the checks actually run on this release.
+For a system Chromium installation, set `DIFFSTORY_CHROMIUM` to its executable path. Browser tests exercise rendering, navigation, expansion, responsive layout, and offline behavior. They do not claim tests passed in the analyzed repository. See [verification](docs/VERIFICATION.md) for the checks actually run on this release.
 
 ## Public examples and privacy
 

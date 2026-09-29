@@ -15,7 +15,6 @@ from .analysis import (
     compile_snapshot,
     evidence_packet,
 )
-from .budget import BudgetLimits
 from .ingest import from_git, from_github
 from .narrative import (
     OPENAI_MODEL,
@@ -67,27 +66,6 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Confirm source transfer without an interactive prompt",
     )
-    parser.add_argument("--max-request-input-tokens", type=int, default=40_000)
-    parser.add_argument("--max-request-output-tokens", type=int, default=4_000)
-    parser.add_argument(
-        "--max-input-tokens",
-        type=int,
-        default=256_000,
-        help="Run-wide reserved input-token limit",
-    )
-    parser.add_argument(
-        "--max-output-tokens",
-        type=int,
-        default=40_000,
-        help="Run-wide reserved output-token limit",
-    )
-    parser.add_argument("--max-provider-calls", type=int, default=64)
-    parser.add_argument(
-        "--narration-timeout",
-        type=float,
-        default=900,
-        help="Run-wide narration deadline in seconds",
-    )
     parser.add_argument(
         "--annotations-out",
         help="Candidate annotations path (default: <out>.annotations.json)",
@@ -124,10 +102,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     github_parser = subparsers.add_parser(
         "github",
-        help="Read a GitHub PR (GITHUB_TOKEN for private repositories)",
+        help="Read a GitHub PR (uses gh auth or GITHUB_TOKEN)",
     )
     github_parser.add_argument("pr", help="owner/repo#123 or GitHub PR URL")
-    github_parser.add_argument("--token-env", default="GITHUB_TOKEN")
+    github_parser.add_argument(
+        "--token-env",
+        default="GITHUB_TOKEN",
+        help="environment variable for GitHub auth; falls back to signed-in gh CLI",
+    )
     github_parser.add_argument("--max-files", type=int, default=500)
 
     for source_parser in (git_parser, github_parser):
@@ -188,24 +170,8 @@ def _load_snapshot(args: argparse.Namespace) -> dict | None:
     return None
 
 
-def _budget_limits(
-    args: argparse.Namespace,
-    provider: NarrativeProvider,
-) -> BudgetLimits:
-    return BudgetLimits(
-        context_tokens=provider.context_tokens,
-        request_input_tokens=args.max_request_input_tokens,
-        request_output_tokens=args.max_request_output_tokens,
-        total_input_tokens=args.max_input_tokens,
-        total_output_tokens=args.max_output_tokens,
-        calls=args.max_provider_calls,
-        seconds=args.narration_timeout,
-    )
-
-
 def _print_narration_preview(
     provider: NarrativeProvider,
-    limits: BudgetLimits,
     report: dict,
     preview: dict,
 ) -> None:
@@ -223,16 +189,30 @@ def _print_narration_preview(
         f"Source scope: {source_scope} · {changed_files} changed files · "
         f"{source_bytes} source bytes · {base_sha} → {head_sha}"
     )
-    print(
-        f"Evidence chunks: {preview['chunks']} · planned calls: {preview['calls']} · "
-        f"reserved input: {preview['reserved_input_tokens']} tokens · "
-        f"reserved output: {preview['reserved_output_tokens']} tokens"
+    conditional_calls = preview.get("conditional_calls", 0)
+    repair_note = (
+        f" · up to {conditional_calls} citation repairs if needed"
+        if conditional_calls
+        else ""
     )
     print(
-        f"Run ceilings: {limits.total_input_tokens} input tokens · "
-        f"{limits.total_output_tokens} output tokens · {limits.calls} calls · "
-        f"{limits.seconds:g} seconds"
+        f"Evidence chunks: {preview['chunks']} · planned calls: {preview['calls']}"
+        f"{repair_note}"
     )
+
+
+def _print_token_usage(usage: dict) -> None:
+    print(
+        "Provider-reported tokens: "
+        f"input {usage['input_tokens']:,} "
+        f"(cached {usage['cached_input_tokens']:,}) · "
+        f"output {usage['output_tokens']:,}"
+    )
+    if usage["unreported_calls"]:
+        print(
+            f"Provider usage unavailable for "
+            f"{usage['unreported_calls']:,} of {usage['calls']:,} calls"
+        )
 
 
 def _confirm_source_transfer(
@@ -273,14 +253,17 @@ def _generate_narration(
         provider = CodexCLIProvider(model=args.model)
     provider.require_credentials()
 
-    limits = _budget_limits(args, provider)
-    narrator = Narrator(provider, limits=limits)
+    narrator = Narrator(provider)
     preview = narrator.preview(report)
-    _print_narration_preview(provider, limits, report, preview)
+    _print_narration_preview(provider, report, preview)
     _confirm_source_transfer(args.yes, provider)
 
-    annotations = narrator.generate(report)
-    annotated_report = apply_annotations(report, annotations)
+    try:
+        annotations = narrator.generate(report)
+        annotated_report = apply_annotations(report, annotations)
+    except Exception:
+        _print_token_usage(narrator.usage.report())
+        raise
     if args.annotations_out:
         candidate_path = Path(args.annotations_out)
     else:
@@ -332,6 +315,8 @@ def _write_outputs(
             f"{len(report['warnings'])} scope/parse warning(s); "
             "see report evidence panel"
         )
+    if annotations is not None:
+        _print_token_usage(annotations["generation"]["usage"])
 
 
 def _export_evidence(args: argparse.Namespace) -> int:

@@ -5107,7 +5107,7 @@
   "method": {
     "version": "0.3.0",
     "matching": "Conservative Python AST matching; no literal or internal-identifier normalization.",
-    "order": "Static prerequisites, SCC condensation, deterministic topic priority. A heuristic reading order, not a mathematically optimal one.",
+    "order": "Static prerequisites, SCC condensation and deterministic topic priority produce a baseline reading order. Narrated reports may choose another order while keeping dependencies before consumers and cycle members together. Both are heuristics, not an optimal order.",
     "tests": "Static calls/references in supplied changed files only. No repository tests were executed.",
     "scope": "Classes are atomic; dynamic dispatch, reflection, generated code, unchanged callers and unprovided source are not fully resolved.",
     "security": "Source is data: never imported or executed. Standalone report makes no network requests."
