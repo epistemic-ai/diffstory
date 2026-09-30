@@ -30,7 +30,7 @@ def main(argv=None) -> int:
     gh = sub.add_parser("github", help="Read a GitHub PR (GITHUB_TOKEN for private repositories)")
     gh.add_argument("pr", help="owner/repo#123 or GitHub PR URL"); gh.add_argument("--token-env", default="GITHUB_TOKEN"); gh.add_argument("--max-files", type=int, default=500)
     sn = sub.add_parser("snapshot", help="Compile a saved diffstory.snapshot.v1 JSON document")
-    sn.add_argument("input")
+    sn.add_argument("input", help="Snapshot JSON path, or - to read from stdin")
     rr = sub.add_parser("render", help="Render an existing report, optionally with authored/model annotations")
     rr.add_argument("input")
     ex = sub.add_parser("evidence", help="Export evidence for a human or model; makes no network call")
