@@ -24,6 +24,28 @@ def read_json(path: str) -> dict:
     return obj
 
 
+def read_snapshot_stream(stream) -> dict:
+    header_line = stream.readline()
+    if not header_line: raise ValueError("Snapshot stream is empty")
+    header = json.loads(header_line)
+    if not isinstance(header, dict): raise ValueError("Snapshot stream header must be an object")
+    if header.get("schema") != "diffstory.snapshot.v1": raise ValueError("Expected diffstory.snapshot.v1 stream header")
+    meta = header.get("meta")
+    if not isinstance(meta, dict): raise ValueError("Snapshot stream header requires meta")
+    warnings = header.get("warnings", [])
+    if not isinstance(warnings, list): raise ValueError("Snapshot stream warnings must be a list")
+    fragments = []
+    total = len(header_line.encode("utf-8"))
+    for line in stream:
+        total += len(line.encode("utf-8"))
+        if total > 80_000_000: raise ValueError("Input JSON exceeds 80 MB")
+        if not line.strip(): continue
+        fragment = json.loads(line)
+        if not isinstance(fragment, dict): raise ValueError("Snapshot stream fragment must be an object")
+        fragments.append(fragment)
+    return {"schema": "diffstory.snapshot.v1", "meta": meta, "fragments": fragments, "warnings": warnings}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="diffstory", description="Compile a semantic code walkthrough. Repository code is never executed.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -36,11 +58,13 @@ def main(argv=None) -> int:
     gh.add_argument("pr", help="owner/repo#123 or GitHub PR URL"); gh.add_argument("--token-env", default="GITHUB_TOKEN"); gh.add_argument("--max-files", type=int, default=500)
     sn = sub.add_parser("snapshot", help="Compile a saved diffstory.snapshot.v1 JSON document")
     sn.add_argument("input", help="Snapshot JSON path, or - to read from stdin")
+    ss = sub.add_parser("snapshot-stream", help="Compile diffstory.snapshot.v1 metadata followed by one JSON fragment per line")
+    ss.add_argument("input", nargs="?", default="-", help="JSON Lines path, or - to read from stdin")
     rr = sub.add_parser("render", help="Render an existing report, optionally with authored/model annotations")
     rr.add_argument("input")
     ex = sub.add_parser("evidence", help="Export evidence for a human or model; makes no network call")
     ex.add_argument("input"); ex.add_argument("--out", required=True)
-    for p in (g, gh, sn, rr):
+    for p in (g, gh, sn, ss, rr):
         p.add_argument("--out", required=True, help="Output .html file")
         p.add_argument("--annotations", help="Optional revision-bound narrative JSON")
         p.add_argument("--save-snapshot", help="Save reusable input source JSON")
@@ -55,6 +79,10 @@ def main(argv=None) -> int:
         if args.command == "git": snapshot = from_git(args.repo, args.base, args.head, two_dot=args.two_dot, max_files=args.max_files)
         elif args.command == "github": snapshot = from_github(args.pr, token_env=args.token_env, max_files=args.max_files)
         elif args.command == "snapshot": snapshot = read_json(args.input)
+        elif args.command == "snapshot-stream":
+            if args.input == "-": snapshot = read_snapshot_stream(sys.stdin)
+            else:
+                with Path(args.input).open(encoding="utf-8") as stream: snapshot = read_snapshot_stream(stream)
         report = compile_snapshot(snapshot) if snapshot is not None else read_json(args.input)
         if args.annotations: report = apply_annotations(report, read_json(args.annotations))
         out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
