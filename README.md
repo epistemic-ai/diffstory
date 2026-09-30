@@ -62,6 +62,12 @@ source-collector | diffstory snapshot - --out walkthrough.html
 
 The producer remains responsible for supplying the complete, revision-pinned snapshot described in `docs/ARCHITECTURE.md`; Diffstory validates and compiles the supplied source without making a network request.
 
+For connector environments that receive source one fragment at a time, `snapshot-stream` accepts JSON Lines: the first record contains `schema`, `meta`, and optional `warnings`; each following record is one ordinary snapshot fragment.
+
+```bash
+source-collector --jsonl | diffstory snapshot-stream - --out walkthrough.html
+```
+
 ## What the compiler knows
 
 Python functions, async functions, classes, and assignments are compared using the standard-library AST. Pairing distinguishes identical ASTs, declaration renames, edited move candidates, ordinary edits, additions, removals, and unresolved counterparts. Literals, internal names, defaults, decorators, and string whitespace are not erased to obtain a convenient match.
