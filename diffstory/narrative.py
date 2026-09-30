@@ -5,13 +5,14 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass
 from http.client import HTTPException
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -32,10 +33,12 @@ CODEX_MODEL_CAPACITIES = {
     "gpt-5.3-codex": (400_000, 128_000),
 }
 PROVIDER_CALL_TIMEOUT_SECONDS = 900
+PROCESS_CLEANUP_TIMEOUT_SECONDS = 2
 MAX_SOURCE_SLICE_BYTES = 12_000
 MAX_SUMMARY_CHARS = 3_000
 MAX_RESPONSE_BYTES = 2_000_000
 LEAF_OUTPUT_RESERVE = 2_400
+LEAF_PER_CHANGE_OUTPUT_RESERVE = 128
 SUMMARY_OUTPUT_RESERVE = 1_200
 STEP_OUTPUT_RESERVE = 1_400
 DOCUMENT_OUTPUT_RESERVE = 700
@@ -259,10 +262,16 @@ class OpenAIResponsesProvider:
         """Require an API key before a request can be sent.
 
         Raises:
-            ValueError: If the configured API key is empty or unavailable.
+            ValueError: If the API key is missing or contains invalid header
+                characters.
         """
         if not self._api_key:
             raise ValueError(f"OpenAI narration needs an API key in {self.token_env}")
+        if not isinstance(self._api_key, str) or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in self._api_key
+        ):
+            raise ValueError("OpenAI API key contains invalid header characters")
 
     def prepare(
         self,
@@ -342,18 +351,18 @@ class OpenAIResponsesProvider:
         request_timeout = (
             timeout if timeout is not None else PROVIDER_CALL_TIMEOUT_SECONDS
         )
-        request = Request(
-            OPENAI_URL,
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": f"diffstory-narration/{__version__}",
-            },
-        )
         try:
+            request = Request(
+                OPENAI_URL,
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": f"diffstory-narration/{__version__}",
+                },
+            )
             opener = build_opener(_RejectRedirects())
             with opener.open(request, timeout=request_timeout) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
@@ -368,6 +377,8 @@ class OpenAIResponsesProvider:
             if isinstance(error, TimeoutError):
                 raise ValueError("OpenAI API request timed out") from None
             raise ValueError("OpenAI API connection failed") from None
+        except ValueError:
+            raise ValueError("OpenAI API request contains invalid headers") from None
         if len(raw) > MAX_RESPONSE_BYTES:
             raise ValueError("OpenAI API response exceeds the 2 MB limit")
         try:
@@ -766,6 +777,39 @@ class ProviderResponseError(ValueError):
         self.usage = usage
 
 
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Terminate a Codex process and its descendants.
+
+    Args:
+        process: Process started in its own POSIX session or Windows group.
+
+    Side Effects:
+        Sends a forceful termination signal to the process group or tree, then
+        to the direct process as a fallback.
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(process.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except (OSError, TypeError):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
 def _run_bounded_subprocess(
     command: list[str],
     prompt: bytes,
@@ -792,17 +836,25 @@ def _run_bounded_subprocess(
         ValueError: If the process cannot start or stdout cannot be read.
         ProviderResponseError: If the process times out or exceeds the output
             limit.
+
+    Side Effects:
+        Starts the child in an isolated process group, writes the prompt to its
+        standard input, and captures bounded standard output.
     """
+    process_options = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "cwd": cwd,
+        "env": environment,
+        "bufsize": 0,
+    }
+    if os.name == "nt":
+        process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        process_options["start_new_session"] = True
     try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            cwd=cwd,
-            env=environment,
-            bufsize=0,
-        )
+        process = subprocess.Popen(command, **process_options)
     except OSError:
         raise ValueError("Could not start the Codex CLI") from None
 
@@ -811,11 +863,8 @@ def _run_bounded_subprocess(
     read_failed = threading.Event()
 
     def stop_process() -> None:
-        """Terminate the child if it is still running."""
-        try:
-            process.kill()
-        except OSError:
-            pass
+        """Terminate the Codex process tree if it is still running."""
+        _terminate_process_tree(process)
 
     def capture_stdout() -> None:
         """Read stdout while retaining at most one byte over the limit."""
@@ -857,18 +906,37 @@ def _run_bounded_subprocess(
     reader.start()
     writer.start()
     timed_out = False
+    cleanup_failed = False
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
         stop_process()
-        process.wait()
+        try:
+            process.wait(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                cleanup_failed = True
     finally:
-        writer.join()
-        reader.join()
-        if process.stdout:
+        writer.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        reader.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        if process.stdout and not reader.is_alive():
             process.stdout.close()
 
+    if writer.is_alive() or reader.is_alive():
+        stop_process()
+        writer.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        reader.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        if process.stdout and not reader.is_alive():
+            process.stdout.close()
+    if cleanup_failed or writer.is_alive() or reader.is_alive():
+        raise ProviderResponseError("Codex CLI process cleanup did not finish")
     if timed_out:
         raise ProviderResponseError("Codex CLI request timed out")
     if exceeded_limit.is_set():
@@ -1176,16 +1244,66 @@ class Narrator:
 
         Returns:
             Serialized request bytes produced by the provider.
+
+        Raises:
+            ValueError: If the requested output reservation is outside the
+                selected model's output capacity.
         """
+        if type(output) is not int or not 0 < output <= self.provider.max_output_tokens:
+            raise ValueError(
+                "Narration output reservation exceeds the selected model capacity"
+            )
         return self.provider.prepare(system, data, schema_name, schema, output)
 
-    def _leaf_output(self) -> int:
-        """Return the per-call output reservation for source-bound passages.
+    def _scaled_output_reserve(
+        self,
+        base_reserve: int,
+        identifiers: Iterable[str],
+        *,
+        identifier_copies: int = 1,
+        per_identifier_tokens: int = 0,
+    ) -> int:
+        """Scale a per-request output reserve for required identifier lists.
+
+        The UTF-8 size of compact JSON identifier arrays is a conservative
+        byte-based token estimate. Leaf responses reserve space for both the
+        citations and repeated passage identifiers plus per-passage structure.
+
+        Args:
+            base_reserve: Output tokens reserved for prose and fixed JSON fields.
+            identifiers: Required IDs that must appear in the response.
+            identifier_copies: Number of serialized ID arrays in the response.
+            per_identifier_tokens: Additional JSON/prose margin per identifier.
 
         Returns:
-            The smaller of the leaf reserve and provider output capacity.
+            Base output reserve plus the identifier-dependent allowance.
         """
-        return min(LEAF_OUTPUT_RESERVE, self.provider.max_output_tokens)
+        unique_ids = sorted(set(identifiers))
+        serialized_ids = json.dumps(unique_ids, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        return (
+            base_reserve
+            + identifier_copies * len(serialized_ids)
+            + per_identifier_tokens * len(unique_ids)
+        )
+
+    def _leaf_output(self, change_ids: Iterable[str] = ()) -> int:
+        """Return the per-call output reservation for source-bound passages.
+
+        Args:
+            change_ids: Changes whose citations must appear in the response.
+
+        Returns:
+            Leaf prose reserve scaled for required citations. May exceed model
+            capacity so the packer can split the request before transfer.
+        """
+        return self._scaled_output_reserve(
+            LEAF_OUTPUT_RESERVE,
+            change_ids,
+            identifier_copies=2,
+            per_identifier_tokens=LEAF_PER_CHANGE_OUTPUT_RESERVE,
+        )
 
     def _summary_output(self) -> int:
         """Return the per-call output reservation for hierarchical summaries.
@@ -1211,13 +1329,16 @@ class Narrator:
         """
         return min(DOCUMENT_OUTPUT_RESERVE, self.provider.max_output_tokens)
 
-    def _order_output(self) -> int:
+    def _order_output(self, group_ids: Iterable[str] = ()) -> int:
         """Return the per-call output reservation for story ordering.
 
+        Args:
+            group_ids: Group IDs that the response must order exactly once.
+
         Returns:
-            The smaller of the order reserve and provider output capacity.
+            Order reserve scaled for the required output identifier list.
         """
-        return min(ORDER_OUTPUT_RESERVE, self.provider.max_output_tokens)
+        return self._scaled_output_reserve(ORDER_OUTPUT_RESERVE, group_ids)
 
     def _estimate_input(self, body: bytes) -> int:
         """Estimate request input with provider-specific framing overhead.
@@ -1292,6 +1413,8 @@ class Narrator:
             ``True`` when estimated input is within capacity, otherwise
             ``False``. No provider request is sent.
         """
+        if type(output) is not int or not 0 < output <= self.provider.max_output_tokens:
+            return False
         body = self._body(system, data, schema_name, schema, output)
         return self._estimate_input(body) <= self.capacity.input_upper_bound
 
@@ -1362,9 +1485,11 @@ class Narrator:
                 group["id"],
                 change["id"],
                 src.get("side", ""),
+                src.get("part", 0),
                 src["start"],
                 src["end"],
                 (counterpart or {}).get("side", ""),
+                (counterpart or {}).get("part", 0),
                 (counterpart or {}).get("start", ""),
             )
             pieces.append(
@@ -1742,7 +1867,7 @@ class Narrator:
             data,
             "diffstory_chunk",
             _LEAF_SCHEMA,
-            self._leaf_output(),
+            self._leaf_output(chunk.change_ids),
         )
         summary, questions, passages = self._check_response(
             response,
@@ -1775,7 +1900,7 @@ class Narrator:
                 },
                 "diffstory_chunk",
                 _LEAF_SCHEMA,
-                self._leaf_output(),
+                self._leaf_output(missing),
             )
             _, _, repair_passages = self._check_response(
                 repair_response,
@@ -1860,7 +1985,7 @@ class Narrator:
                     payload,
                     "diffstory_chunk",
                     _LEAF_SCHEMA,
-                    self._leaf_output(),
+                    self._leaf_output(piece["change_id"] for piece in current),
                 ):
                     raise ValueError("A packed evidence chunk exceeds the selected model context")
                 result.append(chunk)
@@ -1882,7 +2007,7 @@ class Narrator:
                     payload,
                     "diffstory_chunk",
                     _LEAF_SCHEMA,
-                    self._leaf_output(),
+                    self._leaf_output(piece["change_id"] for piece in proposed),
                 ):
                     current.append(piece)
                     continue
@@ -1901,7 +2026,7 @@ class Narrator:
                     payload,
                     "diffstory_chunk",
                     _LEAF_SCHEMA,
-                    self._leaf_output(),
+                    self._leaf_output([piece["change_id"]]),
                 ):
                     raise ValueError(
                         "One source evidence slice exceeds the selected model context; "
@@ -2258,7 +2383,7 @@ class Narrator:
             self._order_input(report, group_summaries, document_summary),
             "diffstory_story_order",
             _ORDER_SCHEMA,
-            self._order_output(),
+            self._order_output(group["id"] for group in report["groups"]),
         )
         if (
             not isinstance(order_response, dict)
@@ -2285,9 +2410,9 @@ class Narrator:
             )
 
             step_passages = passages_by_group[group_id]
-            if not step_passages or len(step_passages) > 1000:
+            if not step_passages:
                 raise ValueError(
-                    f"Generated passages are missing or exceed the limit for group {group_id}"
+                    f"Generated passages are missing for group {group_id}"
                 )
             cited = {
                 change_id
@@ -2403,7 +2528,7 @@ class Narrator:
                 repair_data,
                 "diffstory_chunk",
                 _LEAF_SCHEMA,
-                self._leaf_output(),
+                self._leaf_output(chunk.change_ids),
             ):
                 raise ValueError(
                     "A citation repair request exceeds the selected model context; "
@@ -2415,7 +2540,7 @@ class Narrator:
                     data,
                     "diffstory_chunk",
                     _LEAF_SCHEMA,
-                    self._leaf_output(),
+                    self._leaf_output(chunk.change_ids),
                 )
             )
 
@@ -2499,7 +2624,7 @@ class Narrator:
                 order_data,
                 "diffstory_story_order",
                 _ORDER_SCHEMA,
-                self._order_output(),
+                self._order_output(group["id"] for group in groups),
             )
         )
 

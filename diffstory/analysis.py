@@ -776,7 +776,7 @@ def validate_passages(passages: list, group: dict, changes: dict) -> None:
         ValueError: If a passage is malformed, cites another group's change,
             or requests an invalid source range.
     """
-    if not isinstance(passages, list) or len(passages) > 1000:
+    if not isinstance(passages, list):
         raise ValueError("Invalid narrative passages")
     allowed = set(group["change_ids"])
     for passage in passages:

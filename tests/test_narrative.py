@@ -1,12 +1,13 @@
 """Mocked provider tests for opt-in, bounded, revision-locked narration."""
+import io
 import json
 import os
 import subprocess
 import sys
-from contextlib import redirect_stderr
-import io
 import tempfile
+import time
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,9 @@ from diffstory.narrative import (
     CODEX_DEFAULT_CONTEXT_TOKENS,
     CODEX_MODEL_CAPACITIES,
     MAX_RESPONSE_BYTES,
+    LEAF_OUTPUT_RESERVE,
+    ORDER_OUTPUT_RESERVE,
+    PROCESS_CLEANUP_TIMEOUT_SECONDS,
     PROVIDER_CALL_TIMEOUT_SECONDS,
     CodexCLIProvider,
     Narrator,
@@ -202,6 +206,61 @@ class NarrativeTests(unittest.TestCase):
             if piece.get("source") and piece["source"].get("side") == "head"
         ]
         self.assertEqual("".join(head_fragments), report["changes"][0]["after"]["source"])
+
+    def test_long_line_slices_have_unique_piece_and_chunk_ids(self):
+        """Keep long same-line source slices distinct through annotation application.
+
+        Returns:
+            ``None``; assertions verify stable unique evidence IDs and coverage.
+        """
+        report = compile_snapshot(snapshot())
+        report["changes"][0]["after"]["source"] = "x" * 2_900_000
+        narrator = Narrator(FakeProvider())
+
+        chunks = narrator._chunks(report)
+        piece_ids = [piece["id"] for chunk in chunks for piece in chunk.pieces]
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(len(piece_ids), len(set(piece_ids)))
+        self.assertEqual(len(chunks), len({chunk.id for chunk in chunks}))
+
+        annotations = narrator.generate(report)
+        self.assertEqual(
+            len(annotations["generation"]["chunk_coverage"]), len(chunks)
+        )
+        apply_annotations(report, annotations)
+
+    def test_large_required_citation_sets_split_leaf_chunks(self):
+        """Scale output reservations and split chunks to cover many changes.
+
+        Returns:
+            ``None``; assertions verify all changes fit within model output limits.
+        """
+        source = "\n".join(
+            f"value_{index} = {index}" for index in range(1_000)
+        ) + "\n"
+        report = compile_snapshot(snapshot(source))
+        provider = FakeProvider()
+        narrator = Narrator(provider)
+
+        self.assertGreaterEqual(len(report["changes"]), 1_000)
+        chunks = narrator._chunks(report)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(
+            all(
+                narrator._leaf_output(chunk.change_ids) <= provider.max_output_tokens
+                for chunk in chunks
+            )
+        )
+        covered = {change_id for chunk in chunks for change_id in chunk.change_ids}
+        self.assertEqual(covered, {change["id"] for change in report["changes"]})
+
+        many_group_ids = [f"group-{index:04d}-" + "a" * 32 for index in range(1_000)]
+        self.assertGreater(narrator._order_output(many_group_ids), ORDER_OUTPUT_RESERVE)
+        self.assertLessEqual(
+            narrator._order_output(many_group_ids), provider.max_output_tokens
+        )
+        annotations = narrator.generate(report)
+        apply_annotations(report, annotations)
 
     def test_preview_has_no_run_token_or_call_ceilings(self):
         """Preview the request plan without imposing arbitrary token or call ceilings.
@@ -451,6 +510,12 @@ class NarrativeTests(unittest.TestCase):
         self.assertEqual(options["stdin"], subprocess.PIPE)
         self.assertEqual(options["stdout"], subprocess.PIPE)
         self.assertEqual(options["stderr"], subprocess.DEVNULL)
+        if os.name == "nt":
+            self.assertTrue(
+                options["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            self.assertTrue(options["start_new_session"])
         self.assertTrue(launch["cwd_exists"])
         self.assertTrue(Path(launch["cwd"]).name.startswith("diffstory-codex-"))
         self.assertEqual(command[command.index("--cd") + 1], launch["cwd"])
@@ -475,11 +540,13 @@ class NarrativeTests(unittest.TestCase):
         process.stdout = io.BytesIO(b"")
         process.wait.side_effect = [subprocess.TimeoutExpired(["codex"], 4), -9]
         with patch.object(provider, "require_credentials"), \
-             patch("diffstory.narrative.subprocess.Popen", return_value=process):
+             patch("diffstory.narrative.subprocess.Popen", return_value=process), \
+             patch("diffstory.narrative._terminate_process_tree") as terminate_tree:
             with self.assertRaisesRegex(ProviderResponseError, "timed out"):
                 provider.complete(body, 4)
         process.wait.assert_any_call(timeout=4)
-        process.kill.assert_called_once()
+        process.wait.assert_any_call(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        terminate_tree.assert_called_once_with(process)
 
     def test_codex_cli_stdout_is_terminated_at_the_response_limit(self):
         """Kill a streaming child as soon as stdout exceeds the configured cap.
@@ -502,6 +569,33 @@ class NarrativeTests(unittest.TestCase):
                     timeout=5,
                     output_limit=MAX_RESPONSE_BYTES,
                 )
+
+    def test_codex_cli_timeout_terminates_descendants_holding_stdout(self):
+        """Terminate descendant processes so inherited stdout cannot hang cleanup.
+
+        Returns:
+            ``None``; the subprocess raises a timeout promptly after tree cleanup.
+        """
+        source = (
+            "import subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            "time.sleep(30)"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            started = time.monotonic()
+            with self.assertRaisesRegex(ProviderResponseError, "timed out"):
+                _run_bounded_subprocess(
+                    [sys.executable, "-c", source],
+                    b"",
+                    cwd=directory,
+                    environment=os.environ.copy(),
+                    timeout=0.1,
+                    output_limit=MAX_RESPONSE_BYTES,
+                )
+            self.assertLess(
+                time.monotonic() - started,
+                PROCESS_CLEANUP_TIMEOUT_SECONDS,
+            )
 
     def test_codex_jsonl_rejects_tool_calls_and_malformed_events(self):
         """Reject Codex output that invokes tools or violates JSONL structure.
@@ -610,6 +704,21 @@ class NarrativeTests(unittest.TestCase):
         self.assertTrue(error.fp.closed)
         self.assertNotIn(secret, str(raised.exception))
         self.assertNotIn("test-secret", str(raised.exception))
+
+    def test_openai_invalid_api_key_header_is_sanitized_before_network_access(self):
+        """Reject control characters in API keys without exposing their value.
+
+        Returns:
+            ``None``; the API key is rejected before constructing a network opener.
+        """
+        secret = "review-test-secret\n"
+        provider = OpenAIResponsesProvider(api_key=secret)
+        with patch("diffstory.narrative.build_opener") as build_opener:
+            with self.assertRaises(ValueError) as raised:
+                provider.complete(b"{}", 1)
+        self.assertIn("invalid header characters", str(raised.exception))
+        self.assertNotIn("review-test-secret", str(raised.exception))
+        build_opener.assert_not_called()
 
 
 if __name__ == "__main__":
