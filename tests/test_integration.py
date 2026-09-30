@@ -57,6 +57,17 @@ class GitIntegrationTests(unittest.TestCase):
         self.assertEqual(e['base_sha'],self.base)
         self.assertEqual(e['head_sha'],self.head)
 
+    def test_snapshot_from_stdin(self):
+        snapshot = from_git(str(self.root), self.base, self.head)
+        out = self.root / "stdin.html"
+        with patch("sys.stdin", io.StringIO(json.dumps(snapshot))), redirect_stdout(io.StringIO()):
+            code = main(["snapshot", "-", "--out", str(out)])
+        self.assertEqual(code, 0)
+        self.assertIn("report-data", out.read_text())
+        report = json.loads(out.with_suffix(".report.json").read_text())
+        self.assertEqual(report["meta"]["base_sha"], self.base)
+        self.assertEqual(report["meta"]["head_sha"], self.head)
+
     def test_empty_comparison(self):
         s=from_git(str(self.root),self.head,self.head)
         r=compile_snapshot(s)
