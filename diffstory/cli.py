@@ -12,9 +12,14 @@ from . import __version__
 
 
 def read_json(path: str) -> dict:
-    p = Path(path)
-    if p.stat().st_size > 80_000_000: raise ValueError("Input JSON exceeds 80 MB")
-    obj = json.loads(p.read_text(encoding="utf-8"))
+    if path == "-":
+        text = sys.stdin.read(80_000_001)
+        if len(text.encode("utf-8")) > 80_000_000: raise ValueError("Input JSON exceeds 80 MB")
+    else:
+        p = Path(path)
+        if p.stat().st_size > 80_000_000: raise ValueError("Input JSON exceeds 80 MB")
+        text = p.read_text(encoding="utf-8")
+    obj = json.loads(text)
     if not isinstance(obj, dict): raise ValueError("JSON must be an object")
     return obj
 
