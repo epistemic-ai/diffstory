@@ -54,6 +54,14 @@ The CLI performs read-only requests, paginates changed files, pins both revision
 
 Every compilation writes standalone HTML plus an adjacent `.report.json`. Binary, oversized, unsupported, or missing source is explicitly reported; it is not silently treated as a complete analysis.
 
+Callers that already retrieve authenticated source can stream a pinned `diffstory.snapshot.v1` without passing their credentials to Diffstory:
+
+```bash
+source-collector | diffstory snapshot - --out walkthrough.html
+```
+
+The producer remains responsible for supplying the complete, revision-pinned snapshot described in `docs/ARCHITECTURE.md`; Diffstory validates and compiles the supplied source without making a network request.
+
 ## What the compiler knows
 
 Python functions, async functions, classes, and assignments are compared using the standard-library AST. Pairing distinguishes identical ASTs, declaration renames, edited move candidates, ordinary edits, additions, removals, and unresolved counterparts. Literals, internal names, defaults, decorators, and string whitespace are not erased to obtain a convenient match.
