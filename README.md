@@ -48,7 +48,7 @@ diffstory github 'OWNER/REPO#NUMBER' \
   --save-snapshot walkthrough.snapshot.json
 ```
 
-Replace `OWNER/REPO#NUMBER` with a real PR. Public PRs can be read without credentials, subject to GitHub rate limits. For private repositories, set `GITHUB_TOKEN` through your existing credential manager; `--token-env NAME` selects another environment variable. Do not paste tokens into issues, commits, commands saved to a shared history, or reports.
+Replace `OWNER/REPO#NUMBER` with a real PR. Public PRs can be read without credentials, subject to GitHub rate limits. For private repositories, Diffstory first uses `GITHUB_TOKEN` (or the variable selected by `--token-env NAME`); if that variable is unset, it reuses an authenticated GitHub CLI session via `gh auth token` when available. Do not paste tokens into issues, commits, commands saved to a shared history, or reports.
 
 The CLI performs read-only requests, paginates changed files, pins both revisions, and rejects a PR that changes during retrieval. It does not inherit credentials from a chat application. The local Git comparison defaults to **merge-base(base, head) → head**; use `--two-dot` for an endpoint comparison. Uncommitted and untracked work is not included.
 
