@@ -114,8 +114,21 @@ def parse_pr(value: str) -> tuple[str, int]:
     return m.group(1), int(m.group(2))
 
 
+def _github_token(token_env: str) -> str | None:
+    token = os.getenv(token_env)
+    if token:
+        return token
+    try:
+        proc = subprocess.run(["gh", "auth", "token"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=10, text=True, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    token = proc.stdout.strip() if proc.returncode == 0 else ""
+    return token or None
+
+
 def from_github(value: str, *, token_env: str = "GITHUB_TOKEN", max_files: int = MAX_FILES) -> dict:
-    repo, number = parse_pr(value); api = GitHubClient(os.getenv(token_env))
+    repo, number = parse_pr(value); api = GitHubClient(_github_token(token_env))
     pr = api.get(f"/repos/{repo}/pulls/{number}")
     # GitHub PR changes are relative to merge-base, not necessarily the current base tip.
     base_tip, head = pr["base"]["sha"], pr["head"]["sha"]
