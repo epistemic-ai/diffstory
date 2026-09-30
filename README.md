@@ -79,7 +79,7 @@ Evidence packets contain source code. Send them only to an approved model or env
 
 ### Opt in to model narration
 
-The `git` and `github` commands accept `--narrate` to generate candidate annotations. By default, `--provider openai` calls the OpenAI Responses API with GPT-6 Astra. This is a separate API integration; a ChatGPT subscription does not supply an API key. Set `OPENAI_API_KEY` with your credential manager, or select another environment variable with `--api-key-env`. Diffstory never accepts the key as a command argument or writes it to generated files.
+The `git` and `github` commands accept `--narrate` to generate candidate annotations. By default, `--provider openai` calls the OpenAI Responses API with [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol). This is a separate API integration; a ChatGPT subscription does not supply an API key. Set `OPENAI_API_KEY` with your credential manager, or select another environment variable with `--api-key-env`. Diffstory never accepts the key as a command argument or writes it to generated files.
 
 ```bash
 diffstory github 'OWNER/REPO#NUMBER' \

@@ -77,7 +77,7 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model",
         help=(
-            "Optional model override (OpenAI: gpt-6-astra; Codex: "
+            "Optional model override (OpenAI: gpt-6.1-sol; Codex: "
             "gpt-6-astra, gpt-6.1-sol, gpt-6-luna, or gpt-5.3-codex)"
         ),
     )

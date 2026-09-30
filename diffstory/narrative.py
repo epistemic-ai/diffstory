@@ -21,7 +21,7 @@ from .usage import ModelCapacity, RunUsage, estimate_input
 
 
 OPENAI_URL = "https://api.openai.com/v1/responses"
-OPENAI_MODEL = "gpt-6-astra"
+OPENAI_MODEL = "gpt-6.1-sol"
 MODEL_CONTEXT_TOKENS = 1_050_000
 MODEL_MAX_OUTPUT_TOKENS = 128_000
 CODEX_DEFAULT_CONTEXT_TOKENS = 400_000

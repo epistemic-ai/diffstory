@@ -584,6 +584,7 @@ class NarrativeTests(unittest.TestCase):
             body = provider.prepare("Return JSON.", {"source": "safe"}, "summary",
                                     {"type": "object"}, 100)
             result, usage = provider.complete(body, 5)
+        self.assertEqual(provider.model, "gpt-6.1-sol")
         request = opener.open.call_args.args[0]
         self.assertEqual(opener.open.call_count, 1)
         self.assertEqual(opener.open.call_args.kwargs["timeout"], 5)
