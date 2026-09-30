@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from diffstory.analysis import compile_snapshot, apply_annotations
 from diffstory.cli import main
-from diffstory.ingest import from_git, from_github
+from diffstory.ingest import from_git, from_github, _github_token
 
 
 class GitIntegrationTests(unittest.TestCase):
@@ -83,6 +83,33 @@ class GitIntegrationTests(unittest.TestCase):
         r=compile_snapshot(from_git(str(self.root),self.base,self.head))
         with self.assertRaisesRegex(ValueError,'different base'):
             apply_annotations(r,{'schema':'diffstory.annotations.v1','base_sha':'wrong','head_sha':self.head,'steps':[]})
+
+
+class GitHubAuthTests(unittest.TestCase):
+    @patch.dict("os.environ", {"GITHUB_TOKEN": "explicit"}, clear=False)
+    @patch("diffstory.ingest.subprocess.run")
+    def test_environment_token_takes_precedence(self, run):
+        self.assertEqual(_github_token("GITHUB_TOKEN"), "explicit")
+        run.assert_not_called()
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("diffstory.ingest.subprocess.run")
+    def test_uses_authenticated_gh_token(self, run):
+        run.return_value = subprocess.CompletedProcess(["gh", "auth", "token"], 0, stdout="from-gh\n")
+        self.assertEqual(_github_token("GITHUB_TOKEN"), "from-gh")
+        run.assert_called_once_with(["gh", "auth", "token"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=10, text=True, check=False)
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("diffstory.ingest.subprocess.run", side_effect=FileNotFoundError)
+    def test_missing_gh_falls_back_to_unauthenticated(self, _run):
+        self.assertIsNone(_github_token("GITHUB_TOKEN"))
+
+    @patch.dict("os.environ", {}, clear=True)
+    @patch("diffstory.ingest.subprocess.run")
+    def test_unauthenticated_gh_falls_back_to_unauthenticated(self, run):
+        run.return_value = subprocess.CompletedProcess(["gh", "auth", "token"], 1, stdout="")
+        self.assertIsNone(_github_token("GITHUB_TOKEN"))
 
 
 class GitHubTransportTests(unittest.TestCase):
