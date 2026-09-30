@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from http.client import HTTPException
 from pathlib import Path
@@ -23,6 +24,14 @@ OPENAI_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = "gpt-6-astra"
 MODEL_CONTEXT_TOKENS = 1_050_000
 MODEL_MAX_OUTPUT_TOKENS = 128_000
+CODEX_DEFAULT_CONTEXT_TOKENS = 400_000
+CODEX_MODEL_CAPACITIES = {
+    "gpt-6-astra": (1_050_000, 128_000),
+    "gpt-6.1-sol": (1_050_000, 128_000),
+    "gpt-6-luna": (1_050_000, 128_000),
+    "gpt-5.3-codex": (400_000, 128_000),
+}
+PROVIDER_CALL_TIMEOUT_SECONDS = 900
 MAX_SOURCE_SLICE_BYTES = 12_000
 MAX_SUMMARY_CHARS = 3_000
 MAX_RESPONSE_BYTES = 2_000_000
@@ -121,6 +130,15 @@ _DOC_SYSTEM = (
 
 
 def _object(properties: dict, required: list[str] | None = None) -> dict:
+    """Build a strict JSON Schema object definition.
+
+    Args:
+        properties: Mapping of property names to schema definitions.
+        required: Required property names; defaults to every property key.
+
+    Returns:
+        Object schema with additional properties disabled.
+    """
     return {
         "type": "object",
         "properties": properties,
@@ -191,6 +209,19 @@ _DOCUMENT_SCHEMA = _object(
 
 class _RejectRedirects(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Reject provider redirects to avoid forwarding authorization headers.
+
+        Args:
+            req: Original request.
+            fp: Original response file pointer.
+            code: HTTP redirect status.
+            msg: HTTP redirect message.
+            headers: Redirect response headers.
+            newurl: Proposed redirect URL.
+
+        Raises:
+            ValueError: Always, because provider redirects are not followed.
+        """
         raise ValueError("OpenAI API redirect rejected")
 
 
@@ -211,10 +242,25 @@ class OpenAIResponsesProvider:
         api_key: str | None = None,
         token_env: str = "OPENAI_API_KEY",
     ):
+        """Configure API-key credentials from an explicit key or environment.
+
+        Args:
+            api_key: Explicit API key, taking precedence over the environment.
+            token_env: Environment variable used when ``api_key`` is omitted.
+
+        Side Effects:
+            Reads the selected environment variable; credentials remain in
+            memory and are not written to disk.
+        """
         self._api_key = api_key if api_key is not None else os.environ.get(token_env)
         self.token_env = token_env
 
     def require_credentials(self) -> None:
+        """Require an API key before a request can be sent.
+
+        Raises:
+            ValueError: If the configured API key is empty or unavailable.
+        """
         if not self._api_key:
             raise ValueError(f"OpenAI narration needs an API key in {self.token_env}")
 
@@ -226,6 +272,22 @@ class OpenAIResponsesProvider:
         schema: dict,
         max_output_tokens: int,
     ) -> bytes:
+        """Serialize an OpenAI Responses request with strict JSON-schema output.
+
+        Args:
+            system: Application instructions for the narration task.
+            data: Source evidence and context sent as user input.
+            schema_name: Name assigned to the structured output schema.
+            schema: JSON Schema constraining the provider response.
+            max_output_tokens: Output reservation for this request.
+
+        Returns:
+            Compact UTF-8 JSON request bytes with response storage disabled.
+
+        Raises:
+            ValueError: If the output reservation exceeds the model maximum.
+            TypeError: If request data cannot be JSON serialized.
+        """
         if max_output_tokens > self.max_output_tokens:
             raise ValueError(
                 "Requested output exceeds the selected model's documented output limit"
@@ -256,7 +318,30 @@ class OpenAIResponsesProvider:
         return serialized.encode("utf-8")
 
     def complete(self, body: bytes, timeout: float | None) -> tuple[dict, dict | None]:
+        """Send one Responses API request and parse its structured JSON result.
+
+        Args:
+            body: Prepared JSON request bytes.
+            timeout: Network timeout in seconds, or ``None`` for no timeout.
+
+        Returns:
+            A tuple of decoded structured output and validated provider usage,
+            or ``None`` usage when the response omits usable token counts.
+
+        Raises:
+            ValueError: If credentials, transport, response size, JSON, or the
+                response envelope is invalid.
+            ProviderResponseError: If the provider refuses, truncates, or
+                otherwise fails to complete structured output.
+
+        Side Effects:
+            Sends source evidence to the OpenAI Responses API once. Redirects
+            are rejected and response bodies are size limited.
+        """
         self.require_credentials()
+        request_timeout = (
+            timeout if timeout is not None else PROVIDER_CALL_TIMEOUT_SECONDS
+        )
         request = Request(
             OPENAI_URL,
             data=body,
@@ -270,7 +355,7 @@ class OpenAIResponsesProvider:
         )
         try:
             opener = build_opener(_RejectRedirects())
-            with opener.open(request, timeout=timeout) as response:
+            with opener.open(request, timeout=request_timeout) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
         except HTTPError as error:
             error.close()
@@ -372,7 +457,7 @@ class CodexCLIProvider:
     consent_name = "Codex"
     model = "Codex CLI default"
     destination = "Codex CLI using its saved account sign-in"
-    context_tokens = MODEL_CONTEXT_TOKENS
+    context_tokens = CODEX_DEFAULT_CONTEXT_TOKENS
     max_output_tokens = MODEL_MAX_OUTPUT_TOKENS
     # Reserve space for Codex's own agent instructions and output-schema framing.
     input_overhead_bytes = 8_192
@@ -393,12 +478,34 @@ class CodexCLIProvider:
     }
 
     def __init__(self, *, model: str | None = None, executable: str = "codex"):
+        """Configure the Codex CLI executable and optional model override.
+
+        Args:
+            model: Optional supported model ID passed through to ``codex exec``.
+            executable: CLI command name or path to invoke.
+
+        Raises:
+            ValueError: If an override has no known model capacity metadata.
+        """
         self._requested_model = model
         self._executable = executable
         if model:
+            capacity = CODEX_MODEL_CAPACITIES.get(model)
+            if capacity is None:
+                supported = ", ".join(sorted(CODEX_MODEL_CAPACITIES))
+                raise ValueError(
+                    f"Codex model {model!r} has no known context capacity; "
+                    f"supported overrides: {supported}"
+                )
+            self.context_tokens, self.max_output_tokens = capacity
             self.model = model
 
     def require_credentials(self) -> None:
+        """Require the configured Codex executable to be available on PATH.
+
+        Raises:
+            ValueError: If the Codex CLI executable cannot be found.
+        """
         if shutil.which(self._executable) is None:
             raise ValueError(
                 "Codex narration requires the Codex CLI; install it and sign in "
@@ -413,6 +520,19 @@ class CodexCLIProvider:
         schema: dict,
         _max_output_tokens: int,
     ) -> bytes:
+        """Serialize the provider-neutral request passed to the Codex CLI.
+
+        Args:
+            system: Application instructions for narration.
+            data: Source evidence and task context.
+            schema_name: Structured-output schema label.
+            schema: JSON Schema required from the CLI.
+            _max_output_tokens: Accepted to satisfy the provider interface;
+                Codex CLI applies its own output handling.
+
+        Returns:
+            Compact UTF-8 JSON request bytes.
+        """
         request = {
             "system": system,
             "data": data,
@@ -424,6 +544,26 @@ class CodexCLIProvider:
         ).encode("utf-8")
 
     def complete(self, body: bytes, timeout: float | None) -> tuple[dict, dict | None]:
+        """Run one isolated, read-only Codex CLI narration request.
+
+        Args:
+            body: Prepared provider-neutral JSON request.
+            timeout: Maximum CLI runtime in seconds, or ``None``.
+
+        Returns:
+            A tuple of structured output and provider-reported usage, when
+            available.
+
+        Raises:
+            ValueError: If credentials, prepared input, or CLI startup is
+                invalid.
+            ProviderResponseError: If the CLI times out, fails, exceeds the
+                output bound, attempts a tool, or returns malformed output.
+
+        Side Effects:
+            Starts the configured Codex CLI in a temporary directory, sends
+            the request through stdin, and removes the temporary files on exit.
+        """
         self.require_credentials()
         try:
             request = json.loads(body.decode("utf-8"))
@@ -486,32 +626,40 @@ class CodexCLIProvider:
                 ]
             )
             prompt = self._PROMPT.encode("utf-8") + body
-            try:
-                response = subprocess.run(
-                    command,
-                    input=prompt,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    cwd=directory,
-                    env=environment,
-                    timeout=timeout,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired:
-                raise ProviderResponseError("Codex CLI request timed out") from None
-            except OSError:
-                raise ValueError("Could not start the Codex CLI") from None
+            returncode, stdout = _run_bounded_subprocess(
+                command,
+                prompt,
+                cwd=directory,
+                environment=environment,
+                timeout=(
+                    timeout
+                    if timeout is not None
+                    else PROVIDER_CALL_TIMEOUT_SECONDS
+                ),
+                output_limit=MAX_RESPONSE_BYTES,
+            )
 
-        if len(response.stdout) > MAX_RESPONSE_BYTES:
-            raise ProviderResponseError("Codex CLI response exceeds the 2 MB limit")
-        if response.returncode != 0:
+        if returncode != 0:
             raise ProviderResponseError(
                 "Codex CLI request failed; check its saved sign-in and account access"
             )
-        return self._parse_response(response.stdout)
+        return self._parse_response(stdout)
 
     @classmethod
     def _parse_response(cls, raw: bytes) -> tuple[dict, dict | None]:
+        """Parse Codex JSONL events and accept only a tool-free final message.
+
+        Args:
+            raw: Complete stdout bytes returned by ``codex exec --json``.
+
+        Returns:
+            The final structured JSON object and validated usage, if present.
+
+        Raises:
+            ProviderResponseError: If events are malformed, a tool was
+                attempted, no final message exists, or structured output is
+                invalid.
+        """
         try:
             lines = raw.decode("utf-8").splitlines()
         except UnicodeDecodeError:
@@ -576,6 +724,15 @@ class CodexCLIProvider:
 
     @staticmethod
     def _usage_from_event(value: Any) -> dict | None:
+        """Normalize valid token counts from a Codex completion event.
+
+        Args:
+            value: Event usage payload.
+
+        Returns:
+            Input, cached-input, and output counts, or ``None`` when the
+            payload is absent or invalid.
+        """
         if not isinstance(value, dict):
             return None
         input_tokens = value.get("input_tokens")
@@ -599,8 +756,128 @@ class CodexCLIProvider:
 
 class ProviderResponseError(ValueError):
     def __init__(self, message: str, usage: dict | None = None):
+        """Create a sanitized provider failure with optional measured usage.
+
+        Args:
+            message: Safe error text that does not expose request contents.
+            usage: Valid usage data reported before the provider failure.
+        """
         super().__init__(message)
         self.usage = usage
+
+
+def _run_bounded_subprocess(
+    command: list[str],
+    prompt: bytes,
+    *,
+    cwd: str,
+    environment: dict[str, str],
+    timeout: float | None,
+    output_limit: int,
+) -> tuple[int, bytes]:
+    """Run a child process with a bounded stdout buffer and optional timeout.
+
+    Args:
+        command: Argument vector for the child process.
+        prompt: Bytes written to the child's standard input.
+        cwd: Working directory supplied to the child process.
+        environment: Child environment mapping.
+        timeout: Maximum child runtime in seconds, or ``None``.
+        output_limit: Maximum accepted stdout size in bytes.
+
+    Returns:
+        Child exit status and captured stdout bytes.
+
+    Raises:
+        ValueError: If the process cannot start or stdout cannot be read.
+        ProviderResponseError: If the process times out or exceeds the output
+            limit.
+    """
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=cwd,
+            env=environment,
+            bufsize=0,
+        )
+    except OSError:
+        raise ValueError("Could not start the Codex CLI") from None
+
+    captured = bytearray()
+    exceeded_limit = threading.Event()
+    read_failed = threading.Event()
+
+    def stop_process() -> None:
+        """Terminate the child if it is still running."""
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    def capture_stdout() -> None:
+        """Read stdout while retaining at most one byte over the limit."""
+        try:
+            while len(captured) <= output_limit:
+                remaining = output_limit + 1 - len(captured)
+                chunk = process.stdout.read(min(65_536, remaining))
+                if not chunk:
+                    return
+                captured.extend(chunk)
+                if len(captured) > output_limit:
+                    exceeded_limit.set()
+                    stop_process()
+                    return
+        except (OSError, ValueError):
+            read_failed.set()
+            stop_process()
+
+    def send_prompt() -> None:
+        """Write the prepared request to stdin and close the input pipe."""
+        try:
+            remaining = memoryview(prompt)
+            while remaining:
+                written = process.stdin.write(remaining)
+                if not written:
+                    raise OSError("Codex CLI closed its input pipe")
+                remaining = remaining[written:]
+            process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    reader = threading.Thread(target=capture_stdout, daemon=True)
+    writer = threading.Thread(target=send_prompt, daemon=True)
+    reader.start()
+    writer.start()
+    timed_out = False
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        stop_process()
+        process.wait()
+    finally:
+        writer.join()
+        reader.join()
+        if process.stdout:
+            process.stdout.close()
+
+    if timed_out:
+        raise ProviderResponseError("Codex CLI request timed out")
+    if exceeded_limit.is_set():
+        raise ProviderResponseError(
+            f"Codex CLI response exceeds the configured {output_limit:,}-byte limit"
+        )
+    if read_failed.is_set():
+        raise ValueError("Could not read the Codex CLI response")
+    return process.returncode, bytes(captured)
 
 
 class NarrativeProvider(Protocol):
@@ -614,7 +891,9 @@ class NarrativeProvider(Protocol):
     max_output_tokens: int
     input_overhead_bytes: int
 
-    def require_credentials(self) -> None: ...
+    def require_credentials(self) -> None:
+        """Raise when the configured provider cannot authenticate a request."""
+        ...
 
     def prepare(
         self,
@@ -623,9 +902,35 @@ class NarrativeProvider(Protocol):
         schema_name: str,
         schema: dict,
         max_output_tokens: int,
-    ) -> bytes: ...
+    ) -> bytes:
+        """Serialize one schema-constrained request without sending it.
 
-    def complete(self, body: bytes, timeout: float | None) -> tuple[dict, dict | None]: ...
+        Args:
+            system: Provider instruction text.
+            data: Request-specific evidence mapping.
+            schema_name: Structured-output schema label.
+            schema: Output JSON Schema.
+            max_output_tokens: Maximum output tokens reserved for the request.
+
+        Returns:
+            Serialized request bytes.
+        """
+        ...
+
+    def complete(self, body: bytes, timeout: float | None) -> tuple[dict, dict | None]:
+        """Send one request and return structured output plus optional usage.
+
+        Args:
+            body: Serialized provider request.
+            timeout: Maximum request duration in seconds, or ``None``.
+
+        Returns:
+            Structured output mapping and provider usage when available.
+
+        Raises:
+            ValueError: If the provider request cannot complete successfully.
+        """
+        ...
 
 
 @dataclass(frozen=True)
@@ -636,10 +941,20 @@ class EvidenceChunk:
 
     @property
     def change_ids(self) -> list[str]:
+        """Return sorted unique change IDs represented in this chunk.
+
+        Returns:
+            Unique IDs from all pieces in ascending lexical order.
+        """
         return sorted({piece["change_id"] for piece in self.pieces})
 
     @property
     def source_slices(self) -> list[dict]:
+        """Return source-line coverage records for primary and paired slices.
+
+        Returns:
+            Existing primary and counterpart references in piece order.
+        """
         slices = []
         for piece in self.pieces:
             for source_slice in (
@@ -652,7 +967,16 @@ class EvidenceChunk:
 
 
 def _split_source(source_info: dict | None) -> list[dict]:
-    """Split source into bounded slices while preserving complete source text."""
+    """Split source into bounded slices while preserving complete source text.
+
+    Args:
+        source_info: Source metadata including text and original starting line,
+            or ``None`` when source text is unavailable.
+
+    Returns:
+        Ordered slice records whose UTF-8 source payloads fit the configured
+        per-slice byte limit. Original line ranges are retained.
+    """
     if not source_info or not isinstance(source_info.get("source"), str):
         return []
 
@@ -729,7 +1053,14 @@ def _split_source(source_info: dict | None) -> list[dict]:
 
 
 def _split_long_line(line: str) -> list[str]:
-    """Partition one long line by UTF-8 size without cutting a code point."""
+    """Partition a long line by UTF-8 size without splitting code points.
+
+    Args:
+        line: Source line that exceeds the normal slice byte limit.
+
+    Returns:
+        Consecutive text pieces, each no larger than the configured limit.
+    """
     pieces = []
     current = []
     current_bytes = 0
@@ -754,6 +1085,18 @@ def _source_record(
     total_parts: int,
     focusable: bool,
 ) -> dict:
+    """Attach source identity and slice metadata to one narration segment.
+
+    Args:
+        source_info: Source identity fields such as path, side, and URL.
+        segment: Text and original line range for this piece.
+        part: One-based segment position.
+        total_parts: Number of segments produced from the source.
+        focusable: Whether model citations may focus this source range.
+
+    Returns:
+        A copy of the segment with source metadata and pagination fields.
+    """
     record = {
         key: source_info.get(key)
         for key in ("name", "path", "side", "url")
@@ -778,6 +1121,15 @@ class Narrator:
         self,
         provider: NarrativeProvider | None = None,
     ):
+        """Initialize a narrator and derive request capacity from its provider.
+
+        Args:
+            provider: Provider adapter; defaults to the OpenAI Responses API.
+
+        Raises:
+            ValueError: If the provider advertises invalid context or output
+                capacity.
+        """
         self.provider = provider or OpenAIResponsesProvider()
         self.capacity = ModelCapacity(
             context_tokens=self.provider.context_tokens,
@@ -789,6 +1141,14 @@ class Narrator:
 
     @staticmethod
     def _report_signature(report: dict) -> str:
+        """Hash canonical report JSON to bind preview approval to its input.
+
+        Args:
+            report: Report mapping to serialize deterministically.
+
+        Returns:
+            SHA-256 hex digest of the canonical UTF-8 JSON representation.
+        """
         serialized = json.dumps(
             report,
             ensure_ascii=False,
@@ -805,24 +1165,69 @@ class Narrator:
         schema: dict,
         output: int,
     ) -> bytes:
+        """Delegate request serialization to the configured provider.
+
+        Args:
+            system: Provider instruction text.
+            data: Request-specific evidence mapping.
+            schema_name: Structured-output schema label.
+            schema: Output JSON Schema.
+            output: Maximum output token reservation.
+
+        Returns:
+            Serialized request bytes produced by the provider.
+        """
         return self.provider.prepare(system, data, schema_name, schema, output)
 
     def _leaf_output(self) -> int:
+        """Return the per-call output reservation for source-bound passages.
+
+        Returns:
+            The smaller of the leaf reserve and provider output capacity.
+        """
         return min(LEAF_OUTPUT_RESERVE, self.provider.max_output_tokens)
 
     def _summary_output(self) -> int:
+        """Return the per-call output reservation for hierarchical summaries.
+
+        Returns:
+            The smaller of the summary reserve and provider output capacity.
+        """
         return min(SUMMARY_OUTPUT_RESERVE, self.provider.max_output_tokens)
 
     def _step_output(self) -> int:
+        """Return the per-call output reservation for a story section.
+
+        Returns:
+            The smaller of the step reserve and provider output capacity.
+        """
         return min(STEP_OUTPUT_RESERVE, self.provider.max_output_tokens)
 
     def _document_output(self) -> int:
+        """Return the per-call output reservation for document prose.
+
+        Returns:
+            The smaller of the document reserve and provider output capacity.
+        """
         return min(DOCUMENT_OUTPUT_RESERVE, self.provider.max_output_tokens)
 
     def _order_output(self) -> int:
+        """Return the per-call output reservation for story ordering.
+
+        Returns:
+            The smaller of the order reserve and provider output capacity.
+        """
         return min(ORDER_OUTPUT_RESERVE, self.provider.max_output_tokens)
 
     def _estimate_input(self, body: bytes) -> int:
+        """Estimate request input with provider-specific framing overhead.
+
+        Args:
+            body: Serialized provider request.
+
+        Returns:
+            Conservative byte-based input-token upper bound.
+        """
         return estimate_input(
             body,
             overhead_bytes=getattr(self.provider, "input_overhead_bytes", 0),
@@ -836,9 +1241,27 @@ class Narrator:
         schema: dict,
         output: int,
     ) -> dict:
+        """Send one provider call and record its reported or missing usage.
+
+        Args:
+            system: Provider instruction text.
+            data: Request-specific evidence mapping.
+            schema_name: Structured-output schema label.
+            schema: Output JSON Schema.
+            output: Maximum output token reservation.
+
+        Returns:
+            The provider's structured response object.
+
+        Raises:
+            Exception: Re-raises provider errors after accounting for reported
+                usage when available.
+        """
         body = self._body(system, data, schema_name, schema, output)
         try:
-            result, usage = self.provider.complete(body, None)
+            result, usage = self.provider.complete(
+                body, PROVIDER_CALL_TIMEOUT_SECONDS
+            )
         except ProviderResponseError as error:
             self.usage.record(error.usage)
             raise
@@ -856,10 +1279,33 @@ class Narrator:
         schema: dict,
         output: int,
     ) -> bool:
+        """Check whether a prepared request fits the model input capacity.
+
+        Args:
+            system: Provider instruction text.
+            data: Request-specific evidence mapping.
+            schema_name: Structured-output schema label.
+            schema: Output JSON Schema.
+            output: Maximum output token reservation.
+
+        Returns:
+            ``True`` when estimated input is within capacity, otherwise
+            ``False``. No provider request is sent.
+        """
         body = self._body(system, data, schema_name, schema, output)
         return self._estimate_input(body) <= self.capacity.input_upper_bound
 
     def _source_pieces(self, group: dict, change: dict) -> list[dict]:
+        """Build stable narration pieces from a change's paired source slices.
+
+        Args:
+            group: Narrative group that owns the change.
+            change: Change record with before/after source metadata.
+
+        Returns:
+            Ordered evidence pieces pairing corresponding base and head slices
+            where available; metadata-only piece when source text is absent.
+        """
         preferred = change.get("after") or change.get("before")
         change_stub = {
             "id": change["id"],
@@ -940,6 +1386,14 @@ class Narrator:
 
     @staticmethod
     def _source_metadata(source: dict | None) -> dict | None:
+        """Project source identity and line bounds without including its text.
+
+        Args:
+            source: Source record, or ``None`` when a revision side is absent.
+
+        Returns:
+            Name, path, and line-bound metadata, or ``None``.
+        """
         if not source:
             return None
         return {
@@ -950,6 +1404,16 @@ class Narrator:
 
     @staticmethod
     def _metadata_piece(group: dict, change: dict, change_stub: dict) -> dict:
+        """Create an evidence piece for a change with no usable source text.
+
+        Args:
+            group: Owning narrative group.
+            change: Change whose stable ID is included in the piece ID.
+            change_stub: Bounded public change facts for provider context.
+
+        Returns:
+            Metadata-only piece with no source-slice citation.
+        """
         return {
             "id": stable_id("narrative-piece", group["id"], change["id"], "metadata"),
             "change_id": change["id"],
@@ -959,6 +1423,15 @@ class Narrator:
 
     @staticmethod
     def _slice_reference(change_id: str, source: dict) -> dict:
+        """Return the persisted citation bounds for one supplied source slice.
+
+        Args:
+            change_id: Change record associated with the slice.
+            source: Source record with side and original line bounds.
+
+        Returns:
+            Change ID, revision side, and inclusive start/end line mapping.
+        """
         return {
             "change_id": change_id,
             "side": source.get("side"),
@@ -968,6 +1441,15 @@ class Narrator:
 
     @staticmethod
     def _group_context(group: dict, *, include_change_ids: bool = False) -> dict:
+        """Select stable group metadata for a provider request.
+
+        Args:
+            group: Compiled report group.
+            include_change_ids: Include the group's change ID list when true.
+
+        Returns:
+            A new mapping containing only the selected contextual fields.
+        """
         fields = ("id", "path", "theme", "title")
         if include_change_ids:
             fields += ("change_ids",)
@@ -976,6 +1458,15 @@ class Narrator:
 
     @staticmethod
     def _pull_request_context(meta: dict) -> dict:
+        """Bound PR metadata and label its description as author-reported.
+
+        Args:
+            meta: Report metadata containing repository, title, and description.
+
+        Returns:
+            Context mapping with motivation truncated to the summary limit and
+            a flag indicating truncation.
+        """
         motivation = str(meta.get("description") or "")
         return {
             "repository": meta.get("repository", ""),
@@ -992,6 +1483,19 @@ class Narrator:
         group_summaries: dict[str, str],
         document_summary: str,
     ) -> dict:
+        """Build context for one story step in the chosen reading order.
+
+        Args:
+            report: Compiled report containing PR metadata and groups.
+            story_groups: Groups arranged in the proposed story order.
+            index: Zero-based position of the current group.
+            group_summaries: Bounded source-grounded summary by group ID.
+            document_summary: Summary of the complete change set.
+
+        Returns:
+            Provider input containing PR motivation, current group,
+            prerequisites, and neighboring story steps.
+        """
         group = story_groups[index]
         group_id = group["id"]
         meta = report["meta"]
@@ -1041,6 +1545,17 @@ class Narrator:
         group_summaries: dict[str, str],
         document_summary: str,
     ) -> dict:
+        """Build model context for selecting a coherent order for all groups.
+
+        Args:
+            report: Compiled report with PR and dependency metadata.
+            group_summaries: Source-grounded summary by group ID.
+            document_summary: Whole-change summary.
+
+        Returns:
+            Provider input describing all groups, prerequisites, cycles, and
+            author-reported PR context.
+        """
         groups_by_id = {group["id"]: group for group in report["groups"]}
         groups = []
         for group in report["groups"]:
@@ -1069,6 +1584,19 @@ class Narrator:
 
     @staticmethod
     def _story_groups(report: dict, proposed_order: Any) -> list[dict]:
+        """Apply a valid provider order while enforcing prerequisite constraints.
+
+        Args:
+            report: Compiled report with groups and dependency edges.
+            proposed_order: Provider-suggested group ID sequence.
+
+        Returns:
+            Group records in deterministic prerequisite-respecting story order.
+            An invalid suggestion falls back to report order.
+
+        Raises:
+            ValueError: If report groups refer to an unknown prerequisite.
+        """
         groups = report["groups"]
         group_ids = [group["id"] for group in groups]
         if (
@@ -1098,6 +1626,14 @@ class Narrator:
 
     @staticmethod
     def _reading_path(story_groups: list[dict]) -> list[dict]:
+        """Project ordered groups into the public reading-path representation.
+
+        Args:
+            story_groups: Groups in final narration order.
+
+        Returns:
+            Numbered title, path, and theme records in the same order.
+        """
         return [
             {
                 "number": index + 1,
@@ -1112,6 +1648,17 @@ class Narrator:
     def _validate_step_response(
         response: dict, group_id: str, *, final_step: bool = False
     ) -> None:
+        """Validate a provider-generated story step against its output schema.
+
+        Args:
+            response: Candidate step mapping.
+            group_id: Group used to identify errors.
+            final_step: Whether an empty transition is allowed.
+
+        Raises:
+            ValueError: If required fields, text bounds, or list fields are
+                invalid.
+        """
         if set(response) != set(_STEP_SCHEMA["properties"]):
             raise ValueError(
                 f"Provider returned an invalid narrative step for group {group_id}"
@@ -1145,6 +1692,15 @@ class Narrator:
 
     @staticmethod
     def _validate_document_response(document: dict) -> None:
+        """Require bounded, non-empty opening and closing document prose.
+
+        Args:
+            document: Provider-generated document narrative.
+
+        Raises:
+            ValueError: If fields are missing, extra, empty, non-text, or too
+                long.
+        """
         if set(document) != {"lead", "closing"} or any(
             not isinstance(document[field], str)
             or not document[field].strip()
@@ -1159,6 +1715,23 @@ class Narrator:
         group: dict,
         change_map: dict[str, dict],
     ) -> tuple[str, list[dict], dict]:
+        """Generate and validate source-bound prose for one evidence chunk.
+
+        Missing citations receive one bounded repair call before the complete
+        passage set is checked against the original report.
+
+        Args:
+            chunk: Evidence chunk to narrate.
+            group: Report group owning the chunk.
+            change_map: Report-wide change lookup for citation validation.
+
+        Returns:
+            Chunk summary, validated passages, and generation coverage record.
+
+        Raises:
+            ValueError: If the provider response is malformed, citations remain
+                incomplete after repair, or summary bounds are exceeded.
+        """
         data = {
             "chunk_id": chunk.id,
             "group": self._group_context(group),
@@ -1240,6 +1813,17 @@ class Narrator:
         return summary, passages, manifest_entry
 
     def _chunks(self, report: dict) -> list[EvidenceChunk]:
+        """Pack each group's source pieces into stable model-context chunks.
+
+        Args:
+            report: Compiled report with groups, changes, and revisions.
+
+        Returns:
+            Stable evidence chunks in report-group order.
+
+        Raises:
+            ValueError: If even one source piece cannot fit the provider context.
+        """
         result: list[EvidenceChunk] = []
         base = report["meta"].get("base_sha")
         head = report["meta"].get("head_sha")
@@ -1252,6 +1836,13 @@ class Narrator:
             current: list[dict] = []
 
             def flush() -> None:
+                """Validate and append the currently packed evidence chunk.
+
+                Side Effects:
+                    Appends a validated chunk to ``result`` and clears
+                    ``current``. Raises before any provider call if it does not
+                    fit the configured context.
+                """
                 if not current:
                     return
                 piece_ids = [piece["id"] for piece in current]
@@ -1326,6 +1917,21 @@ class Narrator:
         expected: set[str],
         chunk: EvidenceChunk,
     ) -> tuple[str, list[str], list[dict]]:
+        """Validate a leaf response and normalize all source-bound passages.
+
+        Args:
+            response: Decoded provider response object.
+            expected: Change IDs permitted in this chunk.
+            chunk: Evidence and line ranges supplied to the provider.
+
+        Returns:
+            Trimmed summary, unresolved review questions, and normalized
+            passage records.
+
+        Raises:
+            ValueError: If schema fields, summary, questions, or passages are
+                invalid or cite unavailable evidence.
+        """
         if set(response) != {"summary", "questions", "passages"}:
             raise ValueError(f"Provider returned an unexpected evidence response for chunk {chunk.id}")
         summary = response["summary"]
@@ -1377,6 +1983,21 @@ class Narrator:
         ranges: dict[str, list[tuple[int, int, bool, bool]]],
         chunk_id: str,
     ) -> dict:
+        """Validate one passage's citations, view, and optional source focus.
+
+        Args:
+            passage: Provider-generated passage mapping.
+            expected: Change IDs allowed for this chunk.
+            ranges: Supplied source bounds and partial/focusable flags by change.
+            chunk_id: Stable chunk ID included in error messages.
+
+        Returns:
+            Normalized passage with optional validated focus range.
+
+        Raises:
+            ValueError: If text, citations, view, focus, or partial-source
+                requirements are invalid.
+        """
         text = passage["text"]
         change_ids = passage["change_ids"]
         view = passage["view"]
@@ -1436,6 +2057,17 @@ class Narrator:
         return normalized
 
     def _summarize(self, data: dict) -> str:
+        """Request and validate one bounded hierarchical summary.
+
+        Args:
+            data: Scope and source-grounded observations to summarize.
+
+        Returns:
+            Trimmed non-empty summary text.
+
+        Raises:
+            ValueError: If the provider response has an invalid schema or text.
+        """
         response = self._call(
             _SUMMARY_SYSTEM,
             data,
@@ -1451,6 +2083,18 @@ class Narrator:
         return summary.strip()
 
     def _summary_batches(self, summaries: list[dict], scope: dict) -> list[list[dict]]:
+        """Greedily partition summaries into requests that fit model context.
+
+        Args:
+            summaries: Ordered summary observations.
+            scope: Group or document scope included in every request.
+
+        Returns:
+            Non-empty ordered batches, each of which fits the model context.
+
+        Raises:
+            ValueError: If any single summary observation cannot fit.
+        """
         batches: list[list[dict]] = []
         current: list[dict] = []
         for item in summaries:
@@ -1483,6 +2127,18 @@ class Narrator:
         return batches
 
     def _reduce_summaries(self, summaries: list[dict], scope: dict) -> str:
+        """Reduce many bounded summaries until they form one overview.
+
+        Args:
+            summaries: Source-grounded observations to combine.
+            scope: Group or document scope retained through reduction.
+
+        Returns:
+            One summary string, or a fixed empty-source message.
+
+        Raises:
+            ValueError: If summary reduction cannot shrink within model context.
+        """
         if not summaries:
             return "No source changes were supplied."
         current = summaries
@@ -1511,11 +2167,38 @@ class Narrator:
 
     @staticmethod
     def _group_title(report: dict, group_id: str) -> str:
+        """Return a group's title, falling back to its ID if it is absent.
+
+        Args:
+            report: Compiled report containing groups.
+            group_id: Group identifier to look up.
+
+        Returns:
+            Matching title or the original identifier.
+        """
         group = next((item for item in report["groups"] if item["id"] == group_id), None)
         return group["title"] if group else group_id
 
     def generate(self, report: dict) -> dict:
-        """Return complete revision-bound candidate annotations, or fail closed."""
+        """Generate complete revision-bound candidate annotations or fail closed.
+
+        Args:
+            report: Compiled report and source evidence to narrate.
+
+        Returns:
+            ``diffstory.annotations.v1`` data with document prose, ordered
+            steps, source-bound passages, usage, and complete coverage metadata.
+
+        Raises:
+            ValueError: If this narrator has already generated, preflight,
+                provider output, or report-wide coverage validation fails.
+            ProviderResponseError: If a provider call cannot complete.
+
+        Side Effects:
+            Sends source evidence to the configured provider after credentials
+            are checked and local packing succeeds. Accumulates usage for every
+            attempted provider call.
+        """
         if self._generation_started:
             raise ValueError("A narrator instance can run only one generation job")
 
@@ -1676,7 +2359,22 @@ class Narrator:
         }
 
     def preview(self, report: dict) -> dict:
-        """Plan requests and check each against model context before sending source."""
+        """Plan narration requests and verify model context without sending source.
+
+        Args:
+            report: Compiled report to pack and plan.
+
+        Returns:
+            A local preview with chunk, call, and conservative input estimates.
+
+        Raises:
+            ValueError: If evidence cannot be packed or a planned request does
+                not fit the provider's advertised context.
+
+        Side Effects:
+            Stores a signature binding later generation approval to this exact
+            report. Makes no provider request and records no token usage.
+        """
         chunks = self._chunks(report)
         groups = report["groups"]
         group_map = {group["id"]: group for group in groups}
@@ -1722,6 +2420,22 @@ class Narrator:
             )
 
         def plan_reduction(count: int, scope: dict) -> str:
+            """Count summary-reduction calls using worst-case summary lengths.
+
+            Args:
+                count: Number of source summaries to reduce.
+                scope: Group or document context included in each request.
+
+            Returns:
+                Placeholder text representing the planned reduced summary.
+
+            Side Effects:
+                Appends required summary requests to the outer local ``calls``
+                plan; does not contact the provider.
+
+            Raises:
+                ValueError: If repeated reduction cannot shrink within context.
+            """
             planned_summaries = [
                 {"chunk_id": "c" * 16, "summary": "x" * MAX_SUMMARY_CHARS}
                 for _ in range(count)

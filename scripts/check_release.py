@@ -44,10 +44,33 @@ SECRET_PATTERNS = (
 
 
 def publication_files(root: Path) -> list[Path]:
-    """Return the exact candidate set, refusing unknown inputs and symlinks."""
+    """Return approved release files, rejecting unrecognized inputs and symlinks.
+
+    Args:
+        root: Candidate publication root.
+
+    Returns:
+        Sorted paths included in the exact publication manifest.
+
+    Raises:
+        OSError: If a directory cannot be traversed.
+        ValueError: If unknown files, directories, symlinks, credential-like
+            files, or unapproved report data are encountered.
+    """
     files: list[Path] = []
 
     def walk(directory: Path):
+        """Visit one approved directory and validate every entry.
+
+        Args:
+            directory: Directory within ``root`` to inspect recursively.
+
+        Side Effects:
+            Adds accepted file paths to the outer ``files`` collection.
+
+        Raises:
+            ValueError: If an entry violates release-input policy.
+        """
         for path in sorted(directory.iterdir()):
             rel = path.relative_to(root).as_posix()
             if path.is_symlink():
@@ -81,6 +104,21 @@ def publication_files(root: Path) -> list[Path]:
 
 
 def inspect_files(root: Path) -> list[Path]:
+    """Validate the release candidate set, contents, and synthetic demo data.
+
+    Args:
+        root: Candidate publication root.
+
+    Returns:
+        The validated, sorted candidate paths.
+
+    Raises:
+        OSError: If a candidate file cannot be read.
+        ValueError: If a file is too large, contains a private marker or
+            possible secret, has an invalid image signature, or demo metadata
+            is missing or not explicitly synthetic.
+        UnicodeError: If a text candidate is not UTF-8.
+    """
     files = publication_files(root)
     for path in files:
         if path.stat().st_size > 12_000_000:
@@ -106,11 +144,41 @@ def inspect_files(root: Path) -> list[Path]:
 
 
 def entries(root: Path, files: list[Path]) -> list[dict[str, str]]:
+    """Calculate relative paths and SHA-256 digests for a file set.
+
+    Args:
+        root: Candidate publication root used to form relative paths.
+        files: Validated files to fingerprint.
+
+    Returns:
+        Manifest entries in the caller-provided order.
+
+    Raises:
+        OSError: If a file cannot be read.
+    """
     return [{'path': path.relative_to(root).as_posix(),
              'sha256': hashlib.sha256(path.read_bytes()).hexdigest()} for path in files]
 
 
 def check(root: Path = ROOT, *, verify: bool = False, write: bool = False) -> int:
+    """Check public release inputs and optionally verify or write a manifest.
+
+    Args:
+        root: Candidate publication root.
+        verify: Compare the exact current paths and hashes to its manifest.
+        write: Write a new manifest for the validated candidate set.
+
+    Returns:
+        Number of validated public files.
+
+    Raises:
+        OSError: If a file or manifest cannot be accessed.
+        ValueError: If a release input is unsafe or a verified manifest differs.
+        json.JSONDecodeError: If an existing manifest is malformed.
+
+    Side Effects:
+        Writes ``PUBLICATION.json`` only when ``write`` is true.
+    """
     root = root.resolve()
     files = inspect_files(root)
     current = entries(root, files)
@@ -127,6 +195,18 @@ def check(root: Path = ROOT, *, verify: bool = False, write: bool = False) -> in
 
 
 def main(argv=None) -> int:
+    """Run the release checker CLI and report validation status.
+
+    Args:
+        argv: Optional argument sequence; defaults to process arguments.
+
+    Returns:
+        Zero when validation succeeds; one for handled input or I/O failures.
+
+    Side Effects:
+        May write a publication manifest when requested and prints status to
+        standard output or a sanitized failure to standard error.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=ROOT)
     action = parser.add_mutually_exclusive_group()

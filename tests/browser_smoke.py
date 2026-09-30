@@ -15,6 +15,16 @@ from diffstory.render import render
 
 
 def main():
+    """Exercise the offline reader in Chromium and capture browser screenshots.
+
+    The smoke contract covers narrative structure, accessible navigation,
+    source expansion, responsive layouts, safe embedding, and absence of
+    runtime network requests.
+
+    Side Effects:
+        Launches Playwright Chromium and writes desktop and mobile screenshots
+        under ``docs/reader``. Raises an assertion or browser error on failure.
+    """
     html = (ROOT / 'examples/demo.html').read_text(encoding='utf-8')
     report = json.loads((ROOT / 'examples/demo.report.json').read_text())
     (ROOT / 'docs/reader').mkdir(parents=True, exist_ok=True)
@@ -23,6 +33,16 @@ def main():
     parsing_group = report['groups'][parsing_index]
     assertions = 0
     def check(value, message):
+        """Assert one browser invariant and count it for the final summary.
+
+        Args:
+            value: Condition that must be true.
+            message: Description shown when the assertion fails.
+
+        Side Effects:
+            Increments the enclosing assertion count or raises
+            ``AssertionError``.
+        """
         nonlocal assertions
         assert value, message
         assertions += 1
@@ -108,6 +128,27 @@ def main():
         page.wait_for_timeout(120)
         represented = page.locator('[data-changes]').evaluate_all('(nodes)=>[...new Set(nodes.flatMap(n=>n.dataset.changes.split(" ").filter(Boolean)))]')
         check(set(represented) == {c['id'] for c in report['changes']}, 'all units retained in main or supporting source')
+
+        repeated_report = json.loads(json.dumps(report))
+        repeated_group = repeated_report['groups'][parsing_index]
+        repeated_passage = next(
+            passage for passage in repeated_group['narrative']['passages']
+            if len(passage['change_ids']) == 1
+        )
+        repeated_change_id = repeated_passage['change_ids'][0]
+        repeated_group['narrative']['passages'].append(dict(repeated_passage))
+        expected_occurrences = sum(
+            repeated_change_id in passage['change_ids']
+            for passage in repeated_group['narrative']['passages']
+        )
+        repeated_page = browser.new_page()
+        repeated_page.set_content(render(repeated_report), wait_until='domcontentloaded')
+        repeated_blocks = repeated_page.locator('.story-section').nth(parsing_index).locator(
+            f'[data-changes~="{repeated_change_id}"]'
+        ).count()
+        check(repeated_blocks == expected_occurrences, 'repeated citations render their code for every passage')
+        repeated_page.close()
+
         page.locator('#moreBtn').click(no_wait_after=True); page.locator('#morePanel a[href="#source-hunks"]').click(no_wait_after=True)
         expect(page.locator('#source-hunks')).to_have_attribute('open', '')
         check(page.locator('.raw-file').count() == 8, 'original hunks grouped by eight unique paths')

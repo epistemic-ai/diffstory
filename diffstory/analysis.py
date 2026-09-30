@@ -32,10 +32,31 @@ LABELS = {
 
 
 def stable_id(*parts: Any) -> str:
+    """Return a deterministic 16-hex identifier for the supplied values.
+
+    Args:
+        *parts: Values whose string forms define the identifier input.
+
+    Returns:
+        The first 16 lowercase hexadecimal characters of the SHA-256 digest.
+    """
     return hashlib.sha256("\0".join(map(str, parts)).encode()).hexdigest()[:16]
 
 
 def source_url(meta: dict, path: str, side: str, start: int, end: int) -> str | None:
+    """Build a GitHub permalink when repository and revision metadata is valid.
+
+    Args:
+        meta: Snapshot metadata containing repository and revision IDs.
+        path: Repository-relative source path.
+        side: ``base`` or ``head`` source side.
+        start: First original source line.
+        end: Last original source line.
+
+    Returns:
+        A GitHub blob URL with the requested line range, or ``None`` when the
+        repository or revision cannot form a trusted permalink.
+    """
     repo = (meta.get("head_repository") if side == "head" else None) or meta.get("repository", "")
     sha = meta.get("base_sha" if side == "base" else "head_sha", "")
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo) or not re.fullmatch(r"[0-9a-f]{7,64}", sha):
@@ -44,16 +65,42 @@ def source_url(meta: dict, path: str, side: str, start: int, end: int) -> str | 
 
 
 def module_name(path: str) -> str:
+    """Convert a Python source path to its dotted module name.
+
+    Args:
+        path: Slash-separated source path, optionally ending in ``.py``.
+
+    Returns:
+        Dotted module name with a trailing ``.__init__`` removed.
+    """
     p = path[:-3] if path.endswith(".py") else path
     return p.replace("/", ".").removesuffix(".__init__")
 
 
 def is_test_path(path: str) -> bool:
+    """Return whether a path follows the repository's test-file conventions.
+
+    Args:
+        path: Repository-relative path to classify.
+
+    Returns:
+        ``True`` for files inside a ``tests`` directory or named as a test;
+        otherwise ``False``.
+    """
     p = PurePosixPath(path)
     return "tests" in p.parts or p.name.startswith("test_") or p.name.endswith("_test.py")
 
 
 def _name(node: ast.AST, fallback: str) -> str:
+    """Extract a declaration or assignment name from a supported AST node.
+
+    Args:
+        node: AST declaration or assignment.
+        fallback: Name used when the node has no supported name form.
+
+    Returns:
+        Function, class, assignment-target, or fallback name.
+    """
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return node.name
     if isinstance(node, ast.Assign):
@@ -64,7 +111,17 @@ def _name(node: ast.AST, fallback: str) -> str:
 
 
 def _fingerprint(node: ast.AST, *, rename_root: bool = False, strip_doc: bool = False) -> str:
-    """Never mask literals, internal names, defaults, annotations or decorators."""
+    """Serialize an AST fingerprint with only explicitly selected normalization.
+
+    Args:
+        node: AST node to fingerprint; it is deep-copied before normalization.
+        rename_root: Replace only the root declaration's name with a marker.
+        strip_doc: Remove only the root declaration's leading docstring.
+
+    Returns:
+        Attribute-free AST text. Literals, internal names, defaults,
+        annotations, and decorators remain significant.
+    """
     node = copy.deepcopy(node)
     if rename_root and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         node.name = "__DECLARATION_NAME__"
@@ -75,6 +132,14 @@ def _fingerprint(node: ast.AST, *, rename_root: bool = False, strip_doc: bool = 
 
 
 def _attr(node: ast.AST) -> str | None:
+    """Return the dotted name represented by a Name or Attribute AST node.
+
+    Args:
+        node: AST expression to convert.
+
+    Returns:
+        Dotted identifier text, or ``None`` for unsupported expressions.
+    """
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
@@ -84,7 +149,22 @@ def _attr(node: ast.AST) -> str | None:
 
 
 def extract(fragment: dict, meta: dict) -> tuple[list[dict], list[dict], str | None]:
-    """Extract top-level units. Classes are atomic; methods remain in class source."""
+    """Extract symbols, imports, and parse status from one source fragment.
+
+    Classes are atomic top-level units; their methods remain in the class
+    source. Repository code is parsed but never imported or executed.
+
+    Args:
+        fragment: Source descriptor containing path, side, text, and line base.
+        meta: Revision metadata used to produce source permalinks.
+
+    Returns:
+        A tuple of extracted symbol records, import records, and an optional
+        text-only or parse-failure note.
+
+    Raises:
+        ValueError: If source exceeds the per-file parsing limit.
+    """
     text, path, side = fragment["text"], fragment["path"], fragment["side"]
     start = fragment.get("start_line", 1)
     if len(text.encode()) > MAX_SOURCE_BYTES:
@@ -145,15 +225,40 @@ def match_symbols(before: list[dict], after: list[dict]) -> tuple[list[tuple[dic
 
     Identical-body functions with multiple candidates are intentionally NOT paired.
     Similarity proposes identity, never semantic equivalence.
+
+    Args:
+        before: Symbol records from the base revision.
+        after: Symbol records from the head revision.
+
+    Returns:
+        Matched ``(before, after, basis)`` triples, unmatched base symbols, and
+        unmatched head symbols.
     """
     old = {s["id"]: s for s in before}
     new = {s["id"]: s for s in after}
     pairs: list[tuple[dict, dict, str]] = []
 
     def take(a: dict, b: dict, basis: str) -> None:
+        """Pair two unique candidates and remove them from further matching.
+
+        Args:
+            a: Unmatched base symbol.
+            b: Unmatched head symbol.
+            basis: Evidence label for the selected correspondence.
+        """
         pairs.append((a, b, basis)); old.pop(a["id"]); new.pop(b["id"])
 
     def unique_join(key, basis: str) -> None:
+        """Pair symbols whose computed key occurs exactly once on each side.
+
+        Args:
+            key: Function mapping a symbol record to its matching key.
+            basis: Evidence label attached to each resulting pair.
+
+        Side Effects:
+            Adds unique matches to ``pairs`` and removes them from ``old`` and
+            ``new`` through ``take``.
+        """
         left, right = defaultdict(list), defaultdict(list)
         for s in old.values(): left[key(s)].append(s)
         for s in new.values(): right[key(s)].append(s)
@@ -186,6 +291,17 @@ def match_symbols(before: list[dict], after: list[dict]) -> tuple[list[tuple[dic
 
 
 def classify(a: dict, b: dict) -> str:
+    """Classify a matched symbol pair from path, name, and AST identity.
+
+    Args:
+        a: Base symbol record.
+        b: Head symbol record.
+
+    Returns:
+        A structural change kind such as ``moved``, ``renamed``, or
+        ``modified``. The result describes AST evidence, not behavior
+        equivalence.
+    """
     moved, renamed = a["path"] != b["path"], a["name"] != b["name"]
     if a["fingerprint"] == b["fingerprint"]:
         return "moved" if moved else "source_only"
@@ -196,6 +312,19 @@ def classify(a: dict, b: dict) -> str:
 
 
 def make_hunks(a: str, b: str, astart: int = 1, bstart: int = 1, context: int = 3) -> list[dict]:
+    """Create line-based diff hunks with original line numbers and row tags.
+
+    Args:
+        a: Base source text.
+        b: Head source text.
+        astart: Original line number of the first base line.
+        bstart: Original line number of the first head line.
+        context: Number of equal lines retained around each changed region.
+
+    Returns:
+        Hunks containing ``context``, ``delete``, and ``add`` rows with their
+        original line numbers.
+    """
     old, new = a.splitlines(), b.splitlines()
     matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
     hunks = []
@@ -213,11 +342,28 @@ def make_hunks(a: str, b: str, astart: int = 1, bstart: int = 1, context: int = 
 
 
 def _public(s: dict | None) -> dict | None:
+    """Return the public symbol fields without internal match bookkeeping.
+
+    Args:
+        s: Internal symbol record, or ``None`` for an absent side.
+
+    Returns:
+        A shallow copy without fingerprints and fragment linkage, or ``None``.
+    """
     if s is None: return None
     return {k: v for k, v in s.items() if k not in {"fingerprint", "rename_fingerprint", "fragment_id"}}
 
 
 def _theme(change: dict) -> str:
+    """Choose a deterministic reading theme from a change's name and path.
+
+    Args:
+        change: Classified change record.
+
+    Returns:
+        Theme label used to group related changes; this is a naming heuristic,
+        not a semantic classification.
+    """
     b = change.get("after") or change.get("before") or {}
     name, path = b.get("name", ""), b.get("path", "")
     if b.get("is_test") or is_test_path(path): return "tests"
@@ -233,11 +379,35 @@ def _theme(change: dict) -> str:
 
 
 def _resolve(module: str, name: str, all_symbols: list[dict]) -> list[dict]:
+    """Find symbols matching a name in an exact or suffix-matching module.
+
+    Args:
+        module: Dotted imported module name.
+        name: Imported symbol name.
+        all_symbols: Candidate symbol records across the snapshot.
+
+    Returns:
+        All matching records; callers decide whether the result is unique.
+    """
     if not module or not name or name == "*": return []
     return [s for s in all_symbols if s["name"] == name and (module_name(s["path"]) == module or module_name(s["path"]).endswith("." + module))]
 
 
 def dependency_edges(symbols: list[dict], imports_by_path: dict[str, list[dict]], meta: dict) -> tuple[list[dict], list[dict]]:
+    """Resolve conservative static references into source-evidence edges.
+
+    Only unambiguous top-level imports and local declarations are followed;
+    dynamic lookup and runtime behavior are not inferred.
+
+    Args:
+        symbols: Head-revision symbol records with calls and references.
+        imports_by_path: Import records grouped by source path.
+        meta: Revision metadata used for source permalinks.
+
+    Returns:
+        A tuple of resolved dependency edges and ambiguous references that
+        could not be resolved uniquely.
+    """
     edges, unresolved = [], []
     by_path = defaultdict(list)
     for s in symbols: by_path[s["path"]].append(s)
@@ -285,9 +455,24 @@ def dependency_edges(symbols: list[dict], imports_by_path: dict[str, list[dict]]
 
 
 def ordered_components(nodes: list[str], prereqs: dict[str, set[str]], priority) -> tuple[list[str], list[list[str]]]:
-    """Tarjan SCCs + deterministic prerequisite ordering; cycles remain explicit."""
+    """Order prerequisite components deterministically while preserving cycles.
+
+    Args:
+        nodes: Node identifiers to order.
+        prereqs: Mapping from node to prerequisite node identifiers.
+        priority: Sort-key function for stable ordering among available nodes.
+
+    Returns:
+        A prerequisite-respecting node order and the multi-node strongly
+        connected components that represent cycles.
+    """
     index = 0; indices = {}; low = {}; stack = []; onstack = set(); comps = []
     def visit(v):
+        """Visit one graph node and collect its Tarjan strongly connected set.
+
+        Args:
+            v: Node identifier currently being traversed.
+        """
         nonlocal index
         indices[v] = low[v] = index; index += 1; stack.append(v); onstack.add(v)
         for w in sorted(prereqs.get(v, set())):
@@ -312,6 +497,16 @@ def ordered_components(nodes: list[str], prereqs: dict[str, set[str]], priority)
 
 
 def _narrative(group: dict, changes: list[dict]) -> dict:
+    """Build deterministic review guidance for a compiled change group.
+
+    Args:
+        group: Group metadata including path and theme.
+        changes: Changes assigned to the group.
+
+    Returns:
+        A narrative template with intent, source locations, invariants,
+        questions, and deterministic provenance. It does not claim test results.
+    """
     kinds = {c["kind"] for c in changes}
     names = [(c.get("after") or c.get("before") or {}).get("name", "file context") for c in changes]
     move = any(k in kinds for k in ("moved", "moved_renamed", "moved_modified"))
@@ -342,6 +537,24 @@ def _narrative(group: dict, changes: list[dict]) -> dict:
 
 
 def compile_snapshot(snapshot: dict) -> dict:
+    """Compile a bounded source snapshot into a deterministic review report.
+
+    The compiler parses Python without executing it, matches declarations,
+    preserves raw changed-line evidence, and builds groups and dependencies.
+    Incomplete excerpts are labeled as observed evidence rather than proof of
+    repository-wide additions or removals.
+
+    Args:
+        snapshot: ``diffstory.snapshot.v1`` mapping with metadata and fragments.
+
+    Returns:
+        A ``diffstory.report.v1`` mapping containing changes, groups, edges,
+        source evidence, statistics, and warnings.
+
+    Raises:
+        ValueError: If the snapshot schema, fragments, source limits, or
+            fragment ranges are invalid.
+    """
     if snapshot.get("schema") != "diffstory.snapshot.v1":
         raise ValueError("Expected diffstory.snapshot.v1")
     meta = dict(snapshot.get("meta", {}))
@@ -381,6 +594,20 @@ def compile_snapshot(snapshot: dict) -> dict:
     changes = []; covered = {key: set() for key in frag_map}; symbol_to_change = {}
 
     def add_change(a, b, kind, basis):
+        """Create a change record and mark its source lines as classified.
+
+        Args:
+            a: Base symbol/context record, or ``None`` when absent.
+            b: Head symbol/context record, or ``None`` when absent.
+            kind: Structural change classification.
+            basis: Evidence explaining how the pair was formed.
+
+        Returns:
+            The newly created change mapping.
+
+        Side Effects:
+            Appends to ``changes`` and updates covered-line and symbol indexes.
+        """
         c = {"id": stable_id((a or {}).get("id", ""), (b or {}).get("id", ""), kind), "kind": kind, "label": LABELS[kind],
              "before": _public(a), "after": _public(b), "basis": basis,
              "hunks": make_hunks((a or {}).get("source", ""), (b or {}).get("source", ""), (a or {}).get("start", 1), (b or {}).get("start", 1))}
@@ -428,6 +655,15 @@ def compile_snapshot(snapshot: dict) -> dict:
         nonblank = [r["text"].strip() for r in unassigned if r["text"].strip() and not r["text"].lstrip().startswith("#")]
         wiring = any(x.startswith(("from ", "import ")) for x in nonblank)
         def context(f):
+            """Extract unclassified changed lines for one source side.
+
+            Args:
+                f: Source fragment, or ``None`` when that side is absent.
+
+            Returns:
+                A context symbol for remaining changed lines, or ``None`` if
+                the side contains no relevant unclassified lines.
+            """
             if not f: return None
             origin = f.get("start_line", 1)
             nums = [r["old"] if f["side"] == "base" else r["new"] for r in unassigned if r["text"].strip() and (r["old"] if f["side"] == "base" else r["new"]) is not None]
@@ -530,6 +766,15 @@ def validate_passages(passages: list, group: dict, changes: dict) -> None:
 
     Repeating a unit in separate paragraphs is valid (e.g. signature, then body).
     Unmentioned units remain reachable through the reader's supporting changes.
+
+    Args:
+        passages: Narrative passages with change IDs, view, and optional focus.
+        group: Report group that owns the cited change IDs.
+        changes: Change lookup used to validate source ranges.
+
+    Raises:
+        ValueError: If a passage is malformed, cites another group's change,
+            or requests an invalid source range.
     """
     if not isinstance(passages, list) or len(passages) > 1000:
         raise ValueError("Invalid narrative passages")
@@ -579,7 +824,18 @@ def validate_passages(passages: list, group: dict, changes: dict) -> None:
 
 
 def evidence_packet(report: dict) -> dict:
-    """Small, deterministic handoff for a human or any model. No network call."""
+    """Build a compact deterministic handoff for human or model review.
+
+    Args:
+        report: Compiled report whose evidence should be handed off.
+
+    Returns:
+        A source-grounded request mapping with instructions, metadata, groups,
+        changes, tests, and warnings.
+
+    Side Effects:
+        Makes no network call and does not mutate ``report``.
+    """
     instructions = (
         "Write a guided reading narrative grounded only in the supplied source. "
         "Do not change structural classifications or claim tests passed. "
@@ -618,6 +874,18 @@ def evidence_packet(report: dict) -> dict:
 
 
 def _generation_ids(generation: dict, field: str) -> list[str]:
+    """Read a unique list of well-formed IDs from a generation manifest.
+
+    Args:
+        generation: Persisted generation metadata.
+        field: ID-list field to validate.
+
+    Returns:
+        The validated ID list.
+
+    Raises:
+        ValueError: If the field is absent, duplicated, malformed, or not a list.
+    """
     value = generation.get(field)
     if (
         not isinstance(value, list)
@@ -633,6 +901,16 @@ def _generation_ids(generation: dict, field: str) -> list[str]:
 
 
 def _validate_group_order(group_order: list[str], groups: list[dict]) -> None:
+    """Require every group once, prerequisites first, and cycles adjacent.
+
+    Args:
+        group_order: Proposed ordered group IDs.
+        groups: Report groups and their prerequisite relationships.
+
+    Raises:
+        ValueError: If IDs are missing, duplicated, unknown, or violate
+            prerequisite or cycle adjacency constraints.
+    """
     group_ids = [group["id"] for group in groups]
     if (
         not isinstance(group_order, list)
@@ -675,6 +953,15 @@ def _validate_group_order(group_order: list[str], groups: list[dict]) -> None:
 
 
 def _validate_generation_usage(usage: dict) -> None:
+    """Validate measured or legacy provider-usage metadata without applying caps.
+
+    Args:
+        usage: Token totals and call counts persisted with generated prose.
+
+    Raises:
+        ValueError: If fields, token counts, cached counts, call counts, or an
+            optional legacy elapsed time are invalid.
+    """
     legacy_fields = {"input_tokens", "output_tokens", "calls", "elapsed_seconds"}
     measured_fields = {
         "input_tokens",
@@ -719,6 +1006,21 @@ def _validate_chunk_coverage(
     groups: dict[str, dict],
     change_map: dict[str, dict],
 ) -> None:
+    """Require generated chunks to cover each expected chunk and change.
+
+    Each recorded source slice must cite a change in its chunk and stay within
+    that change's original source range.
+
+    Args:
+        generation: Persisted generation mapping containing chunk coverage.
+        expected_chunks: Deterministic chunk IDs planned for this generation.
+        groups: Group lookup used to constrain chunk change IDs.
+        change_map: Change lookup used to validate source-slice bounds.
+
+    Raises:
+        ValueError: If coverage is malformed, incomplete, duplicated, or cites
+            an invalid group, change, side, or line range.
+    """
     chunks = generation.get("chunk_coverage")
     if not isinstance(chunks, list) or len(chunks) != len(expected_chunks):
         raise ValueError("Invalid generated narration chunk coverage")
@@ -795,7 +1097,16 @@ def _validate_chunk_coverage(
 
 
 def validate_generation(report: dict, generation: dict) -> None:
-    """Validate the persisted origin and complete coverage for generated prose."""
+    """Validate generated-prose provenance, revision binding, and coverage.
+
+    Args:
+        report: Compiled report to which the generation belongs.
+        generation: Persisted generation manifest.
+
+    Raises:
+        ValueError: If provenance, revisions, usage, group order, change
+            coverage, chunk coverage, or completion state is invalid.
+    """
     required_fields = {
         "schema",
         "origin",
@@ -885,7 +1196,15 @@ def validate_generation(report: dict, generation: dict) -> None:
 
 
 def validate_generated_report(report: dict) -> None:
-    """Check that persisted generated reports keep their label and full evidence."""
+    """Require a generated report to retain provenance and complete evidence.
+
+    Args:
+        report: Report carrying a generated narrative and generation manifest.
+
+    Raises:
+        ValueError: If generation metadata, document narration, provenance
+            labels, evidence IDs, or source-bound passages are incomplete.
+    """
     generation = report.get("generation")
     validate_generation(report, generation)
     document = report.get("document")
@@ -922,7 +1241,19 @@ def validate_generated_report(report: dict) -> None:
 
 
 def apply_annotations(report: dict, annotations: dict) -> dict:
-    """Validate provenance and revision. Narrative cannot override analysis facts."""
+    """Apply revision-bound narrative annotations without replacing report facts.
+
+    Args:
+        report: Deterministic report to annotate.
+        annotations: Authored or generated ``diffstory.annotations.v1`` data.
+
+    Returns:
+        A deep-copied report with validated narrative fields applied.
+
+    Raises:
+        ValueError: If schema, revisions, provenance, group coverage, evidence,
+            or passage ranges do not match the report.
+    """
     if annotations.get("schema") != "diffstory.annotations.v1":
         raise ValueError("Expected diffstory.annotations.v1")
     if annotations.get("head_sha") != report["meta"].get("head_sha"):

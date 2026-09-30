@@ -7,7 +7,19 @@ from .analysis import SCHEMA, validate_generated_report, validate_passages
 
 
 def validate_report(report: dict) -> None:
-    """Check fields used as HTML attributes/numbers; prose is escaped by the UI."""
+    """Validate report structure and values that affect safe rendering.
+
+    Textual prose is rendered as escaped data by the browser UI. This check
+    validates report identifiers, numeric fields, narrative evidence, and
+    generated-report provenance before embedding the report.
+
+    Args:
+        report: Parsed Diffstory report mapping.
+
+    Raises:
+        ValueError: If the schema or any renderer-facing field is invalid.
+        TypeError: If a value has an unsupported container or scalar type.
+    """
     if report.get('schema') != SCHEMA: raise ValueError('Expected a diffstory report')
     for name in ('groups','changes','tests','edges','raw_files','warnings'):
         if not isinstance(report.get(name),list): raise ValueError(f'Report {name} must be a list')
@@ -15,6 +27,15 @@ def validate_report(report: dict) -> None:
     numeric = {'number','start','end','old_start','new_start','old_count','new_count','old','new',
                'changed_files','additions','deletions','source_bytes'}
     def walk(value):
+        """Recursively reject unsafe or malformed identifiers and numbers.
+
+        Args:
+            value: Nested report value to validate.
+
+        Raises:
+            ValueError: If a recognized identifier, number, or diff tag is
+                malformed.
+        """
         if isinstance(value,dict):
             for key,item in value.items():
                 if item is not None and (key=='id' or key.endswith('_id') or key in {'from','to'}):
@@ -48,6 +69,19 @@ def validate_report(report: dict) -> None:
 
 
 def render(report: dict) -> str:
+    """Render a validated report as a self-contained HTML document.
+
+    Args:
+        report: Report mapping to validate and embed.
+
+    Returns:
+        HTML containing the report data and packaged CSS, JavaScript, and mark.
+
+    Raises:
+        ValueError: If report validation fails.
+        OSError: If a packaged renderer asset cannot be read.
+        TypeError: If the report cannot be serialized as JSON.
+    """
     validate_report(report)
     assets = Path(__file__).with_name('assets')
     payload = json.dumps(report, ensure_ascii=False, separators=(',', ':'))

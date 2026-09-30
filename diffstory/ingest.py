@@ -21,6 +21,15 @@ MAX_FILES = 500
 
 
 def _validate_source_limit(max_source_bytes: int) -> None:
+    """Require a positive source-byte limit no higher than the hard cap.
+
+    Args:
+        max_source_bytes: Aggregate source limit requested for ingestion.
+
+    Raises:
+        ValueError: If the limit is non-positive, not an integer, or above the
+            repository-wide hard cap.
+    """
     if type(max_source_bytes) is not int or max_source_bytes <= 0:
         raise ValueError("--max-source-bytes must be a positive integer")
     if max_source_bytes > MAX_SNAPSHOT_SOURCE_BYTES:
@@ -28,6 +37,20 @@ def _validate_source_limit(max_source_bytes: int) -> None:
 
 
 def _git(repo: Path, *args: str, limit: int = MAX_FILE) -> bytes:
+    """Run a bounded, non-interactive Git command without invoking hooks.
+
+    Args:
+        repo: Repository directory passed to ``git -C``.
+        *args: Git subcommand and its arguments; passed without a shell.
+        limit: Maximum stdout size accepted from the command.
+
+    Returns:
+        Command standard output as bytes.
+
+    Raises:
+        ValueError: If Git exits unsuccessfully or output exceeds ``limit``.
+        subprocess.TimeoutExpired: If Git does not finish within 90 seconds.
+    """
     # No shell interpolation, no external diff drivers and no optional git locks.
     command = [
         "git",
@@ -58,6 +81,19 @@ def _git(repo: Path, *args: str, limit: int = MAX_FILE) -> bytes:
 
 
 def _resolve(repo: Path, ref: str) -> str:
+    """Resolve a revision expression to a verified commit object ID.
+
+    Args:
+        repo: Repository directory containing the revision.
+        ref: User-supplied Git revision expression.
+
+    Returns:
+        The full hexadecimal commit ID.
+
+    Raises:
+        ValueError: If the revision is missing, option-like, unresolved, or
+            does not resolve to a commit ID.
+    """
     if not ref or ref.startswith("-"):
         raise ValueError("Invalid git revision")
     revision = ref + "^{commit}"
@@ -82,6 +118,30 @@ def from_git(
     max_files: int = MAX_FILES,
     max_source_bytes: int = MAX_SNAPSHOT_SOURCE_BYTES,
 ) -> dict:
+    """Build a source snapshot from committed objects at two Git revisions.
+
+    The working tree is never read, so uncommitted and untracked changes are
+    excluded. File-count and aggregate-byte limits are enforced before a
+    snapshot is returned.
+
+    Args:
+        repo: Local Git repository path.
+        base: Base revision expression.
+        head: Head revision expression.
+        two_dot: Compare the exact base commit to head instead of using their
+            merge base.
+        max_files: Maximum number of changed paths to accept.
+        max_source_bytes: Maximum aggregate source bytes to inspect.
+
+    Returns:
+        A ``diffstory.snapshot.v1`` mapping with metadata, source fragments,
+        and warnings for skipped files.
+
+    Raises:
+        ValueError: If revisions, limits, Git objects, or source contents are
+            invalid, or if the snapshot exceeds a configured bound.
+        subprocess.TimeoutExpired: If a Git command exceeds its time limit.
+    """
     _validate_source_limit(max_source_bytes)
     root = Path(repo).resolve()
     base_sha, head_sha = _resolve(root, base), _resolve(root, head)
@@ -190,6 +250,19 @@ class RejectRedirects(HTTPRedirectHandler):
     """Never forward authorization or follow an API redirect to another resource."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Reject API redirects so authorization cannot reach another URL.
+
+        Args:
+            req: Original request.
+            fp: Original response file pointer.
+            code: HTTP redirect status.
+            msg: HTTP redirect message.
+            headers: Redirect response headers.
+            newurl: Proposed redirect URL.
+
+        Raises:
+            ValueError: Always, because redirects are not followed.
+        """
         raise ValueError("GitHub API redirect rejected; use the repository's canonical name.")
 
 
@@ -197,9 +270,30 @@ class GitHubClient:
     """Small GitHub REST client with bounded requests and no persistent token storage."""
 
     def __init__(self, token: str | None = None):
+        """Create a client that keeps the optional token in memory only.
+
+        Args:
+            token: GitHub bearer token for requests, or ``None`` for anonymous
+                access.
+        """
         self.token = token
 
     def get(self, path: str, *, optional: bool = False):
+        """Fetch and decode a repository-scoped GitHub REST resource.
+
+        Args:
+            path: API path beginning with ``/repos/``.
+            optional: Return ``None`` for a 404 response when the resource is
+                explicitly optional.
+
+        Returns:
+            The decoded JSON payload, or ``None`` for an optional missing
+            resource.
+
+        Raises:
+            ValueError: If the path is outside the supported endpoint scope,
+                the response is invalid or too large, or the request fails.
+        """
         if not path.startswith("/repos/"):
             raise ValueError("Unsupported GitHub API path")
 
@@ -241,7 +335,15 @@ class GitHubClient:
 
 
 def _github_token(token_env: str) -> str | None:
-    """Prefer the configured environment token, then the signed-in gh account."""
+    """Read a token from the named environment variable or signed-in ``gh``.
+
+    Args:
+        token_env: Environment variable checked before the GitHub CLI account.
+
+    Returns:
+        A non-empty token, or ``None`` if neither source provides one. The
+        token is returned to the caller and is not persisted.
+    """
     token = os.getenv(token_env)
     if token and token.strip():
         return token.strip()
@@ -264,6 +366,17 @@ def _github_token(token_env: str) -> str | None:
 
 
 def parse_pr(value: str) -> tuple[str, int]:
+    """Parse a GitHub pull-request URL or ``owner/repo#number`` reference.
+
+    Args:
+        value: Pull-request reference to parse.
+
+    Returns:
+        The repository slug and positive numeric pull-request identifier.
+
+    Raises:
+        ValueError: If ``value`` does not match a supported reference format.
+    """
     pattern = (
         r"(?:https://github\.com/)?"
         r"([\w.-]+/[\w.-]+)"
@@ -313,10 +426,11 @@ def _read_github_file(
         task: Repository, path, revision side, revision SHA, and region path.
 
     Returns:
-        Fragment, warning, and byte count; fragment or warning may be absent.
+        Fragment, warning, and bytes read or declared for aggregate-limit
+        accounting; fragment or warning may be absent.
 
     Raises:
-        ValueError: If a GitHub request fails.
+        ValueError: If a GitHub request fails or its response is invalid.
 
     Side Effects:
         Reads file contents from the GitHub API.
@@ -375,18 +489,23 @@ def from_github(
 ) -> dict:
     """Fetch a complete, size-bounded pull request snapshot from GitHub.
 
+    The pull request's merge base defines the base revision. Changed-file pages
+    are verified before the snapshot is returned, and files are fetched from
+    the correct repository for each side of a fork.
+
     Args:
-        value: Pull request URL or ``owner/repo#number`` identifier.
-        token_env: Environment variable checked for an API token.
-        max_files: Maximum changed-file count accepted for the snapshot.
-        max_source_bytes: Maximum combined source bytes accepted from GitHub.
+        value: Pull-request URL or ``owner/repo#number`` reference.
+        token_env: Environment variable used before the signed-in ``gh`` token.
+        max_files: Maximum changed-file count to accept.
+        max_source_bytes: Maximum aggregate source bytes to inspect.
 
     Returns:
-        A ``diffstory.snapshot.v1`` mapping tied to one base and head revision.
+        A ``diffstory.snapshot.v1`` mapping with source fragments, metadata,
+        and warnings for unsupported files.
 
     Raises:
-        ValueError: If limits are invalid, GitHub access fails, or the PR
-            changes while its source is being fetched.
+        ValueError: If the PR is inaccessible, incomplete, malformed, changes
+            during retrieval, or exceeds a configured limit.
 
     Side Effects:
         Reads the PR and changed source from GitHub and may invoke ``gh`` to

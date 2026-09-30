@@ -188,6 +188,16 @@ def test_first_record_wins():
 
 
 def demo_snapshot():
+    """Build the entirely synthetic base/head source snapshot for the demo.
+
+    Returns:
+        A ``diffstory.snapshot.v1`` mapping with catalog examples, tests, and
+        explicit synthetic-source metadata.
+
+    Side Effects:
+        None. The fixture is assembled in memory and performs no repository or
+        network reads.
+    """
     before = {
         "catalog/search.py": '\n\n'.join([LABEL, TAGS, MERGE, QUERY_BASE, PARSE_BASE, RUN_BASE]),
         "tools/export.py": 'from catalog.search import split_tags\n\n\ndef export_tags(value):\n    return ";".join(split_tags(value))\n',
@@ -234,6 +244,19 @@ EXPLANATIONS = {
 
 
 def demo_annotations(report):
+    """Create authored walkthrough annotations for the synthetic report.
+
+    Args:
+        report: Compiled report produced from :func:`demo_snapshot`.
+
+    Returns:
+        Revision-bound annotations with source-citing passages and document
+        opening and closing text.
+
+    Raises:
+        KeyError: If the report does not contain expected example changes or
+            revision metadata.
+    """
     by_id = {c['id']: c for c in report['changes']}
     steps = []
     for group in report['groups']:
@@ -286,6 +309,11 @@ def demo_annotations(report):
 
 
 def build():
+    """Compile the synthetic snapshot and apply its authored annotations.
+
+    Returns:
+        A tuple of snapshot, annotations, and fully annotated report mappings.
+    """
     snapshot = demo_snapshot()
     report = compile_snapshot(snapshot)
     annotations = demo_annotations(report)
@@ -294,6 +322,13 @@ def build():
 
 
 def main():
+    """Regenerate the checked-in synthetic demo data and standalone HTML.
+
+    Side Effects:
+        Writes demo snapshot, annotations, report, and HTML files under the
+        examples directory, then prints a short summary. It makes no network
+        request and reads no repository source.
+    """
     snapshot, annotations, report = build()
     out = ROOT / 'examples'
     for suffix, obj in [('snapshot', snapshot), ('annotations', annotations), ('report', report)]:

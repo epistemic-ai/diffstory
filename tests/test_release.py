@@ -29,6 +29,8 @@ spec.loader.exec_module(checker)
 
 class TransportHardeningTests(unittest.TestCase):
     def test_redirect_rejected_without_token_or_location_in_error(self):
+        """Reject redirects without exposing authorization values or redirect locations.
+        """
         request = Request('https://api.github.com/repos/example/catalog',
                           headers={'Authorization': 'Bearer never-print-this-value'})
         for url in ('https://other.invalid/path', 'https://api.github.com/repos/new/name'):
@@ -38,6 +40,8 @@ class TransportHardeningTests(unittest.TestCase):
             self.assertNotIn(url, str(error.exception))
 
     def test_auth_stays_in_request_not_error_message(self):
+        """Send authentication only in the request and omit it from sanitized errors.
+        """
         opener = MagicMock()
         opener.open.side_effect = HTTPError('https://api.github.com/repos/a/b', 403, 'Forbidden', {}, None)
         with patch('diffstory.ingest.build_opener', return_value=opener), self.assertRaises(ValueError) as error:
@@ -47,6 +51,8 @@ class TransportHardeningTests(unittest.TestCase):
         self.assertNotIn('never-print-this-value', str(error.exception))
 
     def test_client_installs_no_redirect_handler(self):
+        """Install redirect rejection and the bounded timeout on GitHub requests.
+        """
         opener = MagicMock()
         opener.open.return_value.__enter__.return_value.read.return_value = b'{"ok": true}'
         with patch('diffstory.ingest.build_opener', return_value=opener) as factory:
@@ -55,10 +61,14 @@ class TransportHardeningTests(unittest.TestCase):
         self.assertEqual(opener.open.call_args.kwargs['timeout'], 40)
 
     def test_rejects_non_repository_endpoints(self):
+        """Reject GitHub API paths outside repository-scoped resources.
+        """
         with self.assertRaises(ValueError):
             GitHubClient().get('/user')
 
     def test_fork_source_links_use_correct_owner_on_each_side(self):
+        """Use the base repository for base links and the fork owner for head links.
+        """
         meta = {'repository': 'example/catalog', 'head_repository': 'contributor/catalog',
                 'base_sha': 'a'*40, 'head_sha': 'b'*40}
         self.assertIn('/example/catalog/', source_url(meta, 'one.py', 'base', 1, 4))
@@ -67,11 +77,15 @@ class TransportHardeningTests(unittest.TestCase):
         self.assertIn('/example/catalog/', source_url(meta, 'two.py', 'head', 1, 4))
 
     def test_invalid_fork_owner_does_not_produce_link(self):
+        """Omit a source permalink when fork owner metadata is invalid.
+        """
         meta = {'repository': 'example/catalog', 'head_repository': 'https://untrusted.invalid',
                 'head_sha': 'b'*40}
         self.assertIsNone(source_url(meta, 'two.py', 'head', 1, 4))
 
     def test_version_flag(self):
+        """Print the package version and exit successfully.
+        """
         with contextlib.redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit) as status:
                 cli_main(['--version'])
@@ -81,6 +95,11 @@ class TransportHardeningTests(unittest.TestCase):
 
 class PublicationTests(unittest.TestCase):
     def setUp(self):
+        """Create a minimal public-release fixture in a temporary directory.
+
+        Side Effects:
+            Creates synthetic README and demo metadata used by publication checks.
+        """
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / 'release'
         self.root.mkdir()
@@ -90,30 +109,42 @@ class PublicationTests(unittest.TestCase):
             (self.root / 'examples' / name).write_text(json.dumps({'meta': {'input': 'synthetic example'}}))
 
     def tearDown(self):
+        """Remove the temporary release fixture.
+        """
         self.tmp.cleanup()
 
     def test_manifest_roundtrip(self):
+        """Write and verify an exact path-and-hash publication manifest.
+        """
         count = checker.check(self.root, write=True)
         self.assertEqual(checker.check(self.root, verify=True), count)
 
     def test_modified_file_invalidates_manifest(self):
+        """Detect a file whose contents changed after manifest creation.
+        """
         checker.check(self.root, write=True)
         (self.root / 'README.md').write_text('Changed after sealing.')
         with self.assertRaisesRegex(ValueError, 'manifest'):
             checker.check(self.root, verify=True)
 
     def test_extra_candidate_invalidates_manifest(self):
+        """Detect a newly added candidate file after manifest creation.
+        """
         checker.check(self.root, write=True)
         (self.root / 'LICENSE').write_text('Some license')
         with self.assertRaisesRegex(ValueError, 'manifest'):
             checker.check(self.root, verify=True)
 
     def test_private_marker_is_rejected(self):
+        """Reject a private prototype marker in candidate text.
+        """
         (self.root / 'README.md').write_text('epistemic-ai/' + 'foundation')
         with self.assertRaisesRegex(ValueError, 'Private prototype marker'):
             checker.check(self.root)
 
     def test_secret_is_rejected_without_printing_value(self):
+        """Reject a token-like value without copying the value into the error.
+        """
         value = 'ghp_' + 'Z'*36
         (self.root / 'README.md').write_text(value)
         with self.assertRaises(ValueError) as error:
@@ -121,31 +152,43 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn(value, str(error.exception))
 
     def test_symlink_is_rejected(self):
+        """Reject symlinks in release inputs.
+        """
         (self.root / 'LICENSE').symlink_to(self.root / 'README.md')
         with self.assertRaisesRegex(ValueError, 'Symlinks'):
             checker.check(self.root)
 
     def test_unapproved_report_is_rejected(self):
+        """Reject report data that is not on the approved synthetic-data list.
+        """
         (self.root / 'examples' / 'customer.report.json').write_text('{}')
         with self.assertRaisesRegex(ValueError, 'Unreviewed report'):
             checker.check(self.root)
 
     def test_demo_cannot_silently_become_real_pr(self):
+        """Require public demo metadata to identify synthetic input.
+        """
         (self.root / 'examples' / 'demo.report.json').write_text(json.dumps({'meta': {'input': 'GitHub REST'}}))
         with self.assertRaisesRegex(ValueError, 'explicitly synthetic'):
             checker.check(self.root)
 
     def test_fonts_are_not_published(self):
+        """Reject unapproved binary font assets from publication.
+        """
         (self.root / 'examples' / 'custom.woff2').write_bytes(b'no fonts')
         with self.assertRaisesRegex(ValueError, 'Unsupported public file type'):
             checker.check(self.root)
 
     def test_environment_file_is_rejected(self):
+        """Reject environment and credential-like files.
+        """
         (self.root / '.env').write_text('example=not-a-secret')
         with self.assertRaisesRegex(ValueError, 'Credential-like file'):
             checker.check(self.root)
 
     def test_generated_distributions_are_not_manifest_inputs(self):
+        """Exclude generated distribution directories from manifest inputs.
+        """
         (self.root / 'dist').mkdir()
         (self.root / 'dist' / 'local.whl').write_bytes(b'not a real wheel')
         checker.check(self.root, write=True)

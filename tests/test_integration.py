@@ -17,6 +17,11 @@ from diffstory.ingest import from_git, from_github, _github_token
 
 class GitIntegrationTests(unittest.TestCase):
     def setUp(self):
+        """Create a temporary Git repository with a committed file move.
+
+        Side Effects:
+            Initializes Git history and stores temporary repository paths on the test.
+        """
         self.tmp=tempfile.TemporaryDirectory()
         self.root=Path(self.tmp.name)
         self.git('init','-q')
@@ -32,11 +37,26 @@ class GitIntegrationTests(unittest.TestCase):
         self.git('add','.');self.git('commit','-qm','extract parser')
         self.head=self.git('rev-parse','HEAD').strip()
 
-    def tearDown(self): self.tmp.cleanup()
+    def tearDown(self):
+        """Remove the temporary Git repository created by ``setUp``."""
+        self.tmp.cleanup()
     def git(self,*args):
+        """Run Git in the test repository and return decoded output.
+
+        Args:
+            *args: Git subcommand and arguments.
+
+        Returns:
+            Standard output as text.
+
+        Raises:
+            subprocess.CalledProcessError: If the Git command fails.
+        """
         return subprocess.check_output(['git','-C',str(self.root),*args],stderr=subprocess.STDOUT,text=True)
 
     def test_git_move_and_dirty_worktree_ignored(self):
+        """Read committed revisions while excluding uncommitted worktree edits.
+        """
         (self.root/'new.py').write_text('THIS IS AN UNCOMMITTED CHANGE\n')
         s=from_git(str(self.root),self.base,self.head)
         self.assertEqual(s['meta']['base_sha'],self.base)
@@ -45,6 +65,8 @@ class GitIntegrationTests(unittest.TestCase):
         self.assertEqual(compile_snapshot(s)['stats']['identical_ast_moves'],1)
 
     def test_cli_roundtrip(self):
+        """Write HTML and snapshot outputs, then export revision-bound evidence.
+        """
         out=self.root/'reader.html';snapshot=self.root/'snapshot.json'
         with redirect_stdout(io.StringIO()):
             code=main(['git','--repo',str(self.root),'--base',self.base,'--head',self.head,'--out',str(out),'--save-snapshot',str(snapshot)])
@@ -58,19 +80,27 @@ class GitIntegrationTests(unittest.TestCase):
         self.assertEqual(e['head_sha'],self.head)
 
     def test_empty_comparison(self):
+        """Compile equal Git revisions without reporting semantic changes.
+        """
         s=from_git(str(self.root),self.head,self.head)
         r=compile_snapshot(s)
         self.assertEqual(r['stats']['units'],0)
 
     def test_file_limit_refuses_partial(self):
+        """Reject a changed-file count above the configured limit.
+        """
         with self.assertRaisesRegex(ValueError,'exceeds'):from_git(str(self.root),self.base,self.head,max_files=1)
 
     def test_bad_revision_error_is_readable(self):
+        """Return a readable CLI error for an unresolved Git revision.
+        """
         with redirect_stderr(io.StringIO()) as err:
             code=main(['git','--repo',str(self.root),'--base','NOT_A_REF','--out',str(self.root/'x.html')])
         self.assertEqual(code,2);self.assertIn('diffstory:',err.getvalue())
 
     def test_skipped_side_does_not_claim_removal(self):
+        """Treat a skipped binary source side as unresolved evidence instead of a proven removal.
+        """
         (self.root/'new.py').write_bytes(b'\x00binary')
         self.git('add','.');self.git('commit','-qm','binary')
         s=from_git(str(self.root),self.head,'HEAD')
@@ -80,6 +110,8 @@ class GitIntegrationTests(unittest.TestCase):
         self.assertFalse(any(c['kind']=='removed' for c in r['changes']))
 
     def test_wrong_base_annotations_rejected(self):
+        """Reject annotations tied to a different base revision.
+        """
         r=compile_snapshot(from_git(str(self.root),self.base,self.head))
         with self.assertRaisesRegex(ValueError,'different base'):
             apply_annotations(r,{'schema':'diffstory.annotations.v1','base_sha':'wrong','head_sha':self.head,'steps':[]})
@@ -115,10 +147,33 @@ class GitHubAuthTests(unittest.TestCase):
 class GitHubTransportTests(unittest.TestCase):
     """These verify transport behavior against fake responses, not a live API."""
     def fake(self,n=1,changed_mid_read=False,returned=None):
+        """Build a deterministic fake GitHub API response handler.
+
+        Args:
+            n: Number of changed files advertised by the pull request.
+            changed_mid_read: Change the head revision on a repeated PR read when true.
+            returned: Optional number of file records actually returned.
+
+        Returns:
+            A fake ``get`` callable and the list of requested API paths.
+        """
         pr={'base':{'sha':'a'*40},'head':{'sha':'b'*40,'repo':{'full_name':'org/repo'}},'changed_files':n,
             'title':'Example','html_url':'https://github.com/org/repo/pull/1','body':'No tests run.'}
         count=0;paths=[]
         def get(_client,path,**kwargs):
+            """Return one deterministic response for a requested fake API path.
+
+            Args:
+                _client: Ignored client receiver used by the patched method.
+                path: GitHub REST path to serve.
+                **kwargs: Ignored optional request arguments.
+
+            Returns:
+                Fixture payload matching the endpoint path.
+
+            Raises:
+                AssertionError: If the test requests an unconfigured endpoint.
+            """
             nonlocal count
             paths.append(path)
             if path.endswith('/pulls/1'):
@@ -135,14 +190,28 @@ class GitHubTransportTests(unittest.TestCase):
         return get,paths
 
     def test_uses_merge_base_not_tip(self):
+        """Use the pull request merge base rather than the current base tip.
+        """
         fake,paths=self.fake()
         with patch('diffstory.ingest.GitHubClient.get',new=fake):s=from_github('org/repo#1')
         self.assertEqual(s['meta']['base_sha'],'d'*40)
         self.assertEqual(s['meta']['requested_base_sha'],'a'*40)
 
     def test_fork_metadata_and_fetch_paths(self):
+        """Read head source and build links using the contributor fork repository.
+        """
         fake, paths = self.fake()
         def fork(client, path, **kwargs):
+            """Wrap the fake endpoint and replace the pull request head owner.
+
+            Args:
+                client: Patched GitHub client receiver.
+                path: REST path requested by ingestion.
+                **kwargs: Optional request arguments forwarded to the fake.
+
+            Returns:
+                The fake response, with fork metadata changed for the PR endpoint.
+            """
             data = fake(client, path, **kwargs)
             if path.endswith('/pulls/1'): data['head']['repo']['full_name'] = 'contributor/repo'
             return data
@@ -152,17 +221,23 @@ class GitHubTransportTests(unittest.TestCase):
         self.assertTrue(any(p.startswith('/repos/contributor/repo/contents/') for p in paths))
 
     def test_paginates_all_changed_files(self):
+        """Fetch every changed-file page before compiling the snapshot.
+        """
         fake,paths=self.fake(101)
         with patch('diffstory.ingest.GitHubClient.get',new=fake):s=from_github('org/repo#1')
         self.assertEqual(len(s['fragments']),101)
         self.assertTrue(any('per_page=100&page=2' in p for p in paths))
 
     def test_incomplete_file_list_rejected(self):
+        """Reject a GitHub response that omits advertised changed files.
+        """
         fake,_=self.fake(2,returned=1)
         with patch('diffstory.ingest.GitHubClient.get',new=fake),self.assertRaisesRegex(ValueError,'complete file list'):
             from_github('org/repo#1')
 
     def test_aggregate_source_limit_stops_before_fetching_remaining_files(self):
+        """Stop source retrieval as soon as the aggregate byte limit is exceeded.
+        """
         fake, paths = self.fake(3)
         with patch('diffstory.ingest.GitHubClient.get', new=fake), self.assertRaisesRegex(ValueError, 'max-source-bytes'):
             from_github('org/repo#1', max_source_bytes=7)
@@ -170,11 +245,15 @@ class GitHubTransportTests(unittest.TestCase):
         self.assertEqual(len(content_requests), 2)
 
     def test_source_limit_cannot_raise_hard_cap_before_api_access(self):
+        """Reject a source limit above the hard cap before making any GitHub request.
+        """
         with patch('diffstory.ingest.GitHubClient.get', side_effect=AssertionError('unexpected GitHub request')):
             with self.assertRaisesRegex(ValueError, 'hard limit'):
                 from_github('org/repo#1', max_source_bytes=MAX_SNAPSHOT_SOURCE_BYTES + 1)
 
     def test_changing_revision_rejected(self):
+        """Reject a pull request whose head revision changes during source retrieval.
+        """
         fake,_=self.fake(changed_mid_read=True)
         with patch('diffstory.ingest.GitHubClient.get',new=fake),self.assertRaisesRegex(ValueError,'changed while fetching'):
             from_github('org/repo#1')

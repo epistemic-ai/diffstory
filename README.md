@@ -99,13 +99,17 @@ diffstory github 'OWNER/REPO#NUMBER' \
 ```
 
 This route runs `codex exec` with the Codex CLI's saved sign-in and default
-model. You can pass `--model MODEL_ID` to choose a Codex model. It does
-not need an OpenAI API key; access and usage follow the signed-in ChatGPT or
-workspace account. The CLI receives only the prepared evidence request, runs
-from a temporary directory with read-only access, and has local shell, browser,
-app, and plugin tools disabled. See the [Codex non-interactive mode
-documentation](https://developers.openai.com/codex/non-interactive-mode) for
-how `codex exec` uses saved authentication and structured output.
+model. You can pass `--model MODEL_ID` for a supported Codex model. Known
+overrides (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and `gpt-5.3-codex`)
+use their published context and output capacities; the CLI default is packed
+against a conservative 400,000-token context bound. Unknown overrides are
+rejected before source transfer until capacity metadata is available. This
+route does not need an OpenAI API key; access and usage follow the signed-in
+ChatGPT or workspace account. The CLI receives only the prepared evidence
+request, runs from a temporary directory with read-only access, and has local
+shell, browser, app, and plugin tools disabled. See the [Codex non-interactive
+mode documentation](https://developers.openai.com/codex/non-interactive-mode)
+for how `codex exec` uses saved authentication and structured output.
 
 Codex CLI does not expose a per-call output-token cap. Diffstory lets Codex
 complete each request, validates its structured response, and records the
@@ -114,6 +118,8 @@ input, cached input, and output token counts reported by the CLI.
 Before the first model request, Diffstory displays the destination, PR revisions, source scope, and planned request count. It asks for confirmation. Use `--yes` only when you have already approved that transfer, such as in an automation job. Without `--narrate`, GitHub ingestion still reads the PR over the network but no model request is made.
 
 Narration packs bounded evidence chunks to fit the selected model's context and uses multi-level summaries for larger changes. Long source lines are split into slices without dropping source text. After a successful run, the CLI prints provider-reported input tokens, cached input tokens, and output tokens; these totals are also stored in the annotations and report. `--max-source-bytes` can lower the hard 64 MB cap on captured source across both revisions. Excess source is rejected before narration, and the GitHub reader stops fetching files once the configured cap is exceeded.
+
+There are no run-wide token, call-count, or elapsed-time ceilings. Each individual provider call has a 15-minute timeout to prevent a stalled request from hanging indefinitely; a run may make as many calls as its source requires.
 
 Successful runs write HTML, `.report.json`, and candidate `.annotations.json` files. Each generated passage is tied to a change ID and checked against its group and source range. The generated report preserves its provider/model, revisions, measured usage, and chunk coverage, and displays a visible **model-generated · unverified** warning. It does not validate whether prose is true.
 

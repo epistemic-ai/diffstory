@@ -1,5 +1,8 @@
 """Mocked provider tests for opt-in, bounded, revision-locked narration."""
 import json
+import os
+import subprocess
+import sys
 from contextlib import redirect_stderr
 import io
 import tempfile
@@ -10,11 +13,31 @@ from unittest.mock import MagicMock, patch
 
 from diffstory.analysis import apply_annotations, compile_snapshot
 from diffstory.cli import main
-from diffstory.narrative import Narrator, OPENAI_MODEL, OPENAI_URL, OpenAIResponsesProvider
+from diffstory.narrative import (
+    CODEX_DEFAULT_CONTEXT_TOKENS,
+    CODEX_MODEL_CAPACITIES,
+    MAX_RESPONSE_BYTES,
+    PROVIDER_CALL_TIMEOUT_SECONDS,
+    CodexCLIProvider,
+    Narrator,
+    OPENAI_MODEL,
+    OPENAI_URL,
+    OpenAIResponsesProvider,
+    ProviderResponseError,
+    _run_bounded_subprocess,
+)
 from diffstory.render import render
 
 
 def snapshot(head_source="def calculate(value):\n    return value + 1\n"):
+    """Build a two-revision snapshot for a value-transforming function.
+
+    Args:
+        head_source: Optional head-side source text.
+
+    Returns:
+        A bounded ``diffstory.snapshot.v1`` mapping.
+    """
     return {
         "schema": "diffstory.snapshot.v1",
         "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40, "scope": "changed files", "changed_files": 1,
@@ -35,18 +58,52 @@ class FakeProvider:
     max_output_tokens = 128_000
 
     def __init__(self, *, mode="valid"):
+        """Configure the fake provider response mode and request log.
+
+        Args:
+            mode: ``valid`` for schema-conforming responses or ``malformed`` for an
+                intentionally incomplete leaf response.
+        """
         self.mode = mode
         self.calls = []
+        self.timeouts = []
 
     def require_credentials(self):
+        """Satisfy credential preflight without external authentication.
+
+        Returns:
+            ``None``; the fake provider never requires credentials.
+        """
         return None
 
     def prepare(self, system, data, schema_name, schema, max_output_tokens):
+        """Serialize fake provider instructions and request data.
+
+        Args:
+            system: Provider instructions.
+            data: Evidence and context payload.
+            schema_name: Structured-output schema name.
+            schema: JSON output schema.
+            max_output_tokens: Per-call output reservation.
+
+        Returns:
+            Encoded JSON request bytes.
+        """
         return json.dumps({"system": system, "data": data, "name": schema_name, "schema": schema,
                            "max_output_tokens": max_output_tokens}, separators=(",", ":")).encode()
 
     def complete(self, body, timeout):
+        """Record one fake request and return its configured structured response.
+
+        Args:
+            body: Encoded fake request.
+            timeout: Unused provider timeout.
+
+        Returns:
+            Response mapping and measured fake token usage.
+        """
         request = json.loads(body)
+        self.timeouts.append(timeout)
         data = request["data"]
         self.calls.append(request)
         if self.mode == "malformed":
@@ -87,6 +144,9 @@ class FakeProvider:
 
 class NarrativeTests(unittest.TestCase):
     def test_generation_and_report_roundtrip_keep_provenance(self):
+        """Keep revision binding, unverified labels, and evidence when generated
+        annotations are applied and rendered.
+        """
         report = compile_snapshot(snapshot())
         provider = FakeProvider()
         narrator = Narrator(provider)
@@ -107,6 +167,8 @@ class NarrativeTests(unittest.TestCase):
         self.assertIn("Model-generated narration · unverified.", render(saved))
 
     def test_large_single_group_is_split_into_stable_bounded_slices(self):
+        """Split a large group into stable bounded slices that retain complete source and coverage.
+        """
         source = "def calculate(value):\n" + "".join(f"    value = value + {n}\n" for n in range(1600)) + "    return value\n"
         report = compile_snapshot(snapshot(source))
         narrator = Narrator(FakeProvider())
@@ -126,6 +188,8 @@ class NarrativeTests(unittest.TestCase):
         self.assertEqual(generated["generation"]["covered_changes"], [report["changes"][0]["id"]])
 
     def test_oversized_single_line_is_split_without_losing_source(self):
+        """Split an oversized source line without losing or reordering any source text.
+        """
         source = "def calculate(): return '" + ("x" * 13_000) + "'\n"
         report = compile_snapshot(snapshot(source))
         provider = FakeProvider()
@@ -140,6 +204,8 @@ class NarrativeTests(unittest.TestCase):
         self.assertEqual("".join(head_fragments), report["changes"][0]["after"]["source"])
 
     def test_preview_has_no_run_token_or_call_ceilings(self):
+        """Preview the request plan without imposing arbitrary token or call ceilings.
+        """
         report = compile_snapshot(snapshot())
         preview = Narrator(FakeProvider()).preview(report)
         self.assertGreater(preview["calls"], 0)
@@ -147,6 +213,8 @@ class NarrativeTests(unittest.TestCase):
         self.assertNotIn("max_calls", preview)
 
     def test_request_capacity_tracks_model_context(self):
+        """Derive input capacity from the provider context and output reservation.
+        """
         provider = FakeProvider()
         narrator = Narrator(provider)
         self.assertEqual(
@@ -154,7 +222,19 @@ class NarrativeTests(unittest.TestCase):
             provider.context_tokens - provider.max_output_tokens,
         )
 
+    def test_provider_calls_use_finite_per_request_timeout(self):
+        """Pass a finite timeout to every provider call without run ceilings.
+        """
+        provider = FakeProvider()
+        Narrator(provider).generate(compile_snapshot(snapshot()))
+        self.assertTrue(provider.timeouts)
+        self.assertEqual(
+            set(provider.timeouts), {PROVIDER_CALL_TIMEOUT_SECONDS}
+        )
+
     def test_malformed_provider_response_does_not_create_annotation(self):
+        """Reject a provider response without valid source-bound passages.
+        """
         report = compile_snapshot(snapshot())
         provider = FakeProvider(mode="malformed")
         narrator = Narrator(provider)
@@ -163,6 +243,8 @@ class NarrativeTests(unittest.TestCase):
         self.assertEqual(len(provider.calls), 1)
 
     def test_generated_annotations_reject_wrong_revision(self):
+        """Reject generated annotations tied to a different head revision.
+        """
         report = compile_snapshot(snapshot())
         annotations = Narrator(FakeProvider()).generate(report)
         annotations["head_sha"] = "c" * 40
@@ -170,6 +252,8 @@ class NarrativeTests(unittest.TestCase):
             apply_annotations(report, annotations)
 
     def test_generated_annotations_require_all_groups_and_passages(self):
+        """Require complete group and passage coverage for generated annotations.
+        """
         report = compile_snapshot(snapshot())
         annotations = Narrator(FakeProvider()).generate(report)
         annotations["steps"][0]["passages"] = []
@@ -177,6 +261,8 @@ class NarrativeTests(unittest.TestCase):
             apply_annotations(report, annotations)
 
     def test_generated_report_rejects_stale_coverage_on_render(self):
+        """Revalidate generated coverage when rendering a saved report.
+        """
         report = compile_snapshot(snapshot())
         generated = apply_annotations(report, Narrator(FakeProvider()).generate(report))
         generated["generation"]["completed_groups"] = []
@@ -184,12 +270,16 @@ class NarrativeTests(unittest.TestCase):
             render(generated)
 
     def test_aggregate_snapshot_source_limit_is_enforced(self):
+        """Enforce the aggregate source-byte limit when compiling a snapshot.
+        """
         from unittest.mock import patch
         with patch("diffstory.analysis.MAX_SNAPSHOT_SOURCE_BYTES", 4):
             with self.assertRaisesRegex(ValueError, "aggregate limit"):
                 compile_snapshot(snapshot())
 
     def test_cli_without_narrate_never_calls_provider(self):
+        """Avoid provider calls and annotation output unless narration is requested.
+        """
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "walkthrough.html"
             snap = snapshot()
@@ -201,6 +291,8 @@ class NarrativeTests(unittest.TestCase):
             self.assertFalse(out.with_suffix(".annotations.json").exists())
 
     def test_cli_narration_requires_confirmation_before_provider_call(self):
+        """Require transfer confirmation before the first provider request.
+        """
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "walkthrough.html"
             provider = FakeProvider()
@@ -213,6 +305,8 @@ class NarrativeTests(unittest.TestCase):
             self.assertFalse(out.exists())
 
     def test_cli_opt_in_writes_candidate_and_generated_report(self):
+        """Write candidate annotations and the generated report after explicit opt-in.
+        """
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "walkthrough.html"
             provider = FakeProvider()
@@ -235,6 +329,8 @@ class NarrativeTests(unittest.TestCase):
             self.assertIn("Model-generated narration · unverified.", imported.read_text())
 
     def test_cli_provider_failure_does_not_write_a_partial_report(self):
+        """Leave report, HTML, and annotation outputs unwritten when generation fails.
+        """
         with tempfile.TemporaryDirectory() as directory:
             out = Path(directory) / "walkthrough.html"
             provider = FakeProvider(mode="malformed")
@@ -249,11 +345,231 @@ class NarrativeTests(unittest.TestCase):
             self.assertFalse(out.with_suffix(".report.json").exists())
             self.assertFalse(out.with_suffix(".annotations.json").exists())
 
+    def test_codex_model_capacity_is_not_inherited_from_openai(self):
+        """Use Codex model metadata and reject overrides without known capacity.
+        """
+        default_provider = CodexCLIProvider()
+        self.assertEqual(default_provider.context_tokens, CODEX_DEFAULT_CONTEXT_TOKENS)
+        for model, (context_tokens, output_tokens) in CODEX_MODEL_CAPACITIES.items():
+            with self.subTest(model=model):
+                provider = CodexCLIProvider(model=model)
+                self.assertEqual(provider.context_tokens, context_tokens)
+                self.assertEqual(provider.max_output_tokens, output_tokens)
+        with self.assertRaisesRegex(ValueError, "no known context capacity"):
+            CodexCLIProvider(model="unlisted-codex-model")
+
+    def test_codex_cli_uses_isolated_flags_scrubs_keys_and_parses_usage(self):
+        """Verify Codex flags, temporary cwd, key removal, JSONL, and usage.
+        """
+        schema = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+            "additionalProperties": False,
+        }
+        provider = CodexCLIProvider(model="gpt-6.1-sol")
+        body = provider.prepare("Summarize evidence.", {"source": "value"}, "summary", schema, 100)
+        events = [
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": '{"summary":"ok"}'},
+            },
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 8,
+                    "cached_input_tokens": 2,
+                    "output_tokens": 3,
+                },
+            },
+        ]
+        process = MagicMock()
+        process.stdin = MagicMock()
+        process.stdin.write.return_value = len(provider._PROMPT.encode()) + len(body)
+        process.stdout = io.BytesIO(
+            "\n".join(json.dumps(event) for event in events).encode()
+        )
+        process.wait.return_value = 0
+        process.returncode = 0
+        launch = {}
+
+        def start_process(command, **kwargs):
+            """Capture launch details while the provider temp directory exists.
+
+            Args:
+                command: Codex CLI argument vector.
+                **kwargs: Subprocess options supplied by the provider.
+
+            Returns:
+                A mocked process with prepared JSONL output.
+            """
+            launch["command"] = command
+            launch["cwd"] = kwargs["cwd"]
+            launch["environment"] = kwargs["env"].copy()
+            schema_path = Path(command[command.index("--output-schema") + 1])
+            launch["schema_path"] = str(schema_path)
+            launch["schema"] = json.loads(schema_path.read_text())
+            launch["cwd_exists"] = Path(kwargs["cwd"]).is_dir()
+            launch["options"] = kwargs
+            return process
+
+        with patch.object(provider, "require_credentials"), \
+             patch("diffstory.narrative.subprocess.Popen", side_effect=start_process), \
+             patch.dict("os.environ", {
+                 "OPENAI_API_KEY": "parent-api-key",
+                 "CODEX_API_KEY": "parent-codex-key",
+             }):
+            result, usage = provider.complete(body, 7)
+
+        command = launch["command"]
+        options = launch["options"]
+        self.assertEqual(result, {"summary": "ok"})
+        self.assertEqual(
+            usage,
+            {"input_tokens": 8, "cached_input_tokens": 2, "output_tokens": 3},
+        )
+        self.assertEqual(command[:4], ["codex", "exec", "--model", "gpt-6.1-sol"])
+        self.assertIn("--ephemeral", command)
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertIn("--json", command)
+        self.assertIn("--skip-git-repo-check", command)
+        self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+        self.assertEqual(
+            [command[index + 1] for index, arg in enumerate(command[:-1]) if arg == "--disable"],
+            [
+                "shell_tool",
+                "code_mode_host",
+                "apps",
+                "plugins",
+                "browser_use",
+                "browser_use_external",
+                "computer_use",
+                "tool_call_mcp_elicitation",
+            ],
+        )
+        self.assertEqual(options["stdin"], subprocess.PIPE)
+        self.assertEqual(options["stdout"], subprocess.PIPE)
+        self.assertEqual(options["stderr"], subprocess.DEVNULL)
+        self.assertTrue(launch["cwd_exists"])
+        self.assertTrue(Path(launch["cwd"]).name.startswith("diffstory-codex-"))
+        self.assertEqual(command[command.index("--cd") + 1], launch["cwd"])
+        self.assertEqual(launch["schema_path"], command[command.index("--output-schema") + 1])
+        self.assertEqual(launch["schema"], schema)
+        self.assertNotIn("OPENAI_API_KEY", launch["environment"])
+        self.assertNotIn("CODEX_API_KEY", launch["environment"])
+        prompt = bytes(process.stdin.write.call_args.args[0])
+        self.assertTrue(prompt.startswith(provider._PROMPT.encode()))
+        self.assertTrue(prompt.endswith(body))
+        process.wait.assert_called_once_with(timeout=7)
+        process.stdin.close.assert_called_once()
+
+    def test_codex_cli_timeout_is_passed_to_process_and_reported(self):
+        """Terminate and report a timed-out Codex subprocess request.
+        """
+        provider = CodexCLIProvider()
+        body = provider.prepare("system", {}, "summary", {"type": "object"}, 100)
+        process = MagicMock()
+        process.stdin = MagicMock()
+        process.stdin.write.return_value = len(provider._PROMPT.encode()) + len(body)
+        process.stdout = io.BytesIO(b"")
+        process.wait.side_effect = [subprocess.TimeoutExpired(["codex"], 4), -9]
+        with patch.object(provider, "require_credentials"), \
+             patch("diffstory.narrative.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(ProviderResponseError, "timed out"):
+                provider.complete(body, 4)
+        process.wait.assert_any_call(timeout=4)
+        process.kill.assert_called_once()
+
+    def test_codex_cli_stdout_is_terminated_at_the_response_limit(self):
+        """Kill a streaming child as soon as stdout exceeds the configured cap.
+        """
+        source = (
+            "import sys, time; "
+            f"sys.stdout.write('x' * {MAX_RESPONSE_BYTES + 1}); "
+            "sys.stdout.flush(); time.sleep(60)"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                ProviderResponseError,
+                f"configured {MAX_RESPONSE_BYTES:,}-byte limit",
+            ):
+                _run_bounded_subprocess(
+                    [sys.executable, "-c", source],
+                    b"",
+                    cwd=directory,
+                    environment=os.environ.copy(),
+                    timeout=5,
+                    output_limit=MAX_RESPONSE_BYTES,
+                )
+
+    def test_codex_jsonl_rejects_tool_calls_and_malformed_events(self):
+        """Reject Codex output that invokes tools or violates JSONL structure.
+        """
+        tool_events = [
+            {"type": "item.completed", "item": {"type": "command_execution"}},
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": '{"summary":"ok"}'},
+            },
+        ]
+        with self.assertRaisesRegex(ProviderResponseError, "attempted tool"):
+            CodexCLIProvider._parse_response(
+                "\n".join(json.dumps(event) for event in tool_events).encode()
+            )
+        with self.assertRaisesRegex(ProviderResponseError, "malformed JSONL"):
+            CodexCLIProvider._parse_response(b"not-json\n")
+
+    def test_codex_nonzero_exit_is_sanitized(self):
+        """Report a safe error when Codex exits unsuccessfully.
+        """
+        provider = CodexCLIProvider()
+        body = provider.prepare("system", {}, "summary", {"type": "object"}, 100)
+        process = MagicMock()
+        process.stdin = MagicMock()
+        process.stdin.write.return_value = len(provider._PROMPT.encode()) + len(body)
+        process.stdout = io.BytesIO(b"")
+        process.wait.return_value = 1
+        process.returncode = 1
+        with patch.object(provider, "require_credentials"), \
+             patch("diffstory.narrative.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(ProviderResponseError, "request failed"):
+                provider.complete(body, 7)
+
     def test_openai_adapter_uses_structured_output_and_one_attempt(self):
+        """Send one structured-output request and preserve sanitized measured usage.
+        """
         class Response:
-            def __enter__(self): return self
-            def __exit__(self, *_): return False
+            """Provide deterministic HTTP response bytes to the adapter."""
+
+            def __enter__(self):
+                """Return this fake response for use in a ``with`` block.
+
+                Returns:
+                    This response object.
+                """
+                return self
+
+            def __exit__(self, *_):
+                """Allow exceptions from the adapter to propagate.
+
+                Args:
+                    *_: Exception details supplied by the context manager.
+
+                Returns:
+                    ``False`` so an active exception is not suppressed.
+                """
+                return False
             def read(self, _limit):
+                """Return the prepared response bytes.
+
+                Args:
+                    _limit: Maximum requested number of bytes; accepted for the HTTP response
+                        interface.
+
+                Returns:
+                    The prepared HTTP response body as JSON bytes.
+                """
                 return json.dumps({"status": "completed", "output": [{"type": "message", "content": [
                     {"type": "output_text", "text": '{"summary":"ok"}'}]}],
                     "usage": {
@@ -280,6 +596,8 @@ class NarrativeTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["store"], False)
 
     def test_openai_http_error_is_sanitized(self):
+        """Hide response bodies and API keys from provider HTTP error messages.
+        """
         secret = "provider-error-secret"
         error = HTTPError(OPENAI_URL, 403, "Forbidden", {}, io.BytesIO(secret.encode()))
         opener = MagicMock()
