@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
-from collections.abc import AbstractSet, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence, Set
 from itertools import islice
 from pathlib import PurePosixPath
 from typing import Any
@@ -802,7 +802,7 @@ def dependency_edges(
 
 def ordered_components(
     nodes: Iterable[str],
-    prereqs: Mapping[str, AbstractSet[str]],
+    prereqs: Mapping[str, Set[str]],
     priority,
 ) -> tuple[Sequence[str], Sequence[Sequence[str]]]:
     """Order prerequisite components deterministically while preserving cycles.
@@ -1638,7 +1638,7 @@ def _build_group_dependencies(
 
 def _order_groups(
     groups: dict,
-    prerequisites: Mapping[str, AbstractSet[str]],
+    prerequisites: Mapping[str, Set[str]],
     symbol_edges: Sequence[dict],
     symbol_to_change: Mapping[str, str],
     changes_by_id: Mapping[str, dict],
