@@ -592,26 +592,24 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
       return {text, change_ids: [c.id]};
     });
   }
-  function passageHTML(p, renderedChanges) {
+  function passageHTML(p) {
     // Lead with the paired edits; a focused definition remains available in the block toggle.
-    const newChanges = p.change_ids.filter(id => !renderedChanges.has(id));
-    p.change_ids.forEach(id => renderedChanges.add(id));
-    const code = newChanges.length > 1 && newChanges.every(id => C.get(id)?.kind === 'moved')
-      ? blockHTML(newChanges, {view: 'diff', label: p.label, focus: p.focus})
-      : newChanges.map(id => blockHTML([id], {view: 'diff', focus: p.focus, label: p.label})).join('');
+    const changeIds = p.change_ids;
+    const code = changeIds.length > 1 && changeIds.every(id => C.get(id)?.kind === 'moved')
+      ? blockHTML(changeIds, {view: 'diff', label: p.label, focus: p.focus})
+      : changeIds.map(id => blockHTML([id], {view: 'diff', focus: p.focus, label: p.label})).join('');
     return `<div class="passage"><div class="prose">${prose(p.text)}</div>${code}</div>`;
   }
   function sectionHTML(g) {
     const n = g.narrative;
     const passages = Array.isArray(n.passages) && n.passages.length ? n.passages : defaultPassages(g);
-    const renderedChanges = new Set();
     const used = new Set(passages.flatMap(p => p.change_ids));
     const extra = g.change_ids.filter(id => !used.has(id));
     const context = [n.intent, n.why_now].filter(value => typeof value === 'string' && value.trim());
     const contextHTML = context.length
       ? `<div class="section-context">${context.map(value => `<p>${inline(value)}</p>`).join('')}</div>`
       : '';
-    return `<section class="story-section" id="${g.id}" data-story-section="${g.id}" aria-labelledby="heading-${g.id}"><header class="section-heading"><span class="section-number">${String(g.number).padStart(2, '0')}</span><h2 id="heading-${g.id}">${inline(g.title)}<a class="section-anchor" href="#${g.id}" aria-label="Link to ${esc(plainInline(g.title))}">#</a></h2></header>${contextHTML}${passages.map(p => passageHTML(p, renderedChanges)).join('')}${n.transition ? `<div class="section-end">${inline(n.transition)}</div>` : ''}${extra.length ? `<details class="section-extra" data-extra="${g.id}"><summary>Supporting changes <span>· ${extra.length}</span></summary><div class="extra-body"></div></details>` : ''}</section>`;
+    return `<section class="story-section" id="${g.id}" data-story-section="${g.id}" aria-labelledby="heading-${g.id}"><header class="section-heading"><span class="section-number">${String(g.number).padStart(2, '0')}</span><h2 id="heading-${g.id}">${inline(g.title)}<a class="section-anchor" href="#${g.id}" aria-label="Link to ${esc(plainInline(g.title))}">#</a></h2></header>${contextHTML}${passages.map(passageHTML).join('')}${n.transition ? `<div class="section-end">${inline(n.transition)}</div>` : ''}${extra.length ? `<details class="section-extra" data-extra="${g.id}"><summary>Supporting changes <span>· ${extra.length}</span></summary><div class="extra-body"></div></details>` : ''}</section>`;
   }
   function buildHeader() {
     const m = R.meta, doc = R.document || {};
