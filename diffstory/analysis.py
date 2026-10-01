@@ -12,6 +12,8 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
+from collections.abc import AbstractSet, Iterable, Mapping, Sequence
+from itertools import islice
 from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import quote
@@ -148,7 +150,9 @@ def _attr(node: ast.AST) -> str | None:
     return None
 
 
-def extract(fragment: dict, meta: dict) -> tuple[list[dict], list[dict], str | None]:
+def extract(
+    fragment: dict, meta: dict
+) -> tuple[Iterable[dict], Iterable[dict], str | None]:
     """Extract symbols, imports, and parse status from one source fragment.
 
     Classes are atomic top-level units; their methods remain in the class
@@ -220,7 +224,13 @@ def extract(fragment: dict, meta: dict) -> tuple[list[dict], list[dict], str | N
     return symbols, imports, None
 
 
-def match_symbols(before: list[dict], after: list[dict]) -> tuple[list[tuple[dict, dict, str]], list[dict], list[dict]]:
+def match_symbols(
+    before: Iterable[dict], after: Iterable[dict]
+) -> tuple[
+    Sequence[tuple[dict, dict, str]],
+    Sequence[dict],
+    Sequence[dict],
+]:
     """Match exact locations first, then unique moves, then conservative edits.
 
     Identical-body functions with multiple candidates are intentionally NOT paired.
@@ -287,7 +297,7 @@ def match_symbols(before: list[dict], after: list[dict]) -> tuple[list[tuple[dic
         ratio = difflib.SequenceMatcher(None, a["fingerprint"], b["fingerprint"], autojunk=False).ratio()
         if ratio >= .40:
             take(a, b, f"unique matching name (ignoring leading underscores)/type + AST-text similarity {ratio:.3f}; candidate correspondence, not an equivalence proof")
-    return pairs, list(old.values()), list(new.values())
+    return tuple(pairs), tuple(old.values()), tuple(new.values())
 
 
 def classify(a: dict, b: dict) -> str:
@@ -378,7 +388,9 @@ def _theme(change: dict) -> str:
     return "implementation"
 
 
-def _resolve(module: str, name: str, all_symbols: list[dict]) -> list[dict]:
+def _resolve(
+    module: str, name: str, all_symbols: Iterable[dict]
+) -> tuple[dict, ...]:
     """Find symbols matching a name in an exact or suffix-matching module.
 
     Args:
@@ -389,11 +401,23 @@ def _resolve(module: str, name: str, all_symbols: list[dict]) -> list[dict]:
     Returns:
         All matching records; callers decide whether the result is unique.
     """
-    if not module or not name or name == "*": return []
-    return [s for s in all_symbols if s["name"] == name and (module_name(s["path"]) == module or module_name(s["path"]).endswith("." + module))]
+    if not module or not name or name == "*": return ()
+    return tuple(
+        s
+        for s in all_symbols
+        if s["name"] == name
+        and (
+            module_name(s["path"]) == module
+            or module_name(s["path"]).endswith("." + module)
+        )
+    )
 
 
-def dependency_edges(symbols: list[dict], imports_by_path: dict[str, list[dict]], meta: dict) -> tuple[list[dict], list[dict]]:
+def dependency_edges(
+    symbols: Sequence[dict],
+    imports_by_path: Mapping[str, Sequence[dict]],
+    meta: dict,
+) -> tuple[list[dict], list[dict]]:
     """Resolve conservative static references into source-evidence edges.
 
     Only unambiguous top-level imports and local declarations are followed;
@@ -454,7 +478,11 @@ def dependency_edges(symbols: list[dict], imports_by_path: dict[str, list[dict]]
     return edges, unresolved
 
 
-def ordered_components(nodes: list[str], prereqs: dict[str, set[str]], priority) -> tuple[list[str], list[list[str]]]:
+def ordered_components(
+    nodes: Iterable[str],
+    prereqs: Mapping[str, AbstractSet[str]],
+    priority,
+) -> tuple[list[str], list[list[str]]]:
     """Order prerequisite components deterministically while preserving cycles.
 
     Args:
@@ -496,7 +524,7 @@ def ordered_components(nodes: list[str], prereqs: dict[str, set[str]], priority)
     return order, [sorted(c) for c in comps if len(c) > 1]
 
 
-def _narrative(group: dict, changes: list[dict]) -> dict:
+def _narrative(group: dict, changes: Sequence[dict]) -> dict:
     """Build deterministic review guidance for a compiled change group.
 
     Args:
@@ -508,7 +536,10 @@ def _narrative(group: dict, changes: list[dict]) -> dict:
         questions, and deterministic provenance. It does not claim test results.
     """
     kinds = {c["kind"] for c in changes}
-    names = [(c.get("after") or c.get("before") or {}).get("name", "file context") for c in changes]
+    names = ", ".join(
+        (c.get("after") or c.get("before") or {}).get("name", "file context")
+        for c in islice(changes, 4)
+    )
     move = any(k in kinds for k in ("moved", "moved_renamed", "moved_modified"))
     theme = group["theme"]
     intent = f"Follow {theme} in {PurePosixPath(group['path']).name}."
@@ -532,7 +563,7 @@ def _narrative(group: dict, changes: list[dict]) -> dict:
     return {"intent": intent, "why_now": "Read its prerequisites first, then follow the source references into this step.",
             "before": "; ".join(sorted({(c.get("before") or {}).get("path", "No base definition in this unit") for c in changes})),
             "after": "; ".join(sorted({(c.get("after") or {}).get("path", "No head definition in this unit") for c in changes})),
-            "takeaway": f"You have inspected {len(changes)} change unit(s) concerning {', '.join(names[:4])}{' and related symbols' if len(names)>4 else ''}.",
+            "takeaway": f"You have inspected {len(changes)} change unit(s) concerning {names}{' and related symbols' if len(changes)>4 else ''}.",
             "invariants": invariants, "questions": questions, "provenance": "deterministic evidence template"}
 
 
@@ -734,7 +765,18 @@ def compile_snapshot(snapshot: dict) -> dict:
             if consumer in local and provider in local and consumer != provider: deps[consumer].add(provider)
         order_units, _ = ordered_components(group["change_ids"], deps, lambda cid: ((by_change[cid].get("after") or by_change[cid].get("before"))["start"], cid))
         group["change_ids"] = order_units
-    order, cycles = ordered_components(list(groups), prerequisites, lambda gid: (weights.get(groups[gid]["theme"], 5), -len(imports["head"].get(groups[gid]["path"], [])) if groups[gid]["theme"] == "wiring" else 0, groups[gid]["path"], gid))
+    order, cycles = ordered_components(
+        groups,
+        prerequisites,
+        lambda gid: (
+            weights.get(groups[gid]["theme"], 5),
+            -len(imports["head"].get(groups[gid]["path"], []))
+            if groups[gid]["theme"] == "wiring"
+            else 0,
+            groups[gid]["path"],
+            gid,
+        ),
+    )
     for index, gid in enumerate(order):
         g = groups[gid]; g["number"] = index + 1; g["prerequisites"] = sorted(prerequisites[gid])
         g["narrative"] = _narrative(g, [by_change[c] for c in g["change_ids"]])
@@ -900,7 +942,9 @@ def _generation_ids(generation: dict, field: str) -> list[str]:
     return value
 
 
-def _validate_group_order(group_order: list[str], groups: list[dict]) -> None:
+def _validate_group_order(
+    group_order: list[str], groups: Sequence[dict]
+) -> None:
     """Require every group once, prerequisites first, and cycles adjacent.
 
     Args:
@@ -1002,7 +1046,7 @@ def _validate_generation_usage(usage: dict) -> None:
 
 def _validate_chunk_coverage(
     generation: dict,
-    expected_chunks: list[str],
+    expected_chunks: Sequence[str],
     groups: dict[str, dict],
     change_map: dict[str, dict],
 ) -> None:

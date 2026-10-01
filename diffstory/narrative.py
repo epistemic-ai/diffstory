@@ -12,7 +12,7 @@ import threading
 from dataclasses import dataclass
 from http.client import HTTPException
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Iterator, Mapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -132,7 +132,7 @@ _DOC_SYSTEM = (
 )
 
 
-def _object(properties: dict, required: list[str] | None = None) -> dict:
+def _object(properties: dict, required: Sequence[str] | None = None) -> dict:
     """Build a strict JSON Schema object definition.
 
     Args:
@@ -145,7 +145,7 @@ def _object(properties: dict, required: list[str] | None = None) -> dict:
     return {
         "type": "object",
         "properties": properties,
-        "required": required or list(properties),
+        "required": list(required) if required is not None else list(properties),
         "additionalProperties": False,
     }
 
@@ -811,7 +811,7 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
 
 
 def _run_bounded_subprocess(
-    command: list[str],
+    command: Sequence[str],
     prompt: bytes,
     *,
     cwd: str,
@@ -1008,33 +1008,33 @@ class EvidenceChunk:
     pieces: tuple[dict, ...]
 
     @property
-    def change_ids(self) -> list[str]:
+    def change_ids(self) -> tuple[str, ...]:
         """Return sorted unique change IDs represented in this chunk.
 
         Returns:
             Unique IDs from all pieces in ascending lexical order.
         """
-        return sorted({piece["change_id"] for piece in self.pieces})
+        return tuple(sorted({piece["change_id"] for piece in self.pieces}))
 
     @property
-    def source_slices(self) -> list[dict]:
+    def source_slices(self) -> tuple[dict, ...]:
         """Return source-line coverage records for primary and paired slices.
 
         Returns:
             Existing primary and counterpart references in piece order.
         """
-        slices = []
-        for piece in self.pieces:
+        return tuple(
+            source_slice
+            for piece in self.pieces
             for source_slice in (
                 piece.get("source_slice"),
                 piece.get("counterpart_slice"),
-            ):
-                if source_slice:
-                    slices.append(source_slice)
-        return slices
+            )
+            if source_slice
+        )
 
 
-def _split_source(source_info: dict | None) -> list[dict]:
+def _split_source(source_info: dict | None) -> tuple[dict, ...]:
     """Split source into bounded slices while preserving complete source text.
 
     Args:
@@ -1046,7 +1046,7 @@ def _split_source(source_info: dict | None) -> list[dict]:
         per-slice byte limit. Original line ranges are retained.
     """
     if not source_info or not isinstance(source_info.get("source"), str):
-        return []
+        return ()
 
     source = source_info["source"]
     lines = source.splitlines(keepends=True)
@@ -1117,10 +1117,10 @@ def _split_source(source_info: dict | None) -> list[dict]:
                 "source": "",
             }
         )
-    return parts
+    return tuple(parts)
 
 
-def _split_long_line(line: str) -> list[str]:
+def _split_long_line(line: str) -> Iterator[str]:
     """Partition a long line by UTF-8 size without splitting code points.
 
     Args:
@@ -1129,20 +1129,18 @@ def _split_long_line(line: str) -> list[str]:
     Returns:
         Consecutive text pieces, each no larger than the configured limit.
     """
-    pieces = []
     current = []
     current_bytes = 0
     for character in line:
         character_bytes = len(character.encode("utf-8"))
         if current and current_bytes + character_bytes > MAX_SOURCE_SLICE_BYTES:
-            pieces.append("".join(current))
+            yield "".join(current)
             current = []
             current_bytes = 0
         current.append(character)
         current_bytes += character_bytes
     if current:
-        pieces.append("".join(current))
-    return pieces
+        yield "".join(current)
 
 
 def _source_record(
@@ -1418,7 +1416,7 @@ class Narrator:
         body = self._body(system, data, schema_name, schema, output)
         return self._estimate_input(body) <= self.capacity.input_upper_bound
 
-    def _source_pieces(self, group: dict, change: dict) -> list[dict]:
+    def _source_pieces(self, group: dict, change: dict) -> Iterator[dict]:
         """Build stable narration pieces from a change's paired source slices.
 
         Args:
@@ -1439,16 +1437,17 @@ class Narrator:
             "after": self._source_metadata(change.get("after")),
         }
         if not preferred or not isinstance(preferred.get("source"), str):
-            return [self._metadata_piece(group, change, change_stub)]
+            yield self._metadata_piece(group, change, change_stub)
+            return
         preferred_side = "head" if change.get("after") else "base"
         other = change.get("before") if change.get("after") else change.get("after")
         preferred_segments = _split_source(preferred)
         other_segments = _split_source(other)
         if not preferred_segments:
-            return [self._metadata_piece(group, change, change_stub)]
+            yield self._metadata_piece(group, change, change_stub)
+            return
 
         piece_count = max(len(preferred_segments), len(other_segments), 1)
-        pieces = []
         for index in range(piece_count):
             primary = preferred_segments[index] if index < len(preferred_segments) else None
             secondary = other_segments[index] if index < len(other_segments) else None
@@ -1492,22 +1491,19 @@ class Narrator:
                 (counterpart or {}).get("part", 0),
                 (counterpart or {}).get("start", ""),
             )
-            pieces.append(
-                {
-                    "id": piece_id,
-                    "change_id": change["id"],
-                    "change": change_stub,
-                    "source": src,
-                    "counterpart": counterpart,
-                    "source_slice": self._slice_reference(change["id"], src),
-                    "counterpart_slice": (
-                        self._slice_reference(change["id"], counterpart)
-                        if counterpart
-                        else None
-                    ),
-                }
-            )
-        return pieces
+            yield {
+                "id": piece_id,
+                "change_id": change["id"],
+                "change": change_stub,
+                "source": src,
+                "counterpart": counterpart,
+                "source_slice": self._slice_reference(change["id"], src),
+                "counterpart_slice": (
+                    self._slice_reference(change["id"], counterpart)
+                    if counterpart
+                    else None
+                ),
+            }
 
     @staticmethod
     def _source_metadata(source: dict | None) -> dict | None:
@@ -1603,7 +1599,7 @@ class Narrator:
     @staticmethod
     def _step_input(
         report: dict,
-        story_groups: list[dict],
+        story_groups: Sequence[dict],
         index: int,
         group_summaries: dict[str, str],
         document_summary: str,
@@ -1708,7 +1704,7 @@ class Narrator:
         }
 
     @staticmethod
-    def _story_groups(report: dict, proposed_order: Any) -> list[dict]:
+    def _story_groups(report: dict, proposed_order: Any) -> tuple[dict, ...]:
         """Apply a valid provider order while enforcing prerequisite constraints.
 
         Args:
@@ -1747,10 +1743,10 @@ class Narrator:
             prerequisites,
             lambda group_id: (preference[group_id], baseline[group_id], group_id),
         )
-        return [group_map[group_id] for group_id in ordered_ids]
+        return tuple(group_map[group_id] for group_id in ordered_ids)
 
     @staticmethod
-    def _reading_path(story_groups: list[dict]) -> list[dict]:
+    def _reading_path(story_groups: Sequence[dict]) -> list[dict]:
         """Project ordered groups into the public reading-path representation.
 
         Args:
@@ -1839,7 +1835,7 @@ class Narrator:
         chunk: EvidenceChunk,
         group: dict,
         change_map: dict[str, dict],
-    ) -> tuple[str, list[dict], dict]:
+    ) -> tuple[str, Sequence[dict], dict]:
         """Generate and validate source-bound prose for one evidence chunk.
 
         Missing citations receive one bounded repair call before the complete
@@ -1860,7 +1856,7 @@ class Narrator:
         data = {
             "chunk_id": chunk.id,
             "group": self._group_context(group),
-            "pieces": list(chunk.pieces),
+            "pieces": chunk.pieces,
         }
         response = self._call(
             _LEAF_SYSTEM,
@@ -1896,7 +1892,7 @@ class Narrator:
                     "chunk_id": repair_chunk.id,
                     "group": self._group_context(group),
                     "required_change_ids": missing,
-                    "pieces": list(repair_chunk.pieces),
+                    "pieces": repair_chunk.pieces,
                 },
                 "diffstory_chunk",
                 _LEAF_SCHEMA,
@@ -1931,13 +1927,13 @@ class Narrator:
         manifest_entry = {
             "id": chunk.id,
             "group_id": chunk.group_id,
-            "change_ids": chunk.change_ids,
-            "source_slices": chunk.source_slices,
+            "change_ids": list(chunk.change_ids),
+            "source_slices": list(chunk.source_slices),
             "status": "complete",
         }
         return summary, passages, manifest_entry
 
-    def _chunks(self, report: dict) -> list[EvidenceChunk]:
+    def _chunks(self, report: dict) -> Sequence[EvidenceChunk]:
         """Pack each group's source pieces into stable model-context chunks.
 
         Args:
@@ -1955,9 +1951,6 @@ class Narrator:
         changes = {change["id"]: change for change in report["changes"]}
         for group in report["groups"]:
             group_context = self._group_context(group)
-            entries = []
-            for change_id in group["change_ids"]:
-                entries.extend(self._source_pieces(group, changes[change_id]))
             current: list[dict] = []
 
             def flush() -> None:
@@ -1970,15 +1963,18 @@ class Narrator:
                 """
                 if not current:
                     return
-                piece_ids = [piece["id"] for piece in current]
                 chunk_id = stable_id(
-                    "narrative-chunk", base, head, group["id"], *piece_ids
+                    "narrative-chunk",
+                    base,
+                    head,
+                    group["id"],
+                    *(piece["id"] for piece in current),
                 )
                 chunk = EvidenceChunk(chunk_id, group["id"], tuple(current))
                 payload = {
                     "chunk_id": chunk.id,
                     "group": group_context,
-                    "pieces": list(chunk.pieces),
+                    "pieces": chunk.pieces,
                 }
                 if not self._fits(
                     _LEAF_SYSTEM,
@@ -1991,11 +1987,19 @@ class Narrator:
                 result.append(chunk)
                 current.clear()
 
-            for piece in entries:
+            pieces = (
+                piece
+                for change_id in group["change_ids"]
+                for piece in self._source_pieces(group, changes[change_id])
+            )
+            for piece in pieces:
                 proposed = current + [piece]
-                piece_ids = [item["id"] for item in proposed]
                 proposed_id = stable_id(
-                    "narrative-chunk", base, head, group["id"], *piece_ids
+                    "narrative-chunk",
+                    base,
+                    head,
+                    group["id"],
+                    *(item["id"] for item in proposed),
                 )
                 payload = {
                     "chunk_id": proposed_id,
@@ -2026,7 +2030,7 @@ class Narrator:
                     payload,
                     "diffstory_chunk",
                     _LEAF_SCHEMA,
-                    self._leaf_output([piece["change_id"]]),
+                    self._leaf_output((piece["change_id"],)),
                 ):
                     raise ValueError(
                         "One source evidence slice exceeds the selected model context; "
@@ -2105,7 +2109,7 @@ class Narrator:
     def _check_passage(
         passage: dict,
         expected: set[str],
-        ranges: dict[str, list[tuple[int, int, bool, bool]]],
+        ranges: Mapping[str, Sequence[tuple[int, int, bool, bool]]],
         chunk_id: str,
     ) -> dict:
         """Validate one passage's citations, view, and optional source focus.
@@ -2207,7 +2211,9 @@ class Narrator:
             raise ValueError("Provider returned an invalid hierarchical summary")
         return summary.strip()
 
-    def _summary_batches(self, summaries: list[dict], scope: dict) -> list[list[dict]]:
+    def _summary_batches(
+        self, summaries: Iterable[dict], scope: dict
+    ) -> Sequence[Sequence[dict]]:
         """Greedily partition summaries into requests that fit model context.
 
         Args:
@@ -2251,7 +2257,7 @@ class Narrator:
             batches.append(current)
         return batches
 
-    def _reduce_summaries(self, summaries: list[dict], scope: dict) -> str:
+    def _reduce_summaries(self, summaries: Sequence[dict], scope: dict) -> str:
         """Reduce many bounded summaries until they form one overview.
 
         Args:
@@ -2503,17 +2509,50 @@ class Narrator:
         chunks = self._chunks(report)
         groups = report["groups"]
         group_map = {group["id"]: group for group in groups}
-        chunks_by_group = {group_id: [] for group_id in group_map}
+        chunk_counts_by_group = {group_id: 0 for group_id in group_map}
         for chunk in chunks:
-            chunks_by_group[chunk.group_id].append(chunk)
+            chunk_counts_by_group[chunk.group_id] += 1
 
-        calls: list[tuple[str, dict, str, dict, int]] = []
+        call_count = 0
+
+        def check_call(
+            system: str,
+            data: dict,
+            schema_name: str,
+            schema: dict,
+            output: int,
+        ) -> None:
+            """Validate one planned request against provider input capacity.
+
+            Args:
+                system: System instructions sent with the request.
+                data: Request payload.
+                schema_name: Provider format name.
+                schema: Strict output schema.
+                output: Reserved output tokens.
+
+            Side Effects:
+                Increments the local planned-call count after validation.
+
+            Raises:
+                ValueError: If the request exceeds the selected context.
+            """
+            nonlocal call_count
+            body = self._body(system, data, schema_name, schema, output)
+            input_bound = self._estimate_input(body)
+            if input_bound > self.capacity.input_upper_bound:
+                raise ValueError(
+                    "A narration request exceeds the selected model context; "
+                    "no provider request was sent"
+                )
+            call_count += 1
+
         for chunk in chunks:
             group = group_map[chunk.group_id]
             data = {
                 "chunk_id": chunk.id,
                 "group": self._group_context(group),
-                "pieces": list(chunk.pieces),
+                "pieces": chunk.pieces,
             }
             repair_data = {
                 "chunk_id": stable_id(
@@ -2521,7 +2560,7 @@ class Narrator:
                 ),
                 "group": self._group_context(group),
                 "required_change_ids": chunk.change_ids,
-                "pieces": list(chunk.pieces),
+                "pieces": chunk.pieces,
             }
             if not self._fits(
                 _LEAF_SYSTEM,
@@ -2534,14 +2573,12 @@ class Narrator:
                     "A citation repair request exceeds the selected model context; "
                     "no provider request was sent"
                 )
-            calls.append(
-                (
-                    _LEAF_SYSTEM,
-                    data,
-                    "diffstory_chunk",
-                    _LEAF_SCHEMA,
-                    self._leaf_output(chunk.change_ids),
-                )
+            check_call(
+                _LEAF_SYSTEM,
+                data,
+                "diffstory_chunk",
+                _LEAF_SCHEMA,
+                self._leaf_output(chunk.change_ids),
             )
 
         def plan_reduction(count: int, scope: dict) -> str:
@@ -2555,16 +2592,16 @@ class Narrator:
                 Placeholder text representing the planned reduced summary.
 
             Side Effects:
-                Appends required summary requests to the outer local ``calls``
-                plan; does not contact the provider.
+                Validates planned requests and counts them without contacting
+                the provider.
 
             Raises:
                 ValueError: If repeated reduction cannot shrink within context.
             """
-            planned_summaries = [
+            planned_summaries = tuple(
                 {"chunk_id": "c" * 16, "summary": "x" * MAX_SUMMARY_CHARS}
                 for _ in range(count)
-            ]
+            )
             if not planned_summaries:
                 return "No source changes were supplied."
 
@@ -2573,42 +2610,38 @@ class Narrator:
                 if len(batches) == 1:
                     if len(planned_summaries) == 1:
                         return planned_summaries[0]["summary"]
-                    calls.append(
-                        (
-                            _SUMMARY_SYSTEM,
-                            {"scope": scope, "observations": batches[0]},
-                            "diffstory_summary",
-                            _SUMMARY_SCHEMA,
-                            self._summary_output(),
-                        )
+                    check_call(
+                        _SUMMARY_SYSTEM,
+                        {"scope": scope, "observations": batches[0]},
+                        "diffstory_summary",
+                        _SUMMARY_SCHEMA,
+                        self._summary_output(),
                     )
                     return "x" * MAX_SUMMARY_CHARS
 
-                calls.extend(
-                    (
+                for batch in batches:
+                    check_call(
                         _SUMMARY_SYSTEM,
                         {"scope": scope, "observations": batch},
                         "diffstory_summary",
                         _SUMMARY_SCHEMA,
                         self._summary_output(),
                     )
-                    for batch in batches
-                )
                 if len(batches) >= len(planned_summaries):
                     raise ValueError(
                         "Narrative reduction cannot fit its summaries within the selected model context"
                     )
-                planned_summaries = [
+                planned_summaries = tuple(
                     {"chunk_id": "c" * 16, "summary": "x" * MAX_SUMMARY_CHARS}
                     for _ in batches
-                ]
+                )
 
         group_summaries = {}
         for group in groups:
             group_id = group["id"]
             scope = {"group_id": group_id, "title": group["title"]}
             group_summaries[group_id] = plan_reduction(
-                len(chunks_by_group[group_id]),
+                chunk_counts_by_group[group_id],
                 scope,
             )
 
@@ -2618,14 +2651,12 @@ class Narrator:
         )
 
         order_data = self._order_input(report, group_summaries, document_summary)
-        calls.append(
-            (
-                _ORDER_SYSTEM,
-                order_data,
-                "diffstory_story_order",
-                _ORDER_SCHEMA,
-                self._order_output(group["id"] for group in groups),
-            )
+        check_call(
+            _ORDER_SYSTEM,
+            order_data,
+            "diffstory_story_order",
+            _ORDER_SCHEMA,
+            self._order_output(group["id"] for group in groups),
         )
 
         longest_title = max(
@@ -2643,44 +2674,31 @@ class Narrator:
                 neighbor = {"title": longest_title, "summary": "x" * 700}
                 data["previous"] = neighbor
                 data["next"] = neighbor
-            calls.append(
-                (
-                    _STEP_SYSTEM,
-                    data,
-                    "diffstory_step",
-                    _STEP_SCHEMA,
-                    self._step_output(),
-                )
+            check_call(
+                _STEP_SYSTEM,
+                data,
+                "diffstory_step",
+                _STEP_SCHEMA,
+                self._step_output(),
             )
 
         meta = report["meta"]
-        calls.append(
-            (
-                _DOC_SYSTEM,
-                {
-                    "summary": document_summary,
-                    "pull_request": self._pull_request_context(meta),
-                    "reading_path": self._reading_path(groups),
-                },
-                "diffstory_document",
-                _DOCUMENT_SCHEMA,
-                self._document_output(),
-            )
+        check_call(
+            _DOC_SYSTEM,
+            {
+                "summary": document_summary,
+                "pull_request": self._pull_request_context(meta),
+                "reading_path": self._reading_path(groups),
+            },
+            "diffstory_document",
+            _DOCUMENT_SCHEMA,
+            self._document_output(),
         )
-
-        for system, data, schema_name, schema, output in calls:
-            body = self._body(system, data, schema_name, schema, output)
-            input_bound = self._estimate_input(body)
-            if input_bound > self.capacity.input_upper_bound:
-                raise ValueError(
-                    "A narration request exceeds the selected model context; "
-                    "no provider request was sent"
-                )
 
         preview = {
             "chunks": len(chunks),
             "groups": len(groups),
-            "calls": len(calls),
+            "calls": call_count,
             "conditional_calls": len(chunks),
         }
         self._preflight_signature = self._report_signature(report)
