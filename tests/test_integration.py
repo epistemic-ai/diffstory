@@ -4,6 +4,7 @@ import base64
 import copy
 import io
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -208,7 +209,7 @@ class GitHubAuthTests(unittest.TestCase):
         )
         self.assertEqual(_github_token("GITHUB_TOKEN"), "from-gh")
         run.assert_called_once_with(
-            ["gh", "auth", "token"],
+            [shutil.which("gh") or "gh", "auth", "token"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=10,
