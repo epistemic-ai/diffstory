@@ -1,4 +1,5 @@
 """Build a reproducible, entirely synthetic walkthrough. No repository/network access."""
+
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +9,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from diffstory.analysis import compile_snapshot, apply_annotations
+from diffstory.analysis import apply_annotations
+from diffstory.analysis import compile_snapshot
 from diffstory.render import render
 
 LABEL = '''def normalize_label(value: str) -> str:
@@ -121,12 +123,12 @@ PARSE_HEAD = '''def parse_record(row):
     populate_metrics(row, result)
     return result
 '''
-RUN_BASE = '''def get_records(connection, term: str, limit: int = 25):
+RUN_BASE = """def get_records(connection, term: str, limit: int = 25):
     statement, parameters = construct_query(term, limit)
     rows = connection.execute(statement, parameters)
     parsed = [parse_record(row) for row in rows]
     return list(merge_records(parsed))
-'''
+"""
 RUN_HEAD = '''def get_records(connection, term: str, limit: int = 25):
     """Build, execute, interpret, then deduplicate a single catalog page."""
     statement, parameters = construct_query(term, limit)
@@ -135,7 +137,7 @@ RUN_HEAD = '''def get_records(connection, term: str, limit: int = 25):
     records = [parse_record(row) for row in rows]
     return list(merge_records(records))
 '''
-TEST_QUERY = '''from catalog.query import construct_query
+TEST_QUERY = """from catalog.query import construct_query
 
 
 def test_query_default():
@@ -160,8 +162,8 @@ def test_page_size_boundaries():
         except ValueError:
             continue
         raise AssertionError(f"unexpectedly accepted {limit!r}")
-'''
-TEST_PARSE = '''from catalog.parsing import parse_record, parse_tags
+"""
+TEST_PARSE = """from catalog.parsing import parse_record, parse_tags
 from catalog.merge import merge_records
 
 
@@ -184,108 +186,224 @@ def test_first_record_wins():
     first = {"id": "7", "label": "First"}
     later = {"id": "7", "label": "Later"}
     assert list(merge_records([first, later])) == [first]
-'''
+"""
 
 
-def demo_snapshot():
+def demo_snapshot() -> dict:
+    """Build the entirely synthetic base/head source snapshot for the demo.
+
+    Returns:
+        A ``diffstory.snapshot.v1`` mapping with catalog examples, tests, and
+        explicit synthetic-source metadata.
+
+    Side Effects:
+        None. The fixture is assembled in memory and performs no repository or
+        network reads.
+    """
     before = {
-        "catalog/search.py": '\n\n'.join([LABEL, TAGS, MERGE, QUERY_BASE, PARSE_BASE, RUN_BASE]),
+        "catalog/search.py": f"{LABEL}\n\n{TAGS}\n\n{MERGE}\n\n{QUERY_BASE}\n\n{PARSE_BASE}\n\n{RUN_BASE}",
         "tools/export.py": 'from catalog.search import split_tags\n\n\ndef export_tags(value):\n    return ";".join(split_tags(value))\n',
     }
     after = {
         "catalog/labels.py": LABEL,
         "catalog/query.py": QUERY_HEAD,
         "catalog/merge.py": MERGE,
-        "catalog/parsing.py": 'from catalog.labels import normalize_label\n\n\n' + TAGS.replace('def split_tags(', 'def parse_tags(') + '\n\n' + METRICS + '\n\n' + PARSE_HEAD,
-        "catalog/search.py": 'from catalog.query import construct_query\nfrom catalog.parsing import parse_record\nfrom catalog.merge import merge_records\n\n\n' + RUN_HEAD,
+        "catalog/parsing.py": "from catalog.labels import normalize_label\n\n\n"
+        + TAGS.replace("def split_tags(", "def parse_tags(")
+        + "\n\n"
+        + METRICS
+        + "\n\n"
+        + PARSE_HEAD,
+        "catalog/search.py": "from catalog.query import construct_query\nfrom catalog.parsing import parse_record\nfrom catalog.merge import merge_records\n\n\n"
+        + RUN_HEAD,
         "tools/export.py": 'from catalog.parsing import parse_tags\n\n\ndef export_tags(value):\n    return ";".join(parse_tags(value))\n',
         "tests/test_query.py": TEST_QUERY,
         "tests/test_parsing.py": TEST_PARSE,
     }
-    digest = lambda source: hashlib.sha1(json.dumps(source, sort_keys=True).encode()).hexdigest()
+
+    def digest(source: dict[str, str]) -> str:
+        """Return a stable SHA-256 digest for one synthetic revision mapping.
+
+        Args:
+            source: Synthetic path-to-source mapping for a revision.
+
+        Returns:
+            Hexadecimal SHA-256 digest of sorted JSON source data.
+        """
+        return hashlib.sha256(
+            json.dumps(source, sort_keys=True).encode(),
+        ).hexdigest()
+
     return {
         "schema": "diffstory.snapshot.v1",
         "meta": {
             "title": "One search module. Three clear responsibilities.",
             "repository": "Synthetic catalog",
-            "base_sha": digest(before), "head_sha": digest(after),
-            "scope": "changed files", "input": "synthetic example",
+            "base_sha": digest(before),
+            "head_sha": digest(after),
+            "scope": "changed files",
+            "input": "synthetic example",
             "comparison": "original synthetic before/after sources",
             "changed_files": len(before.keys() | after.keys()),
             "description": "An original catalog-search example for this open-source project. No private source or real customer data. The query page-size validation is an intentional behavior change.",
             "validation": "Test source is provided for explanation. Diffstory does not execute or assert results for those tests.",
         },
-        "fragments": [{"path": path, "side": side, "text": code, "start_line": 1, "scope": "full"}
-                      for side, files in (("base", before), ("head", after)) for path, code in sorted(files.items())],
+        "fragments": [
+            {
+                "path": path,
+                "side": side,
+                "text": code,
+                "start_line": 1,
+                "scope": "full",
+            }
+            for side, files in (("base", before), ("head", after))
+            for path, code in sorted(files.items())
+        ],
         "warnings": [],
     }
 
 
 EXPLANATIONS = {
-    'construct_query': ('A move can also change the contract', 'The query builder moves out of the search module, but this is **not an unchanged extraction**. It now rejects page sizes outside 1–100, non-integers, and booleans. The SQL still uses bound parameters. Read the actual delta before treating the new module as a mechanical move.', 'diff'),
-    'normalize_label': ('Give labels one small, predictable rule', 'One of the smallest dependencies is the label rule. `normalize_label` collapses whitespace and preserves case. The declaration moves unchanged to `catalog/labels.py`. Showing it once makes the rule easier to inspect than a deletion followed by an identical addition.', 'definition'),
-    'parse_tags': ('Rename the helper, not its behavior', '`split_tags` becomes `parse_tags` in the parsing module. Empty fields disappear, tags become lowercase, and source order—including duplicates—survives. Only the declaration name changes; internal names and literal values still participate in the structural comparison.', 'definition'),
-    'populate_metrics': ('Extract a rule with observable edge cases', 'The click-rate calculation is now a shared helper. A missing or zero view count leaves the existing result unchanged. A nonzero view count produces a ratio rounded to four decimal places. This helper is newly declared; its calculation was previously inline, so “new definition” does not mean “new behavior.”', 'definition'),
-    'parse_record': ('Assemble the same public record', 'The parsing boundary brings those rules together. It still returns the same four fields, but delegates label normalization, tag parsing, and metrics. Compare the helper calls as well as the output keys: an unchanged shape is not sufficient evidence of unchanged values.', 'diff'),
-    'merge_records': ('Preserve which duplicate wins', 'This generator moves intact into `catalog/merge.py`. Its rule is first-record-wins, not last-record-wins. Encounter order therefore remains part of the API even though the function now lives in a different module.', 'definition'),
-    'get_records': ('Return to the caller with the pieces understood', 'Now the entry point is readable as a sequence: construct a query, execute it, interpret each row, and merge duplicates. It still materializes the parsed rows before merging. The tighter page-size rule reaches users through this call; it must not be hidden under the refactor label.', 'definition'),
-    'export_tags': ('Follow the boundary beyond the main caller', 'The export utility must follow the renamed parser. Its separator is still a semicolon, and tag normalization comes from the same implementation as the catalog path. This is the kind of small consumer update that can be missed when review stops at the new modules.', 'diff'),
+    "construct_query": (
+        "A move can also change the contract",
+        "The query builder moves out of the search module, but this is **not an unchanged extraction**. It now rejects page sizes outside 1 to 100, non-integers, and booleans. The SQL still uses bound parameters. Read the actual delta before treating the new module as a mechanical move.",
+        "diff",
+    ),
+    "normalize_label": (
+        "Give labels one small, predictable rule",
+        "One of the smallest dependencies is the label rule. `normalize_label` collapses whitespace and preserves case. The declaration moves unchanged to `catalog/labels.py`. Showing it once makes the rule easier to inspect than a deletion followed by an identical addition.",
+        "definition",
+    ),
+    "parse_tags": (
+        "Rename the helper, not its behavior",
+        "`split_tags` becomes `parse_tags` in the parsing module. Empty fields disappear, tags become lowercase, and source order—including duplicates—survives. Only the declaration name changes; internal names and literal values still participate in the structural comparison.",
+        "definition",
+    ),
+    "populate_metrics": (
+        "Extract a rule with observable edge cases",
+        "The click-rate calculation is now a shared helper. A missing or zero view count leaves the existing result unchanged. A nonzero view count produces a ratio rounded to four decimal places. This helper is newly declared; its calculation was previously inline, so “new definition” does not mean “new behavior.”",
+        "definition",
+    ),
+    "parse_record": (
+        "Assemble the same public record",
+        "The parsing boundary brings those rules together. It still returns the same four fields, but delegates label normalization, tag parsing, and metrics. Compare the helper calls as well as the output keys: an unchanged shape is not sufficient evidence of unchanged values.",
+        "diff",
+    ),
+    "merge_records": (
+        "Preserve which duplicate wins",
+        "This generator moves intact into `catalog/merge.py`. Its rule is first-record-wins, not last-record-wins. Encounter order therefore remains part of the API even though the function now lives in a different module.",
+        "definition",
+    ),
+    "get_records": (
+        "Return to the caller with the pieces understood",
+        "Now the entry point is readable as a sequence: construct a query, execute it, interpret each row, and merge duplicates. It still materializes the parsed rows before merging. The tighter page-size rule reaches users through this call; it must not be hidden under the refactor label.",
+        "definition",
+    ),
+    "export_tags": (
+        "Follow the boundary beyond the main caller",
+        "The export utility must follow the renamed parser. Its separator is still a semicolon, and tag normalization comes from the same implementation as the catalog path. This is the kind of small consumer update that can be missed when review stops at the new modules.",
+        "diff",
+    ),
 }
 
 
-def demo_annotations(report):
-    by_id = {c['id']: c for c in report['changes']}
+def demo_annotations(report: dict) -> dict:
+    """Create authored walkthrough annotations for the synthetic report.
+
+    Args:
+        report: Compiled report produced from :func:`demo_snapshot`.
+
+    Returns:
+        Revision-bound annotations with source-citing passages and document
+        opening and closing text.
+
+    Raises:
+        KeyError: If the report does not contain expected example changes or
+            revision metadata.
+    """
+    by_id = {c["id"]: c for c in report["changes"]}
     steps = []
-    for group in report['groups']:
+    for group in report["groups"]:
         passages = []
         title = None
-        for cid in group['change_ids']:
-            c = by_id[cid]; sym = c.get('after') or c.get('before'); name = sym['name']
+        for cid in group["change_ids"]:
+            c = by_id[cid]
+            sym = c.get("after") or c.get("before")
+            name = sym["name"]
             if name in EXPLANATIONS:
                 heading, text, view = EXPLANATIONS[name]
                 title = title or heading
-            elif name == 'module imports / context':
-                title = title or 'Point imports at the defining modules'
-                text = 'These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.'
-                view = 'diff'
-            elif group['theme'] == 'tests':
-                title = 'Check the contract at its boundary' if 'query' in group['path'] else 'Make the preserved rules executable'
+            elif name == "module imports / context":
+                title = title or "Point imports at the defining modules"
+                text = "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order."
+                view = "diff"
+            elif group["theme"] == "tests":
+                title = (
+                    "Check the contract at its boundary"
+                    if "query" in group["path"]
+                    else "Make the preserved rules executable"
+                )
                 text = {
-                    'test_query_default': 'The default case locks down the 25-row page size and the shape of the parameter tuple. This test calls the extracted query module directly.',
-                    'test_term_stays_a_parameter': 'A quote in the search term must remain data rather than changing the SQL statement. Inspect both the SQL and the bound value; checking only that the call succeeds would miss the contract.',
-                    'test_page_size_boundaries': 'These are the boundary cases for the intentional behavior change. Accept 1 and 100; reject 0, 101, booleans, and other non-integer values. This is test source, not a recorded passing run.',
-                    'test_record_preserves_display_contract': 'A representative row checks the complete display record: identifier, normalized label, ordered tags, and the rounded click rate. Delegation should not change those values.',
-                    'test_missing_and_zero_views': 'Both absent and zero view counts must keep the rate unset. The explicit cases protect against introducing a division-by-zero path during extraction.',
-                    'test_tag_order_and_duplicates': 'Case normalization and empty-tag removal must not turn the list into a set. The assertion preserves duplicates and source order.',
-                    'test_first_record_wins': 'Two records share an identifier. The earlier record must win, so this assertion checks values as well as deduplication.',
-                }.get(name, f'`{name}` states an expectation about the public boundary. This is test source, not an executed result.')
-                view = 'definition'
-            elif group['theme'] == 'wiring':
-                title = 'Point imports at the defining modules'
-                text = 'These imports connect the implementation to the definitions already introduced. Check that the new modules expose every requested name and do not introduce a circular import.'
-                view = 'diff'
+                    "test_query_default": "The default case locks down the 25-row page size and the shape of the parameter tuple. This test calls the extracted query module directly.",
+                    "test_term_stays_a_parameter": "A quote in the search term must remain data rather than changing the SQL statement. Inspect both the SQL and the bound value; checking only that the call succeeds would miss the contract.",
+                    "test_page_size_boundaries": "These are the boundary cases for the intentional behavior change. Accept 1 and 100; reject 0, 101, booleans, and other non-integer values. This is test source, not a recorded passing run.",
+                    "test_record_preserves_display_contract": "A representative row checks the complete display record: identifier, normalized label, ordered tags, and the rounded click rate. Delegation should not change those values.",
+                    "test_missing_and_zero_views": "Both absent and zero view counts must keep the rate unset. The explicit cases protect against introducing a division-by-zero path during extraction.",
+                    "test_tag_order_and_duplicates": "Case normalization and empty-tag removal must not turn the list into a set. The assertion preserves duplicates and source order.",
+                    "test_first_record_wins": "Two records share an identifier. The earlier record must win, so this assertion checks values as well as deduplication.",
+                }.get(
+                    name,
+                    f"`{name}` states an expectation about the public boundary. This is test source, not an executed result.",
+                )
+                view = "definition"
+            elif group["theme"] == "wiring":
+                title = "Point imports at the defining modules"
+                text = "These imports connect the implementation to the definitions already introduced. Check that the new modules expose every requested name and do not introduce a circular import."
+                view = "diff"
             else:
-                title = title or 'Keep the supporting changes in view'
-                text = 'This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.'
-                view = 'diff'
-            passages.append({'text': text, 'change_ids': [cid], 'view': view})
-        if group['theme'] == 'tests': title = 'Check the contract at its boundary' if 'query' in group['path'] else 'Make the preserved rules executable'
-        if group['theme'] == 'result parsing': title = 'Build one parsing boundary'
-        if group['theme'] == 'orchestration': title = 'Return to the search entry point'
-        steps.append({
-            'group_id': group['id'], 'title': title,
-            'evidence_change_ids': list(group['change_ids']),
-            'passages': passages,
-            'transition': 'Follow the next dependency without leaving this document.' if group['next_id'] else 'The source trail now reaches the tests as well as the callers.',
-        })
-    return {'schema': 'diffstory.annotations.v1', 'base_sha': report['meta']['base_sha'], 'head_sha': report['meta']['head_sha'],
-        'document': {
-            'lead': 'A module extraction is easiest to understand as a sequence of ideas, not a list of files. Follow the small rules, the query boundary, and the callers—with each explanation next to its source.',
-            'closing': 'The search entry point now composes focused modules. Several declarations moved without structural changes; the query limit contract deliberately changed. Those are different review tasks. The source and tests stay together so the distinction remains visible.'},
-        'steps': steps}
+                title = title or "Keep the supporting changes in view"
+                text = "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction."
+                view = "diff"
+            passages.append({"text": text, "change_ids": [cid], "view": view})
+        if group["theme"] == "tests":
+            title = (
+                "Check the contract at its boundary"
+                if "query" in group["path"]
+                else "Make the preserved rules executable"
+            )
+        if group["theme"] == "result parsing":
+            title = "Build one parsing boundary"
+        if group["theme"] == "orchestration":
+            title = "Return to the search entry point"
+        steps.append(
+            {
+                "group_id": group["id"],
+                "title": title,
+                "evidence_change_ids": list(group["change_ids"]),
+                "passages": passages,
+                "transition": "Follow the next dependency without leaving this document."
+                if group["next_id"]
+                else "The source trail now reaches the tests as well as the callers.",
+            }
+        )
+    return {
+        "schema": "diffstory.annotations.v1",
+        "base_sha": report["meta"]["base_sha"],
+        "head_sha": report["meta"]["head_sha"],
+        "document": {
+            "lead": "A module extraction is easiest to understand as a sequence of ideas, not a list of files. Follow the small rules, the query boundary, and the callers—with each explanation next to its source.",
+            "closing": "The search entry point now composes focused modules. Several declarations moved without structural changes; the query limit contract deliberately changed. Those are different review tasks. The source and tests stay together so the distinction remains visible.",
+        },
+        "steps": steps,
+    }
 
 
-def build():
+def build() -> tuple[dict, dict, dict]:
+    """Compile the synthetic snapshot and apply its authored annotations.
+
+    Returns:
+        A tuple of snapshot, annotations, and fully annotated report mappings.
+    """
     snapshot = demo_snapshot()
     report = compile_snapshot(snapshot)
     annotations = demo_annotations(report)
@@ -293,14 +411,30 @@ def build():
     return snapshot, annotations, report
 
 
-def main():
+def main() -> None:
+    """Regenerate the checked-in synthetic demo data and standalone HTML.
+
+    Side Effects:
+        Writes demo snapshot, annotations, report, and HTML files under the
+        examples directory, then prints a short summary. It makes no network
+        request and reads no repository source.
+    """
     snapshot, annotations, report = build()
-    out = ROOT / 'examples'
-    for suffix, obj in [('snapshot', snapshot), ('annotations', annotations), ('report', report)]:
-        (out / f'demo.{suffix}.json').write_text(json.dumps(obj, indent=2, ensure_ascii=False)+'\n', encoding='utf-8')
-    (out / 'demo.html').write_text(render(report), encoding='utf-8')
-    print(f'Synthetic example: {report["stats"]["groups"]} sections, {report["stats"]["units"]} changes.')
+    out = ROOT / "examples"
+    for suffix, obj in [
+        ("snapshot", snapshot),
+        ("annotations", annotations),
+        ("report", report),
+    ]:
+        (out / f"demo.{suffix}.json").write_text(
+            json.dumps(obj, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    (out / "demo.html").write_text(render(report), encoding="utf-8")
+    print(
+        f"Synthetic example: {report['stats']['groups']} sections, {report['stats']['units']} changes."
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

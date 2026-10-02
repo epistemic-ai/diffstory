@@ -22,17 +22,14 @@
   <div class="popover-heading"><strong>In this reading</strong><span id="sectionCount"></span></div>
   <label class="search-label"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="Find a section or symbol" aria-label="Find a section or symbol" autocomplete="off"><kbd>/</kbd></label>
   <nav id="contentsList" aria-label="Document contents"></nav>
-  <div class="contents-foot"><a href="#source-hunks">Source hunks</a><a href="#evidence">Evidence & scope</a><span id="reviewProgress"></span></div>
+  <div class="contents-foot"><a href="#source-hunks">Source hunks</a><a href="#evidence">Evidence & scope</a></div>
 </div>
 <div id="morePanel" class="popover more-panel" hidden>
-  <button id="auditBtn" aria-pressed="false">Show review details <span id="auditStatus">Off</span></button>
   <button id="collapseBtn">Collapse expanded code</button>
   <div class="menu-rule"></div>
   <a href="#source-hunks">Original source hunks</a>
   <a href="#evidence">Evidence & scope</a>
   <div class="menu-rule"></div>
-  <button id="exportBtn">Export review notes <span>↓</span></button>
-  <button id="importBtn">Import review notes <span>↑</span></button>
   <button id="downloadReport">Download analysis JSON <span>↓</span></button>
 </div>
 <main id="top">
@@ -40,8 +37,6 @@
   <article id="story" aria-label="Continuous code walkthrough"></article>
   <footer id="documentFooter" class="document-footer"></footer>
 </main>
-<div id="toast" role="status" aria-live="polite"></div>
-<input type="file" id="importFile" accept="application/json,.json" hidden>
 <noscript><p class="noscript">This offline reader needs JavaScript to display its embedded source and narrative. No network connection is needed.</p></noscript>
 <script type="application/json" id="report-data">__REPORT_JSON__</script>
 <script>/*__JS__*/</script>

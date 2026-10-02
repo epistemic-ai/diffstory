@@ -34,9 +34,9 @@ No third-party runtime dependencies. Build and browser-test tools are developmen
 
 ## A reading path, not a dashboard
 
-The reader alternates an explanation with the exact code that supports it, preserving original line numbers. **View diff** and **Read definition** switch one block in place. Long code starts with an excerpt; **Load full diff** and **Read full definition** progressively reveal the rest, at most 160 display rows per expansion. Code scrolls with the document, not inside a second vertical viewport.
+The reader alternates an explanation with the paired diff that supports it, preserving original line numbers. Diffs open by default; **Read definition** switches a block in place. Code identifiers, paths, commands, and literal values use inline code styling. Long code starts with an excerpt; **Load full diff** and **Read full definition** progressively reveal the rest, at most 160 display rows per expansion. Code scrolls with the document, not inside a second vertical viewport.
 
-**Contents** searches sections and symbols without filtering the document away. **Invariants, tests & notes** opens review details beneath a section. Notes and reviewed markers can be exported and imported with an exact base/head revision lock. Browser storage is best effort; export important notes.
+**Contents** searches sections and symbols without filtering the document away. Reader options collapse expanded code or download the analysis JSON.
 
 “Lazy loading” means deferred rendering from embedded data. The complete supplied snapshot is still inside the HTML. Treat reports, snapshots, and exported evidence as source-code-bearing files.
 
@@ -48,7 +48,7 @@ diffstory github 'OWNER/REPO#NUMBER' \
   --save-snapshot walkthrough.snapshot.json
 ```
 
-Replace `OWNER/REPO#NUMBER` with a real PR. Public PRs can be read without credentials, subject to GitHub rate limits. For private repositories, Diffstory first uses `GITHUB_TOKEN` (or the variable selected by `--token-env NAME`); if that variable is unset, it reuses an authenticated GitHub CLI session via `gh auth token` when available. Do not paste tokens into issues, commits, commands saved to a shared history, or reports.
+Replace `OWNER/REPO#NUMBER` with a real PR. For private repositories, Diffstory first uses `GITHUB_TOKEN` (or the variable selected by `--token-env NAME`); if that variable is unset, it reuses the signed-in GitHub CLI account through `gh auth token`. Run `gh auth login` once if needed. Public PRs can be read without credentials, subject to GitHub rate limits. Do not paste tokens into issues, commits, commands saved to a shared history, or reports.
 
 The CLI performs read-only requests, paginates changed files, pins both revisions, and rejects a PR that changes during retrieval. It does not inherit credentials from a chat application. The local Git comparison defaults to **merge-base(base, head) → head**; use `--two-dot` for an endpoint comparison. Uncommitted and untracked work is not included.
 
@@ -58,7 +58,7 @@ Every compilation writes standalone HTML plus an adjacent `.report.json`. Binary
 
 Python functions, async functions, classes, and assignments are compared using the standard-library AST. Pairing distinguishes identical ASTs, declaration renames, edited move candidates, ordinary edits, additions, removals, and unresolved counterparts. Literals, internal names, defaults, decorators, and string whitespace are not erased to obtain a convenient match.
 
-Static calls, references, import aliases, and test references form a dependency graph. Strongly connected components handle cycles; deterministic priorities produce a reproducible reading order. This is a comprehension heuristic, not a proof of an optimal order.
+Static calls, references, import aliases, and test references form a dependency graph. Strongly connected components handle cycles; deterministic priorities produce a reproducible baseline order. Narrated reports may choose a different story order while keeping prerequisites ahead of their dependents. This is a comprehension heuristic, not a proof of an optimal order.
 
 Other languages, newer Python syntax unsupported by your interpreter, and unclassified module-level code remain available as textual hunks. Classes are atomic units. Dynamic dispatch, reflection, unchanged external callers, and whole-program behavior are not fully resolved.
 
@@ -75,7 +75,55 @@ diffstory render walkthrough.report.json \
   --annotations annotations.json --out narrated.html
 ```
 
-Evidence packets contain source code. Send them only to an approved model or environment. No model provider is called automatically, no API key is needed, and no billing integration is included. Annotation validation locks revisions and evidence IDs; it cannot establish that every prose claim is true. See [the annotation contract](docs/ARCHITECTURE.md#annotation-handoff).
+Evidence packets contain source code. Send them only to an approved model or environment. The manual annotation workflow makes no provider call and needs no API key. Annotation validation locks revisions and evidence IDs; it cannot establish that every prose claim is true. See [the annotation contract](docs/ARCHITECTURE.md#annotation-handoff).
+
+### Opt in to model narration
+
+The `git` and `github` commands accept `--narrate` to generate candidate annotations. By default, `--provider openai` calls the OpenAI Responses API with [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol). This is a separate API integration; a ChatGPT subscription does not supply an API key. Set `OPENAI_API_KEY` with your credential manager, or select another environment variable with `--api-key-env`. Diffstory never accepts the key as a command argument or writes it to generated files.
+
+```bash
+diffstory github 'OWNER/REPO#NUMBER' \
+  --narrate \
+  --out walkthrough.html
+```
+
+To use your signed-in Codex CLI account instead, install and sign in to the
+[Codex CLI](https://developers.openai.com/codex/cli) with `codex login`, then
+select `--provider codex`:
+
+```bash
+diffstory github 'OWNER/REPO#NUMBER' \
+  --narrate \
+  --provider codex \
+  --out walkthrough.html
+```
+
+This route runs `codex exec` with the Codex CLI's saved sign-in and default
+model. You can pass `--model MODEL_ID` for a supported Codex model. Known
+overrides (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and `gpt-5.3-codex`)
+use their published context and output capacities; the CLI default is packed
+against a conservative 400,000-token context bound. Unknown overrides are
+rejected before source transfer until capacity metadata is available. This
+route does not need an OpenAI API key; access and usage follow the signed-in
+ChatGPT or workspace account. The CLI receives only the prepared evidence
+request, runs from a temporary directory with read-only access, and has local
+shell, browser, app, and plugin tools disabled. See the [Codex non-interactive
+mode documentation](https://developers.openai.com/codex/non-interactive-mode)
+for how `codex exec` uses saved authentication and structured output.
+
+Codex CLI does not expose a per-call output-token cap. Diffstory lets Codex
+complete each request, validates its structured response, and records the
+input, cached input, and output token counts reported by the CLI.
+
+Before the first model request, Diffstory displays the destination, PR revisions, source scope, and planned request count. It asks for confirmation. Use `--yes` only when you have already approved that transfer, such as in an automation job. Without `--narrate`, GitHub ingestion still reads the PR over the network but no model request is made.
+
+Narration packs bounded evidence chunks to fit the selected model's context and uses multi-level summaries for larger changes. Long source lines are split into slices without dropping source text. After a successful run, the CLI prints provider-reported input tokens, cached input tokens, and output tokens; these totals are also stored in the annotations and report. `--max-source-bytes` can lower the hard 64 MB cap on captured source across both revisions. Excess source is rejected before narration, and the GitHub reader stops fetching files once the configured cap is exceeded.
+
+There are no run-wide token, call-count, or elapsed-time ceilings. Each individual provider call has a 15-minute timeout to prevent a stalled request from hanging indefinitely; a run may make as many calls as its source requires.
+
+Successful runs write HTML, `.report.json`, and candidate `.annotations.json` files. Each generated passage is tied to a change ID and checked against its group and source range. The generated report preserves its provider/model, revisions, measured usage, and chunk coverage, and displays a visible **model-generated · unverified** warning. It does not validate whether prose is true.
+
+The OpenAI API request sets `store: false`, but this is not a zero-retention promise. OpenAI's API data controls, abuse-monitoring retention, organization settings, and applicable exceptions govern what the API retains; check the current [OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data) before sending confidential source. The API calls are documented in the [Responses API](https://developers.openai.com/api/docs/guides/structured-outputs) documentation. Codex CLI runs follow the signed-in ChatGPT or workspace account's current data and retention controls.
 
 ## Develop and verify
 
@@ -90,7 +138,7 @@ python -m build
 python -m twine check dist/*
 ```
 
-For a system Chromium installation, set `DIFFSTORY_CHROMIUM` to its executable path. Browser tests exercise rendering, navigation, expansion, notes, responsive layout, and offline behavior. They do not claim tests passed in the analyzed repository. See [verification](docs/VERIFICATION.md) for the checks actually run on this release.
+For a system Chromium installation, set `DIFFSTORY_CHROMIUM` to its executable path. Browser tests exercise rendering, navigation, expansion, responsive layout, and offline behavior. They do not claim tests passed in the analyzed repository. See [verification](docs/VERIFICATION.md) for the checks actually run on this release.
 
 ## Public examples and privacy
 

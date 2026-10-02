@@ -7,31 +7,95 @@
   const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
+  const basename = path => String(path || '').split('/').pop();
+  // Explicit backticks are preferred; report-backed code tokens are the rendering fallback.
+  const codeTerms = new Set(['None', 'True', 'False', 'null', 'undefined']);
+  const identifier = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/;
+  const pathLike = /^(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+$|^[A-Za-z0-9_.-]+\.[A-Za-z0-9]+$/;
+  const commonCalls = new Set([
+    'all', 'any', 'bool', 'dict', 'enumerate', 'filter', 'float', 'int',
+    'len', 'list', 'map', 'max', 'min', 'open', 'print', 'range', 'set',
+    'str', 'sum', 'tuple', 'type', 'zip'
+  ]);
+  function addCodeTerm(value, kind = 'name') {
+    if (typeof value !== 'string') return;
+    const term = value.trim();
+    if (!term || term.length > 160 || /[\r\n`]/.test(term)) return;
+    if (identifier.test(term) || pathLike.test(term)) {
+      if (kind !== 'call' || !commonCalls.has(term)) codeTerms.add(term);
+    }
+  }
+  for (const change of R.changes) {
+    for (const source of [change.before, change.after]) {
+      if (!source) continue;
+      addCodeTerm(source.path, 'path');
+      addCodeTerm(basename(source.path), 'path');
+      addCodeTerm(source.name);
+      for (const binding of source.local_bindings || []) {
+        if (binding.length <= 2) addCodeTerm(binding, 'binding');
+      }
+      for (const call of source.calls || []) addCodeTerm(call.name, 'call');
+      for (const ref of source.references || []) {
+        if (ref.name.length <= 2) addCodeTerm(ref.name, 'binding');
+      }
+    }
+  }
+  for (const file of R.raw_files || []) {
+    addCodeTerm(file.path, 'path');
+    addCodeTerm(basename(file.path), 'path');
+  }
+  for (const field of ['base_ref', 'head_ref', 'base_branch', 'head_branch']) {
+    addCodeTerm(R.meta[field], 'path');
+  }
+  for (const group of R.groups) addCodeTerm(group.path, 'path');
+  for (const test of R.tests || []) {
+    addCodeTerm(test.path, 'path');
+    addCodeTerm(test.name);
+  }
+  const escapedCodeTerms = [...codeTerms]
+    .sort((a, b) => b.length - a.length)
+    .map(term => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const pathPattern = String.raw`(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+\.(?:py|pyi|js|jsx|ts|tsx|json|md|toml|yaml|yml|sh|html|css|go|rs|java|kt|c|h|cpp|hpp|sql|txt|xml)`;
+  const codeTermPattern = new RegExp(
+    `(^|[^A-Za-z0-9_$])(${escapedCodeTerms.join('|')}|--[A-Za-z][A-Za-z0-9-]*|${pathPattern})(?=$|[^A-Za-z0-9_$])`,
+    'g'
+  );
+  function inlineText(value) {
+    codeTermPattern.lastIndex = 0;
+    let result = '', cursor = 0;
+    for (const match of value.matchAll(codeTermPattern)) {
+      const start = match.index + match[1].length;
+      result += esc(value.slice(cursor, start)) + `<code>${esc(match[2])}</code>`;
+      cursor = start + match[2].length;
+    }
+    return result + esc(value.slice(cursor));
+  }
   // Only code spans and emphasis are supported. An annotation cannot supply arbitrary HTML.
-  const inline = value => String(value ?? '').split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g).map(part =>
-    part.startsWith('`') && part.endsWith('`') ? `<code>${esc(part.slice(1, -1))}</code>` :
-      part.startsWith('**') && part.endsWith('**') ? `<strong>${esc(part.slice(2, -2))}</strong>` : esc(part)
-  ).join('');
+  const inline = value => String(value ?? '').split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g)
+    .map(part => {
+      if (part.startsWith('`') && part.endsWith('`')) {
+        return `<code>${esc(part.slice(1, -1))}</code>`;
+      }
+      if (part.startsWith('**') && part.endsWith('**')) {
+        return `<strong>${inlineText(part.slice(2, -2))}</strong>`;
+      }
+      return inlineText(part);
+    }).join('');
+  const plainInline = value => String(value ?? '')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1');
   const prose = value => String(value ?? '').split(/\n\s*\n/).filter(Boolean)
     .map(p => `<p>${inline(p)}</p>`).join('');
   const G = new Map(R.groups.map(g => [g.id, g]));
   const C = new Map(R.changes.map(c => [c.id, c]));
-  const T = new Map(R.tests.map(t => [t.id, t]));
-  const basename = path => String(path || '').split('/').pop();
   const safeURL = value => {
     try { const u = new URL(value); return u.protocol === 'https:' && u.hostname === 'github.com' ? u.href : null; }
     catch (_) { return null; }
   };
   const link = (url, label, cls = '') => safeURL(url)
     ? `<a href="${esc(safeURL(url))}" class="${cls}" target="_blank" rel="noopener noreferrer">${esc(label)} ↗</a>` : '';
-  const revision = `${R.meta.repository || 'local'}:${R.meta.base_sha || ''}:${R.meta.head_sha || ''}`;
-  const storageKey = `diffstory.review.v1:${revision}`;
-  let review = {notes: {}, checked: {}};
-  let canPersist = true;
   let activeSection = null;
-  let showAudit = false;
   let blockCounter = 0;
-  let toastTimer;
   const blocks = new Map();
   const anchors = new Set();
   const PREVIEW_LIMIT = 34;
@@ -39,40 +103,6 @@
   const PREVIEW_TAIL = 5;
   const CHUNK = 160;
 
-  function sanitizeReview(data) {
-    const out = {notes: {}, checked: {}};
-    if (!data || typeof data !== 'object') return out;
-    for (const g of R.groups) {
-      if (typeof data.notes?.[g.id] === 'string') out.notes[g.id] = data.notes[g.id].slice(0, 50000);
-      if (data.checked?.[g.id] === true) out.checked[g.id] = true;
-    }
-    return out;
-  }
-  try { review = sanitizeReview(JSON.parse(localStorage.getItem(storageKey) || '{}')); }
-  catch (_) { canPersist = false; }
-
-  function notify(text) {
-    clearTimeout(toastTimer);
-    $('#toast').textContent = text;
-    $('#toast').classList.add('show');
-    toastTimer = setTimeout(() => $('#toast').classList.remove('show'), 3400);
-  }
-  function saveReview() {
-    try { localStorage.setItem(storageKey, JSON.stringify(review)); }
-    catch (_) { canPersist = false; }
-    updateReviewMarkers();
-  }
-  function updateReviewMarkers() {
-    const count = R.groups.filter(g => review.checked[g.id] === true).length;
-    $('#reviewProgress').textContent = count ? `${count}/${R.groups.length} reviewed` : '';
-    $$('[data-reviewed-indicator]').forEach(node => {
-      node.textContent = review.checked[node.dataset.reviewedIndicator] ? '✓ Reviewed' : '';
-    });
-    $$('.contents-item').forEach(node => {
-      const marker = $('.contents-check', node);
-      if (marker) marker.textContent = review.checked[node.dataset.section] ? '✓' : '';
-    });
-  }
   function classification(c) {
     if ((c.after || c.before)?.is_test) return ['Test source', ''];
     const kinds = {
@@ -176,7 +206,7 @@
     const spec = {
       id: `block-${++blockCounter}`, changes: cs, test: options.test || null,
       raw: options.raw || null, focus: options.focus || null, label: options.label || '',
-      view: options.view || (options.raw ? 'diff' : first?.kind === 'wiring' || first?.kind === 'text' || first?.kind === 'modified' ? 'diff' : 'definition'),
+      view: options.view || (options.test ? 'definition' : 'diff'),
       expanded: false, loaded: 0, materialized: false, cache: {}, primaryPath,
       baseURL: options.raw?.before_url || first?.before?.url,
       headURL: options.raw?.after_url || options.test?.url || first?.after?.url,
@@ -185,7 +215,21 @@
     let badge = options.raw ? ['Source hunk', ''] : options.test ? ['Test source', ''] : cs.length > 1 ? [`${cs.length} moved declarations`, 'move'] : classification(first);
     const name = options.label || (cs.length > 1 ? 'graph constants' : source?.name === 'module imports / context' ? 'imports' : source?.name === 'file context' ? '' : source?.name || '');
     const symbol = name ? `<span class="symbol-name">· ${esc(name)}</span>` : '';
-    const estimated = spec.focus ? Math.min(PREVIEW_LIMIT, spec.focus.end - spec.focus.start + 3) : Math.min(PREVIEW_LIMIT, options.raw ? options.raw.hunks.reduce((n, h) => n + h.rows.length + 1, 0) : cs.reduce((n, c) => n + (spec.view === 'diff' ? c.hunks.reduce((v, h) => v + h.rows.length + 1, 0) : (c.after || c.before).end - (c.after || c.before).start + 1), options.test ? options.test.end - options.test.start + 1 : 0));
+    const focusedEstimate = spec.focus && spec.view === 'definition'
+      ? spec.focus.end - spec.focus.start + 3
+      : null;
+    const sourceEstimate = options.raw
+      ? options.raw.hunks.reduce((total, hunk) => total + hunk.rows.length + 1, 0)
+      : options.test
+        ? options.test.end - options.test.start + 1
+        : cs.reduce((total, change) => {
+          const source = change.after || change.before;
+          const size = spec.view === 'diff'
+            ? change.hunks.reduce((hunkTotal, hunk) => hunkTotal + hunk.rows.length + 1, 0)
+            : source.end - source.start + 1;
+          return total + size;
+        }, 0);
+    const estimated = Math.min(PREVIEW_LIMIT, focusedEstimate ?? sourceEstimate);
     const beforeAnchors = cs.filter(c => !anchors.has(c.id)).map(c => { anchors.add(c.id); return `<span id="unit-${c.id}" class="change-anchor"></span>`; }).join('');
     return `${beforeAnchors}<figure class="code-block" id="${spec.id}" data-block="${spec.id}" data-changes="${cs.map(c => c.id).join(' ')}"><figcaption class="code-header"><span class="filename" title="${esc(primaryPath)}">${esc(basename(primaryPath))}${symbol}</span><span class="classification ${badge[1]}">${esc(badge[0])}</span></figcaption><div class="code-body"><div class="lazy-shell" style="min-height:${Math.max(58, Math.min(430, estimated * 22))}px"><button data-load-preview="${spec.id}">Load ${spec.view === 'diff' ? 'diff' : 'code'} ↓</button></div></div><div class="code-footer"></div></figure>`;
   }
@@ -193,9 +237,11 @@
     const first = spec.changes[0];
     const a = spec.test || first?.after || first?.before;
     const b = first?.before;
-    let location = spec.view === 'diff' ? 'Paired diff' : a ? `L${spec.focus && !spec.expanded ? spec.focus.start : a.start}–${spec.focus && !spec.expanded ? spec.focus.end : (spec.changes.at(-1)?.after || spec.changes.at(-1)?.before || a).end}` : 'Source';
+    let location = spec.changes.length > 1
+      ? (spec.view === 'diff' ? 'Paired diffs' : 'Definitions')
+      : spec.view === 'diff' ? 'Paired diff' : a ? `L${spec.focus && !spec.expanded ? spec.focus.start : a.start}–${spec.focus && !spec.expanded ? spec.focus.end : (spec.changes.at(-1)?.after || spec.changes.at(-1)?.before || a).end}` : 'Source';
     if (first?.before && first?.after && first.before.path !== first.after.path) location = `${basename(b.path)} → ${basename(first.after.path)} · ${location}`;
-    const modeButton = !spec.raw && !spec.test && spec.changes.length === 1
+    const modeButton = !spec.raw && !spec.test && spec.changes.length > 0
       ? `<button class="text-button" data-switch="${spec.id}">${spec.view === 'diff' ? 'Read definition' : 'View diff'}</button>` : '';
     const collapse = spec.expanded ? `<button class="text-button" data-collapse="${spec.id}">Collapse</button>` : '';
     const base = spec.baseURL ? link(spec.baseURL, 'Base', 'code-source-link') : '';
@@ -251,9 +297,11 @@
     });
   }
   function passageHTML(p) {
-    const code = p.change_ids.length > 1 && p.change_ids.every(id => C.get(id)?.kind === 'moved')
-      ? blockHTML(p.change_ids, {view: p.view || 'definition', label: p.label, focus: p.focus})
-      : p.change_ids.map(id => blockHTML([id], {view: p.view, focus: p.focus, label: p.label})).join('');
+    // Lead with the paired edits; a focused definition remains available in the block toggle.
+    const changeIds = p.change_ids;
+    const code = changeIds.length > 1 && changeIds.every(id => C.get(id)?.kind === 'moved')
+      ? blockHTML(changeIds, {view: 'diff', label: p.label, focus: p.focus})
+      : changeIds.map(id => blockHTML([id], {view: 'diff', focus: p.focus, label: p.label})).join('');
     return `<div class="passage"><div class="prose">${prose(p.text)}</div>${code}</div>`;
   }
   function sectionHTML(g) {
@@ -261,14 +309,20 @@
     const passages = Array.isArray(n.passages) && n.passages.length ? n.passages : defaultPassages(g);
     const used = new Set(passages.flatMap(p => p.change_ids));
     const extra = g.change_ids.filter(id => !used.has(id));
-    return `<section class="story-section" id="${g.id}" data-story-section="${g.id}" aria-labelledby="heading-${g.id}"><header class="section-heading"><span class="section-number">${String(g.number).padStart(2, '0')}</span><h2 id="heading-${g.id}">${esc(g.title)}<a class="section-anchor" href="#${g.id}" aria-label="Link to ${esc(g.title)}">#</a></h2></header>${passages.map(passageHTML).join('')}${n.transition ? `<div class="section-end">${inline(n.transition)}</div>` : ''}${extra.length ? `<details class="section-extra" data-extra="${g.id}"><summary>Supporting changes <span>· ${extra.length}</span></summary><div class="extra-body"></div></details>` : ''}<details class="review-details" data-audit="${g.id}"><summary>Invariants, tests & notes <span data-reviewed-indicator="${g.id}" class="review-check-indicator"></span></summary><div class="audit-content"></div></details></section>`;
+    const context = [n.intent, n.why_now].filter(value => typeof value === 'string' && value.trim());
+    const contextHTML = context.length
+      ? `<div class="section-context">${context.map(value => `<p>${inline(value)}</p>`).join('')}</div>`
+      : '';
+    return `<section class="story-section" id="${g.id}" data-story-section="${g.id}" aria-labelledby="heading-${g.id}"><header class="section-heading"><span class="section-number">${String(g.number).padStart(2, '0')}</span><h2 id="heading-${g.id}">${inline(g.title)}<a class="section-anchor" href="#${g.id}" aria-label="Link to ${esc(plainInline(g.title))}">#</a></h2></header>${contextHTML}${passages.map(passageHTML).join('')}${n.transition ? `<div class="section-end">${inline(n.transition)}</div>` : ''}${extra.length ? `<details class="section-extra" data-extra="${g.id}"><summary>Supporting changes <span>· ${extra.length}</span></summary><div class="extra-body"></div></details>` : ''}</section>`;
   }
   function buildHeader() {
     const m = R.meta, doc = R.document || {};
     const title = m.title || 'Read the change, one idea at a time';
-    document.title = `Diffstory · ${m.number ? '#' + m.number : title} · Reader`;
+    document.title = `Diffstory · ${m.number ? '#' + m.number : plainInline(title)} · Reader`;
     const lead = doc.lead || 'Read the change in one continuous thread: the idea, its code, then what follows from it. Source stays close to the explanation.';
-    $('#documentHeader').innerHTML = `<div class="document-kicker">${link(m.url, m.repository || 'Local repository') || esc(m.repository || 'Local repository')}<span class="kicker-dot">/</span><span>${m.number ? 'PR ' + m.number : m.input === 'synthetic example' ? 'SYNTHETIC EXAMPLE' : 'COMMITTED COMPARISON'}</span></div><h1>${esc(title)}</h1><p class="lead">${inline(lead)}</p><div class="document-meta"><span>${R.groups.length} sections</span><span class="sep">·</span><span>${R.stats.supplied_paths} source paths</span><span class="sep">·</span><span class="revisions">${esc((m.base_sha || 'base').slice(0, 7))} → ${esc((m.head_sha || 'head').slice(0, 7))}</span></div><p class="document-scope">${m.input === 'synthetic example' ? 'Original synthetic example. No private repository source.' : m.scope === 'selected excerpts' ? 'Selected source excerpts, not the complete PR.' : 'Committed, changed-file snapshot.'} <a href="#evidence">Evidence & scope</a></p><div class="header-rule"></div>`;
+    const generationNotice = R.generation
+      ? `<p class="generation-notice" role="status"><strong>Model-generated narration · unverified.</strong> Provider: ${esc(R.generation.provider)} · model: ${esc(R.generation.model)}. Check every claim against the linked source.</p>` : '';
+    $('#documentHeader').innerHTML = `<div class="document-kicker">${link(m.url, m.repository || 'Local repository') || esc(m.repository || 'Local repository')}<span class="kicker-dot">/</span><span>${m.number ? 'PR ' + m.number : m.input === 'synthetic example' ? 'SYNTHETIC EXAMPLE' : 'COMMITTED COMPARISON'}</span></div><h1>${inline(title)}</h1><p class="lead">${inline(lead)}</p>${generationNotice}<div class="document-meta"><span>${R.groups.length} sections</span><span class="sep">·</span><span>${R.stats.supplied_paths} source paths</span><span class="sep">·</span><span class="revisions">${esc((m.base_sha || 'base').slice(0, 7))} → ${esc((m.head_sha || 'head').slice(0, 7))}</span></div><p class="document-scope">${m.input === 'synthetic example' ? 'Original synthetic example. No private repository source.' : m.scope === 'selected excerpts' ? 'Selected source excerpts, not the complete PR.' : 'Committed, changed-file snapshot.'} <a href="#evidence">Evidence & scope</a></p><div class="header-rule"></div>`;
   }
   function buildFooter() {
     const closing = R.document?.closing || 'The definitions, their callers, and the available tests are now in one reading path. Structural matches and test references guide review; they do not substitute for execution evidence.';
@@ -280,17 +334,7 @@
     const filtered = R.groups.filter(g => [g.title, g.path, g.theme, g.narrative.intent, ...g.change_ids.map(id => {
       const c = C.get(id); return [c.before?.name, c.after?.name, c.before?.path, c.after?.path].join(' ');
     })].join(' ').toLowerCase().includes(q));
-    $('#contentsList').innerHTML = filtered.map(g => `<a class="contents-item" href="#${g.id}" data-section="${g.id}" ${activeSection === g.id ? 'aria-current="location"' : ''}><span class="contents-number">${String(g.number).padStart(2, '0')}</span><span>${esc(g.title)}</span><span class="contents-check">${review.checked[g.id] ? '✓' : ''}</span></a>`).join('') || '<p class="empty">No matching section or symbol.</p>';
-    updateReviewMarkers();
-  }
-
-  function ensureAudit(details) {
-    if (details.dataset.ready) return;
-    const g = G.get(details.dataset.audit), n = g.narrative;
-    const ids = [...new Set(g.test_links.map(x => x.test_id))];
-    const tests = ids.map(id => T.get(id)).filter(Boolean);
-    $('.audit-content', details).innerHTML = `<div class="audit-columns"><div><h3>Keep these invariants</h3><ul>${n.invariants.map(x => `<li>${inline(x)}</li>`).join('')}</ul></div><div><h3>Questions worth checking</h3><ul>${n.questions.map(x => `<li>${inline(x)}</li>`).join('')}</ul></div></div><h3>Test evidence</h3>${tests.length ? tests.map(t => `<details class="test-reference" data-test="${t.id}"><summary>${esc(t.name)}</summary><div class="test-body"></div></details>`).join('') : `<p class="test-run-note">${g.theme === 'tests' ? 'The test definitions are in the reading above.' : 'No test relationship was resolved in the supplied changed files.'}</p>`}<p class="test-run-note">Source references only. No repository tests were executed by this analyzer.</p><details class="audit-source"><summary>Classification evidence & reading dependencies</summary><div class="audit-source-body">${g.change_ids.map(id => { const c = C.get(id); return `<p><code>${esc((c.after || c.before).name)}</code> — ${esc(c.label)}. ${esc(c.basis)}${c.signature_changed ? ' Signature differs.' : ''}</p>`; }).join('')}${g.prerequisites.length ? `<p>Builds on: ${g.prerequisites.map(id => `<a href="#${id}">${esc(G.get(id).title)}</a>`).join('; ')}.</p>` : ''}<p>${esc(n.provenance)}</p></div></details><div class="review-form"><label><input type="checkbox" data-review="${g.id}" ${review.checked[g.id] ? 'checked' : ''}> I reviewed this section</label><textarea data-note="${g.id}" aria-label="Review notes for ${esc(g.title)}" placeholder="What did you verify? What still needs checking?" maxlength="50000">${esc(review.notes[g.id] || '')}</textarea><div class="review-local-note">${canPersist ? 'Saved in this browser when storage is available.' : 'Local storage unavailable here.'} Export a portable copy from the ••• menu.</div></div>`;
-    details.dataset.ready = 'true';
+    $('#contentsList').innerHTML = filtered.map(g => `<a class="contents-item" href="#${g.id}" data-section="${g.id}" ${activeSection === g.id ? 'aria-current="location"' : ''}><span class="contents-number">${String(g.number).padStart(2, '0')}</span><span>${inline(g.title)}</span></a>`).join('') || '<p class="empty">No matching section or symbol.</p>';
   }
   function ensureExtra(details) {
     if (details.dataset.ready) return;
@@ -299,12 +343,6 @@
     $('.extra-body', details).innerHTML = g.change_ids.filter(id => !used.has(id)).map(id => blockHTML([id])).join('');
     details.dataset.ready = 'true';
     observeBlocks(details);
-  }
-  function ensureTest(details) {
-    if (details.dataset.ready) return;
-    const t = T.get(details.dataset.test);
-    $('.test-body', details).innerHTML = blockHTML([], {test: t, view: 'definition'});
-    details.dataset.ready = 'true'; observeBlocks(details);
   }
   function ensureAppendix(details) {
     if (details.dataset.ready) return;
@@ -315,7 +353,7 @@
       body.innerHTML = `<p>${R.meta.scope === 'selected excerpts' ? 'These are diffs of the supplied excerpts, not the full GitHub patch.' : 'Hunks computed from the supplied before/after file snapshots.'} Open a file to load its hunks. Nothing below changes the reading order above.</p>${[...files.entries()].map(([path, fs], i) => `<details class="raw-file" data-raw="${i}"><summary>${esc(path)} <span class="region-label">· ${fs.length} region${fs.length === 1 ? '' : 's'}</span></summary><div class="raw-body"></div></details>`).join('')}`;
     } else {
       const m = R.meta;
-      body.innerHTML = `<dl><dt>Repository</dt><dd>${link(m.url, m.repository || 'Local Git') || esc(m.repository || 'Local Git')}</dd><dt>Base revision</dt><dd class="mono">${esc(m.base_sha)}</dd><dt>Head revision</dt><dd class="mono">${esc(m.head_sha)}</dd><dt>Scope</dt><dd>${esc(m.scope)}</dd><dt>Captured</dt><dd>${esc(m.captured_at || 'Not recorded')}</dd><dt>Supplied source</dt><dd>${R.stats.supplied_paths} paths · ${R.stats.units} analysis units</dd><dt>Test runs</dt><dd>0 runs verified by this analyzer</dd></dl><h3>What the matches establish</h3><p>An identical AST is structural evidence, not a proof that a move preserves behavior. Changed global bindings, import paths, initialization order and external consumers still need review. An edited pair is not automatically a confirmed behavioral change.</p><h3>Provenance</h3><p>${esc(m.validation || 'No execution evidence was attached.')}</p><p>Narrative paragraphs are authored interpretations linked to immutable source ranges. They cannot override the compiler’s source, structural classifications or test status.</p>${R.warnings.length ? `<h3>Limits of this input</h3><ul>${R.warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}<details><summary>Compiler methods</summary><dl>${Object.entries(R.method).map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('')}</dl></details>${m.description ? `<details><summary>PR description, as captured</summary><pre>${esc(m.description)}</pre></details>` : ''}<h3>Local by design</h3><p>No external fonts, libraries, analytics or network requests are needed. The HTML embeds the source snapshot; keep it private for a private repository. Diffs are rendered lazily from that embedded data, not fetched from a server. Clicking a source link opens GitHub.</p><p>Review notes are bound to these exact revisions. Browser-local storage is best effort; export notes from the ••• menu for a portable record.</p>`;
+      body.innerHTML = `<dl><dt>Repository</dt><dd>${link(m.url, m.repository || 'Local Git') || esc(m.repository || 'Local Git')}</dd><dt>Base revision</dt><dd class="mono">${esc(m.base_sha)}</dd><dt>Head revision</dt><dd class="mono">${esc(m.head_sha)}</dd><dt>Scope</dt><dd>${esc(m.scope)}</dd><dt>Captured</dt><dd>${esc(m.captured_at || 'Not recorded')}</dd><dt>Supplied source</dt><dd>${R.stats.supplied_paths} paths · ${R.stats.units} analysis units</dd><dt>Test runs</dt><dd>0 runs verified by this analyzer</dd></dl><h3>What the matches establish</h3><p>An identical AST is structural evidence, not a proof that a move preserves behavior. Changed global bindings, import paths, initialization order and external consumers still need review. An edited pair is not automatically a confirmed behavioral change.</p><h3>Provenance</h3><p>${esc(m.validation || 'No execution evidence was attached.')}</p><p>Narrative paragraphs are authored interpretations linked to immutable source ranges. They cannot override the compiler’s source, structural classifications or test status.</p>${R.warnings.length ? `<h3>Limits of this input</h3><ul>${R.warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}<details><summary>Compiler methods</summary><dl>${Object.entries(R.method).map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('')}</dl></details>${m.description ? `<details><summary>PR description, as captured</summary><pre>${esc(m.description)}</pre></details>` : ''}<h3>Local by design</h3><p>No external fonts, libraries, analytics or network requests are needed. The HTML embeds the source snapshot; keep it private for a private repository. Diffs are rendered lazily from that embedded data, not fetched from a server. Clicking a source link opens GitHub.</p>`;
     }
     details.dataset.ready = 'true';
   }
@@ -329,9 +367,7 @@
   document.addEventListener('toggle', event => {
     const d = event.target;
     if (d.tagName !== 'DETAILS' || !d.open) return;
-    if (d.dataset.audit) ensureAudit(d);
-    else if (d.dataset.extra) ensureExtra(d);
-    else if (d.dataset.test) ensureTest(d);
+    if (d.dataset.extra) ensureExtra(d);
     else if (d.dataset.appendix) ensureAppendix(d);
     else if ('raw' in d.dataset) ensureRaw(d);
     observeBlocks(d);
@@ -425,45 +461,14 @@
       s.view = s.view === 'diff' ? 'definition' : 'diff'; s.expanded = false; s.loaded = 0;
       paintBlock(s); if (above) element.scrollIntoView({block: 'start'}); return;
     }
-    if (button.id === 'auditBtn') {
-      showAudit = !showAudit;
-      button.setAttribute('aria-pressed', String(showAudit)); $('#auditStatus').textContent = showAudit ? 'On' : 'Off';
-      button.firstChild.textContent = showAudit ? 'Hide review details ' : 'Show review details ';
-      $$('[data-audit]').forEach(d => { if (showAudit) ensureAudit(d); d.open = showAudit; });
-      closePopovers(); return;
-    }
     if (button.id === 'collapseBtn') {
       const active = activeSection;
       for (const s of blocks.values()) if (s.materialized && s.expanded) { s.expanded = false; s.loaded = 0; paintBlock(s); }
       closePopovers(); if (active) navigateTo('#' + active, false); return;
     }
-    if (button.id === 'exportBtn') {
-      download(`diffstory-${(R.meta.head_sha || 'review').slice(0, 12)}-review.json`, {schema: 'diffstory.review.v1', revision, exported_at: new Date().toISOString(), ...review});
-      closePopovers(); notify('Review notes exported for these exact revisions.'); return;
-    }
-    if (button.id === 'importBtn') { closePopovers(); $('#importFile').click(); return; }
     if (button.id === 'downloadReport') { download('diffstory-report.json', R); closePopovers(); return; }
   });
-  document.addEventListener('input', event => {
-    if (event.target.dataset.note) { review.notes[event.target.dataset.note] = event.target.value; saveReview(); }
-  });
-  document.addEventListener('change', event => {
-    if (event.target.dataset.review) { review.checked[event.target.dataset.review] = event.target.checked; saveReview(); }
-  });
   $('#search').addEventListener('input', contents);
-  $('#importFile').addEventListener('change', async event => {
-    const file = event.target.files[0]; event.target.value = ''; if (!file) return;
-    try {
-      if (file.size > 5000000) throw new Error('Review file exceeds 5 MB.');
-      const data = JSON.parse(await file.text());
-      if (data.schema !== 'diffstory.review.v1' || data.revision !== revision) throw new Error('Review belongs to a different report revision.');
-      if (!data.notes || typeof data.notes !== 'object' || Array.isArray(data.notes) || !data.checked || typeof data.checked !== 'object' || Array.isArray(data.checked)) throw new Error('Invalid review schema.');
-      review = sanitizeReview(data); saveReview();
-      $$('[data-note]').forEach(input => { input.value = review.notes[input.dataset.note] || ''; });
-      $$('[data-review]').forEach(input => { input.checked = !!review.checked[input.dataset.review]; });
-      contents(); notify('Review imported for these exact revisions.');
-    } catch (err) { notify(err.message || 'Could not import review.'); }
-  });
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') { closePopovers(true); return; }
     if (['INPUT', 'TEXTAREA', 'SELECT'].includes(event.target.tagName) || event.target.isContentEditable || event.ctrlKey || event.metaKey || event.altKey) return;
@@ -473,6 +478,6 @@
 
   buildHeader();
   $('#story').innerHTML = R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>';
-  buildFooter(); contents(); updateReviewMarkers(); observeBlocks(); updateScroll();
+  buildFooter(); contents(); observeBlocks(); updateScroll();
   if (location.hash) requestAnimationFrame(() => navigateTo(location.hash, false));
 })();

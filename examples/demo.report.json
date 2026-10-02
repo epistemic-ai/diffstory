@@ -3,14 +3,15 @@
   "meta": {
     "title": "One search module. Three clear responsibilities.",
     "repository": "Synthetic catalog",
-    "base_sha": "44912524610170cef73861796b05188a13b7e1b0",
-    "head_sha": "2ac82c2ba3bffd4500379bc1fced0900a12bb2ba",
+    "base_sha": "f02951246558fb83690cda57b5b2e69f9db8fd200d1238aac5560862867db108",
+    "head_sha": "cef8d49e22be5fbaba70cdfdfe00da3b3ff36d5142e7af7a7243e38a5414b4a4",
     "scope": "changed files",
     "input": "synthetic example",
     "comparison": "original synthetic before/after sources",
     "changed_files": 8,
     "description": "An original catalog-search example for this open-source project. No private source or real customer data. The query page-size validation is an intentional behavior change.",
-    "validation": "Test source is provided for explanation. Diffstory does not execute or assert results for those tests."
+    "validation": "Test source is provided for explanation. Diffstory does not execute or assert results for those tests.",
+    "source_bytes": 7449
   },
   "changes": [
     {
@@ -2656,7 +2657,7 @@
         "transition": "Follow the next dependency without leaving this document.",
         "passages": [
           {
-            "text": "The query builder moves out of the search module, but this is **not an unchanged extraction**. It now rejects page sizes outside 1–100, non-integers, and booleans. The SQL still uses bound parameters. Read the actual delta before treating the new module as a mechanical move.",
+            "text": "The query builder moves out of the search module, but this is **not an unchanged extraction**. It now rejects page sizes outside 1 to 100, non-integers, and booleans. The SQL still uses bound parameters. Read the actual delta before treating the new module as a mechanical move.",
             "change_ids": [
               "aa655bcd417f3a21"
             ],
@@ -5106,7 +5107,7 @@
   "method": {
     "version": "0.3.0",
     "matching": "Conservative Python AST matching; no literal or internal-identifier normalization.",
-    "order": "Static prerequisites, SCC condensation, deterministic topic priority. A heuristic reading order, not a mathematically optimal one.",
+    "order": "Static prerequisites, SCC condensation and deterministic topic priority produce a baseline reading order. Narrated reports may choose another order while keeping dependencies before consumers and cycle members together. Both are heuristics, not an optimal order.",
     "tests": "Static calls/references in supplied changed files only. No repository tests were executed.",
     "scope": "Classes are atomic; dynamic dispatch, reflection, generated code, unchanged callers and unprovided source are not fully resolved.",
     "security": "Source is data: never imported or executed. Standalone report makes no network requests."

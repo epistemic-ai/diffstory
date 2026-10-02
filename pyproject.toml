@@ -24,7 +24,12 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["build>=1.6.1,<2", "twine>=7.0.0,<8", "playwright>=1.63.0,<2"]
+dev = [
+  "build>=1.6.1,<2",
+  "playwright>=1.63.0,<2",
+  "ruff==0.11.2",
+  "twine>=7.0.0,<8",
+]
 
 [project.urls]
 Homepage = "https://www.epistemic.ai"
@@ -41,3 +46,59 @@ diffstory = ["assets/*.html", "assets/*.css", "assets/*.js", "assets/*.svg"]
 [tool.setuptools.packages.find]
 include = ["diffstory*"]
 exclude = ["tests*", "examples*", "docs*", "scripts*"]
+
+[tool.ruff]
+force-exclude = true
+line-length = 79
+unsafe-fixes = true
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812", # The formatter adds trailing commas itself.
+  "D203", # Conflicts with D211.
+  "D212", # Conflicts with D213.
+  "E501", # Long prose, comments, and embedded examples need manual wrapping.
+  "TRY004", # Schema validation consistently reports malformed data as ValueError.
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"diffstory/cli.py" = [
+  "T201", # CLI status and consent prompts are user-facing command output.
+]
+"examples/make_demo.py" = [
+  "T201", # The demo generator reports its generated artifact paths.
+]
+"scripts/check_release.py" = [
+  "T201", # Release checks report pass/fail status on the command line.
+]
+"tests/browser_smoke.py" = [
+  "T201", # The smoke-test runner reports its assertion count.
+]
+"tests/test_narrative.py" = [
+  "SLF001", # Provider protocol and chunk boundaries require white-box assertions.
+]
+"tests/**/*.py" = [
+  "INP001", # Test modules are discovered by unittest, not imported as a package.
+  "PLR2004", # Literal expected values make tests easier to read.
+  "PT", # The suite uses unittest and does not depend on pytest.
+  "S101", # Assertions are intentional in tests.
+  "S603", # Test subprocesses use fixed commands and controlled arguments.
+  "S607", # Tests intentionally resolve standard tools through PATH.
+]
+"examples/**/*.py" = [
+  "E402", # The demo adds the repository root before importing the package.
+  "INP001", # Demo scripts are run directly, not imported as a package.
+]
+"scripts/**/*.py" = [
+  "INP001", # Repository scripts are run directly, not imported as a package.
+]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.format]
+docstring-code-format = false
