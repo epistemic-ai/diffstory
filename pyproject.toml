@@ -24,7 +24,12 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["build>=1.6.1,<2", "twine>=7.0.0,<8", "playwright>=1.63.0,<2"]
+dev = [
+  "build>=1.6.1,<2",
+  "playwright>=1.63.0,<2",
+  "ruff==0.11.2",
+  "twine>=7.0.0,<8",
+]
 
 [project.urls]
 Homepage = "https://www.epistemic.ai"
@@ -41,3 +46,22 @@ diffstory = ["assets/*.html", "assets/*.css", "assets/*.js", "assets/*.svg"]
 [tool.setuptools.packages.find]
 include = ["diffstory*"]
 exclude = ["tests*", "examples*", "docs*", "scripts*"]
+
+[tool.ruff]
+force-exclude = true
+line-length = 79
+
+[tool.ruff.lint]
+select = [
+  "F", # pyflakes
+  "E", # pycode style: error
+  "W", # pycode style: warning
+  "G", # flake8-logging-format
+]
+ignore = ["E501"] # Line length too long
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.format]
+docstring-code-format = false

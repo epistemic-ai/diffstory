@@ -9,7 +9,6 @@ import ast
 import copy
 import difflib
 import hashlib
-import json
 import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence, Set
