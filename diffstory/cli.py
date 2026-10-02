@@ -1,4 +1,5 @@
 """Read-only CLI. Run from the extracted folder with python -m diffstory."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,28 +7,32 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import __version__
-from .analysis import (
-    MAX_SNAPSHOT_SOURCE_BYTES,
-    SCHEMA,
-    apply_annotations,
-    compile_snapshot,
-    evidence_packet,
-)
-from .ingest import from_git, from_github
-from .narrative import (
-    OPENAI_MODEL,
-    CodexCLIProvider,
-    NarrativeProvider,
-    Narrator,
-    OpenAIResponsesProvider,
-)
+from .analysis import MAX_SNAPSHOT_SOURCE_BYTES
+from .analysis import SCHEMA
+from .analysis import apply_annotations
+from .analysis import compile_snapshot
+from .analysis import evidence_packet
+from .ingest import from_git
+from .ingest import from_github
+from .narrative import OPENAI_MODEL
+from .narrative import CodexCLIProvider
+from .narrative import NarrativeProvider
+from .narrative import Narrator
+from .narrative import OpenAIResponsesProvider
 from .render import render
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+MAX_INPUT_BYTES = 80_000_000
 
 
 def read_json(path: str) -> dict:
-    """Read one bounded UTF-8 JSON object from disk.
+    """
+    Read one bounded UTF-8 JSON object from disk.
 
     Args:
         path: Input file path.
@@ -37,21 +42,26 @@ def read_json(path: str) -> dict:
 
     Raises:
         OSError: If the file cannot be read.
-        ValueError: If the file is too large, malformed, or not a JSON object.
+        ValueError: If the file is too large or malformed.
+        TypeError: If the JSON value is not an object.
         UnicodeError: If the file is not valid UTF-8.
+
     """
     input_path = Path(path)
-    if input_path.stat().st_size > 80_000_000:
-        raise ValueError("Input JSON exceeds 80 MB")
+    if input_path.stat().st_size > MAX_INPUT_BYTES:
+        msg = "Input JSON exceeds 80 MB"
+        raise ValueError(msg)
 
     value = json.loads(input_path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise ValueError("JSON must be an object")
+        msg = "JSON must be an object"
+        raise TypeError(msg)
     return value
 
 
 def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add source-limit and opt-in narration flags to a source subcommand.
+    """
+    Add source-limit and opt-in narration flags to a source subcommand.
 
     Args:
         parser: Argument parser for a Git or GitHub source command.
@@ -59,6 +69,7 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
     Side Effects:
         Adds narration, provider, model, confirmation, and annotation options
         directly to ``parser``.
+
     """
     parser.add_argument(
         "--max-source-bytes",
@@ -98,10 +109,12 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the command-line parser for all supported Diffstory commands.
+    """
+    Build the command-line parser for all supported Diffstory commands.
 
     Returns:
         A configured parser with required subcommands and their options.
+
     """
     parser = argparse.ArgumentParser(
         prog="diffstory",
@@ -164,8 +177,15 @@ def _build_parser() -> argparse.ArgumentParser:
     evidence_parser.add_argument("input")
     evidence_parser.add_argument("--out", required=True)
 
-    for command_parser in (git_parser, github_parser, snapshot_parser, render_parser):
-        command_parser.add_argument("--out", required=True, help="Output .html file")
+    for command_parser in (
+        git_parser,
+        github_parser,
+        snapshot_parser,
+        render_parser,
+    ):
+        command_parser.add_argument(
+            "--out", required=True, help="Output .html file"
+        )
         command_parser.add_argument(
             "--annotations",
             help="Optional revision-bound narrative JSON",
@@ -179,7 +199,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _load_snapshot(args: argparse.Namespace) -> dict | None:
-    """Load source data for a repository command or saved snapshot.
+    """
+    Load source data for a repository command or saved snapshot.
 
     Args:
         args: Parsed command-line arguments.
@@ -191,6 +212,7 @@ def _load_snapshot(args: argparse.Namespace) -> dict | None:
     Raises:
         ValueError: If repository ingestion or snapshot decoding fails.
         OSError: If the saved snapshot cannot be read.
+
     """
     if args.command == "git":
         return from_git(
@@ -218,7 +240,8 @@ def _print_narration_preview(
     report: dict,
     preview: dict,
 ) -> None:
-    """Print the evidence-transfer destination and planned narration work.
+    """
+    Print the evidence-transfer destination and planned narration work.
 
     Args:
         provider: Selected narration provider and model.
@@ -227,6 +250,7 @@ def _print_narration_preview(
 
     Side Effects:
         Writes a transfer summary to standard output; makes no provider call.
+
     """
     meta = report["meta"]
     base_sha = meta.get("base_sha", "")[:12]
@@ -255,13 +279,15 @@ def _print_narration_preview(
 
 
 def _print_token_usage(usage: dict) -> None:
-    """Print provider-reported token totals and any calls lacking usage data.
+    """
+    Print provider-reported token totals and any calls lacking usage data.
 
     Args:
         usage: Usage mapping returned by ``RunUsage.report``.
 
     Side Effects:
         Writes token totals to standard output.
+
     """
     print(
         "Provider-reported tokens: "
@@ -277,10 +303,12 @@ def _print_token_usage(usage: dict) -> None:
 
 
 def _confirm_source_transfer(
+    *,
     assume_yes: bool,
     provider: NarrativeProvider,
 ) -> None:
-    """Require consent before source evidence is transferred to a provider.
+    """
+    Require consent before source evidence is transferred to a provider.
 
     Args:
         assume_yes: Whether the caller explicitly supplied ``--yes``.
@@ -292,32 +320,37 @@ def _confirm_source_transfer(
     Side Effects:
         May prompt on standard input. Returns without prompting when
         ``assume_yes`` is true.
+
     """
     if assume_yes:
         return
     if not sys.stdin.isatty():
-        raise ValueError(
-            "Source was not sent. Rerun with --yes only after approving the displayed transfer"
-        )
+        msg = "Source was not sent. Rerun with --yes only after approving the displayed transfer"
+        raise ValueError(msg)
 
     try:
         provider_name = getattr(provider, "consent_name", provider.name)
-        answer = input(
-            f"Send source evidence to {provider_name} and generate narration? [y/N] "
-        ).strip().lower()
+        answer = (
+            input(
+                f"Send source evidence to {provider_name} and generate narration? [y/N] "
+            )
+            .strip()
+            .lower()
+        )
     except EOFError:
-        raise ValueError(
-            "Source was not sent because confirmation was not available"
-        ) from None
+        msg = "Source was not sent because confirmation was not available"
+        raise ValueError(msg) from None
     if answer not in {"y", "yes"}:
-        raise ValueError("Narration cancelled; no model request was made")
+        msg = "Narration cancelled; no model request was made"
+        raise ValueError(msg)
 
 
 def _generate_narration(
     args: argparse.Namespace,
     report: dict,
 ) -> tuple[dict, dict, Path]:
-    """Generate validated narration annotations after preview and consent.
+    """
+    Generate validated narration annotations after preview and consent.
 
     Args:
         args: Parsed source and provider options.
@@ -337,10 +370,12 @@ def _generate_narration(
     Side Effects:
         Prints a local transfer preview and, after consent, may send source
         evidence to the selected provider. Does not write output files.
+
     """
     if args.provider == "openai":
         if args.model not in {None, OPENAI_MODEL}:
-            raise ValueError(f"OpenAI narration currently supports only {OPENAI_MODEL}")
+            msg = f"OpenAI narration currently supports only {OPENAI_MODEL}"
+            raise ValueError(msg)
         provider: NarrativeProvider = OpenAIResponsesProvider(
             token_env=args.api_key_env
         )
@@ -351,7 +386,7 @@ def _generate_narration(
     narrator = Narrator(provider)
     preview = narrator.preview(report)
     _print_narration_preview(provider, report, preview)
-    _confirm_source_transfer(args.yes, provider)
+    _confirm_source_transfer(assume_yes=args.yes, provider=provider)
 
     try:
         annotations = narrator.generate(report)
@@ -373,7 +408,8 @@ def _write_outputs(
     annotations: dict | None,
     candidate_path: Path | None,
 ) -> None:
-    """Render and write requested HTML, report, snapshot, and annotations.
+    """
+    Render and write requested HTML, report, snapshot, and annotations.
 
     Args:
         args: Parsed output and optional snapshot paths.
@@ -389,6 +425,7 @@ def _write_outputs(
     Side Effects:
         Creates parent directories and writes requested output files; prints
         output paths, report counts, warnings, and usage to standard output.
+
     """
     output_path = Path(args.out)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -432,7 +469,8 @@ def _write_outputs(
 
 
 def _export_evidence(args: argparse.Namespace) -> int:
-    """Write a compact evidence packet from an existing report JSON file.
+    """
+    Write a compact evidence packet from an existing report JSON file.
 
     Args:
         args: Parsed evidence input and required output path.
@@ -443,10 +481,12 @@ def _export_evidence(args: argparse.Namespace) -> int:
     Raises:
         ValueError: If the input does not contain a Diffstory report.
         OSError: If input or output files cannot be accessed.
+
     """
     report = read_json(args.input)
     if report.get("schema") != SCHEMA:
-        raise ValueError("Evidence input must be report JSON")
+        msg = "Evidence input must be report JSON"
+        raise ValueError(msg)
     evidence_path = Path(args.out)
     evidence_path.write_text(
         json.dumps(evidence_packet(report), ensure_ascii=False, indent=2),
@@ -456,8 +496,26 @@ def _export_evidence(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv=None) -> int:
-    """Run the requested Diffstory command and translate expected failures.
+def _validate_command_options(args: argparse.Namespace) -> None:
+    """
+    Reject incompatible narration modes before loading their inputs.
+
+    Args:
+        args: Parsed command-line options.
+
+    Raises:
+        ValueError: If repository narration and authored annotations are both
+            requested for the same command.
+    """
+    uses_repository_source = args.command in {"git", "github"}
+    if uses_repository_source and args.narrate and args.annotations:
+        msg = "Use --narrate or --annotations, not both"
+        raise ValueError(msg)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """
+    Run the requested Diffstory command and translate expected failures.
 
     Args:
         argv: Optional argument sequence; defaults to process command-line
@@ -471,6 +529,7 @@ def main(argv=None) -> int:
         May read source/report files, contact GitHub or a narration provider
         when explicitly requested, write outputs, and print status to standard
         output or errors to standard error.
+
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -485,21 +544,21 @@ def main(argv=None) -> int:
         else:
             report = read_json(args.input)
 
+        _validate_command_options(args)
         uses_repository_source = args.command in {"git", "github"}
-        if uses_repository_source and args.narrate and args.annotations:
-            raise ValueError("Use --narrate or --annotations, not both")
 
         annotations = None
         candidate_path = None
         if uses_repository_source and args.narrate:
-            annotations, report, candidate_path = _generate_narration(args, report)
+            annotations, report, candidate_path = _generate_narration(
+                args, report
+            )
 
         if args.annotations:
             authored_annotations = read_json(args.annotations)
             report = apply_annotations(report, authored_annotations)
 
         _write_outputs(args, report, snapshot, annotations, candidate_path)
-        return 0
     except (
         ValueError,
         KeyError,
@@ -510,6 +569,8 @@ def main(argv=None) -> int:
     ) as error:
         print(f"diffstory: {error}", file=sys.stderr)
         return 2
+    else:
+        return 0
 
 
 if __name__ == "__main__":

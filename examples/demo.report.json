@@ -3,8 +3,8 @@
   "meta": {
     "title": "One search module. Three clear responsibilities.",
     "repository": "Synthetic catalog",
-    "base_sha": "44912524610170cef73861796b05188a13b7e1b0",
-    "head_sha": "2ac82c2ba3bffd4500379bc1fced0900a12bb2ba",
+    "base_sha": "f02951246558fb83690cda57b5b2e69f9db8fd200d1238aac5560862867db108",
+    "head_sha": "cef8d49e22be5fbaba70cdfdfe00da3b3ff36d5142e7af7a7243e38a5414b4a4",
     "scope": "changed files",
     "input": "synthetic example",
     "comparison": "original synthetic before/after sources",
@@ -2657,7 +2657,7 @@
         "transition": "Follow the next dependency without leaving this document.",
         "passages": [
           {
-            "text": "The query builder moves out of the search module, but this is **not an unchanged extraction**. It now rejects page sizes outside 1–100, non-integers, and booleans. The SQL still uses bound parameters. Read the actual delta before treating the new module as a mechanical move.",
+            "text": "The query builder moves out of the search module, but this is **not an unchanged extraction**. It now rejects page sizes outside 1 to 100, non-integers, and booleans. The SQL still uses bound parameters. Read the actual delta before treating the new module as a mechanical move.",
             "change_ids": [
               "aa655bcd417f3a21"
             ],
