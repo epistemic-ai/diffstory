@@ -72,14 +72,15 @@ def _validate_nested_value(value: object) -> None:
 
 
 def _validate_report_collections(report: dict) -> None:
-    """Require report collection fields to contain mapping records.
+    """Validate object collections and string-list report fields.
 
     Args:
         report: Parsed Diffstory report mapping.
 
     Raises:
-        ValueError: If a collection is absent, not a list, or contains a
-            non-object record.
+        ValueError: If an object collection contains a non-object, or warnings
+            and notes are not lists of strings. Notes may be absent in a v1
+            report produced before notes were added.
     """
     for name in (
         "groups",
@@ -87,13 +88,21 @@ def _validate_report_collections(report: dict) -> None:
         "tests",
         "edges",
         "raw_files",
-        "warnings",
     ):
         records = report.get(name)
         if not isinstance(records, list) or any(
             not isinstance(record, dict) for record in records
         ):
             msg = f"Report {name} must be a list of objects"
+            raise ValueError(msg)
+    for name in ("warnings", "notes"):
+        if name not in report and name == "notes":
+            continue
+        values = report.get(name)
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) for value in values
+        ):
+            msg = f"Report {name} must be a list of strings"
             raise ValueError(msg)
 
 
@@ -190,9 +199,10 @@ def validate_report(report: dict) -> None:
     if "document" in report:
         d = report["document"]
         if not isinstance(d, dict) or any(
-            k not in {"lead", "closing"}
+            k not in {"preamble", "lead", "closing"}
             or not isinstance(v, str)
             or len(v) > MAX_NARRATIVE_TEXT_CHARS
+            or (k == "preamble" and not v.strip())
             for k, v in d.items()
         ):
             msg = "Invalid document narrative"

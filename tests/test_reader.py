@@ -96,6 +96,7 @@ class LiterateReaderTests(unittest.TestCase):
             out["groups"][0]["narrative"]["passages"],
             a["steps"][0]["passages"],
         )
+        self.assertNotIn("preamble", out["document"])
         self.assertEqual(out["changes"], r["changes"])
         self.assertEqual(out["stats"], r["stats"])
         self.assertNotIn("document", r)
@@ -188,7 +189,7 @@ class LiterateReaderTests(unittest.TestCase):
             apply_annotations(r, a)
 
     def test_bad_document_rejected(self) -> None:
-        """Reject document fields outside the supported opening and closing contract."""
+        """Reject document fields outside the supported narration contract."""
         r = report()
         a = annotations(r)
         a["document"]["test_runs"] = 100
@@ -211,11 +212,32 @@ class LiterateReaderTests(unittest.TestCase):
         a = annotations(r)
         attack = "</script><script>window.COMPROMISED=true</script>"
         a["document"]["lead"] = attack
+        a["document"]["preamble"] = attack
         a["steps"][0]["passages"][0]["text"] = attack
         h = render(apply_annotations(r, a))
         self.assertNotIn(attack, h)
         self.assertIn("\\u003c/script\\u003e", h)
         self.assertIn("connect-src 'none'", h)
+
+    def test_optional_preamble_is_preserved_and_must_contain_text(
+        self,
+    ) -> None:
+        """Keep an optional authored preamble and reject a blank supplied value."""
+        r = report()
+        a = annotations(r)
+        a["document"]["preamble"] = (
+            "This change joins the report to its source.\n"
+            "Map: report → sections → code."
+        )
+        out = apply_annotations(r, a)
+        self.assertEqual(
+            out["document"]["preamble"], a["document"]["preamble"]
+        )
+        self.assertIn("\\nMap: report", render(out))
+
+        a["document"]["preamble"] = "  "
+        with self.assertRaisesRegex(ValueError, "preamble"):
+            apply_annotations(r, a)
 
     def test_renderer_validates_loaded_report_passages(self) -> None:
         """Validate persisted passage evidence again when loading a report for rendering."""
@@ -230,6 +252,106 @@ class LiterateReaderTests(unittest.TestCase):
         self.assertIn("passages", i)
         self.assertIn("original line numbers", i)
         self.assertIn("Do not rewrite source", i)
+
+    def test_report_string_lists_render(self) -> None:
+        """Notes and warnings are string lists, while old reports may omit notes."""
+        compiled = compile_snapshot(
+            {
+                "schema": "diffstory.snapshot.v1",
+                "meta": {"changed_files": 2},
+                "fragments": [
+                    {"path": "README.md", "side": "head", "text": "A note.\n"},
+                    {
+                        "path": "broken.py",
+                        "side": "head",
+                        "text": "def broken(:\n",
+                    },
+                ],
+                "warnings": ["Incoming legacy warning."],
+            },
+        )
+        old_report = copy.deepcopy(compiled)
+        old_report.pop("notes")
+        malformed_warnings = copy.deepcopy(compiled)
+        malformed_warnings["warnings"] = [{"message": "not a string"}]
+        malformed_notes = copy.deepcopy(compiled)
+        malformed_notes["notes"] = [None]
+        rows = [
+            ("new report", compiled, True),
+            ("old report", old_report, True),
+            ("object warning", malformed_warnings, False),
+            ("non-string note", malformed_notes, False),
+        ]
+        for name, candidate, valid in rows:
+            with self.subTest(case=name):
+                if valid:
+                    render(candidate)
+                else:
+                    with self.assertRaisesRegex(ValueError, "list of strings"):
+                        render(candidate)
+
+    def test_annotations_preserve_kind_and_basis(self) -> None:
+        """Authored prose must not change the compiler's file status or basis."""
+        source_report = report()
+        before = copy.deepcopy(source_report["changes"])
+        annotated = apply_annotations(
+            source_report, annotations(source_report)
+        )
+        self.assertEqual(annotated["changes"], before)
+        self.assertTrue(
+            all(change["basis"] for change in annotated["changes"])
+        )
+
+    def test_stale_change_ids_are_rejected(self) -> None:
+        """Annotations citing IDs from a corrected kind must fail validation."""
+        source = "def f():\n    return 1\n"
+        old_report = compile_snapshot(
+            {
+                "schema": "diffstory.snapshot.v1",
+                "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+                "fragments": [
+                    {
+                        "path": "x.py",
+                        "side": "head",
+                        "text": source,
+                        "start_line": 1,
+                        "scope": "full",
+                    },
+                ],
+            },
+        )
+        new_report = compile_snapshot(
+            {
+                "schema": "diffstory.snapshot.v1",
+                "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+                "fragments": [
+                    {
+                        "path": "x.py",
+                        "side": "head",
+                        "text": source,
+                        "start_line": 1,
+                        "scope": "full",
+                    },
+                ],
+                "file_evidence": [
+                    {
+                        "base": {"path": "x.py", "state": "absent"},
+                        "head": {
+                            "path": "x.py",
+                            "state": "supplied",
+                            "coverage": "full",
+                        },
+                    },
+                ],
+            },
+        )
+        stale_id = old_report["changes"][0]["id"]
+        current = annotations(new_report)
+        current["steps"][0]["evidence_change_ids"] = [stale_id]
+        current["steps"][0]["passages"][0]["change_ids"] = [stale_id]
+        self.assertNotEqual(stale_id, new_report["changes"][0]["id"])
+        with self.assertRaisesRegex(ValueError, "outside its group"):
+            apply_annotations(new_report, current)
 
 
 if __name__ == "__main__":

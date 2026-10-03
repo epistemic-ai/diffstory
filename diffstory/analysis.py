@@ -57,10 +57,10 @@ LABELS = {
     "moved_modified": "Moved + edited · candidate",
     "modified": "Edited · review behavior",
     "source_only": "Source-only edit",
-    "added": "New definition",
-    "removed": "Removed definition",
-    "observed_head": "Head definition · counterpart unresolved",
-    "observed_base": "Base definition · counterpart unresolved",
+    "added": "Added to file",
+    "removed": "Removed from file",
+    "observed_head": "Addition unresolved",
+    "observed_base": "Removal unresolved",
     "wiring": "Import wiring",
     "text": "Text-only change",
     "test": "Test change",
@@ -434,7 +434,7 @@ def _symbol_record(
 def extract(
     fragment: dict,
     meta: dict,
-) -> tuple[Iterable[dict], Iterable[dict], str | None]:
+) -> tuple[Iterable[dict], Iterable[dict], str, str | None]:
     """
     Extract symbols, imports, and parse status from one source fragment.
 
@@ -446,8 +446,9 @@ def extract(
         meta: Revision metadata used to produce source permalinks.
 
     Returns:
-        A tuple of extracted symbol records, import records, and an optional
-        text-only or parse-failure note.
+        A tuple of symbols, imports, parse status, and an optional note.
+        Status is ``ok``, ``text_only``, or ``failed``. Text-only source and
+        parse failures return a note; successful Python parsing returns none.
 
     Raises:
         ValueError: If source exceeds the per-file parsing limit.
@@ -461,13 +462,18 @@ def extract(
         msg = f"Source exceeds the 8 MB parsing limit: {path}"
         raise ValueError(msg)
     if not path.endswith(".py") or fragment.get("syntax") == "text":
-        return [], [], "Text-only evidence; no Python AST classification."
+        return (
+            [],
+            [],
+            "text_only",
+            "Text-only evidence; no Python AST classification.",
+        )
 
     try:
         tree = ast.parse(source_text, filename=path, type_comments=True)
     except (SyntaxError, ValueError, RecursionError) as error:
         note = f"AST unavailable: {type(error).__name__}: {str(error)[:180]}"
-        return [], [], note
+        return [], [], "failed", note
 
     source_lines = source_text.splitlines()
     symbols = tuple(
@@ -475,7 +481,7 @@ def extract(
         for index, node in enumerate(tree.body)
         if isinstance(node, SYMBOL_TYPES)
     )
-    return symbols, _imports_from_tree(tree, start_line), None
+    return symbols, _imports_from_tree(tree, start_line), "ok", None
 
 
 def match_symbols(
@@ -1300,9 +1306,9 @@ def _narrative(group: dict, changes: Sequence[dict]) -> dict:
     }
 
 
-def _validate_snapshot_input(
+def _validate_snapshot_input(  # noqa: C901  # Envelope checks form one validation contract.
     snapshot: dict,
-) -> tuple[dict, list[dict], int, list[str]]:
+) -> tuple[dict, list[dict], int, list[str], list[dict] | None]:
     """
     Validate the snapshot envelope and calculate its UTF-8 source size.
 
@@ -1310,17 +1316,25 @@ def _validate_snapshot_input(
         snapshot: ``diffstory.snapshot.v1`` mapping to validate.
 
     Returns:
-        Metadata, source fragments, aggregate bytes, and initial warnings.
+        Metadata, source fragments, aggregate bytes, initial warnings, and
+        validated file evidence or ``None`` when the field is omitted.
 
     Raises:
-        ValueError: If the schema, fragment list, or aggregate source limit is
-            invalid.
+        ValueError: If the schema, metadata, fragments, warning strings, file
+            evidence, or aggregate source limit is invalid.
     """
-    if snapshot.get("schema") != "diffstory.snapshot.v1":
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("schema") != "diffstory.snapshot.v1"
+    ):
         msg = "Expected diffstory.snapshot.v1"
         raise ValueError(msg)
 
-    meta = dict(snapshot.get("meta", {}))
+    raw_meta = snapshot.get("meta", {})
+    if not isinstance(raw_meta, dict):
+        msg = "Snapshot metadata must be an object"
+        raise ValueError(msg)
+    meta = dict(raw_meta)
     fragments = snapshot.get("fragments", [])
     if not isinstance(fragments, list):
         msg = "Snapshot fragments must be a list"
@@ -1335,7 +1349,11 @@ def _validate_snapshot_input(
             msg = "Snapshot fragment text must be a string"
             raise ValueError(msg)
 
-        source_bytes += len(fragment["text"].encode("utf-8"))
+        try:
+            source_bytes += len(fragment["text"].encode("utf-8"))
+        except UnicodeEncodeError as error:
+            msg = "Snapshot fragment text must be valid UTF-8"
+            raise ValueError(msg) from error
         if source_bytes > MAX_SNAPSHOT_SOURCE_BYTES:
             msg = (
                 "Snapshot source exceeds the "
@@ -1348,9 +1366,145 @@ def _validate_snapshot_input(
     if not fragments and meta.get("changed_files") != 0:
         msg = "Snapshot contains no source fragments"
         raise ValueError(msg)
+    warnings = snapshot.get("warnings", [])
+    if not isinstance(warnings, list) or any(
+        not isinstance(warning, str) for warning in warnings
+    ):
+        msg = "Snapshot warnings must be a list of strings"
+        raise ValueError(msg)
+    file_evidence = None
+    if "file_evidence" in snapshot:
+        file_evidence = _validate_file_evidence(snapshot["file_evidence"])
     meta["source_bytes"] = source_bytes
-    warnings = list(snapshot.get("warnings", []))
-    return meta, fragments, source_bytes, warnings
+    return meta, fragments, source_bytes, list(warnings), file_evidence
+
+
+FILE_EVIDENCE_REASONS = frozenset(
+    {
+        "not_supplied",
+        "size_limit",
+        "binary_or_non_utf8",
+        "unsupported_object",
+        "invalid_content_size",
+        "unsupported_encoding",
+        "read_failed",
+    },
+)
+
+
+def _validate_evidence_path(path: object) -> str:
+    """Validate a repository-relative path used by file evidence.
+
+    Args:
+        path: Untrusted path value from a file comparison record.
+
+    Returns:
+        The accepted path string, without filesystem resolution.
+
+    Raises:
+        ValueError: If the path is empty, absolute, contains NUL, or has a dot
+            or parent component.
+    """
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\0" in path
+        or path.startswith(("/", "\\"))
+        or re.match(r"^[A-Za-z]:", path)
+        or any(part in {".", ".."} for part in path.split("/"))
+    ):
+        msg = "File evidence path must be a nonempty repository-relative path"
+        raise ValueError(msg)
+    return path
+
+
+def _validate_evidence_side(side: object) -> dict:
+    """Validate one strict file-availability side record.
+
+    A ``supplied`` side has ``path``, ``state``, and ``coverage``. Coverage is
+    ``full`` or ``partial``. An ``absent`` side has only ``path`` and ``state``.
+    An ``unavailable`` side has ``path``, ``state``, and a reason code from
+    :data:`FILE_EVIDENCE_REASONS`.
+
+    Args:
+        side: Untrusted base or head side mapping.
+
+    Returns:
+        The validated side mapping.
+
+    Raises:
+        ValueError: If its state, fields, path, coverage, or reason is invalid.
+    """
+    if not isinstance(side, dict):
+        msg = "File evidence sides must be objects"
+        raise ValueError(msg)
+    state = side.get("state")
+    if not isinstance(state, str):
+        msg = "File evidence state must be a string"
+        raise ValueError(msg)
+    expected_fields = {
+        "supplied": {"path", "state", "coverage"},
+        "absent": {"path", "state"},
+        "unavailable": {"path", "state", "reason"},
+    }.get(state)
+    if expected_fields is None or set(side) != expected_fields:
+        msg = "File evidence side has invalid state or fields"
+        raise ValueError(msg)
+    _validate_evidence_path(side["path"])
+    if state == "supplied" and (
+        not isinstance(side["coverage"], str)
+        or side["coverage"]
+        not in {
+            "full",
+            "partial",
+        }
+    ):
+        msg = "File evidence coverage must be full or partial"
+        raise ValueError(msg)
+    if state == "unavailable" and (
+        not isinstance(side["reason"], str)
+        or side["reason"] not in FILE_EVIDENCE_REASONS
+    ):
+        msg = "File evidence reason is not supported"
+        raise ValueError(msg)
+    return dict(side)
+
+
+def _validate_file_evidence(value: object) -> list[dict]:
+    """Validate records and uniqueness for the optional v1 evidence field.
+
+    Args:
+        value: Untrusted ``file_evidence`` value.
+
+    Returns:
+        Validated records with exact base/head side fields.
+
+    Raises:
+        ValueError: If the list shape, record shape, side data, or path
+            uniqueness is invalid.
+    """
+    if not isinstance(value, list):
+        msg = "Snapshot file_evidence must be a list"
+        raise ValueError(msg)
+    records = []
+    seen = set()
+    for record in value:
+        if not isinstance(record, dict) or set(record) != {"base", "head"}:
+            msg = "File evidence records must contain exactly base and head"
+            raise ValueError(msg)
+        base = _validate_evidence_side(record["base"])
+        head = _validate_evidence_side(record["head"])
+        if base["state"] == head["state"] == "absent":
+            msg = "A file evidence record cannot be absent on both sides"
+            raise ValueError(msg)
+        for side_name, side in (("base", base), ("head", head)):
+            key = (side_name, side["path"])
+            if key in seen:
+                msg = "File evidence side path must be unique"
+                raise ValueError(msg)
+            seen.add(key)
+        records.append({"base": base, "head": head})
+    return records
 
 
 def _validate_fragment_range(
@@ -1374,13 +1528,18 @@ def _validate_fragment_range(
     path = fragment.get("path")
     text = fragment.get("text")
     start_line = fragment.get("start_line", 1)
-    if side not in {"base", "head"}:
+    if not isinstance(side, str) or side not in {"base", "head"}:
         msg = "Fragment side must be base or head"
         raise ValueError(msg)
     if not isinstance(text, str) or not isinstance(path, str):
         msg = "Fragment path/text must be strings"
         raise ValueError(msg)
-    if not isinstance(start_line, int) or start_line < 1:
+    if "region" in fragment and (
+        not isinstance(fragment["region"], str) or not fragment["region"]
+    ):
+        msg = "Fragment region must be a nonempty string"
+        raise ValueError(msg)
+    if type(start_line) is not int or start_line < 1:
         msg = "start_line must be a positive integer"
         raise ValueError(msg)
 
@@ -1406,6 +1565,8 @@ def _index_snapshot_fragments(
     dict[str, dict],
     dict[str, list[dict]],
     dict[str, defaultdict[str, list[dict]]],
+    dict[str, str],
+    list[str],
     list[str],
 ]:
     """
@@ -1418,7 +1579,7 @@ def _index_snapshot_fragments(
 
     Returns:
         Fragments by ID, symbols by revision side, imports by side and path,
-        and parse warnings.
+        parse statuses, analysis notes, and warnings.
     """
     symbols_by_side = {"base": [], "head": []}
     imports_by_side = {
@@ -1426,6 +1587,8 @@ def _index_snapshot_fragments(
         "head": defaultdict(list),
     }
     fragments_by_id = {}
+    parse_status_by_id = {}
+    notes = []
     occupied_ranges = defaultdict(list)
 
     for index, original_fragment in enumerate(fragments):
@@ -1438,18 +1601,286 @@ def _index_snapshot_fragments(
         fragment["id"] = stable_id(side, path, start_line, index)
         fragments_by_id[fragment["id"]] = fragment
 
-        symbols, imports, parse_note = extract(fragment, meta)
+        symbols, imports, parse_status, parse_note = extract(fragment, meta)
         symbols_by_side[side].extend(symbols)
         imports_by_side[side][path].extend(imports)
+        parse_status_by_id[fragment["id"]] = parse_status
         if parse_note:
-            warnings.append(f"{path} ({side}): {parse_note}")
+            target = notes if parse_status == "text_only" else warnings
+            target.append(f"{path} ({side}): {parse_note}")
 
     return (
         fragments_by_id,
         symbols_by_side,
         imports_by_side,
+        parse_status_by_id,
+        notes,
         warnings,
     )
+
+
+def _file_coverage_side(
+    side: dict,
+    fragment_ids: Sequence[str],
+    parse_status_by_id: Mapping[str, str],
+) -> dict:
+    """Build one internal status entry for a file comparison side.
+
+    Args:
+        side: Side fields from explicit evidence or the legacy fallback.
+        fragment_ids: Source fragment IDs assigned to this side.
+        parse_status_by_id: Parse status for every supplied fragment.
+
+    Returns:
+        Path, state, coverage, reason, fragment IDs, and parse results.
+    """
+    state = side["state"]
+    return {
+        "path": side["path"],
+        "state": state,
+        "coverage": side.get("coverage") if state == "supplied" else None,
+        "reason": side.get("reason") if state == "unavailable" else None,
+        "fragment_ids": list(fragment_ids),
+        "parse_statuses": [parse_status_by_id[item] for item in fragment_ids],
+    }
+
+
+def _legacy_file_pairs(
+    fragments_by_id: Mapping[str, dict],
+) -> list[tuple[str | None, str | None]]:
+    """Pair legacy files by exact path or a unique shared explicit region.
+
+    Args:
+        fragments_by_id: Validated fragments from a snapshot without explicit
+            file evidence.
+
+    Returns:
+        Base/head path pairs. Ambiguous cross-path links remain unpaired.
+    """
+    paths = {
+        side: {
+            fragment["path"]
+            for fragment in fragments_by_id.values()
+            if fragment["side"] == side
+        }
+        for side in ("base", "head")
+    }
+    pairs = [(path, path) for path in sorted(paths["base"] & paths["head"])]
+    used_base = {base for base, _ in pairs}
+    used_head = {head for _, head in pairs}
+    regions = {"base": defaultdict(set), "head": defaultdict(set)}
+    for fragment in fragments_by_id.values():
+        if "region" in fragment:
+            regions[fragment["side"]][fragment["region"]].add(fragment["path"])
+    candidates = defaultdict(set)
+    reverse = defaultdict(set)
+    for region in regions["base"].keys() & regions["head"].keys():
+        base_paths = regions["base"][region]
+        head_paths = regions["head"][region]
+        if len(base_paths) == len(head_paths) == 1:
+            base_path = next(iter(base_paths))
+            head_path = next(iter(head_paths))
+            if base_path != head_path:
+                candidates[base_path].add(head_path)
+                reverse[head_path].add(base_path)
+    for base_path, heads in sorted(candidates.items()):
+        if len(heads) != 1 or base_path in used_base:
+            continue
+        head_path = next(iter(heads))
+        if head_path in used_head or len(reverse[head_path]) != 1:
+            continue
+        pairs.append((base_path, head_path))
+        used_base.add(base_path)
+        used_head.add(head_path)
+    paired_base = {base for base, _ in pairs}
+    paired_head = {head for _, head in pairs}
+    pairs.extend((path, None) for path in sorted(paths["base"] - paired_base))
+    pairs.extend((None, path) for path in sorted(paths["head"] - paired_head))
+    return pairs
+
+
+def _validate_explicit_regions(
+    records: Sequence[dict],
+    fragments_by_id: Mapping[str, dict],
+) -> None:
+    """Validate region uniqueness and record ownership for explicit evidence.
+
+    Args:
+        records: File evidence records augmented with fragment IDs.
+        fragments_by_id: Validated source fragments.
+
+    Raises:
+        ValueError: If a region repeats on one side or crosses file records.
+    """
+    occupied = set()
+    owners = {}
+    for record_index, record in enumerate(records):
+        regions_by_side = {"base": [], "head": []}
+        default_region = record["head"]["path"]
+        for side_name in ("base", "head"):
+            side = record[side_name]
+            for fragment_id in side["fragment_ids"]:
+                fragment = fragments_by_id[fragment_id]
+                region = fragment.get("region", default_region)
+                if not isinstance(region, str) or not region:
+                    msg = "Fragment region must be a nonempty string"
+                    raise ValueError(msg)
+                key = (region, side_name)
+                if key in occupied:
+                    msg = "Duplicate raw region for one revision side"
+                    raise ValueError(msg)
+                occupied.add(key)
+                owner = owners.setdefault(region, record_index)
+                if owner != record_index:
+                    msg = "A raw region cannot join different file evidence records"
+                    raise ValueError(msg)
+                fragment["_raw_region"] = region
+                regions_by_side[side_name].append(region)
+        if (
+            record["base"]["state"] == "supplied"
+            and record["head"]["state"] == "supplied"
+            and record["base"]["coverage"] == "full"
+            and record["head"]["coverage"] == "full"
+            and regions_by_side["base"] != regions_by_side["head"]
+        ):
+            msg = "Full file sides in one evidence record must share a region"
+            raise ValueError(msg)
+
+
+def _build_coverage_index(  # noqa: C901, PLR0912, PLR0915  # Explicit and legacy records have separate invariants.
+    file_evidence: list[dict] | None,
+    meta: Mapping[str, object],
+    fragments_by_id: Mapping[str, dict],
+    parse_status_by_id: Mapping[str, str],
+) -> dict[tuple[str, str], dict]:
+    """Validate fragment assignment and build per-file coverage entries.
+
+    Args:
+        file_evidence: Validated explicit evidence or ``None`` for legacy input.
+        meta: Snapshot metadata used only for conservative legacy inference.
+        fragments_by_id: Validated source fragments.
+        parse_status_by_id: Parse status for every fragment.
+
+    Returns:
+        Coverage entries keyed by ``(side, path)`` with paired file identity.
+
+    Raises:
+        ValueError: If evidence does not cover fragments or contradicts them.
+    """
+    fragments_by_file = defaultdict(list)
+    for fragment_id, fragment in fragments_by_id.items():
+        fragments_by_file[(fragment["side"], fragment["path"])].append(
+            fragment_id,
+        )
+
+    if file_evidence is not None:
+        records = []
+        expected_keys = set()
+        for index, source_record in enumerate(file_evidence):
+            record = {
+                "base": dict(source_record["base"]),
+                "head": dict(source_record["head"]),
+                "id": ("evidence", index),
+            }
+            for side_name in ("base", "head"):
+                side = record[side_name]
+                key = (side_name, side["path"])
+                expected_keys.add(key)
+                side["fragment_ids"] = fragments_by_file.get(key, [])
+                count = len(side["fragment_ids"])
+                if side["state"] == "supplied":
+                    if not count:
+                        msg = "A supplied file evidence side must have a fragment"
+                        raise ValueError(msg)
+                    if side["coverage"] == "full":
+                        if count != 1:
+                            msg = "Full file evidence requires exactly one fragment"
+                            raise ValueError(msg)
+                        fragment = fragments_by_id[side["fragment_ids"][0]]
+                        if fragment.get("start_line", 1) != 1:
+                            msg = "Full file evidence must start at line 1"
+                            raise ValueError(msg)
+                        if fragment.get("scope") not in (
+                            None,
+                            "full",
+                            "complete",
+                        ):
+                            msg = "Full file evidence conflicts with excerpt scope"
+                            raise ValueError(msg)
+                elif count:
+                    msg = (
+                        f"{side['state'].capitalize()} file evidence "
+                        "cannot contain fragments"
+                    )
+                    raise ValueError(msg)
+            records.append(record)
+        if set(fragments_by_file) - expected_keys:
+            msg = "File evidence must cover every supplied fragment"
+            raise ValueError(msg)
+        _validate_explicit_regions(records, fragments_by_id)
+        coverage = {}
+        for record in records:
+            for side_name, opposite in (("base", "head"), ("head", "base")):
+                entry = _file_coverage_side(
+                    record[side_name],
+                    record[side_name]["fragment_ids"],
+                    parse_status_by_id,
+                )
+                entry["record_id"] = record["id"]
+                entry["counterpart_path"] = record[opposite]["path"]
+                coverage[(side_name, entry["path"])] = entry
+        return coverage
+
+    coverage = {}
+    pairs = _legacy_file_pairs(fragments_by_id)
+    selected_excerpts = meta.get("scope") == "selected excerpts"
+    for pair_index, (base_path, head_path) in enumerate(pairs):
+        record_id = ("legacy", pair_index)
+        for side_name, path, opposite_path in (
+            ("base", base_path, head_path),
+            ("head", head_path, base_path),
+        ):
+            fallback_path = opposite_path or base_path or head_path
+            fragment_ids = (
+                fragments_by_file.get((side_name, path), []) if path else []
+            )
+            if fragment_ids:
+                only = fragments_by_id[fragment_ids[0]]
+                full = (
+                    not selected_excerpts
+                    and len(fragment_ids) == 1
+                    and only.get("start_line", 1) == 1
+                    and only.get("scope") == "full"
+                )
+                side = {
+                    "path": path,
+                    "state": "supplied",
+                    "coverage": "full" if full else "partial",
+                }
+            else:
+                side = {
+                    "path": fallback_path,
+                    "state": "unavailable",
+                    "reason": "not_supplied",
+                }
+            entry = _file_coverage_side(side, fragment_ids, parse_status_by_id)
+            entry["record_id"] = record_id
+            entry["counterpart_path"] = opposite_path or entry["path"]
+            coverage[(side_name, entry["path"])] = entry
+
+    occupied = set()
+    for fragment in fragments_by_id.values():
+        region = fragment.get("region", fragment["path"])
+        if not isinstance(region, str) or not region:
+            msg = "Fragment region must be a nonempty string"
+            raise ValueError(msg)
+        key = (region, fragment["side"])
+        if key in occupied:
+            msg = "Duplicate raw region for one revision side"
+            raise ValueError(msg)
+        occupied.add(key)
+        fragment["_raw_region"] = region
+    return coverage
 
 
 def _prepare_snapshot(
@@ -1460,6 +1891,9 @@ def _prepare_snapshot(
     Mapping[str, dict],
     Mapping[str, Sequence[dict]],
     Mapping[str, Mapping[str, Sequence[dict]]],
+    Mapping[str, str],
+    Mapping[tuple[str, str], dict],
+    Sequence[str],
     Sequence[str],
 ]:
     """
@@ -1470,25 +1904,39 @@ def _prepare_snapshot(
 
     Returns:
         Metadata with the aggregate source size, original fragments, indexed
-        fragments, symbols and imports grouped by revision side, and warnings.
+        fragments, symbols, imports, parse statuses, per-file coverage, notes,
+        and warnings.
 
     Raises:
         ValueError: If snapshot fields, fragment ranges, or source limits are
             invalid.
     """
-    meta, fragments, _, warnings = _validate_snapshot_input(snapshot)
+    meta, fragments, _, warnings, file_evidence = _validate_snapshot_input(
+        snapshot
+    )
     (
         fragments_by_id,
         symbols_by_side,
         imports_by_side,
+        parse_status_by_id,
+        notes,
         warnings,
     ) = _index_snapshot_fragments(fragments, meta, warnings)
+    coverage_index = _build_coverage_index(
+        file_evidence,
+        meta,
+        fragments_by_id,
+        parse_status_by_id,
+    )
     return (
         meta,
         fragments,
         fragments_by_id,
         symbols_by_side,
         imports_by_side,
+        parse_status_by_id,
+        coverage_index,
+        notes,
         warnings,
     )
 
@@ -1562,43 +2010,183 @@ def _append_change(  # noqa: PLR0913  # Each mutable index and evidence input is
     return change
 
 
-def _collect_symbol_changes(  # noqa: PLR0913  # Matching and scope inputs stay explicit.
+def _is_full_and_parsed(side: Mapping[str, object] | None) -> bool:
+    """Return whether a supplied file side is full and successfully parsed.
+
+    Args:
+        side: Internal per-file coverage entry, or ``None`` if unlinked.
+
+    Returns:
+        ``True`` only for full supplied source with successful parse status.
+    """
+    statuses = side.get("parse_statuses", []) if side else []
+    return bool(
+        side
+        and side.get("state") == "supplied"
+        and side.get("coverage") == "full"
+        and statuses
+        and all(status == "ok" for status in statuses)
+    )
+
+
+def _coverage_blockers(
+    side_name: str,
+    side: Mapping[str, object] | None,
+) -> list[str]:
+    """Return deterministic reasons why one file side cannot confirm absence.
+
+    Args:
+        side_name: File revision side, ``base`` or ``head``.
+        side: Internal per-file coverage entry, or ``None`` if unlinked.
+
+    Returns:
+        Plain-language blocker sentences. Confirmed absence has no blocker.
+    """
+    if side is None:
+        return [
+            f"The {side_name} source was not supplied; file absence is not confirmed."
+        ]
+    if side["state"] == "absent":
+        return []
+    if side["state"] == "unavailable":
+        reason = side.get("reason")
+        descriptions = {
+            "not_supplied": f"The {side_name} source was not supplied; file absence is not confirmed.",
+            "size_limit": f"The {side_name} source is unavailable because it exceeds the file size limit.",
+            "binary_or_non_utf8": f"The {side_name} source is unavailable because it is binary or is not UTF-8.",
+            "unsupported_object": f"The {side_name} source is unavailable because it is not a supported regular file.",
+            "invalid_content_size": f"The {side_name} source is unavailable because its declared size is invalid.",
+            "unsupported_encoding": f"The {side_name} source is unavailable because its encoding is unsupported.",
+            "read_failed": f"The {side_name} source could not be read; file absence is not confirmed.",
+        }
+        return [
+            descriptions.get(reason, f"The {side_name} source is unavailable.")
+        ]
+    blockers = []
+    if side.get("coverage") != "full":
+        blockers.append(f"Only part of the {side_name} file is supplied.")
+    statuses = side.get("parse_statuses", [])
+    if "failed" in statuses:
+        blockers.append(f"The {side_name} Python source could not be parsed.")
+    if "text_only" in statuses:
+        blockers.append(
+            f"The {side_name} source is text-only; Python parsing is not available."
+        )
+    return blockers
+
+
+def _unmatched_basis(  # noqa: PLR0913  # Each input controls one evidence statement.
+    symbol: dict,
+    own: Mapping[str, object] | None,
+    counterpart: Mapping[str, object] | None,
+    *,
+    is_base: bool,
+    declaration_remains: bool,
+    confirmed: bool,
+) -> str:
+    """Build deterministic basis text for an unmatched declaration.
+
+    Args:
+        symbol: Unmatched declaration record.
+        own: Coverage entry for the declaration's side.
+        counterpart: Coverage entry for the paired file on the other side.
+        is_base: True for a base-side declaration.
+        declaration_remains: True if a same-name, same-type declaration remains.
+        confirmed: Result of the file-level confirmation predicate.
+
+    Returns:
+        Basis text with file-level evidence and any repository limit.
+    """
+    name = symbol["name"]
+    own_side = "base" if is_base else "head"
+    own_path = own.get("path", symbol["path"]) if own else symbol["path"]
+    other_path = counterpart.get("path", own_path) if counterpart else own_path
+    base_path, head_path = (
+        (own_path, other_path) if is_base else (other_path, own_path)
+    )
+    linked_paths = (
+        f" Base path: {base_path}. Head path: {head_path}."
+        if own_path != other_path
+        else ""
+    )
+
+    if confirmed and counterpart and counterpart.get("state") == "absent":
+        if is_base:
+            basis = (
+                f"Definition {name} was removed from the supplied file {own_path}. "
+                "The base file is fully supplied and parsed. "
+                "The file is confirmed absent at the head revision."
+            )
+        else:
+            basis = (
+                f"Definition {name} was added to the supplied file {own_path}. "
+                "The file is confirmed absent at the base revision. "
+                "The head file is fully supplied and parsed."
+            )
+    elif confirmed:
+        if is_base:
+            basis = (
+                f"Definition {name} was removed from the supplied file {own_path}. "
+                "Both file versions are fully supplied and parsed. "
+                "No counterpart was matched."
+            )
+        else:
+            basis = (
+                f"Definition {name} was added to the supplied file {own_path}. "
+                "Both file versions are fully supplied and parsed. "
+                "No counterpart was matched."
+            )
+    else:
+        blockers = []
+        blockers.extend(
+            _coverage_blockers("base", own if is_base else counterpart)
+        )
+        blockers.extend(
+            _coverage_blockers("head", counterpart if is_base else own)
+        )
+        if declaration_remains:
+            blockers.append(
+                "A definition with the same name and type remains in the other "
+                "file version, but the matcher did not form one pair."
+            )
+        reason = " ".join(blocker.rstrip(".") for blocker in blockers)
+        action = "Removal" if is_base else "Addition"
+        basis = (
+            f"Definition {name} is present in the supplied {own_side} source "
+            f"for {own_path}. {action} from this file is unresolved: {reason}."
+        )
+    if confirmed:
+        basis += (
+            " This result does not establish whether the definition or its "
+            "behavior exists elsewhere in the repository."
+        )
+    return basis + linked_paths
+
+
+def _collect_symbol_changes(  # noqa: PLR0913  # Each evidence index is an independent input.
     matched: Sequence[tuple[dict, dict, str]],
     removed: Sequence[dict],
     added: Sequence[dict],
-    fragments: Sequence[dict],
     fragments_by_id: Mapping[str, dict],
-    warnings: Sequence[str],
-    meta: Mapping[str, object],
+    coverage_index: Mapping[tuple[str, str], dict],
+    symbols_by_side: Mapping[str, Sequence[dict]],
 ) -> tuple[list[dict], dict[str, set[int]], dict[str, str]]:
-    """
-    Classify matched and unmatched symbols into report changes.
+    """Classify matched and unmatched symbols using per-file evidence.
 
     Args:
-        matched: Matched base/head symbol pairs and their identity evidence.
+        matched: Matched pairs and their existing identity evidence.
         removed: Unmatched base symbols.
         added: Unmatched head symbols.
-        fragments: Original snapshot fragments used to determine excerpt scope.
-        fragments_by_id: Snapshot fragments indexed by stable fragment ID.
-        warnings: Snapshot and parse warnings that make identity incomplete.
-        meta: Snapshot metadata used to determine source scope.
+        fragments_by_id: Fragments used for raw-line coverage.
+        coverage_index: File availability, coverage, parse, and pair entries.
+        symbols_by_side: All extracted symbols, including matched symbols.
 
     Returns:
-        Change records, covered source lines by fragment, and the symbol-to-change
-        lookup.
-
+        Changes, covered source lines, and the symbol-to-change lookup.
     """
     changes = []
     covered_lines = {fragment_id: set() for fragment_id in fragments_by_id}
     symbol_to_change = {}
-    is_excerpt = (
-        meta.get("scope") == "selected excerpts"
-        or any(
-            fragment.get("scope", "full") != "full" for fragment in fragments
-        )
-        or bool(warnings)
-    )
-
     for before_symbol, after_symbol, basis in matched:
         unchanged_location = (
             before_symbol["path"] == after_symbol["path"]
@@ -1616,41 +2204,54 @@ def _collect_symbol_changes(  # noqa: PLR0913  # Matching and scope inputs stay 
             basis,
         )
 
-    unmatched_basis = (
-        "Unmatched in the supplied source set; "
-        "not a repository-wide identity proof."
-    )
-    for symbol in removed:
-        kind = (
-            "observed_base"
-            if is_excerpt and not symbol.get("known_removed")
-            else "removed"
-        )
-        _append_change(
-            changes,
-            covered_lines,
-            symbol_to_change,
-            symbol,
-            None,
-            kind,
-            unmatched_basis,
-        )
-    for symbol in added:
-        kind = (
-            "observed_head"
-            if is_excerpt and not symbol.get("known_added")
-            else "added"
-        )
-        _append_change(
-            changes,
-            covered_lines,
-            symbol_to_change,
-            None,
-            symbol,
-            kind,
-            unmatched_basis,
-        )
-
+    for is_base, unmatched in ((True, removed), (False, added)):
+        own_side = "base" if is_base else "head"
+        other_side = "head" if is_base else "base"
+        for symbol in unmatched:
+            own = coverage_index.get((own_side, symbol["path"]))
+            counterpart_path = (
+                own.get("counterpart_path") if own else symbol["path"]
+            )
+            counterpart = coverage_index.get((other_side, counterpart_path))
+            declaration_remains = bool(
+                counterpart
+                and any(
+                    candidate["path"] == counterpart_path
+                    and candidate["name"] == symbol["name"]
+                    and candidate["node_type"] == symbol["node_type"]
+                    for candidate in symbols_by_side[other_side]
+                )
+            )
+            confirmed = bool(
+                _is_full_and_parsed(own)
+                and (
+                    (counterpart and counterpart.get("state") == "absent")
+                    or _is_full_and_parsed(counterpart)
+                )
+                and not declaration_remains
+            )
+            kind = (
+                ("removed" if is_base else "added")
+                if confirmed
+                else ("observed_base" if is_base else "observed_head")
+            )
+            basis = _unmatched_basis(
+                symbol,
+                own,
+                counterpart,
+                is_base=is_base,
+                declaration_remains=declaration_remains,
+                confirmed=confirmed,
+            )
+            _append_change(
+                changes,
+                covered_lines,
+                symbol_to_change,
+                symbol if is_base else None,
+                None if is_base else symbol,
+                kind,
+                basis,
+            )
     return changes, covered_lines, symbol_to_change
 
 
@@ -1844,7 +2445,9 @@ def _collect_raw_changes(
     """
     fragments_by_region = defaultdict(dict)
     for fragment in fragments_by_id.values():
-        region = fragment.get("region", fragment["path"])
+        region = fragment.get(
+            "_raw_region", fragment.get("region", fragment["path"])
+        )
         fragments_by_region[region][fragment["side"]] = fragment
 
     raw_changes = []
@@ -2347,6 +2950,9 @@ def compile_snapshot(snapshot: dict) -> dict:
         fragments_by_id,
         symbols_by_side,
         imports_by_side,
+        _parse_status_by_id,
+        coverage_index,
+        notes,
         warnings,
     ) = _prepare_snapshot(snapshot)
     matched, removed, added = match_symbols(
@@ -2357,10 +2963,9 @@ def compile_snapshot(snapshot: dict) -> dict:
         matched,
         removed,
         added,
-        fragments,
         fragments_by_id,
-        warnings,
-        meta,
+        coverage_index,
+        symbols_by_side,
     )
     raw_changes = _collect_raw_changes(
         fragments_by_id,
@@ -2454,6 +3059,7 @@ def compile_snapshot(snapshot: dict) -> dict:
         "unresolved": unresolved,
         "stats": stats,
         "warnings": list(dict.fromkeys(warnings)),
+        "notes": list(dict.fromkeys(notes)),
         "method": method,
     }
 
@@ -2565,7 +3171,8 @@ def evidence_packet(report: dict) -> dict:
 
     Returns:
         A source-grounded request mapping with instructions, metadata, groups,
-        changes, tests, and warnings.
+        changes, tests, notes, and warnings. Old reports without notes use an
+        empty list.
 
     Side Effects:
         Makes no network call and does not mutate ``report``.
@@ -2573,6 +3180,13 @@ def evidence_packet(report: dict) -> dict:
     """
     instructions = (
         "Write a guided reading narrative grounded only in the supplied source. "
+        "Use ASD-STE100 principles as a strong guide, with roughly 80 to 90 "
+        "percent adherence across the prose. Do not claim formal compliance. "
+        "Prefer clear, simple words, active constructions, and one main idea "
+        "per sentence. Keep terms consistent and technical names exact. Vary "
+        "sentence length and structure for a natural rhythm; do not use a "
+        "repeated sentence template. Make only claims supported by the "
+        "evidence. "
         "Do not change structural classifications or claim tests passed. "
         "Return diffstory.annotations.v1 with base_sha, head_sha, "
         "steps[{group_id,title,intent,why_now,takeaway,invariants,questions,"
@@ -2580,8 +3194,27 @@ def evidence_packet(report: dict) -> dict:
         "When every group has a step, their array order is the reading order; "
         "choose a coherent order that puts prerequisites before dependents "
         "and keeps groups in a reported cycle adjacent. "
-        "Optional document {lead,closing} supplies the opening and closing "
-        "paragraphs. "
+        "Optional document {preamble,lead,closing} supplies document prose. "
+        "Preamble remains a string. When present, it introduces the whole "
+        "change before any code tour. State the supplied goal only when it is "
+        "known. Explain how the conceptual areas fit, then give the supplied "
+        "reading path. Use about 200 to 450 words when the evidence supports "
+        "that length; use less for a small change and do not pad. Keep it to "
+        "roughly one page and under 4,000 characters. Separate paragraphs "
+        "with a blank line. Do not name real files, paths, functions, "
+        "identifiers, commands, or source lines. Do not tour files, explain "
+        "implementation steps, or claim unverified tests. Choose the smallest "
+        "useful conceptual view: pseudocode, a system architecture sketch, or "
+        "a decision flow chart. For a multi-part change, include at least "
+        "one compact sketch when the evidence supports one. Do not force a "
+        "sketch when it adds no clarity, and do not stack views. Put a sketch "
+        "near its supporting paragraph. Use a fenced plain-text block marked "
+        "text; do not use Mermaid. For a two-path decision flow chart, write "
+        "exactly three lines: a short decision label, then "
+        "├─ condition → outcome and └─ condition → outcome. The reader draws "
+        "a decision node, arrows, and outcome boxes. Other text shapes stay "
+        "monospaced. Use abstract role labels, not "
+        "source identifiers or implementation details. "
         "Each passage alternates plain prose with the referenced code. "
         "In every prose field, wrap code identifiers (including one-letter "
         "variables), paths, filenames, branch names, commands, API names, and "
@@ -2605,6 +3238,7 @@ def evidence_packet(report: dict) -> dict:
         "changes": report["changes"],
         "tests": report["tests"],
         "warnings": report["warnings"],
+        "notes": report.get("notes", []),
     }
 
 
@@ -3087,6 +3721,13 @@ def validate_generated_report(report: dict) -> None:
     ):
         msg = "Generated report is missing its document narration"
         raise ValueError(msg)
+    if "preamble" in document and (
+        not isinstance(document["preamble"], str)
+        or not document["preamble"].strip()
+        or len(document["preamble"]) > MAX_NARRATIVE_TEXT_CHARS
+    ):
+        msg = "Generated report has an invalid document preamble"
+        raise ValueError(msg)
     changes = {change["id"]: change for change in report["changes"]}
     for group in report["groups"]:
         narrative = group.get("narrative", {})
@@ -3126,7 +3767,8 @@ def _apply_document_annotations(
     Validate and copy document-level narration into a report.
 
     Args:
-        annotations: Annotation document containing optional lead and closing.
+        annotations: Annotation document containing optional preamble, lead,
+            and closing fields.
         result: Deep-copied report being annotated.
         generated: Whether the annotation source is a model provider.
 
@@ -3136,7 +3778,7 @@ def _apply_document_annotations(
     """
     if "document" in annotations:
         document = annotations["document"]
-        allowed_fields = {"lead", "closing"}
+        allowed_fields = {"preamble", "lead", "closing"}
         if not isinstance(document, dict) or any(
             field not in allowed_fields for field in document
         ):
@@ -3147,6 +3789,9 @@ def _apply_document_annotations(
             for value in document.values()
         ):
             msg = "Invalid document narrative text"
+            raise ValueError(msg)
+        if "preamble" in document and not document["preamble"].strip():
+            msg = "Invalid document preamble"
             raise ValueError(msg)
         result["document"] = copy.deepcopy(document)
 

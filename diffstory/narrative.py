@@ -60,12 +60,13 @@ ASCII_CONTROL_CHARACTER_MAX = 31
 ASCII_DELETE_CHARACTER = 127
 MAX_QUESTION_CHARS = 2_000
 MAX_NARRATIVE_TEXT_CHARS = 6_000
+MAX_PREAMBLE_CHARS = 4_000
 MAX_SOURCE_REDUCTION_CHARS = 800
 LEAF_OUTPUT_RESERVE = 2_400
 LEAF_PER_CHANGE_OUTPUT_RESERVE = 128
 SUMMARY_OUTPUT_RESERVE = 1_200
 STEP_OUTPUT_RESERVE = 1_400
-DOCUMENT_OUTPUT_RESERVE = 700
+DOCUMENT_OUTPUT_RESERVE = 1_400
 ORDER_OUTPUT_RESERVE = 1_200
 
 _LEAF_SYSTEM = (
@@ -137,14 +138,39 @@ _STEP_SYSTEM = (
     "Return JSON matching the required schema."
 )
 _DOC_SYSTEM = (
-    "Write a short opening and closing for this source-grounded code walkthrough. "
+    "Write an opening, preamble, and closing for this source-grounded code walkthrough. "
     "Wrap referenced identifiers, paths, filenames, branch names, commands, "
     "API names, and literal code values in single backticks, for example "
     "`main`, `m`, `src/module.py`, and `--provider`; leave ordinary English "
     "unformatted. Backticks are markup delimiters only; the reader hides "
     "them and renders the enclosed term in monospaced code styling. "
-    "The opening should orient the reader to the PR's stated goal, the main "
-    "areas of the system it touches, and the supplied reading path. The closing "
+    "Write a required preamble that introduces the whole change before any "
+    "code tour. Open with the change's main idea. State the supplied goal "
+    "only when it is known. Explain the system-level areas and how they fit, "
+    "then give the supplied reading path. Use about 200 to 450 words when "
+    "the change and evidence support that length. Use less for a small "
+    "change. Do not pad to reach a word count. Keep the preamble to roughly "
+    "one page and under 4,000 characters. Use separate paragraphs with a "
+    "blank line between them. Do not name real files, paths, functions, "
+    "identifiers, commands, or source lines. Do not tour each file or "
+    "explain implementation steps. Make only claims supported by the "
+    "supplied whole-change evidence. Do not claim tests passed or imply "
+    "that prose was verified. Choose the smallest useful conceptual view: "
+    "pseudocode, a system architecture sketch, or a decision flow chart. "
+    "For a multi-part change, include at least one compact sketch "
+    "when the evidence supports one. Do not force a sketch when it adds no "
+    "clarity, and do not stack multiple views. Put a sketch near the "
+    "paragraph that explains it. Write sketches in fenced plain-text blocks "
+    "marked `text`; do not use Mermaid. For a two-path decision flow chart, "
+    "write exactly three lines: a short decision label, then two branch "
+    "lines in the form `├─ condition → outcome` and "
+    "`└─ condition → outcome`. The reader draws a decision node, arrows, "
+    "and outcome boxes. Other sketches stay monospaced. "
+    "Use abstract role labels in sketches, not source identifiers or "
+    "implementation details. "
+    "Keep the lead to one high-level sentence. Do "
+    "not name files, paths, functions, identifiers, or commands in the lead. "
+    "The lead should orient the reader to the whole change. The closing "
     "should synthesize what the change accomplishes "
     "according to the supplied evidence. Distinguish author-reported intent "
     "from behavior established by source. Use the whole-change summary for "
@@ -154,6 +180,34 @@ _DOC_SYSTEM = (
     "Do not claim tests passed or imply that the prose has been verified. "
     "Return JSON matching the required schema."
 )
+
+ASD_STYLE_INSTRUCTION = (
+    "Use ASD-STE100 principles as a strong guide, with roughly 80 to 90 "
+    "percent adherence across the prose. Do not claim formal compliance. "
+    "Prefer clear, simple words, active constructions, and one main idea per "
+    "sentence. Keep terms consistent and technical names exact. Vary sentence "
+    "length and structure so the prose has a natural rhythm and does not "
+    "sound like a repeated template. Make only claims supported by the "
+    "evidence. Apply this guidance to every prose field."
+)
+
+
+def _with_asd_style(instructions: str) -> str:
+    """Add the shared ASD-style guidance to one prose-generating prompt.
+
+    Args:
+        instructions: Stage-specific provider instructions.
+
+    Returns:
+        Stage instructions followed by the shared writing guidance.
+    """
+    return f"{instructions} {ASD_STYLE_INSTRUCTION}"
+
+
+_LEAF_SYSTEM = _with_asd_style(_LEAF_SYSTEM)
+_SUMMARY_SYSTEM = _with_asd_style(_SUMMARY_SYSTEM)
+_STEP_SYSTEM = _with_asd_style(_STEP_SYSTEM)
+_DOC_SYSTEM = _with_asd_style(_DOC_SYSTEM)
 
 
 def _object(properties: dict, required: Sequence[str] | None = None) -> dict:
@@ -234,7 +288,32 @@ _STEP_SCHEMA = _object(
     },
 )
 _DOCUMENT_SCHEMA = _object(
-    {"lead": {"type": "string"}, "closing": {"type": "string"}},
+    {
+        "preamble": {
+            "type": "string",
+            "description": (
+                "A flexible, evidence-scaled overview before any code tour. "
+                "Use about 200 to 450 words when the change and evidence "
+                "support it; use less for a small change and do not pad. Keep "
+                "it to roughly one page. Introduce the whole change, explain "
+                "how its conceptual areas fit, and give the reading path. Do "
+                "not use real files, paths, functions, identifiers, commands, "
+                "source lines, or implementation steps. Use at most one "
+                "compact evidence-grounded conceptual sketch when useful. "
+                "For a multi-part change, seek at least one useful compact "
+                "sketch when supported. Choose pseudocode, a system "
+                "architecture sketch, or a decision flow chart. Put the "
+                "sketch in a fenced plain-text block marked text. For a drawn "
+                "flow chart, use exactly three lines: a short decision label, "
+                "then ├─ condition → outcome and └─ condition → outcome. "
+                "Other shapes stay as text. Do not use "
+                "Mermaid. Separate paragraphs with a blank line."
+            ),
+            "maxLength": MAX_PREAMBLE_CHARS,
+        },
+        "lead": {"type": "string"},
+        "closing": {"type": "string"},
+    },
 )
 
 
@@ -2420,7 +2499,7 @@ class Narrator:
     @staticmethod
     def _validate_document_response(document: dict) -> None:
         """
-        Require bounded, non-empty opening and closing document prose.
+        Require bounded, non-empty preamble, opening, and closing prose.
 
         Args:
             document: Provider-generated document narrative.
@@ -2430,13 +2509,18 @@ class Narrator:
                 long.
 
         """
-        if set(document) != {"lead", "closing"} or any(
+        if set(document) != {"preamble", "lead", "closing"} or any(
             not isinstance(document[field], str)
             or not document[field].strip()
-            or len(document[field]) > MAX_NARRATIVE_TEXT_CHARS
-            for field in ("lead", "closing")
+            or len(document[field])
+            > (
+                MAX_PREAMBLE_CHARS
+                if field == "preamble"
+                else MAX_NARRATIVE_TEXT_CHARS
+            )
+            for field in ("preamble", "lead", "closing")
         ):
-            msg = "Provider returned an invalid document opening or closing"
+            msg = "Provider returned an invalid document preamble, opening, or closing"
             raise ValueError(msg)
 
     def _generate_chunk(

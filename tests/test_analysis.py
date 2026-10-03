@@ -52,6 +52,64 @@ def snap(
     }
 
 
+def evidence_snap(
+    before: dict[str, str],
+    after: dict[str, str],
+    *,
+    overrides: dict[tuple[str, str], dict] | None = None,
+    fragment_options: dict[tuple[str, str], dict] | None = None,
+    warnings: list[str] | None = None,
+    **meta: object,
+) -> dict:
+    """Build a snapshot with one explicit comparison record per path.
+
+    Args:
+        before: Base-side source by repository path.
+        after: Head-side source by repository path.
+        overrides: Optional complete evidence side records keyed by side/path.
+        fragment_options: Optional fields such as range and region by side/path.
+        warnings: Legacy input warning strings.
+        **meta: Snapshot metadata fields that override defaults.
+
+    Returns:
+        A v1 snapshot with supplied and absent file evidence.
+    """
+    overrides = overrides or {}
+    fragment_options = fragment_options or {}
+    paths = sorted(before.keys() | after.keys())
+    records = []
+    for path in paths:
+        record = {}
+        for side, sources in (("base", before), ("head", after)):
+            value = (
+                {"path": path, "state": "supplied", "coverage": "full"}
+                if path in sources
+                else {"path": path, "state": "absent"}
+            )
+            value = dict(overrides.get((side, path), value))
+            value.setdefault("path", path)
+            record[side] = value
+        records.append(record)
+    fragments = []
+    for side, sources in (("base", before), ("head", after)):
+        for path, text in sources.items():
+            fragment = {"path": path, "side": side, "text": text}
+            fragment.update(fragment_options.get((side, path), {}))
+            fragments.append(fragment)
+    return {
+        "schema": "diffstory.snapshot.v1",
+        "meta": {
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "scope": "changed files",
+            **meta,
+        },
+        "fragments": fragments,
+        "file_evidence": records,
+        "warnings": warnings or [],
+    }
+
+
 def symbols(r: dict) -> list[dict]:
     """
     Return semantic changes from a compiled report.
@@ -320,6 +378,886 @@ class CompilerTests(unittest.TestCase):
         )
         self.assertEqual(symbols(r)[0]["kind"], "observed_head")
 
+    def test_unrelated_input_preserves_kind(self) -> None:
+        """A limit or warning in another file must not change a full-file result."""
+        rows = [
+            ("addition", False, "added"),
+            ("removal", True, "removed"),
+        ]
+        unrelated = [
+            ("none", {}, []),
+            (
+                "markdown",
+                {"README.md": ("old text\n", "new text\n")},
+                [],
+            ),
+            (
+                "build file",
+                {"BUILD.bazel": ("old rule\n", "new rule\n")},
+                [],
+            ),
+            (
+                "parse failure",
+                {"broken.py": ("def broken(:\n", "def broken(:\n")},
+                [],
+            ),
+            ("incoming warning", {}, ["Unrelated source was skipped."]),
+        ]
+        for direction, is_removal, expected in rows:
+            for extra_name, extra_files, warning_list in unrelated:
+                with self.subTest(direction=direction, unrelated=extra_name):
+                    base = "def keep():\n    return 1\n"
+                    head = base
+                    if is_removal:
+                        base += "\ndef target():\n    return 2\n"
+                    else:
+                        head += "\ndef target():\n    return 2\n"
+                    before = {"config.py": base}
+                    after = {"config.py": head}
+                    for path, (old_text, new_text) in extra_files.items():
+                        before[path] = old_text
+                        after[path] = new_text
+                    report = compile_snapshot(
+                        evidence_snap(before, after, warnings=warning_list),
+                    )
+                    target = next(
+                        change
+                        for change in symbols(report)
+                        if (change.get("after") or change.get("before"))[
+                            "name"
+                        ]
+                        == "target"
+                    )
+                    self.assertEqual(target["kind"], expected)
+
+    def test_relevant_limits_leave_kind_observed(self) -> None:
+        """Missing, partial, or unparsed counterpart evidence must stay observed."""
+        rows = []
+        for is_addition in (True, False):
+            expected = "observed_head" if is_addition else "observed_base"
+            own_text = (
+                "def keep():\n    return 1\n\ndef target():\n    return 2\n"
+            )
+            other_text = "def keep():\n    return 1\n"
+            for mode in (
+                "missing",
+                "unavailable",
+                "partial",
+                "line 20",
+                "parse failure",
+            ):
+                if mode == "missing":
+                    before = {} if is_addition else {"x.py": own_text}
+                    after = {"x.py": own_text} if is_addition else {}
+                    snapshot = snap(before, after)
+                elif mode == "unavailable":
+                    before = {} if is_addition else {"x.py": own_text}
+                    after = {"x.py": own_text} if is_addition else {}
+                    missing_side = "base" if is_addition else "head"
+                    snapshot = evidence_snap(
+                        before,
+                        after,
+                        overrides={
+                            (missing_side, "x.py"): {
+                                "path": "x.py",
+                                "state": "unavailable",
+                                "reason": "size_limit",
+                            },
+                        },
+                    )
+                elif mode == "partial":
+                    before = (
+                        {"x.py": other_text}
+                        if is_addition
+                        else {"x.py": own_text}
+                    )
+                    after = (
+                        {"x.py": own_text}
+                        if is_addition
+                        else {"x.py": other_text}
+                    )
+                    counterpart_side = "base" if is_addition else "head"
+                    snapshot = evidence_snap(
+                        before,
+                        after,
+                        overrides={
+                            (counterpart_side, "x.py"): {
+                                "path": "x.py",
+                                "state": "supplied",
+                                "coverage": "partial",
+                            },
+                        },
+                    )
+                elif mode == "line 20":
+                    before = (
+                        {"x.py": other_text}
+                        if is_addition
+                        else {"x.py": own_text}
+                    )
+                    after = (
+                        {"x.py": own_text}
+                        if is_addition
+                        else {"x.py": other_text}
+                    )
+                    snapshot = snap(before, after)
+                    for fragment in snapshot["fragments"]:
+                        fragment["start_line"] = 20
+                        fragment["scope"] = "complete"
+                else:
+                    invalid = "def broken(:\n"
+                    before = (
+                        {"x.py": invalid}
+                        if is_addition
+                        else {"x.py": own_text}
+                    )
+                    after = (
+                        {"x.py": own_text}
+                        if is_addition
+                        else {"x.py": invalid}
+                    )
+                    snapshot = evidence_snap(before, after)
+                rows.append((f"{mode} {expected}", snapshot, expected))
+        for name, snapshot, expected in rows:
+            with self.subTest(case=name):
+                report = compile_snapshot(snapshot)
+                self.assertEqual(symbols(report)[0]["kind"], expected)
+
+    def test_empty_python_is_full_parsed(self) -> None:
+        """Empty Python files must support confirmed additions and removals."""
+        rows = [
+            (
+                {"empty.py": ""},
+                {"empty.py": "def f():\n    return 1\n"},
+                "added",
+            ),
+            (
+                {"empty.py": "def f():\n    return 1\n"},
+                {"empty.py": ""},
+                "removed",
+            ),
+        ]
+        for before, after, expected in rows:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    symbols(compile_snapshot(evidence_snap(before, after)))[0][
+                        "kind"
+                    ],
+                    expected,
+                )
+
+    def test_explicit_absence_confirms_kind(self) -> None:
+        """Explicit absent file sides must confirm whole-file additions and removals."""
+        source = "def f():\n    return 1\n"
+        rows = [
+            ({}, {"new.py": source}, "added"),
+            ({"old.py": source}, {}, "removed"),
+        ]
+        for before, after, expected in rows:
+            with self.subTest(expected=expected):
+                change = symbols(
+                    compile_snapshot(evidence_snap(before, after))
+                )[0]
+                self.assertEqual(change["kind"], expected)
+                self.assertIn("confirmed absent", change["basis"])
+
+    def test_legacy_missing_source_is_unavailable(self) -> None:
+        """Warnings and file counts must not turn a missing legacy side into absence."""
+        rows = [
+            (
+                snap(
+                    {}, {"x.py": "def f():\n    return 1\n"}, changed_files=0
+                ),
+                "observed_head",
+            ),
+            (
+                snap(
+                    {"x.py": "def f():\n    return 1\n"}, {}, changed_files=1
+                ),
+                "observed_base",
+            ),
+        ]
+        for snapshot, expected in rows:
+            snapshot["warnings"] = [
+                "Skipped source; deletion status is unknown."
+            ]
+            with self.subTest(expected=expected):
+                change = symbols(compile_snapshot(snapshot))[0]
+                self.assertEqual(change["kind"], expected)
+                self.assertIn("file absence is not confirmed", change["basis"])
+
+    def test_legacy_scope_limits_full_coverage(self) -> None:
+        """Only explicit line-one full scope may confirm legacy file coverage."""
+        cases = [
+            ("explicit full", "full", 1, "changed files", "added"),
+            ("omitted scope", None, 1, "changed files", "observed_head"),
+            ("complete", "complete", 1, "changed files", "observed_head"),
+            (
+                "selected excerpts",
+                "full",
+                1,
+                "selected excerpts",
+                "observed_head",
+            ),
+        ]
+        before = {"x.py": "def keep():\n    return 1\n"}
+        after = {"x.py": before["x.py"] + "\ndef added():\n    return 2\n"}
+        for name, scope, start, report_scope, expected in cases:
+            with self.subTest(case=name):
+                snapshot = snap(before, after, scope=report_scope)
+                for fragment in snapshot["fragments"]:
+                    fragment["start_line"] = start
+                    if scope is None:
+                        fragment.pop("scope")
+                    else:
+                        fragment["scope"] = scope
+                self.assertEqual(
+                    symbols(compile_snapshot(snapshot))[0]["kind"], expected
+                )
+
+    def test_legacy_region_link_must_be_unique(self) -> None:
+        """Only a unique shared region may link different legacy file paths."""
+        source = "def keep():\n    return 1\n"
+        unique = snap(
+            {"old.py": source},
+            {"new.py": source + "\ndef added():\n    return 2\n"},
+        )
+        for fragment in unique["fragments"]:
+            fragment["region"] = "rename-link"
+        conflict = {
+            "schema": "diffstory.snapshot.v1",
+            "meta": {"scope": "changed files", "changed_files": 3},
+            "fragments": [
+                {
+                    "path": "old.py",
+                    "side": "base",
+                    "start_line": 1,
+                    "scope": "full",
+                    "region": "one",
+                    "text": "def old_a():\n    return 1\n",
+                },
+                {
+                    "path": "old.py",
+                    "side": "base",
+                    "start_line": 10,
+                    "scope": "full",
+                    "region": "two",
+                    "text": "def old_b():\n    return 2\n",
+                },
+                {
+                    "path": "new_a.py",
+                    "side": "head",
+                    "start_line": 1,
+                    "scope": "full",
+                    "region": "one",
+                    "text": "new_a = 3\n",
+                },
+                {
+                    "path": "new_b.py",
+                    "side": "head",
+                    "start_line": 1,
+                    "scope": "full",
+                    "region": "two",
+                    "text": "new_b = 4\n",
+                },
+            ],
+        }
+        rows = [
+            ("unique", unique, "added"),
+            ("conflicting", conflict, "observed_head"),
+        ]
+        for name, snapshot, expected in rows:
+            with self.subTest(case=name):
+                result = symbols(compile_snapshot(snapshot))
+                self.assertIn(expected, [change["kind"] for change in result])
+                if name == "unique":
+                    added = next(
+                        change
+                        for change in result
+                        if change["kind"] == "added"
+                    )
+                    self.assertIn(
+                        "Base path: old.py. Head path: new.py.", added["basis"]
+                    )
+
+    def test_repeated_declaration_blocks_confirmation(self) -> None:
+        """A remaining same-name declaration blocks unmatched confirmation after matching."""
+        one = "def f():\n    return 1\n"
+        duplicate = one + "\n" + one
+        rows = [
+            ({"x.py": duplicate}, {"x.py": one}, "observed_base"),
+            ({"x.py": one}, {"x.py": duplicate}, "observed_head"),
+        ]
+        for before, after, expected in rows:
+            with self.subTest(expected=expected):
+                report = compile_snapshot(evidence_snap(before, after))
+                change = next(
+                    item
+                    for item in symbols(report)
+                    if item["kind"] == expected
+                )
+                self.assertEqual(change["kind"], expected)
+                self.assertIn("same name and type remains", change["basis"])
+
+    def test_partial_parse_failure_keeps_valid_symbols(self) -> None:
+        """One failed excerpt must not discard symbols from another excerpt."""
+        snapshot = {
+            "schema": "diffstory.snapshot.v1",
+            "meta": {"scope": "selected excerpts", "changed_files": 1},
+            "fragments": [
+                {
+                    "path": "x.py",
+                    "side": "head",
+                    "start_line": 1,
+                    "scope": "complete",
+                    "region": "part-a",
+                    "text": "def valid():\n    return 1\n",
+                },
+                {
+                    "path": "x.py",
+                    "side": "head",
+                    "start_line": 10,
+                    "scope": "complete",
+                    "region": "part-b",
+                    "text": "def broken(:\n",
+                },
+            ],
+            "file_evidence": [
+                {
+                    "base": {"path": "x.py", "state": "absent"},
+                    "head": {
+                        "path": "x.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                },
+            ],
+        }
+        report = compile_snapshot(snapshot)
+        change = next(
+            item
+            for item in symbols(report)
+            if (item.get("after") or {}).get("name") == "valid"
+        )
+        self.assertEqual(change["kind"], "observed_head")
+        self.assertIn(
+            "Only part of the head file is supplied", change["basis"]
+        )
+        self.assertIn(
+            "head Python source could not be parsed", change["basis"]
+        )
+        self.assertTrue(
+            any("AST unavailable" in warning for warning in report["warnings"])
+        )
+
+    def test_evidence_shape_is_strict(self) -> None:
+        """Malformed v1 file evidence must fail instead of being repaired."""
+        valid = evidence_snap({}, {"x.py": "def f():\n    return 1\n"})
+        bad_values = [
+            ("not a list", {"base": valid["file_evidence"][0]["base"]}),
+            ("record fields", [{**valid["file_evidence"][0], "extra": 1}]),
+            (
+                "side object",
+                [{"base": [], "head": valid["file_evidence"][0]["head"]}],
+            ),
+            (
+                "side fields",
+                [
+                    {
+                        "base": {
+                            **valid["file_evidence"][0]["base"],
+                            "reason": "not_supplied",
+                        },
+                        "head": valid["file_evidence"][0]["head"],
+                    }
+                ],
+            ),
+            (
+                "unknown state",
+                [
+                    {
+                        "base": {"path": "x.py", "state": "maybe"},
+                        "head": valid["file_evidence"][0]["head"],
+                    }
+                ],
+            ),
+            (
+                "unknown coverage",
+                [
+                    {
+                        "base": valid["file_evidence"][0]["base"],
+                        "head": {
+                            "path": "x.py",
+                            "state": "supplied",
+                            "coverage": "some",
+                        },
+                    }
+                ],
+            ),
+            (
+                "missing reason",
+                [
+                    {
+                        "base": {"path": "x.py", "state": "unavailable"},
+                        "head": valid["file_evidence"][0]["head"],
+                    }
+                ],
+            ),
+            (
+                "unknown reason",
+                [
+                    {
+                        "base": {
+                            "path": "x.py",
+                            "state": "unavailable",
+                            "reason": "weird",
+                        },
+                        "head": valid["file_evidence"][0]["head"],
+                    }
+                ],
+            ),
+        ]
+        for name, invalid in bad_values:
+            with self.subTest(case=name):
+                snapshot = copy.deepcopy(valid)
+                snapshot["file_evidence"] = invalid
+                with self.assertRaises(ValueError):
+                    compile_snapshot(snapshot)
+
+    def test_evidence_paths_are_relative(self) -> None:
+        """Evidence paths must not escape the repository or name its root."""
+        valid = evidence_snap({}, {"x.py": "def f():\n    return 1\n"})
+        paths = [
+            "",
+            "/x.py",
+            "\\root.py",
+            "a\0b.py",
+            "a/./b.py",
+            "a/../b.py",
+            "C:/x.py",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                snapshot = copy.deepcopy(valid)
+                snapshot["file_evidence"][0]["base"]["path"] = path
+                with self.assertRaisesRegex(ValueError, "repository-relative"):
+                    compile_snapshot(snapshot)
+        self.assertGreater(compile_snapshot(valid)["stats"]["units"], 0)
+
+    def test_evidence_side_is_unique(self) -> None:
+        """One side/path pair cannot belong to more than one evidence record."""
+        snapshot = evidence_snap({}, {"x.py": "def f():\n    return 1\n"})
+        snapshot["file_evidence"].append(
+            {
+                "base": {
+                    "path": "x.py",
+                    "state": "unavailable",
+                    "reason": "not_supplied",
+                },
+                "head": {
+                    "path": "other.py",
+                    "state": "unavailable",
+                    "reason": "not_supplied",
+                },
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            compile_snapshot(snapshot)
+
+    def test_absence_record_is_valid(self) -> None:
+        """Both absent is invalid, while two unavailable sides remain unresolved."""
+        snapshot = evidence_snap(
+            {"a.py": "value = 1\n"},
+            {"a.py": "value = 2\n"},
+        )
+        accepted = copy.deepcopy(snapshot)
+        accepted["file_evidence"].append(
+            {
+                "base": {
+                    "path": "not-read.py",
+                    "state": "unavailable",
+                    "reason": "read_failed",
+                },
+                "head": {
+                    "path": "not-read.py",
+                    "state": "unavailable",
+                    "reason": "read_failed",
+                },
+            },
+        )
+        rejected = copy.deepcopy(snapshot)
+        rejected["file_evidence"].append(
+            {
+                "base": {"path": "gone.py", "state": "absent"},
+                "head": {"path": "gone.py", "state": "absent"},
+            },
+        )
+        rows = [
+            ("two unavailable", accepted, True),
+            ("two absent", rejected, False),
+        ]
+        for name, candidate, valid in rows:
+            with self.subTest(case=name):
+                if valid:
+                    compile_snapshot(candidate)
+                else:
+                    with self.assertRaisesRegex(ValueError, "both sides"):
+                        compile_snapshot(candidate)
+
+    def test_empty_snapshot_rule_is_preserved(self) -> None:
+        """Evidence records alone must not replace the declared empty comparison rule."""
+        empty = {
+            "schema": "diffstory.snapshot.v1",
+            "meta": {"changed_files": 0},
+            "fragments": [],
+            "file_evidence": [],
+        }
+        rows = [
+            ("declared empty", empty, True),
+            (
+                "undeclared empty",
+                {**empty, "meta": {"changed_files": 1}},
+                False,
+            ),
+        ]
+        for name, snapshot, valid in rows:
+            with self.subTest(case=name):
+                if valid:
+                    compile_snapshot(snapshot)
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "no source fragments"
+                    ):
+                        compile_snapshot(snapshot)
+
+    def test_evidence_covers_fragments(self) -> None:
+        """Every fragment must belong to one supplied side and empty source counts."""
+        valid = evidence_snap({"x.py": ""}, {"x.py": ""})
+        uncovered = copy.deepcopy(valid)
+        uncovered["fragments"].append(
+            {"path": "extra.py", "side": "head", "text": ""},
+        )
+        absent_with_source = copy.deepcopy(valid)
+        absent_with_source["file_evidence"][0]["base"] = {
+            "path": "x.py",
+            "state": "absent",
+        }
+        no_supplied_fragment = evidence_snap({}, {"x.py": ""})
+        no_supplied_fragment["file_evidence"][0]["base"] = {
+            "path": "x.py",
+            "state": "supplied",
+            "coverage": "full",
+        }
+        rows = [
+            ("uncovered fragment", uncovered, False),
+            ("absent side has source", absent_with_source, False),
+            ("supplied side has no fragment", no_supplied_fragment, False),
+            ("empty supplied source", valid, True),
+        ]
+        for name, snapshot, accepted in rows:
+            with self.subTest(case=name):
+                if accepted:
+                    compile_snapshot(snapshot)
+                else:
+                    with self.assertRaises(ValueError):
+                        compile_snapshot(snapshot)
+
+    def test_full_coverage_claim_is_valid(self) -> None:
+        """Full claims require one line-one fragment and permit documented scopes."""
+        source = "def f():\n    return 1\n"
+        rows = [
+            ("multiple fragments", "full", 1, 2, False),
+            ("non-one start", "full", 2, None, False),
+            ("boolean start", "full", True, None, False),
+            ("excerpt scope", "selected excerpts", 1, None, False),
+            ("omitted scope", None, 1, None, True),
+            ("full scope", "full", 1, None, True),
+            ("complete scope", "complete", 1, None, True),
+        ]
+        for name, scope, start, second_start, accepted in rows:
+            with self.subTest(case=name):
+                snapshot = evidence_snap(
+                    {"x.py": source},
+                    {"x.py": source},
+                    fragment_options={
+                        ("base", "x.py"): {
+                            "start_line": start,
+                            **({} if scope is None else {"scope": scope}),
+                        },
+                        ("head", "x.py"): {
+                            "start_line": 1,
+                            **({} if scope is None else {"scope": scope}),
+                        },
+                    },
+                )
+                if second_start is not None:
+                    snapshot["fragments"].append(
+                        {
+                            "path": "x.py",
+                            "side": "head",
+                            "text": "def g():\n    return 2\n",
+                            "start_line": second_start,
+                            "scope": "complete",
+                            "region": "part-b",
+                        },
+                    )
+                if accepted:
+                    compile_snapshot(snapshot)
+                else:
+                    with self.assertRaises(ValueError):
+                        compile_snapshot(snapshot)
+
+    def test_partial_ranges_do_not_overlap(self) -> None:
+        """Adjacent excerpt ranges remain partial while overlapping ranges fail."""
+        rows = [("adjacent", 3, True), ("overlap", 2, False)]
+        for name, second_start, accepted in rows:
+            with self.subTest(case=name):
+                snapshot = {
+                    "schema": "diffstory.snapshot.v1",
+                    "meta": {"changed_files": 1},
+                    "fragments": [
+                        {
+                            "path": "x.py",
+                            "side": "base",
+                            "text": "def f():\n    return 1\n",
+                            "start_line": 1,
+                            "region": "one",
+                        },
+                        {
+                            "path": "x.py",
+                            "side": "base",
+                            "text": "def g():\n    return 2\n",
+                            "start_line": second_start,
+                            "region": "two",
+                        },
+                    ],
+                    "file_evidence": [
+                        {
+                            "base": {
+                                "path": "x.py",
+                                "state": "supplied",
+                                "coverage": "partial",
+                            },
+                            "head": {
+                                "path": "x.py",
+                                "state": "unavailable",
+                                "reason": "not_supplied",
+                            },
+                        },
+                    ],
+                }
+                if accepted:
+                    compile_snapshot(snapshot)
+                else:
+                    with self.assertRaisesRegex(ValueError, "Overlapping"):
+                        compile_snapshot(snapshot)
+
+    def test_region_side_is_unique(self) -> None:
+        """A raw region cannot overwrite another fragment on the same side."""
+        snapshot = evidence_snap(
+            {"x.py": "def f():\n    return 1\n"},
+            {},
+            overrides={
+                ("base", "x.py"): {
+                    "path": "x.py",
+                    "state": "supplied",
+                    "coverage": "partial",
+                },
+            },
+            fragment_options={("base", "x.py"): {"region": "same"}},
+        )
+        snapshot["fragments"].append(
+            {
+                "path": "x.py",
+                "side": "base",
+                "start_line": 10,
+                "region": "same",
+                "text": "value = 2\n",
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "Duplicate raw region"):
+            compile_snapshot(snapshot)
+
+    def test_region_links_stay_within_record(self) -> None:
+        """Explicit raw regions must agree with their file record and side pair."""
+        mismatched = evidence_snap(
+            {"x.py": "value = 1\n"},
+            {"x.py": "value = 2\n"},
+            fragment_options={
+                ("base", "x.py"): {"region": "base-region"},
+                ("head", "x.py"): {"region": "head-region"},
+            },
+        )
+        cross_record = evidence_snap(
+            {"old.py": "value = 1\n"},
+            {"new.py": "value = 2\n"},
+            fragment_options={
+                ("base", "old.py"): {"region": "shared"},
+                ("head", "new.py"): {"region": "shared"},
+            },
+        )
+        rows = [
+            ("full sides disagree", mismatched, "share a region"),
+            (
+                "region crosses records",
+                cross_record,
+                "different file evidence records",
+            ),
+        ]
+        for name, snapshot, reason in rows:
+            with (
+                self.subTest(case=name),
+                self.assertRaisesRegex(ValueError, reason),
+            ):
+                compile_snapshot(snapshot)
+
+    def test_raw_rows_survive_classification(self) -> None:
+        """Confirmed additions and removals must retain their original raw diff rows."""
+        snapshot = evidence_snap(
+            {"config.py": "def removed():\n    return 1\n"},
+            {"config.py": "added = 2\n"},
+        )
+        report = compile_snapshot(snapshot)
+        self.assertEqual(
+            {item["kind"] for item in symbols(report)},
+            {"added", "removed"},
+        )
+        raw = next(
+            item for item in report["raw_files"] if item["path"] == "config.py"
+        )
+        tags = {row["tag"] for hunk in raw["hunks"] for row in hunk["rows"]}
+        self.assertEqual(tags, {"add", "delete"})
+
+    def test_partial_regions_keep_all_rows(self) -> None:
+        """Distinct partial regions must preserve every supplied source row."""
+        snapshot = {
+            "schema": "diffstory.snapshot.v1",
+            "meta": {"changed_files": 1, "scope": "selected excerpts"},
+            "fragments": [
+                {
+                    "path": "x.py",
+                    "side": "base",
+                    "start_line": 1,
+                    "region": "first",
+                    "text": "value = 1\n",
+                },
+                {
+                    "path": "x.py",
+                    "side": "head",
+                    "start_line": 1,
+                    "region": "first",
+                    "text": "value = 2\n",
+                },
+                {
+                    "path": "x.py",
+                    "side": "base",
+                    "start_line": 10,
+                    "region": "second",
+                    "text": "other = 3\n",
+                },
+                {
+                    "path": "x.py",
+                    "side": "head",
+                    "start_line": 10,
+                    "region": "second",
+                    "text": "other = 4\n",
+                },
+            ],
+            "file_evidence": [
+                {
+                    "base": {
+                        "path": "x.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                    "head": {
+                        "path": "x.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                },
+            ],
+        }
+        report = compile_snapshot(snapshot)
+        self.assertEqual(
+            {file["region"] for file in report["raw_files"]},
+            {"first", "second"},
+        )
+        self.assertEqual(
+            sum(
+                row["tag"] != "context"
+                for file in report["raw_files"]
+                for hunk in file["hunks"]
+                for row in hunk["rows"]
+            ),
+            4,
+        )
+
+    def test_basis_reasons_are_deterministic(self) -> None:
+        """Basis text must list base then head blockers and both linked paths."""
+        snapshot = {
+            "schema": "diffstory.snapshot.v1",
+            "meta": {"changed_files": 1},
+            "fragments": [
+                {
+                    "path": "old.py",
+                    "side": "base",
+                    "start_line": 1,
+                    "region": "rename",
+                    "text": "def f():\n    return 1\n",
+                },
+            ],
+            "file_evidence": [
+                {
+                    "base": {
+                        "path": "old.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                    "head": {
+                        "path": "new.py",
+                        "state": "unavailable",
+                        "reason": "size_limit",
+                    },
+                },
+            ],
+        }
+        first = symbols(compile_snapshot(snapshot))[0]["basis"]
+        second = symbols(compile_snapshot(snapshot))[0]["basis"]
+        self.assertEqual(first, second)
+        self.assertLess(
+            first.index("part of the base"),
+            first.index("head source is unavailable"),
+        )
+        self.assertIn("Base path: old.py. Head path: new.py.", first)
+
+    def test_evidence_packet_includes_notes(self) -> None:
+        """Evidence packets must carry new notes and default old reports to empty."""
+        report = compile_snapshot(
+            {
+                "schema": "diffstory.snapshot.v1",
+                "meta": {"changed_files": 1},
+                "fragments": [
+                    {
+                        "path": "README.md",
+                        "side": "head",
+                        "text": "Read this.\n",
+                    },
+                ],
+            },
+        )
+        legacy_report = copy.deepcopy(report)
+        legacy_report.pop("notes")
+        rows = [
+            ("new report", report["notes"]),
+            ("old report", []),
+        ]
+        for name, expected in rows:
+            with self.subTest(case=name):
+                packet = evidence_packet(
+                    report if name == "new report" else legacy_report
+                )
+                self.assertEqual(packet["notes"], expected)
+
     def test_overlapping_fragments_rejected(self) -> None:
         """Reject overlapping source fragments for the same path and side."""
         s = snap({}, {"a.py": "def f():\n return 1\n"})
@@ -464,6 +1402,31 @@ class CompilerTests(unittest.TestCase):
         e = evidence_packet(r)
         self.assertEqual(e["schema"], "diffstory.narrative-request.v1")
         self.assertIn("untrusted", e["instructions"])
+
+    def test_evidence_packet_describes_a_flexible_conceptual_preamble(
+        self,
+    ) -> None:
+        """Describe the evidence-scaled overview and sketch rules in the packet instructions."""
+        packet = evidence_packet(compile_snapshot(snap({}, {"a.py": "x=1"})))
+        instructions = packet["instructions"]
+        self.assertIn("Preamble remains a string", instructions)
+        self.assertIn("about 200 to 450 words", instructions)
+        self.assertIn("under 4,000 characters", instructions)
+        self.assertIn("do not pad", instructions)
+        self.assertIn("fenced plain-text block", instructions)
+        self.assertIn("do not use Mermaid", instructions)
+        self.assertIn("blank line", instructions)
+
+    def test_evidence_packet_calls_for_natural_asd_style_guidance(
+        self,
+    ) -> None:
+        """Ask packet writers to follow ASD principles with natural prose rhythm."""
+        packet = evidence_packet(compile_snapshot(snap({}, {"a.py": "x=1"})))
+        instructions = packet["instructions"]
+        self.assertIn("ASD-STE100 principles as a strong guide", instructions)
+        self.assertIn("roughly 80 to 90 percent", instructions)
+        self.assertIn("Do not claim formal compliance", instructions)
+        self.assertIn("natural rhythm", instructions)
 
 
 if __name__ == "__main__":

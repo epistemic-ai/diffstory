@@ -117,7 +117,7 @@ def _git_object_info(
     revision: str,
     path: str,
     side: str,
-) -> tuple[tuple[str, int] | None, str | None]:
+) -> tuple[tuple[str, int] | None, str | None, str | None]:
     """
     Inspect a tree entry and report its object ID and size when it is a file.
 
@@ -128,9 +128,9 @@ def _git_object_info(
         side: Snapshot side used in any warning.
 
     Returns:
-        A ``(object_id, size)`` pair and no warning for a regular file; or no
-        object information and a warning when the path is a symlink, gitlink,
-        or other unsupported object.
+        A ``(object_id, size)`` pair, warning, and no reason for a regular file;
+        or no object information, warning, and ``unsupported_object`` for an
+        unsupported tree entry.
 
     Raises:
         ValueError: If the diff path is absent from the resolved tree.
@@ -151,10 +151,10 @@ def _git_object_info(
     mode, kind, object_id = entry.split(b"\t", 1)[0].decode().split()
     if mode not in {"100644", "100755"} or kind != "blob":
         warning = f"Skipped {side} {path}: mode {mode}, object type {kind}"
-        return None, warning
+        return None, warning, "unsupported_object"
 
     size = int(_git(repo, "cat-file", "-s", object_id).decode())
-    return (object_id, size), None
+    return (object_id, size), None, None
 
 
 def _resolve(repo: Path, ref: str) -> str:
@@ -221,7 +221,7 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
 
     Returns:
         A ``diffstory.snapshot.v1`` mapping with metadata, source fragments,
-        and warnings for skipped files.
+        per-side file evidence, and warnings for skipped files.
 
     Raises:
         ValueError: If revisions, limits, Git objects, or source contents are
@@ -264,17 +264,45 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
             msg,
         )
     fragments, warnings = [], []
+    file_evidence = []
     source_bytes = 0
     for status, path in items:
+        base_state = (
+            {"path": path, "state": "absent"}
+            if status == "A"
+            else {
+                "path": path,
+                "state": "unavailable",
+                "reason": "not_supplied",
+            }
+        )
+        head_state = (
+            {"path": path, "state": "absent"}
+            if status == "D"
+            else {
+                "path": path,
+                "state": "unavailable",
+                "reason": "not_supplied",
+            }
+        )
+        evidence_record = {"base": base_state, "head": head_state}
+        file_evidence.append(evidence_record)
         for side, sha, present in (
             ("base", effective, status != "A"),
             ("head", head_sha, status != "D"),
         ):
             if not present:
                 continue
-            object_info, warning = _git_object_info(root, sha, path, side)
+            object_info, warning, reason = _git_object_info(
+                root, sha, path, side
+            )
             if warning:
                 warnings.append(warning)
+                evidence_record[side] = {
+                    "path": path,
+                    "state": "unavailable",
+                    "reason": reason,
+                }
                 continue
             oid, size = object_info
             source_bytes += size
@@ -285,12 +313,22 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
                 warnings.append(
                     f"Skipped {side} {path}: {size} bytes exceeds {MAX_FILE}",
                 )
+                evidence_record[side] = {
+                    "path": path,
+                    "state": "unavailable",
+                    "reason": "size_limit",
+                }
                 continue
             data = _git(root, "cat-file", "blob", oid)
             if b"\0" in data:
                 warnings.append(
                     f"Skipped {side} {path}: binary or non-UTF-8 source",
                 )
+                evidence_record[side] = {
+                    "path": path,
+                    "state": "unavailable",
+                    "reason": "binary_or_non_utf8",
+                }
                 continue
             try:
                 text = data.decode("utf-8")
@@ -298,6 +336,11 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
                 warnings.append(
                     f"Skipped {side} {path}: binary or non-UTF-8 source",
                 )
+                evidence_record[side] = {
+                    "path": path,
+                    "state": "unavailable",
+                    "reason": "binary_or_non_utf8",
+                }
                 continue
             fragments.append(
                 {
@@ -308,6 +351,11 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
                     "scope": "full",
                 },
             )
+            evidence_record[side] = {
+                "path": path,
+                "state": "supplied",
+                "coverage": "full",
+            }
 
     meta = {
         "title": f"{base} → {head}",
@@ -330,6 +378,7 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
         "schema": "diffstory.snapshot.v1",
         "meta": meta,
         "fragments": fragments,
+        "file_evidence": file_evidence,
         "warnings": warnings,
     }
 
@@ -519,7 +568,7 @@ def _github_file_bytes(
     owner: str,
     side: str,
     path: str,
-) -> tuple[bytes | None, str | None, int]:
+) -> tuple[bytes | None, str | None, int, str | None]:
     """
     Fetch and decode the base64 payload for one GitHub file.
 
@@ -531,8 +580,9 @@ def _github_file_bytes(
         path: Repository-relative file path.
 
     Returns:
-        Decoded file bytes, warning, and byte count; bytes are absent when a
-        warning prevents this file from being processed.
+        Decoded bytes, warning, byte count, and one reason code. Codes are
+        ``invalid_content_size``, ``size_limit``, or
+        ``unsupported_encoding``; successful reads have no reason.
 
     Raises:
         ValueError: If a GitHub request fails or its response is invalid.
@@ -543,12 +593,18 @@ def _github_file_bytes(
     """
     declared_size = content_info.get("size", 0)
     if type(declared_size) is not int or declared_size < 0:
-        return None, f"Skipped {side} {path}: invalid content size", 0
+        return (
+            None,
+            f"Skipped {side} {path}: invalid content size",
+            0,
+            "invalid_content_size",
+        )
     if declared_size > MAX_FILE:
         return (
             None,
             f"Skipped {side} {path}: exceeds {MAX_FILE} bytes",
             declared_size,
+            "size_limit",
         )
 
     if content_info.get("encoding") == "base64":
@@ -561,6 +617,7 @@ def _github_file_bytes(
                 None,
                 f"Skipped {side} {path}: unsupported blob encoding",
                 declared_size,
+                "unsupported_encoding",
             )
         data = base64.b64decode(blob["content"])
 
@@ -569,8 +626,9 @@ def _github_file_bytes(
             None,
             f"Skipped {side} {path}: exceeds {MAX_FILE} bytes",
             len(data),
+            "size_limit",
         )
-    return data, None, len(data)
+    return data, None, len(data), None
 
 
 def _decode_github_source(data: bytes) -> str | None:
@@ -594,18 +652,20 @@ def _decode_github_source(data: bytes) -> str | None:
 
 def _read_github_file(
     api: GitHubClient,
-    task: tuple[str, str, str, str, str],
-) -> tuple[dict | None, str | None, int]:
+    task: tuple[str, str, str, str, str, int],
+) -> tuple[dict | None, str | None, int, str | None]:
     """
     Fetch and decode one GitHub source file for a snapshot.
 
     Args:
         api: Client used for authenticated GitHub requests.
-        task: Repository, path, revision side, revision SHA, and region path.
+        task: Repository, path, revision side, revision SHA, region path, and
+            file-evidence record index.
 
     Returns:
-        Fragment, warning, and bytes read or declared for aggregate-limit
-        accounting; fragment or warning may be absent.
+        Fragment, warning, bytes read or declared, and one availability reason:
+        ``unsupported_object``, a reason from :func:`_github_file_bytes`,
+        ``binary_or_non_utf8``, or ``None`` after a successful read.
 
     Raises:
         ValueError: If a GitHub request fails or its response is invalid.
@@ -614,7 +674,7 @@ def _read_github_file(
         Reads file contents from the GitHub API.
 
     """
-    owner, path, side, revision, region = task
+    owner, path, side, revision, region, _record_index = task
     contents_path = (
         f"/repos/{owner}/contents/{quote(path, safe='/')}?ref={revision}"
     )
@@ -623,9 +683,14 @@ def _read_github_file(
         not isinstance(content_info, dict)
         or content_info.get("type") != "file"
     ):
-        return None, f"Skipped {side} {path}: not a regular file", 0
+        return (
+            None,
+            f"Skipped {side} {path}: not a regular file",
+            0,
+            "unsupported_object",
+        )
 
-    data, warning, size = _github_file_bytes(
+    data, warning, size, reason = _github_file_bytes(
         api,
         content_info,
         owner,
@@ -633,10 +698,15 @@ def _read_github_file(
         path,
     )
     if warning:
-        return None, warning, size
+        return None, warning, size, reason
     text = _decode_github_source(data)
     if text is None:
-        return None, f"Skipped {side} {path}: binary or non-UTF-8 source", size
+        return (
+            None,
+            f"Skipped {side} {path}: binary or non-UTF-8 source",
+            size,
+            "binary_or_non_utf8",
+        )
 
     fragment = {
         "path": path,
@@ -646,7 +716,7 @@ def _read_github_file(
         "scope": "full",
         "region": region,
     }
-    return fragment, None, size
+    return fragment, None, size, None
 
 
 def _list_github_files(
@@ -710,7 +780,7 @@ def _github_file_tasks(
     head_repo: str,
     base: str,
     head: str,
-) -> tuple[tuple[str, str, str, str, str], ...]:
+) -> tuple[tuple[tuple[str, str, str, str, str, int], ...], list[dict]]:
     """
     Plan base and head content requests for each changed path.
 
@@ -722,31 +792,53 @@ def _github_file_tasks(
         head: Head commit ID.
 
     Returns:
-        Immutable content-fetch tasks in changed-file and revision order.
+        Content tasks and initial file evidence in changed-file order. Added
+        and removed files receive one absent side. Renames link the required
+        ``previous_filename`` to the new path.
     """
     tasks = []
-    for file_info in files:
-        old_path = file_info.get("previous_filename", file_info["filename"])
-        if file_info["status"] != "added":
-            tasks.append((repo, old_path, "base", base, file_info["filename"]))
-        if file_info["status"] != "removed":
-            tasks.append(
-                (
-                    head_repo,
-                    file_info["filename"],
-                    "head",
-                    head,
-                    file_info["filename"],
-                ),
-            )
-    return tuple(tasks)
+    evidence = []
+    for record_index, file_info in enumerate(files):
+        path = file_info["filename"]
+        status = file_info["status"]
+        if status == "renamed":
+            old_path = file_info.get("previous_filename")
+            if not isinstance(old_path, str) or not old_path:
+                msg = "GitHub renamed file record requires previous_filename"
+                raise ValueError(msg)
+        else:
+            old_path = path
+        base_side = (
+            {"path": path, "state": "absent"}
+            if status == "added"
+            else {
+                "path": old_path,
+                "state": "unavailable",
+                "reason": "not_supplied",
+            }
+        )
+        head_side = (
+            {"path": path, "state": "absent"}
+            if status == "removed"
+            else {
+                "path": path,
+                "state": "unavailable",
+                "reason": "not_supplied",
+            }
+        )
+        evidence.append({"base": base_side, "head": head_side})
+        if status != "added":
+            tasks.append((repo, old_path, "base", base, path, record_index))
+        if status != "removed":
+            tasks.append((head_repo, path, "head", head, path, record_index))
+    return tuple(tasks), evidence
 
 
 def _read_github_tasks(
     api: GitHubClient,
-    tasks: Sequence[tuple[str, str, str, str, str]],
+    tasks: Sequence[tuple[str, str, str, str, str, int]],
     max_source_bytes: int,
-) -> tuple[list[dict], list[str], int]:
+) -> tuple[list[dict], list[str], int, list[dict]]:
     """
     Fetch source fragments while enforcing the aggregate byte cap.
 
@@ -756,16 +848,17 @@ def _read_github_tasks(
         max_source_bytes: Maximum aggregate source bytes accepted.
 
     Returns:
-        Fragments, warnings, and the total declared or retrieved source bytes.
+        Fragments, warnings, byte count, and structured side-read results.
 
     Raises:
         ValueError: If the aggregate source exceeds ``max_source_bytes``.
     """
     fragments = []
     warnings = []
+    results = []
     source_bytes = 0
     for task in tasks:
-        fragment, warning, size = _read_github_file(api, task)
+        fragment, warning, size, reason = _read_github_file(api, task)
         source_bytes += size
         if source_bytes > max_source_bytes:
             msg = (
@@ -775,9 +868,24 @@ def _read_github_tasks(
             raise ValueError(msg)
         if fragment:
             fragments.append(fragment)
+            results.append(
+                {
+                    "record_index": task[5],
+                    "side": task[2],
+                    "state": "supplied",
+                },
+            )
         if warning:
             warnings.append(warning)
-    return fragments, warnings, source_bytes
+            results.append(
+                {
+                    "record_index": task[5],
+                    "side": task[2],
+                    "state": "unavailable",
+                    "reason": reason,
+                },
+            )
+    return fragments, warnings, source_bytes, results
 
 
 def from_github(
@@ -802,7 +910,7 @@ def from_github(
 
     Returns:
         A ``diffstory.snapshot.v1`` mapping with source fragments, metadata,
-        and warnings for unsupported files.
+        per-side file evidence, and warnings for unsupported files.
 
     Raises:
         ValueError: If the PR is inaccessible, incomplete, malformed, changes
@@ -832,12 +940,29 @@ def from_github(
         pr.get("changed_files"),
     )
     head_repo = (pr.get("head", {}).get("repo") or {}).get("full_name") or repo
-    tasks = _github_file_tasks(files, repo, head_repo, base, head)
-    fragments, warnings, source_bytes = _read_github_tasks(
+    tasks, file_evidence = _github_file_tasks(
+        files, repo, head_repo, base, head
+    )
+    fragments, warnings, source_bytes, read_results = _read_github_tasks(
         api,
         tasks,
         max_source_bytes,
     )
+    for result in read_results:
+        side_name = result["side"]
+        side = file_evidence[result["record_index"]][side_name]
+        if result["state"] == "supplied":
+            file_evidence[result["record_index"]][side_name] = {
+                "path": side["path"],
+                "state": "supplied",
+                "coverage": "full",
+            }
+        else:
+            file_evidence[result["record_index"]][side_name] = {
+                "path": side["path"],
+                "state": "unavailable",
+                "reason": result["reason"],
+            }
 
     # Fail if the PR changed during the read; don't silently mix multiple revisions.
     end = api.get(f"/repos/{repo}/pulls/{number}")
@@ -876,5 +1001,6 @@ def from_github(
         "schema": "diffstory.snapshot.v1",
         "meta": meta,
         "fragments": fragments,
+        "file_evidence": file_evidence,
         "warnings": warnings,
     }

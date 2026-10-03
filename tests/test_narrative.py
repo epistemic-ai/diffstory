@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import itertools
 import json
@@ -21,8 +22,11 @@ from urllib.error import HTTPError
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.cli import main
+from diffstory.narrative import ASD_STYLE_INSTRUCTION
 from diffstory.narrative import CODEX_DEFAULT_CONTEXT_TOKENS
 from diffstory.narrative import CODEX_MODEL_CAPACITIES
+from diffstory.narrative import DOCUMENT_OUTPUT_RESERVE
+from diffstory.narrative import MAX_PREAMBLE_CHARS
 from diffstory.narrative import MAX_RESPONSE_BYTES
 from diffstory.narrative import OPENAI_MODEL
 from diffstory.narrative import OPENAI_URL
@@ -284,15 +288,19 @@ class FakeProvider:
 
     @staticmethod
     def _document_response(_data: dict) -> dict:
-        """Return deterministic opening and closing document prose.
+        """Return deterministic preamble, opening, and closing prose.
 
         Args:
             _data: Whole-change context, unused by the fixed fixture.
 
         Returns:
-            A document response with a lead and closing paragraph.
+            A document response with preamble, lead, and closing prose.
         """
         return {
+            "preamble": (
+                "This change adjusts a value transformation. The section "
+                "explains the change. Its source follows the explanation."
+            ),
             "lead": "This change adjusts a value transformation.",
             "closing": "The source shows the adjusted return path.",
         }
@@ -303,14 +311,65 @@ class NarrativeTests(unittest.TestCase):
 
     def test_generation_and_report_roundtrip_keep_provenance(self) -> None:
         """Retain revision binding and evidence when narrations are rendered."""
-        report = compile_snapshot(snapshot())
+        source_snapshot = snapshot()
+        source_snapshot["meta"]["changed_files"] = 2
+        source_snapshot["fragments"].extend(
+            [
+                {
+                    "path": "other.py",
+                    "side": "base",
+                    "text": "def normalize(value):\n    return value\n",
+                    "start_line": 1,
+                    "scope": "full",
+                },
+                {
+                    "path": "other.py",
+                    "side": "head",
+                    "text": "def normalize(value):\n    return value.strip()\n",
+                    "start_line": 1,
+                    "scope": "full",
+                },
+            ],
+        )
+        report = compile_snapshot(source_snapshot)
         provider = FakeProvider()
         narrator = Narrator(provider)
         preview = narrator.preview(report)
-        self.assertEqual(
-            preview["calls"], len(report["groups"]) + preview["chunks"] + 2
-        )
         annotations = narrator.generate(report)
+        self.assertEqual(preview["calls"], len(provider.calls))
+        prose_requests = [
+            request
+            for request in provider.calls
+            if request["name"]
+            in {
+                "diffstory_chunk",
+                "diffstory_summary",
+                "diffstory_step",
+                "diffstory_document",
+            }
+        ]
+        self.assertEqual(
+            {request["name"] for request in prose_requests},
+            {
+                "diffstory_chunk",
+                "diffstory_summary",
+                "diffstory_step",
+                "diffstory_document",
+            },
+        )
+        self.assertTrue(
+            all(
+                ASD_STYLE_INSTRUCTION in request["system"]
+                for request in prose_requests
+            )
+        )
+        document_request = next(
+            request
+            for request in prose_requests
+            if request["name"] == "diffstory_document"
+        )
+        self.assertIn("preamble", document_request["schema"]["required"])
+        self.assertIn("preamble", annotations["document"])
         generated = apply_annotations(report, annotations)
         self.assertEqual(generated["generation"]["verification"], "unverified")
         self.assertEqual(
@@ -328,6 +387,90 @@ class NarrativeTests(unittest.TestCase):
         )
         saved = json.loads(json.dumps(generated))
         self.assertIn("Model-generated narration · unverified.", render(saved))
+        legacy_annotations = copy.deepcopy(annotations)
+        legacy_annotations["document"].pop("preamble")
+        legacy_report = apply_annotations(report, legacy_annotations)
+        self.assertNotIn("preamble", legacy_report["document"])
+        self.assertIn(
+            "Model-generated narration · unverified.", render(legacy_report)
+        )
+        legacy_saved = json.loads(json.dumps(legacy_report))
+        self.assertNotIn("preamble", legacy_saved["document"])
+        self.assertIn(
+            "Model-generated narration · unverified.", render(legacy_saved)
+        )
+
+    def test_asd_style_guidance_keeps_natural_prose_rhythm(self) -> None:
+        """Use ASD principles as a strong guide without making prose robotic."""
+        self.assertIn("strong guide", ASD_STYLE_INSTRUCTION)
+        self.assertIn("roughly 80 to 90 percent", ASD_STYLE_INSTRUCTION)
+        self.assertIn("Do not claim formal compliance", ASD_STYLE_INSTRUCTION)
+        self.assertIn("natural rhythm", ASD_STYLE_INSTRUCTION)
+
+    def test_new_document_response_requires_a_nonempty_preamble(self) -> None:
+        """Require a preamble in new provider output and reject an empty value."""
+        valid = FakeProvider._document_response({})
+        Narrator._validate_document_response(valid)
+
+        missing = copy.deepcopy(valid)
+        missing.pop("preamble")
+        empty = copy.deepcopy(valid)
+        empty["preamble"] = " \n"
+        for response in (missing, empty):
+            with (
+                self.subTest(response=response),
+                self.assertRaisesRegex(ValueError, "preamble"),
+            ):
+                Narrator._validate_document_response(response)
+
+    def test_document_prompt_supports_a_flexible_conceptual_overview(
+        self,
+    ) -> None:
+        """Describe an evidence-scaled, conceptual preamble in the document contract."""
+        provider = FakeProvider()
+        Narrator(provider).generate(compile_snapshot(snapshot()))
+        request = next(
+            call
+            for call in provider.calls
+            if call["name"] == "diffstory_document"
+        )
+        prompt = request["system"]
+        preamble_schema = request["schema"]["properties"]["preamble"]
+        self.assertIn("before any code tour", prompt)
+        self.assertIn("about 200 to 450 words", prompt)
+        self.assertIn("Do not pad", prompt)
+        self.assertIn("fenced plain-text blocks", prompt)
+        self.assertIn("blank line", prompt)
+        self.assertIn("do not use Mermaid", prompt)
+        self.assertEqual(preamble_schema["type"], "string")
+        self.assertEqual(preamble_schema["maxLength"], MAX_PREAMBLE_CHARS)
+        self.assertIn("about 200 to 450 words", preamble_schema["description"])
+        self.assertIn("multi-part change", preamble_schema["description"])
+
+    def test_document_output_reserve_covers_a_page_sized_preamble(
+        self,
+    ) -> None:
+        """Reserve enough response tokens for a page-sized preamble and document fields."""
+        provider = FakeProvider()
+        Narrator(provider).generate(compile_snapshot(snapshot()))
+        request = next(
+            call
+            for call in provider.calls
+            if call["name"] == "diffstory_document"
+        )
+        self.assertEqual(request["max_output_tokens"], DOCUMENT_OUTPUT_RESERVE)
+        self.assertGreaterEqual(request["max_output_tokens"], 1_200)
+
+    def test_document_preamble_enforces_its_character_bound(self) -> None:
+        """Accept a preamble at its bound and reject text above the bound."""
+        valid = FakeProvider._document_response({})
+        valid["preamble"] = "x" * MAX_PREAMBLE_CHARS
+        Narrator._validate_document_response(valid)
+
+        too_long = copy.deepcopy(valid)
+        too_long["preamble"] += "x"
+        with self.assertRaisesRegex(ValueError, "preamble"):
+            Narrator._validate_document_response(too_long)
 
     def test_large_single_group_is_split_into_stable_bounded_slices(
         self,
