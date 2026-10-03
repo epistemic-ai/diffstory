@@ -41,11 +41,17 @@ Module environment differences are deliberately not erased. Renaming a reference
       "scope": "full"
     }
   ],
+  "file_evidence": [{
+    "base": {"path": "pkg/module.py", "state": "absent"},
+    "head": {"path": "pkg/module.py", "state": "supplied", "coverage": "full"}
+  }],
   "warnings": []
 }
 ```
 
-Use `scope: "selected excerpts"` for partial snapshots. Each excerpt retains its original line offset. When multiple excerpts are supplied from the same file, set a distinct `region` to identify each before/after pair; source ranges must not overlap. Full snapshots include both sides of modified files and the existing side of truly added/deleted files. Missing data, parse failures and skip warnings cause conservative unresolved-counterpart labels instead of definitive addition/removal claims.
+`file_evidence` records the source state of each changed path on both revisions. A side is `absent`, `unavailable` with a reason, or `supplied` with `full` coverage. Git and GitHub ingestion create these records from pinned source reads. A copy or rename keeps its old path on the base side and its new path on the head side. The path link lets the compiler compare the correct files. A missing or skipped read cannot prove that a definition is absent.
+
+Use `scope: "selected excerpts"` for partial snapshots. Each excerpt retains its original line offset. When multiple excerpts are supplied from the same file, set a distinct `region` to identify each before/after pair; source ranges must not overlap. Full snapshots include both sides of modified files and the existing side of truly added/deleted files. A confirmed Python definition addition or removal needs full, parsed source for the relevant file pair. A warning about another file, including a Markdown file, does not weaken that evidence. Missing source and parse failures on the relevant file leave the counterpart unresolved. Legacy snapshots without `file_evidence` use conservative coverage rules.
 
 The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_files`, `cycles`, `warnings`, `stats`, `meta` and `method`. Stable IDs join evidence and narrative. Line URLs bind to a commit, not a moving branch. The renderer rejects malformed identifiers, numeric fields, diff tags and missing group references, escapes source/prose and prevents literal script terminators in embedded JSON.
 
@@ -57,6 +63,7 @@ The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_
   "base_sha": "<same effective base as the report>",
   "head_sha": "<same head as the report>",
   "document": {
+    "preamble": "A source-grounded overview of the whole change, before the code tour.",
     "lead": "A short source-grounded opening paragraph.",
     "closing": "The mental model to retain."
   },
@@ -79,6 +86,8 @@ The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_
   }]
 }
 ```
+
+The optional preamble introduces the whole change before the code tour. Model narration requires it. It can include one compact conceptual sketch; a two-path decision sketch uses a three-line plain-text flow chart. The preamble has a 4,000-character limit. Other document prose has a 6,000-character limit. The provider, annotation, generated-report, and renderer checks use these limits.
 
 The compiler rejects a revision mismatch, missing/out-of-group evidence IDs, oversized prose and invalid field types. Annotation fields cannot replace structural matches or claim test execution. The current validator does not prove that a natural-language claim follows from the source. Human review remains necessary.
 

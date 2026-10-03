@@ -9,11 +9,14 @@ import re
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Literal
 from typing import NoReturn
+from typing import TypedDict
 from urllib.error import HTTPError
 from urllib.error import URLError
 from urllib.parse import quote
@@ -25,6 +28,7 @@ from . import __version__
 from .analysis import MAX_SNAPSHOT_SOURCE_BYTES
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
 MAX_FILE = 8_000_000
@@ -36,6 +40,96 @@ GITHUB_RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
 HTTP_NOT_FOUND = 404
 HTTP_AUTH_FAILURE_CODES = frozenset({401, 403, HTTP_NOT_FOUND})
 GITHUB_AUTH_ENV = "GITHUB_TOKEN"
+
+
+class _FileSideRequired(TypedDict):
+    """Store one path's source state in a snapshot evidence record.
+
+    Attributes:
+        path: Repository-relative path for this revision side.
+        state: ``absent``, ``unavailable``, or ``supplied``.
+    """
+
+    path: str
+    state: Literal["absent", "unavailable", "supplied"]
+
+
+class _FileSideEvidence(_FileSideRequired, total=False):
+    """Add state-specific fields to a serialized source-side record.
+
+    Attributes:
+        reason: Availability code, present only for ``unavailable``.
+        coverage: ``full``, present only for ``supplied``.
+    """
+
+    reason: str
+    coverage: Literal["full"]
+
+
+@dataclass(frozen=True, slots=True)
+class _GitHubFileTask:
+    """Identify one base or head source read for a changed GitHub file.
+
+    Attributes:
+        repository: Repository that contains the requested revision.
+        path: Path to fetch from that revision.
+        side: ``base`` or ``head``.
+        revision: Pinned commit ID for the requested side.
+        region: New path used to link both sides of a copy or rename.
+        record_index: Position of the related changed-file evidence record.
+    """
+
+    repository: str
+    path: str
+    side: Literal["base", "head"]
+    revision: str
+    region: str
+    record_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GitHubReadResult:
+    """Record the state of one attempted GitHub source read.
+
+    Attributes:
+        record_index: Position of the changed-file evidence record to update.
+        side: ``base`` or ``head``.
+        state: ``supplied`` after a read or ``unavailable`` after a skip.
+        reason: Availability code for a skipped read; otherwise ``None``.
+    """
+
+    record_index: int
+    side: Literal["base", "head"]
+    state: Literal["supplied", "unavailable"]
+    reason: str | None = None
+
+
+def _side_evidence(
+    path: str,
+    state: Literal["absent", "unavailable", "supplied"],
+    reason: str | None = None,
+) -> _FileSideEvidence:
+    """Build one schema-valid side record without changing its path.
+
+    Args:
+        path: Path at this revision side, including an old copy/rename path.
+        state: Whether source is absent, unavailable, or fully supplied.
+        reason: Required availability code when ``state`` is ``unavailable``.
+
+    Returns:
+        A fresh snapshot side record with fields for the selected state.
+
+    Raises:
+        ValueError: If an unavailable side has no reason code.
+    """
+    if state == "absent":
+        return {"path": path, "state": state}
+    if state == "supplied":
+        return {"path": path, "state": state, "coverage": "full"}
+    if reason is None:
+        msg = "Unavailable source requires an availability reason"
+        raise ValueError(msg)
+    return {"path": path, "state": state, "reason": reason}
 
 
 def _validate_source_limit(max_source_bytes: int) -> None:
@@ -267,23 +361,15 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
     file_evidence = []
     source_bytes = 0
     for status, path in items:
-        base_state = (
-            {"path": path, "state": "absent"}
-            if status == "A"
-            else {
-                "path": path,
-                "state": "unavailable",
-                "reason": "not_supplied",
-            }
+        base_state = _side_evidence(
+            path,
+            "absent" if status == "A" else "unavailable",
+            "not_supplied",
         )
-        head_state = (
-            {"path": path, "state": "absent"}
-            if status == "D"
-            else {
-                "path": path,
-                "state": "unavailable",
-                "reason": "not_supplied",
-            }
+        head_state = _side_evidence(
+            path,
+            "absent" if status == "D" else "unavailable",
+            "not_supplied",
         )
         evidence_record = {"base": base_state, "head": head_state}
         file_evidence.append(evidence_record)
@@ -298,11 +384,9 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
             )
             if warning:
                 warnings.append(warning)
-                evidence_record[side] = {
-                    "path": path,
-                    "state": "unavailable",
-                    "reason": reason,
-                }
+                evidence_record[side] = _side_evidence(
+                    path, "unavailable", reason
+                )
                 continue
             oid, size = object_info
             source_bytes += size
@@ -313,34 +397,19 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
                 warnings.append(
                     f"Skipped {side} {path}: {size} bytes exceeds {MAX_FILE}",
                 )
-                evidence_record[side] = {
-                    "path": path,
-                    "state": "unavailable",
-                    "reason": "size_limit",
-                }
+                evidence_record[side] = _side_evidence(
+                    path, "unavailable", "size_limit"
+                )
                 continue
             data = _git(root, "cat-file", "blob", oid)
-            if b"\0" in data:
+            text = _decode_source(data)
+            if text is None:
                 warnings.append(
                     f"Skipped {side} {path}: binary or non-UTF-8 source",
                 )
-                evidence_record[side] = {
-                    "path": path,
-                    "state": "unavailable",
-                    "reason": "binary_or_non_utf8",
-                }
-                continue
-            try:
-                text = data.decode("utf-8")
-            except UnicodeError:
-                warnings.append(
-                    f"Skipped {side} {path}: binary or non-UTF-8 source",
+                evidence_record[side] = _side_evidence(
+                    path, "unavailable", "binary_or_non_utf8"
                 )
-                evidence_record[side] = {
-                    "path": path,
-                    "state": "unavailable",
-                    "reason": "binary_or_non_utf8",
-                }
                 continue
             fragments.append(
                 {
@@ -351,11 +420,7 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
                     "scope": "full",
                 },
             )
-            evidence_record[side] = {
-                "path": path,
-                "state": "supplied",
-                "coverage": "full",
-            }
+            evidence_record[side] = _side_evidence(path, "supplied")
 
     meta = {
         "title": f"{base} → {head}",
@@ -631,7 +696,7 @@ def _github_file_bytes(
     return data, None, len(data), None
 
 
-def _decode_github_source(data: bytes) -> str | None:
+def _decode_source(data: bytes) -> str | None:
     """
     Decode one source file as UTF-8, excluding binary content.
 
@@ -652,15 +717,14 @@ def _decode_github_source(data: bytes) -> str | None:
 
 def _read_github_file(
     api: GitHubClient,
-    task: tuple[str, str, str, str, str, int],
+    task: _GitHubFileTask,
 ) -> tuple[dict | None, str | None, int, str | None]:
     """
     Fetch and decode one GitHub source file for a snapshot.
 
     Args:
         api: Client used for authenticated GitHub requests.
-        task: Repository, path, revision side, revision SHA, region path, and
-            file-evidence record index.
+        task: Pinned source request and its evidence record index.
 
     Returns:
         Fragment, warning, bytes read or declared, and one availability reason:
@@ -674,9 +738,11 @@ def _read_github_file(
         Reads file contents from the GitHub API.
 
     """
-    owner, path, side, revision, region, _record_index = task
+    owner = task.repository
+    path = task.path
+    side = task.side
     contents_path = (
-        f"/repos/{owner}/contents/{quote(path, safe='/')}?ref={revision}"
+        f"/repos/{owner}/contents/{quote(path, safe='/')}?ref={task.revision}"
     )
     content_info = api.get(contents_path)
     if (
@@ -699,7 +765,7 @@ def _read_github_file(
     )
     if warning:
         return None, warning, size, reason
-    text = _decode_github_source(data)
+    text = _decode_source(data)
     if text is None:
         return (
             None,
@@ -714,7 +780,7 @@ def _read_github_file(
         "text": text,
         "start_line": 1,
         "scope": "full",
-        "region": region,
+        "region": task.region,
     }
     return fragment, None, size, None
 
@@ -775,12 +841,12 @@ def _list_github_files(
 
 
 def _github_file_tasks(
-    files: Sequence[dict],
+    files: Iterable[dict],
     repo: str,
     head_repo: str,
     base: str,
     head: str,
-) -> tuple[tuple[tuple[str, str, str, str, str, int], ...], list[dict]]:
+) -> tuple[tuple[_GitHubFileTask, ...], list[dict[str, _FileSideEvidence]]]:
     """
     Plan base and head content requests for each changed path.
 
@@ -793,52 +859,54 @@ def _github_file_tasks(
 
     Returns:
         Content tasks and initial file evidence in changed-file order. Added
-        and removed files receive one absent side. Renames link the required
-        ``previous_filename`` to the new path.
+        and removed files receive one absent side. Copies and renames link
+        the required ``previous_filename`` to the new path.
     """
-    tasks = []
-    evidence = []
+    tasks: list[_GitHubFileTask] = []
+    evidence: list[dict[str, _FileSideEvidence]] = []
+    # Each changed file gets one evidence pair and up to two source reads.
+    # Copies and renames read the old path at base and the new path at head.
     for record_index, file_info in enumerate(files):
         path = file_info["filename"]
         status = file_info["status"]
-        if status == "renamed":
+        if status in {"renamed", "copied"}:
             old_path = file_info.get("previous_filename")
             if not isinstance(old_path, str) or not old_path:
-                msg = "GitHub renamed file record requires previous_filename"
+                msg = f"GitHub {status} file record requires previous_filename"
                 raise ValueError(msg)
         else:
             old_path = path
-        base_side = (
-            {"path": path, "state": "absent"}
-            if status == "added"
-            else {
-                "path": old_path,
-                "state": "unavailable",
-                "reason": "not_supplied",
-            }
+        base_side = _side_evidence(
+            old_path,
+            "absent" if status == "added" else "unavailable",
+            "not_supplied",
         )
-        head_side = (
-            {"path": path, "state": "absent"}
-            if status == "removed"
-            else {
-                "path": path,
-                "state": "unavailable",
-                "reason": "not_supplied",
-            }
+        head_side = _side_evidence(
+            path,
+            "absent" if status == "removed" else "unavailable",
+            "not_supplied",
         )
         evidence.append({"base": base_side, "head": head_side})
         if status != "added":
-            tasks.append((repo, old_path, "base", base, path, record_index))
+            tasks.append(
+                _GitHubFileTask(
+                    repo, old_path, "base", base, path, record_index
+                )
+            )
         if status != "removed":
-            tasks.append((head_repo, path, "head", head, path, record_index))
+            tasks.append(
+                _GitHubFileTask(
+                    head_repo, path, "head", head, path, record_index
+                )
+            )
     return tuple(tasks), evidence
 
 
 def _read_github_tasks(
     api: GitHubClient,
-    tasks: Sequence[tuple[str, str, str, str, str, int]],
+    tasks: Iterable[_GitHubFileTask],
     max_source_bytes: int,
-) -> tuple[list[dict], list[str], int, list[dict]]:
+) -> tuple[list[dict], list[str], int, list[_GitHubReadResult]]:
     """
     Fetch source fragments while enforcing the aggregate byte cap.
 
@@ -855,7 +923,7 @@ def _read_github_tasks(
     """
     fragments = []
     warnings = []
-    results = []
+    results: list[_GitHubReadResult] = []
     source_bytes = 0
     for task in tasks:
         fragment, warning, size, reason = _read_github_file(api, task)
@@ -869,21 +937,14 @@ def _read_github_tasks(
         if fragment:
             fragments.append(fragment)
             results.append(
-                {
-                    "record_index": task[5],
-                    "side": task[2],
-                    "state": "supplied",
-                },
+                _GitHubReadResult(task.record_index, task.side, "supplied"),
             )
         if warning:
             warnings.append(warning)
             results.append(
-                {
-                    "record_index": task[5],
-                    "side": task[2],
-                    "state": "unavailable",
-                    "reason": reason,
-                },
+                _GitHubReadResult(
+                    task.record_index, task.side, "unavailable", reason
+                ),
             )
     return fragments, warnings, source_bytes, results
 
@@ -949,20 +1010,10 @@ def from_github(
         max_source_bytes,
     )
     for result in read_results:
-        side_name = result["side"]
-        side = file_evidence[result["record_index"]][side_name]
-        if result["state"] == "supplied":
-            file_evidence[result["record_index"]][side_name] = {
-                "path": side["path"],
-                "state": "supplied",
-                "coverage": "full",
-            }
-        else:
-            file_evidence[result["record_index"]][side_name] = {
-                "path": side["path"],
-                "state": "unavailable",
-                "reason": result["reason"],
-            }
+        side = file_evidence[result.record_index][result.side]
+        file_evidence[result.record_index][result.side] = _side_evidence(
+            side["path"], result.state, result.reason
+        )
 
     # Fail if the PR changed during the read; don't silently mix multiple revisions.
     end = api.get(f"/repos/{repo}/pulls/{number}")

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from collections.abc import Callable
+from collections.abc import Sequence
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -314,7 +315,7 @@ class GitHubTransportTests(unittest.TestCase):
         *,
         changed_mid_read: bool = False,
         returned: int | None = None,
-        file_records: list[dict] | None = None,
+        file_records: Sequence[dict] | None = None,
         content_response: dict | None = None,
         blob_response: dict | None = None,
     ) -> tuple[Callable[..., object], list[str]]:
@@ -381,7 +382,9 @@ class GitHubTransportTests(unittest.TestCase):
                     ]
                 )
                 amount = len(records) if returned is None else returned
-                return records[(page - 1) * 100 : min(page * 100, amount)]
+                return list(
+                    records[(page - 1) * 100 : min(page * 100, amount)]
+                )
             if "/contents/" in path:
                 return (
                     copy.deepcopy(content_response)
@@ -415,7 +418,7 @@ class GitHubTransportTests(unittest.TestCase):
         self.assertEqual(s["meta"]["requested_base_sha"], "a" * 40)
 
     def test_ingest_maps_github_file_status_to_evidence(self) -> None:
-        """Added, removed, and renamed API states must map to exact side paths."""
+        """Each file status must keep its base and head evidence paths."""
         rows = [
             (
                 "added",
@@ -439,10 +442,22 @@ class GitHubTransportTests(unittest.TestCase):
                     "head": ("new.py", "supplied"),
                 },
             ),
+            (
+                "copied",
+                {
+                    "filename": "copy.py",
+                    "previous_filename": "original.py",
+                    "status": "copied",
+                },
+                {
+                    "base": ("original.py", "supplied"),
+                    "head": ("copy.py", "supplied"),
+                },
+            ),
         ]
         for name, file_info, expected in rows:
             with self.subTest(status=name):
-                fake, _ = self.fake(file_records=[file_info])
+                fake, paths = self.fake(file_records=(file_info,))
                 with patch("diffstory.ingest.GitHubClient.get", new=fake):
                     snapshot = from_github("org/repo#1")
                 record = snapshot["file_evidence"][0]
@@ -451,17 +466,32 @@ class GitHubTransportTests(unittest.TestCase):
                     self.assertEqual(record[side_name]["state"], state)
                     if state == "supplied":
                         self.assertEqual(record[side_name]["coverage"], "full")
+                if name in {"renamed", "copied"}:
+                    self.assertTrue(
+                        any(
+                            "/contents/" + expected["base"][0] in p
+                            for p in paths
+                        )
+                    )
+                    self.assertTrue(
+                        any(
+                            "/contents/" + expected["head"][0] in p
+                            for p in paths
+                        )
+                    )
 
     def test_github_rename_requires_previous_path(self) -> None:
-        """A renamed API entry without previous_filename must fail without guessing."""
-        fake, _ = self.fake(
-            file_records=[{"filename": "new.py", "status": "renamed"}],
-        )
-        with (
-            patch("diffstory.ingest.GitHubClient.get", new=fake),
-            self.assertRaisesRegex(ValueError, "previous_filename"),
-        ):
-            from_github("org/repo#1")
+        """A copy or rename without its old path must fail without guessing."""
+        for status in ("renamed", "copied"):
+            with self.subTest(status=status):
+                fake, _ = self.fake(
+                    file_records=({"filename": "new.py", "status": status},),
+                )
+                with (
+                    patch("diffstory.ingest.GitHubClient.get", new=fake),
+                    self.assertRaisesRegex(ValueError, "previous_filename"),
+                ):
+                    from_github("org/repo#1")
 
     def test_github_skip_reason_is_structured(self) -> None:
         """Each nonfatal GitHub read skip must keep its reason separate from warning text."""

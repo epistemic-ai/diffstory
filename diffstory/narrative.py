@@ -25,6 +25,7 @@ from urllib.request import Request
 from urllib.request import build_opener
 
 from . import __version__
+from .analysis import MAX_PREAMBLE_CHARS
 from .analysis import ordered_components
 from .analysis import stable_id
 from .analysis import validate_passages
@@ -39,29 +40,41 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+# Direct API endpoint and default model for opt-in narration.
 OPENAI_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = "gpt-6.1-sol"
+
+# Token limits used to pack requests before calling each provider.
 MODEL_CONTEXT_TOKENS = 1_050_000
 MODEL_MAX_OUTPUT_TOKENS = 128_000
 CODEX_DEFAULT_CONTEXT_TOKENS = 400_000
+# Known Codex model names map to (context tokens, output tokens).
 CODEX_MODEL_CAPACITIES = {
     "gpt-6-astra": (1_050_000, 128_000),
     "gpt-6.1-sol": (1_050_000, 128_000),
     "gpt-6-luna": (1_050_000, 128_000),
     "gpt-5.3-codex": (400_000, 128_000),
 }
+# Seconds allowed for one provider call and for stopping a child process.
 PROVIDER_CALL_TIMEOUT_SECONDS = 900
 PROCESS_CLEANUP_TIMEOUT_SECONDS = 2
+
+# Byte and character caps for source slices, summaries, and provider output.
 MAX_SOURCE_SLICE_BYTES = 12_000
 MAX_SUMMARY_CHARS = 3_000
 MAX_RESPONSE_BYTES = 2_000_000
+MAX_SOURCE_REDUCTION_CHARS = 800
+
+# Environment key for direct API auth, and ASCII codes rejected from output.
 OPENAI_AUTH_ENV = "OPENAI_API_KEY"
 ASCII_CONTROL_CHARACTER_MAX = 31
 ASCII_DELETE_CHARACTER = 127
+
+# Character caps for questions and document or step narration.
 MAX_QUESTION_CHARS = 2_000
 MAX_NARRATIVE_TEXT_CHARS = 6_000
-MAX_PREAMBLE_CHARS = 4_000
-MAX_SOURCE_REDUCTION_CHARS = 800
+
+# Output tokens reserved for each stage before packing source into a request.
 LEAF_OUTPUT_RESERVE = 2_400
 LEAF_PER_CHANGE_OUTPUT_RESERVE = 128
 SUMMARY_OUTPUT_RESERVE = 1_200

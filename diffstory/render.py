@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+from .analysis import MAX_PREAMBLE_CHARS
 from .analysis import SCHEMA
 from .analysis import validate_generated_report
 from .analysis import validate_passages
@@ -95,15 +96,18 @@ def _validate_report_collections(report: dict) -> None:
         ):
             msg = f"Report {name} must be a list of objects"
             raise ValueError(msg)
-    for name in ("warnings", "notes"):
-        if name not in report and name == "notes":
-            continue
-        values = report.get(name)
-        if not isinstance(values, list) or any(
-            not isinstance(value, str) for value in values
-        ):
-            msg = f"Report {name} must be a list of strings"
-            raise ValueError(msg)
+    warnings = report.get("warnings")
+    if not isinstance(warnings, list) or any(
+        not isinstance(value, str) for value in warnings
+    ):
+        msg = "Report warnings must be a list of strings"
+        raise ValueError(msg)
+    notes = report.get("notes", [])
+    if not isinstance(notes, list) or any(
+        not isinstance(value, str) for value in notes
+    ):
+        msg = "Report notes must be a list of strings"
+        raise ValueError(msg)
 
 
 def _validate_report_stats(stats: object) -> None:
@@ -201,7 +205,12 @@ def validate_report(report: dict) -> None:
         if not isinstance(d, dict) or any(
             k not in {"preamble", "lead", "closing"}
             or not isinstance(v, str)
-            or len(v) > MAX_NARRATIVE_TEXT_CHARS
+            or len(v)
+            > (
+                MAX_PREAMBLE_CHARS
+                if k == "preamble"
+                else MAX_NARRATIVE_TEXT_CHARS
+            )
             or (k == "preamble" and not v.strip())
             for k, v in d.items()
         ):

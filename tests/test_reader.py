@@ -3,6 +3,7 @@
 import copy
 import unittest
 
+from diffstory.analysis import MAX_PREAMBLE_CHARS
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.analysis import evidence_packet
@@ -238,6 +239,32 @@ class LiterateReaderTests(unittest.TestCase):
         a["document"]["preamble"] = "  "
         with self.assertRaisesRegex(ValueError, "preamble"):
             apply_annotations(r, a)
+
+    def test_authored_preamble_limit_applies_to_annotations_and_saved_reports(
+        self,
+    ) -> None:
+        """Reject an authored preamble above its limit at both input boundaries."""
+        source_report = report()
+        for length, valid in (
+            (MAX_PREAMBLE_CHARS, True),
+            (MAX_PREAMBLE_CHARS + 1, False),
+        ):
+            with self.subTest(length=length):
+                preamble = "x" * length
+                candidate = annotations(source_report)
+                candidate["document"]["preamble"] = preamble
+                saved = apply_annotations(
+                    source_report, annotations(source_report)
+                )
+                saved["document"]["preamble"] = preamble
+                if valid:
+                    apply_annotations(source_report, candidate)
+                    render(saved)
+                else:
+                    with self.assertRaises(ValueError):
+                        apply_annotations(source_report, candidate)
+                    with self.assertRaises(ValueError):
+                        render(saved)
 
     def test_renderer_validates_loaded_report_passages(self) -> None:
         """Validate persisted passage evidence again when loading a report for rendering."""

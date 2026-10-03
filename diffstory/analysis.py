@@ -37,6 +37,7 @@ MAX_SNAPSHOT_SOURCE_BYTES = 64_000_000
 MIN_SYMBOL_SIMILARITY = 0.40
 RELATED_SYMBOL_THRESHOLD = 4
 MAX_NARRATIVE_TEXT_CHARS = 6_000
+MAX_PREAMBLE_CHARS = 4_000
 MAX_QUESTION_CHARS = 2_000
 MAX_TITLE_CHARS = 200
 MAX_PROVIDER_NAME_CHARS = 80
@@ -3724,7 +3725,7 @@ def validate_generated_report(report: dict) -> None:
     if "preamble" in document and (
         not isinstance(document["preamble"], str)
         or not document["preamble"].strip()
-        or len(document["preamble"]) > MAX_NARRATIVE_TEXT_CHARS
+        or len(document["preamble"]) > MAX_PREAMBLE_CHARS
     ):
         msg = "Generated report has an invalid document preamble"
         raise ValueError(msg)
@@ -3785,8 +3786,14 @@ def _apply_document_annotations(
             msg = "Invalid document narrative"
             raise ValueError(msg)
         if any(
-            not isinstance(value, str) or len(value) > MAX_NARRATIVE_TEXT_CHARS
-            for value in document.values()
+            not isinstance(value, str)
+            or len(value)
+            > (
+                MAX_PREAMBLE_CHARS
+                if field == "preamble"
+                else MAX_NARRATIVE_TEXT_CHARS
+            )
+            for field, value in document.items()
         ):
             msg = "Invalid document narrative text"
             raise ValueError(msg)

@@ -21,6 +21,7 @@ from urllib.error import HTTPError
 
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
+from diffstory.analysis import validate_generated_report
 from diffstory.cli import main
 from diffstory.narrative import ASD_STYLE_INSTRUCTION
 from diffstory.narrative import CODEX_DEFAULT_CONTEXT_TOKENS
@@ -471,6 +472,27 @@ class NarrativeTests(unittest.TestCase):
         too_long["preamble"] += "x"
         with self.assertRaisesRegex(ValueError, "preamble"):
             Narrator._validate_document_response(too_long)
+
+    def test_generated_report_rechecks_preamble_bound(self) -> None:
+        """Reject an oversized saved preamble after provider validation."""
+        source_report = compile_snapshot(snapshot())
+        candidate = Narrator(FakeProvider()).generate(source_report)
+        generated = apply_annotations(source_report, candidate)
+        for length, valid in (
+            (MAX_PREAMBLE_CHARS, True),
+            (MAX_PREAMBLE_CHARS + 1, False),
+        ):
+            with self.subTest(length=length):
+                saved = copy.deepcopy(generated)
+                saved["document"]["preamble"] = "x" * length
+                if valid:
+                    validate_generated_report(saved)
+                    render(saved)
+                else:
+                    with self.assertRaisesRegex(ValueError, "preamble"):
+                        validate_generated_report(saved)
+                    with self.assertRaises(ValueError):
+                        render(saved)
 
     def test_large_single_group_is_split_into_stable_bounded_slices(
         self,
