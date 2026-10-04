@@ -31,7 +31,7 @@ from .analysis import ordered_components
 from .analysis import stable_id
 from .analysis import validate_passages
 from .models import MAX_NARRATIVE_TEXT_CHARS
-from .models import ProviderDocument
+from .models import GeneratedDocument
 from .usage import ModelCapacity
 from .usage import RunUsage
 from .usage import estimate_input
@@ -287,7 +287,7 @@ _STEP_SCHEMA = _object(
         },
     },
 )
-_DOCUMENT_SCHEMA = ProviderDocument.model_json_schema()
+_DOCUMENT_SCHEMA = GeneratedDocument.model_json_schema()
 
 
 class _RejectRedirects(HTTPRedirectHandler):
@@ -2483,7 +2483,7 @@ class Narrator:
 
         """
         try:
-            ProviderDocument.model_validate(document)
+            GeneratedDocument.model_validate(document)
         except ValidationError as error:
             msg = "Provider returned an invalid document preamble, opening, or closing"
             raise ValueError(msg) from error

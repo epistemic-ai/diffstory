@@ -52,6 +52,8 @@ Replace `OWNER/REPO#NUMBER` with a real PR. For private repositories, Diffstory 
 
 The CLI performs read-only requests, paginates changed files, pins both revisions, and rejects a PR that changes during retrieval. It does not inherit credentials from a chat application. The local Git comparison defaults to **merge-base(base, head) → head**; use `--two-dot` for an endpoint comparison. Uncommitted and untracked work is not included.
 
+Snapshots must include `file_evidence` with an explicit source state for both revisions of each file. The Git and GitHub commands supply these records. Inputs that omit them are rejected.
+
 Every compilation writes standalone HTML plus an adjacent `.report.json`. Binary, oversized, unsupported, or missing source is explicitly reported; it is not silently treated as a complete analysis.
 
 ## What the compiler knows

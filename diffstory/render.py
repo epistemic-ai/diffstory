@@ -79,8 +79,7 @@ def _validate_report_collections(report: dict) -> None:
 
     Raises:
         ValueError: If an object collection contains a non-object, or warnings
-            and notes are not lists of strings. Notes may be absent in a v1
-            report produced before notes were added.
+            and notes are not lists of strings.
     """
     for name in (
         "groups",
@@ -101,7 +100,7 @@ def _validate_report_collections(report: dict) -> None:
     ):
         msg = "Report warnings must be a list of strings"
         raise ValueError(msg)
-    notes = report.get("notes", [])
+    notes = report.get("notes")
     if not isinstance(notes, list) or any(
         not isinstance(value, str) for value in notes
     ):

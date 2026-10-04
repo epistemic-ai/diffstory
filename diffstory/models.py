@@ -45,6 +45,42 @@ class StrictModel(BaseModel):
     )
 
 
+class GenerationUsage(StrictModel):
+    """Validate measured token totals and provider call counts.
+
+    Attributes:
+        input_tokens: Total reported input tokens, at least zero.
+        cached_input_tokens: Cached input tokens, no greater than input tokens.
+        output_tokens: Total reported output tokens, at least zero.
+        calls: Total provider calls, at least zero.
+        unreported_calls: Calls without usage, no greater than total calls.
+    """
+
+    input_tokens: int = Field(ge=0)
+    cached_input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    calls: int = Field(ge=0)
+    unreported_calls: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def subtotals_fit(self) -> GenerationUsage:
+        """Require cached tokens and unreported calls to fit their totals.
+
+        Returns:
+            This usage record without changing any counts.
+
+        Raises:
+            ValueError: If either subtotal exceeds its total.
+        """
+        if self.cached_input_tokens > self.input_tokens:
+            msg = "Cached input tokens exceed total input tokens"
+            raise ValueError(msg)
+        if self.unreported_calls > self.calls:
+            msg = "Unreported calls exceed total calls"
+            raise ValueError(msg)
+        return self
+
+
 class FileSide(StrictModel):
     """Identify a file at one pinned revision.
 
@@ -149,11 +185,11 @@ class FileEvidence(StrictModel):
         return self
 
 
-class SourceFragment(StrictModel):
+class SourceFragment(FileSide):
     """Validate source text and its position while preserving producer metadata.
 
     Attributes:
-        path: Source path; legacy fragments retain their original path rules.
+        path: Nonempty repository-relative path, without dot or parent parts.
         side: ``base`` or ``head``.
         text: UTF-8 source text, including an empty file.
         start_line: Positive original line number; booleans are rejected.
@@ -163,7 +199,6 @@ class SourceFragment(StrictModel):
 
     model_config = ConfigDict(extra="allow")
 
-    path: str
     side: RevisionSide
     text: str
     start_line: int = Field(default=1, ge=1)
@@ -198,7 +233,7 @@ class SnapshotInput(StrictModel):
         meta: Producer metadata with measured source bytes added after validation.
         fragments: Source records in their original order.
         warnings: Producer warnings; their text never controls classification.
-        file_evidence: Explicit file pairs, or ``None`` for legacy snapshots.
+        file_evidence: Required file pairs with explicit source states for both revisions.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -207,26 +242,7 @@ class SnapshotInput(StrictModel):
     meta: dict = Field(default_factory=dict)
     fragments: list[SourceFragment] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
-    file_evidence: list[FileEvidence] | None = None
-
-    @field_validator("file_evidence", mode="before")
-    @classmethod
-    def evidence_list(cls, value: object) -> object:
-        """Require a list when explicit file evidence is present.
-
-        Args:
-            value: Explicit field value; this check does not run on omission.
-
-        Returns:
-            The input list for model validation.
-
-        Raises:
-            ValueError: If the field is not a list, including explicit null.
-        """
-        if not isinstance(value, list):
-            msg = "Snapshot file_evidence must be a list"
-            raise ValueError(msg)
-        return value
+    file_evidence: list[FileEvidence]
 
     @field_validator("file_evidence")
     @classmethod
@@ -352,12 +368,29 @@ class DocumentNarrative(StrictModel):
 
 
 class GeneratedDocument(DocumentNarrative):
-    """Require opening and closing prose in saved generated narration.
+    """Require the overview, opening, and closing in generated narration.
 
     Attributes:
+        preamble: Required overview with separate prose and sketch allowances.
         lead: Required nonblank opening, at most 6,000 characters.
         closing: Required nonblank closing, at most 6,000 characters.
     """
+
+    preamble: str = Field(
+        max_length=MAX_PREAMBLE_TOTAL_CHARS,
+        description=(
+            "Introduce the whole change before a code tour. Use about 200 to 450 words "
+            "when the evidence supports that length; use less for a small change. "
+            "Explain the conceptual areas and reading path without real source names. "
+            "For a multi-part change, include one useful conceptual sketch when "
+            "supported. Use a fenced text block; a decision flow chart has a label "
+            "and two branches: ├─ condition → outcome, then └─ condition → outcome. "
+            "Keep other sketches as text. Allow at most 4,000 characters of prose "
+            "and a separate 4,000 characters for all complete sketches, including "
+            "their fences. Keep the total within 8,000 characters. "
+            "Separate prose paragraphs with a blank line."
+        ),
+    )
 
     lead: str = Field(max_length=MAX_NARRATIVE_TEXT_CHARS)
     closing: str = Field(max_length=MAX_NARRATIVE_TEXT_CHARS)
@@ -382,30 +415,6 @@ class GeneratedDocument(DocumentNarrative):
         return value
 
 
-class ProviderDocument(GeneratedDocument):
-    """Require a preamble in newly generated narration.
-
-    Attributes:
-        preamble: Required overview with separate prose and sketch allowances.
-    """
-
-    preamble: str = Field(
-        max_length=MAX_PREAMBLE_TOTAL_CHARS,
-        description=(
-            "Introduce the whole change before a code tour. Use about 200 to 450 words "
-            "when the evidence supports that length; use less for a small change. "
-            "Explain the conceptual areas and reading path without real source names. "
-            "For a multi-part change, include one useful conceptual sketch when "
-            "supported. Use a fenced text block; a decision flow chart has a label "
-            "and two branches: ├─ condition → outcome, then └─ condition → outcome. "
-            "Keep other sketches as text. Allow at most 4,000 characters of prose "
-            "and a separate 4,000 characters for all complete sketches, including "
-            "their fences. Keep the total within 8,000 characters. "
-            "Separate prose paragraphs with a blank line."
-        ),
-    )
-
-
 def validate_document(
     value: object, *, generated: bool = False
 ) -> DocumentNarrative:
@@ -413,7 +422,7 @@ def validate_document(
 
     Args:
         value: Untrusted document mapping.
-        generated: Whether opening and closing fields are required.
+        generated: Whether the preamble, opening, and closing are required.
 
     Returns:
         Validated prose with omitted optional fields retained as omission.

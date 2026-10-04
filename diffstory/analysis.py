@@ -26,6 +26,7 @@ from .evidence import DefinitionEvidence
 from .evidence import FileCoverage
 from .evidence import build_file_coverage
 from .models import MAX_NARRATIVE_TEXT_CHARS
+from .models import GenerationUsage
 from .models import ParseStatus
 from .models import SnapshotInput
 from .models import SourceFragment
@@ -1421,7 +1422,7 @@ def _prepare_snapshot(snapshot: dict) -> PreparedSnapshot:
             target = notes if extracted.status == "text_only" else warnings
             target.append(f"{item.path} ({item.side}): {extracted.note}")
     coverage = build_file_coverage(
-        source.meta, indexed, parse_statuses, evidence=source.file_evidence
+        indexed, parse_statuses, evidence=source.file_evidence
     )
     return PreparedSnapshot(
         meta=source.meta,
@@ -1566,16 +1567,15 @@ def _collect_symbol_changes(
     for side, unmatched in (("base", removed), ("head", added)):
         opposite = "head" if side == "base" else "base"
         for symbol in unmatched:
-            own = source.coverage_index.get((side, symbol["path"]))
-            other_path = own.counterpart_path if own else symbol["path"]
-            counterpart = source.coverage_index.get((opposite, other_path))
+            own = source.coverage_index[(side, symbol["path"])]
+            other_path = own.counterpart_path
+            counterpart = source.coverage_index[(opposite, other_path)]
             declaration_key = (other_path, symbol["name"], symbol["node_type"])
             evidence = DefinitionEvidence(
                 side=side,
                 own=own,
                 counterpart=counterpart,
-                declaration_remains=counterpart is not None
-                and declaration_key in declarations[opposite],
+                declaration_remains=declaration_key in declarations[opposite],
             )
             _append_change(
                 result.changes,
@@ -1584,7 +1584,7 @@ def _collect_symbol_changes(
                 symbol if side == "base" else None,
                 symbol if side == "head" else None,
                 evidence.kind,
-                evidence.basis(symbol["name"], symbol["path"]),
+                evidence.basis(symbol["name"]),
             )
     return result
 
@@ -2492,8 +2492,7 @@ def evidence_packet(report: dict) -> dict:
 
     Returns:
         A source-grounded request mapping with instructions, metadata, groups,
-        changes, tests, notes, and warnings. Old reports without notes use an
-        empty list.
+        changes, tests, notes, and warnings.
 
     Side Effects:
         Makes no network call and does not mutate ``report``.
@@ -2559,7 +2558,7 @@ def evidence_packet(report: dict) -> dict:
         "changes": report["changes"],
         "tests": report["tests"],
         "warnings": report["warnings"],
-        "notes": report.get("notes", []),
+        "notes": report["notes"],
     }
 
 
@@ -2697,65 +2696,6 @@ def _validate_cycle_adjacency(
         cycle_positions = [position[group_id] for group_id in cycle]
         if max(cycle_positions) - min(cycle_positions) + 1 != len(cycle):
             msg = "Groups in a dependency cycle must stay adjacent"
-            raise ValueError(msg)
-
-
-def _validate_generation_usage(usage: dict) -> None:
-    """
-    Validate measured or legacy provider-usage metadata without applying caps.
-
-    Args:
-        usage: Token totals and call counts persisted with generated prose.
-
-    Raises:
-        ValueError: If fields, token counts, cached counts, call counts, or an
-            optional legacy elapsed time are invalid.
-
-    """
-    legacy_fields = {
-        "input_tokens",
-        "output_tokens",
-        "calls",
-        "elapsed_seconds",
-    }
-    measured_fields = {
-        "input_tokens",
-        "cached_input_tokens",
-        "output_tokens",
-        "calls",
-        "unreported_calls",
-    }
-    if not isinstance(usage, dict) or frozenset(usage) not in {
-        frozenset(legacy_fields),
-        frozenset(measured_fields),
-    }:
-        msg = "Invalid generated narration usage"
-        raise ValueError(msg)
-
-    for field in ("input_tokens", "output_tokens", "calls"):
-        if type(usage[field]) is not int or usage[field] < 0:
-            msg = "Invalid generated narration usage"
-            raise ValueError(msg)
-
-    cached_input_tokens = usage.get("cached_input_tokens", 0)
-    unreported_calls = usage.get("unreported_calls", 0)
-    if (
-        type(cached_input_tokens) is not int
-        or not 0 <= cached_input_tokens <= usage["input_tokens"]
-        or type(unreported_calls) is not int
-        or not 0 <= unreported_calls <= usage["calls"]
-    ):
-        msg = "Invalid generated narration usage"
-        raise ValueError(msg)
-
-    if "elapsed_seconds" in usage:
-        elapsed_seconds = usage["elapsed_seconds"]
-        if (
-            isinstance(elapsed_seconds, bool)
-            or not isinstance(elapsed_seconds, (int, float))
-            or elapsed_seconds < 0
-        ):
-            msg = "Invalid generated narration elapsed time"
             raise ValueError(msg)
 
 
@@ -2943,10 +2883,10 @@ def validate_generation(report: dict, generation: dict) -> None:
         "chunk_coverage",
         "errors",
     }
-    if not isinstance(generation, dict) or frozenset(generation) not in {
-        frozenset(required_fields),
-        frozenset(required_fields | {"limits"}),
-    }:
+    if (
+        not isinstance(generation, dict)
+        or generation.keys() != required_fields
+    ):
         msg = "Invalid generated narration manifest"
         raise ValueError(msg)
 
@@ -3000,9 +2940,7 @@ def validate_generation(report: dict, generation: dict) -> None:
         msg = "Generated narration does not cover every report change"
         raise ValueError(msg)
 
-    # Older annotations may contain a `limits` record. Treat it as historical
-    # metadata; measured provider usage must not be rejected against old caps.
-    _validate_generation_usage(generation.get("usage"))
+    GenerationUsage.model_validate(generation.get("usage"))
 
     groups_by_id = {group["id"]: group for group in report.get("groups", [])}
     changes_by_id = {
@@ -3081,7 +3019,7 @@ def _apply_document_annotations(
 
     Raises:
         ValueError: If document fields are invalid or generated narration omits
-            its required opening or closing.
+            its required preamble, opening, or closing.
     """
     if "document" in annotations or generated:
         document = validate_document(

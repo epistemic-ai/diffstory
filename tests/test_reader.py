@@ -28,6 +28,28 @@ def report() -> dict:
                 "scope": "full changed files",
                 "changed_files": 2,
             },
+            "file_evidence": [
+                {
+                    "base": {
+                        "path": "query.py",
+                        "state": "unavailable",
+                        "reason": "not_supplied",
+                    },
+                    "head": {
+                        "path": "query.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                },
+                {
+                    "base": {"path": "parse.py", "state": "absent"},
+                    "head": {
+                        "path": "parse.py",
+                        "state": "supplied",
+                        "coverage": "full",
+                    },
+                },
+            ],
             "fragments": [
                 {
                     "path": "query.py",
@@ -334,7 +356,7 @@ class LiterateReaderTests(unittest.TestCase):
         self.assertIn("Do not rewrite source", i)
 
     def test_report_string_lists_render(self) -> None:
-        """Notes and warnings are string lists, while old reports may omit notes."""
+        """Notes and warnings must be present as lists of strings."""
         compiled = compile_snapshot(
             {
                 "schema": "diffstory.snapshot.v1",
@@ -347,18 +369,29 @@ class LiterateReaderTests(unittest.TestCase):
                         "text": "def broken(:\n",
                     },
                 ],
-                "warnings": ["Incoming legacy warning."],
+                "file_evidence": [
+                    {
+                        "base": {"path": path, "state": "absent"},
+                        "head": {
+                            "path": path,
+                            "state": "supplied",
+                            "coverage": "full",
+                        },
+                    }
+                    for path in ("README.md", "broken.py")
+                ],
+                "warnings": ["Incoming source warning."],
             },
         )
-        old_report = copy.deepcopy(compiled)
-        old_report.pop("notes")
+        missing_notes = copy.deepcopy(compiled)
+        missing_notes.pop("notes")
         malformed_warnings = copy.deepcopy(compiled)
         malformed_warnings["warnings"] = [{"message": "not a string"}]
         malformed_notes = copy.deepcopy(compiled)
         malformed_notes["notes"] = [None]
         rows = [
-            ("new report", compiled, True),
-            ("old report", old_report, True),
+            ("valid report", compiled, True),
+            ("missing notes", missing_notes, False),
             ("object warning", malformed_warnings, False),
             ("non-string note", malformed_notes, False),
         ]
@@ -385,10 +418,24 @@ class LiterateReaderTests(unittest.TestCase):
     def test_stale_change_ids_are_rejected(self) -> None:
         """Annotations citing IDs from a corrected kind must fail validation."""
         source = "def f():\n    return 1\n"
-        old_report = compile_snapshot(
+        unresolved_report = compile_snapshot(
             {
                 "schema": "diffstory.snapshot.v1",
                 "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+                "file_evidence": [
+                    {
+                        "base": {
+                            "path": "x.py",
+                            "state": "unavailable",
+                            "reason": "not_supplied",
+                        },
+                        "head": {
+                            "path": "x.py",
+                            "state": "supplied",
+                            "coverage": "full",
+                        },
+                    },
+                ],
                 "fragments": [
                     {
                         "path": "x.py",
@@ -425,7 +472,7 @@ class LiterateReaderTests(unittest.TestCase):
                 ],
             },
         )
-        stale_id = old_report["changes"][0]["id"]
+        stale_id = unresolved_report["changes"][0]["id"]
         current = annotations(new_report)
         current["steps"][0]["evidence_change_ids"] = [stale_id]
         current["steps"][0]["passages"][0]["change_ids"] = [stale_id]

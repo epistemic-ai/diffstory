@@ -514,7 +514,7 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
         )
         check(
             page.locator(".preamble").count() == 0,
-            "legacy reports without a preamble keep the existing layout",
+            "manually authored narration can omit the optional preamble",
         )
         check(
             page.locator(".story-section").count() == 10,
@@ -819,6 +819,20 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
                 "changed_files": 1,
                 "scope": "complete",
             },
+            "file_evidence": [
+                {
+                    "base": {
+                        "path": "large.py",
+                        "state": "supplied",
+                        "coverage": "full",
+                    },
+                    "head": {
+                        "path": "large.py",
+                        "state": "supplied",
+                        "coverage": "full",
+                    },
+                },
+            ],
             "fragments": [
                 {
                     "side": "base",

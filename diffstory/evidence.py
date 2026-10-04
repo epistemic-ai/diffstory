@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
@@ -134,7 +133,7 @@ def _coverage_side(
     """Validate a side's source claim against its assigned fragments.
 
     Args:
-        source: Validated file state from explicit or legacy evidence.
+        source: Validated file state from the snapshot evidence.
         counterpart_path: Linked path at the other revision.
         fragment_ids: IDs assigned to this side and path.
         fragments: Indexed source records.
@@ -163,149 +162,23 @@ def _coverage_side(
     )
 
 
-def _legacy_path_pairs(
-    fragments: Mapping[str, dict],
-) -> list[tuple[str | None, str | None]]:
-    """Pair old snapshots by equal paths or an unambiguous explicit region.
-
-    Pairing rules, in order:
-        1. Pair equal paths first; a region cannot replace those pairs.
-        2. A shared region proposes an old/new path link only when it names
-           exactly one path on each side. Repeated regions for the same two
-           paths count as one proposed link.
-        3. Accept a link only when neither path has another candidate or an
-           equal-path pair. Leave all other paths single-sided and unresolved.
-
-    Args:
-        fragments: Validated source records from a snapshot without file evidence.
-
-    Returns:
-        Sorted base/head pairs, followed by remaining single-sided paths.
-    """
-    paths = {side: set() for side in ("base", "head")}
-    regions = {side: defaultdict(set) for side in ("base", "head")}
-    for fragment in fragments.values():
-        side, path = fragment["side"], fragment["path"]
-        paths[side].add(path)
-        if "region" in fragment:
-            regions[side][fragment["region"]].add(path)
-    same_paths = paths["base"] & paths["head"]
-    pairs = [(path, path) for path in sorted(same_paths)]
-    candidates = set()
-    for region in regions["base"].keys() & regions["head"].keys():
-        bases, heads = regions["base"][region], regions["head"][region]
-        if len(bases) == len(heads) == 1:
-            base, head = next(iter(bases)), next(iter(heads))
-            if base != head:
-                candidates.add((base, head))
-    # Count distinct links at each endpoint; a one-way match is not enough.
-    base_choices = Counter(base for base, _ in candidates)
-    head_choices = Counter(head for _, head in candidates)
-    pairs.extend(
-        (base, head)
-        for base, head in sorted(candidates)
-        if base_choices[base] == head_choices[head] == 1
-        and base not in same_paths
-        and head not in same_paths
-    )
-    used_base = {base for base, _ in pairs}
-    used_head = {head for _, head in pairs}
-    pairs.extend((path, None) for path in sorted(paths["base"] - used_base))
-    pairs.extend((None, path) for path in sorted(paths["head"] - used_head))
-    return pairs
-
-
-def _legacy_side(
-    path: str,
-    ids: Sequence[str],
-    fragments: Mapping[str, dict],
-    *,
-    excerpts: bool,
-) -> SourceSide:
-    """Infer coverage conservatively when a producer omitted file evidence.
-
-    Args:
-        path: Original path, or the paired path when source is missing.
-        ids: Fragment IDs assigned to this side.
-        fragments: Source records indexed by ID.
-        excerpts: Whether snapshot metadata declares selected excerpts.
-
-    Returns:
-        Unavailable source when omitted; full coverage only for one explicit
-        line-one full fragment outside a selected-excerpt snapshot.
-    """
-    if not ids:
-        return UnavailableFile(path=path, reason="not_supplied")
-    fragment = fragments[ids[0]]
-    full = (
-        not excerpts
-        and len(ids) == 1
-        and fragment.get("start_line", 1) == 1
-        and fragment.get("scope") == "full"
-    )
-    return SuppliedFile(path=path, coverage="full" if full else "partial")
-
-
-def _legacy_evidence(
-    fragments: Mapping[str, dict],
-    by_file: Mapping[tuple[str, str], Sequence[str]],
-    *,
-    excerpts: bool,
-) -> list[FileEvidence]:
-    """Build typed comparison records for old snapshots.
-
-    Args:
-        fragments: Validated source records indexed by ID.
-        by_file: Fragment IDs grouped by revision and path.
-        excerpts: Whether the producer declared selected excerpts.
-
-    Returns:
-        Conservative source pairs without inferring file absence.
-    """
-    records = []
-    for base_path, head_path in _legacy_path_pairs(fragments):
-        base = base_path or head_path
-        head = head_path or base_path
-        records.append(
-            FileEvidence(
-                base=_legacy_side(
-                    base,
-                    by_file.get(("base", base), ()),
-                    fragments,
-                    excerpts=excerpts,
-                ),
-                head=_legacy_side(
-                    head,
-                    by_file.get(("head", head), ()),
-                    fragments,
-                    excerpts=excerpts,
-                ),
-            )
-        )
-    return records
-
-
 def _assign_regions(
-    pairs: Sequence[FilePair], fragments: Mapping[str, dict], *, explicit: bool
+    pairs: Sequence[FilePair], fragments: Mapping[str, dict]
 ) -> None:
     """Assign raw diff regions without merging unrelated source records.
 
     For each file pair:
-        Choose a default region: the head path for explicit evidence, or the
-        side's own path for legacy evidence.
-        For each fragment, reject a repeated (region, side). With explicit
-        evidence, also reject a region owned by another file pair. Store the
-        accepted region on that fragment.
-        With explicit evidence, require matching region labels when both sides
-        supply a full file.
+        Use the head path as the default region.
+        For each fragment, reject a repeated (region, side) or a region owned
+        by another file pair. Store the accepted region on that fragment.
+        Require matching region labels when both sides supply a full file.
 
     Args:
         pairs: Validated base/head coverage pairs.
         fragments: Indexed source records to receive ``_raw_region`` values.
-        explicit: Whether pair ownership comes from explicit file evidence.
 
     Raises:
-        ValueError: If regions repeat on a side, cross explicit records, or
+        ValueError: If regions repeat on a side, cross file records, or
             fail to pair two full file versions.
     """
     occupied = set()
@@ -313,7 +186,7 @@ def _assign_regions(
     for index, pair in enumerate(pairs):
         for side_name in ("base", "head"):
             side = getattr(pair, side_name)
-            default = pair.head.source.path if explicit else side.source.path
+            default = pair.head.source.path
             for fragment_id in side.fragment_ids:
                 fragment = fragments[fragment_id]
                 region = fragment.get("region", default)
@@ -322,13 +195,12 @@ def _assign_regions(
                     msg = "Duplicate raw region for one revision side"
                     raise ValueError(msg)
                 occupied.add(key)
-                if explicit:
-                    if region in owners and owners[region] != index:
-                        msg = "A raw region cannot join different file evidence records"
-                        raise ValueError(msg)
-                    owners[region] = index
+                if region in owners and owners[region] != index:
+                    msg = "A raw region cannot join different file evidence records"
+                    raise ValueError(msg)
+                owners[region] = index
                 fragment["_raw_region"] = region
-        if explicit and pair.base.full_source and pair.head.full_source:
+        if pair.base.full_source and pair.head.full_source:
             base_region = fragments[pair.base.fragment_ids[0]]["_raw_region"]
             head_region = fragments[pair.head.fragment_ids[0]]["_raw_region"]
             if base_region != head_region:
@@ -337,19 +209,17 @@ def _assign_regions(
 
 
 def build_file_coverage(
-    meta: Mapping[str, object],
     fragments: Mapping[str, dict],
     parse_statuses: Mapping[str, ParseStatus],
     *,
-    evidence: Sequence[FileEvidence] | None = None,
+    evidence: Sequence[FileEvidence],
 ) -> dict[tuple[str, str], FileCoverage]:
-    """Index file coverage from explicit records or conservative legacy inference.
+    """Index file coverage from the required comparison records.
 
     Args:
-        meta: Snapshot metadata used only to identify selected excerpts.
         fragments: Validated source records indexed by ID.
         parse_statuses: Parse outcome for every source record.
-        evidence: Validated explicit records, or ``None`` for an older snapshot.
+        evidence: Validated records linking every supplied file to its counterpart.
 
     Returns:
         Typed coverage indexed by revision side and path.
@@ -360,19 +230,9 @@ def build_file_coverage(
     by_file = defaultdict(list)
     for fragment_id, fragment in fragments.items():
         by_file[(fragment["side"], fragment["path"])].append(fragment_id)
-    explicit = evidence is not None
-    records = (
-        evidence
-        if explicit
-        else _legacy_evidence(
-            fragments,
-            by_file,
-            excerpts=meta.get("scope") == "selected excerpts",
-        )
-    )
     pairs = []
     coverage = {}
-    for record in records:
+    for record in evidence:
         sides = {}
         for side_name, opposite in (("base", "head"), ("head", "base")):
             source = getattr(record, side_name)
@@ -390,7 +250,7 @@ def build_file_coverage(
     if set(by_file) - coverage.keys():
         msg = "File evidence must cover every supplied fragment"
         raise ValueError(msg)
-    _assign_regions(pairs, fragments, explicit=explicit)
+    _assign_regions(pairs, fragments)
     return coverage
 
 
@@ -399,21 +259,19 @@ class DefinitionEvidence(StrictModel):
 
     Attributes:
         side: Revision containing the unmatched definition.
-        own: Coverage for the definition's file, or none when unlinked.
+        own: Coverage for the definition's file.
         counterpart: Coverage for the paired file at the other revision.
         declaration_remains: Whether a same-name, same-type declaration remains.
     """
 
     side: RevisionSide
-    own: FileCoverage | None
-    counterpart: FileCoverage | None
+    own: FileCoverage
+    counterpart: FileCoverage
     declaration_remains: bool
 
     @property
     def confirmed(self) -> bool:
         """Return whether file evidence confirms this addition or removal."""
-        if self.own is None or self.counterpart is None:
-            return False
         return (
             self.own.full_and_parsed
             and (self.counterpart.absent or self.counterpart.full_and_parsed)
@@ -474,15 +332,7 @@ class DefinitionEvidence(StrictModel):
         )
         blockers = []
         for side_name, coverage in (("base", base), ("head", head)):
-            blockers.extend(
-                coverage.blockers(side_name)
-                if coverage
-                else [
-                    UNAVAILABLE_DESCRIPTIONS["not_supplied"].format(
-                        side=side_name
-                    )
-                ]
-            )
+            blockers.extend(coverage.blockers(side_name))
         if self.declaration_remains:
             blockers.append(
                 "A definition with the same name and type remains in the other file version, but the matcher did not form one pair."
@@ -491,20 +341,17 @@ class DefinitionEvidence(StrictModel):
         action = "Removal" if self.side == "base" else "Addition"
         return f"Definition {name} is present in the supplied {self.side} source for {path}. {action} from this file is unresolved: {reason}."
 
-    def basis(self, name: str, path: str) -> str:
+    def basis(self, name: str) -> str:
         """Return the classification's basis with both paths when they differ.
 
         Args:
             name: Definition name from parsed source.
-            path: Definition path, used when coverage is unlinked.
 
         Returns:
             Plain-language file evidence without claiming repository behavior.
         """
-        own_path = self.own.source.path if self.own else path
-        other_path = (
-            self.counterpart.source.path if self.counterpart else own_path
-        )
+        own_path = self.own.source.path
+        other_path = self.counterpart.source.path
         basis = (
             self._confirmed_basis(name, own_path)
             if self.confirmed

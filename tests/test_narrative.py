@@ -86,6 +86,20 @@ def snapshot(
                 "scope": "full",
             },
         ],
+        "file_evidence": [
+            {
+                "base": {
+                    "path": "module.py",
+                    "state": "supplied",
+                    "coverage": "full",
+                },
+                "head": {
+                    "path": "module.py",
+                    "state": "supplied",
+                    "coverage": "full",
+                },
+            },
+        ],
         "warnings": [],
     }
 
@@ -334,6 +348,20 @@ class NarrativeTests(unittest.TestCase):
                 },
             ],
         )
+        source_snapshot["file_evidence"].append(
+            {
+                "base": {
+                    "path": "other.py",
+                    "state": "supplied",
+                    "coverage": "full",
+                },
+                "head": {
+                    "path": "other.py",
+                    "state": "supplied",
+                    "coverage": "full",
+                },
+            },
+        )
         report = compile_snapshot(source_snapshot)
         provider = FakeProvider()
         narrator = Narrator(provider)
@@ -390,18 +418,75 @@ class NarrativeTests(unittest.TestCase):
         )
         saved = json.loads(json.dumps(generated))
         self.assertIn("Model-generated narration · unverified.", render(saved))
-        legacy_annotations = copy.deepcopy(annotations)
-        legacy_annotations["document"].pop("preamble")
-        legacy_report = apply_annotations(report, legacy_annotations)
-        self.assertNotIn("preamble", legacy_report["document"])
-        self.assertIn(
-            "Model-generated narration · unverified.", render(legacy_report)
-        )
-        legacy_saved = json.loads(json.dumps(legacy_report))
-        self.assertNotIn("preamble", legacy_saved["document"])
-        self.assertIn(
-            "Model-generated narration · unverified.", render(legacy_saved)
-        )
+
+    def test_generated_preamble_is_required(self) -> None:
+        """Reject generated annotations and saved reports that omit the overview."""
+        source_report = compile_snapshot(snapshot())
+        candidate = Narrator(FakeProvider()).generate(source_report)
+        generated = apply_annotations(source_report, candidate)
+        for name in ("annotations", "saved report"):
+            with self.subTest(boundary=name):
+                value = copy.deepcopy(
+                    candidate if name == "annotations" else generated
+                )
+                value["document"].pop("preamble")
+                with self.assertRaisesRegex(ValueError, "preamble"):
+                    if name == "annotations":
+                        apply_annotations(source_report, value)
+                    else:
+                        render(value)
+
+    def test_generated_manifest_requires_current_fields(self) -> None:
+        """Reject obsolete usage and limits records at annotation import."""
+        source_report = compile_snapshot(snapshot())
+        candidate = Narrator(FakeProvider()).generate(source_report)
+        cases = [
+            (
+                "obsolete usage",
+                "usage",
+                {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "calls": 1,
+                    "elapsed_seconds": 1.0,
+                },
+            ),
+            ("obsolete limits", "limits", {}),
+        ]
+        for name, field, value in cases:
+            with self.subTest(case=name):
+                invalid = copy.deepcopy(candidate)
+                invalid["generation"][field] = value
+                with self.assertRaises(ValueError):
+                    apply_annotations(source_report, invalid)
+
+    def test_generated_usage_subtotals_fit_totals(self) -> None:
+        """Reject impossible token and call totals while accepting exact bounds."""
+        source_report = compile_snapshot(snapshot())
+        candidate = Narrator(FakeProvider()).generate(source_report)
+        usage = {
+            "input_tokens": 10,
+            "cached_input_tokens": 10,
+            "output_tokens": 5,
+            "calls": 2,
+            "unreported_calls": 2,
+        }
+        cases = [
+            ("exact bounds", {}, True),
+            ("cached above input", {"cached_input_tokens": 11}, False),
+            ("unreported above calls", {"unreported_calls": 3}, False),
+            ("negative count", {"output_tokens": -1}, False),
+            ("boolean count", {"calls": True}, False),
+        ]
+        for name, changes, valid in cases:
+            with self.subTest(case=name):
+                annotated = copy.deepcopy(candidate)
+                annotated["generation"]["usage"] = {**usage, **changes}
+                if valid:
+                    apply_annotations(source_report, annotated)
+                else:
+                    with self.assertRaises(ValueError):
+                        apply_annotations(source_report, annotated)
 
     def test_asd_style_guidance_keeps_natural_prose_rhythm(self) -> None:
         """Use ASD principles as a strong guide without making prose robotic."""
