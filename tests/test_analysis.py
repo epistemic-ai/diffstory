@@ -592,6 +592,25 @@ class CompilerTests(unittest.TestCase):
         )
         for fragment in unique["fragments"]:
             fragment["region"] = "rename-link"
+        repeated_link = copy.deepcopy(unique)
+        repeated_link["fragments"].extend(
+            [
+                {
+                    "path": "old.py",
+                    "side": "base",
+                    "start_line": 20,
+                    "region": "second-link",
+                    "text": "base_extra = 31\n",
+                },
+                {
+                    "path": "new.py",
+                    "side": "head",
+                    "start_line": 20,
+                    "region": "second-link",
+                    "text": "head_extra = 32\n",
+                },
+            ]
+        )
         conflict = {
             "schema": "diffstory.snapshot.v1",
             "meta": {"scope": "changed files", "changed_files": 3},
@@ -633,19 +652,31 @@ class CompilerTests(unittest.TestCase):
         rows = [
             ("unique", unique, "added"),
             ("conflicting", conflict, "observed_head"),
+            ("repeated link", repeated_link, "observed_head"),
         ]
+        reverse_conflict = copy.deepcopy(conflict)
+        for fragment in reverse_conflict["fragments"]:
+            fragment["side"] = "head" if fragment["side"] == "base" else "base"
+        rows.append(("reverse conflict", reverse_conflict, "observed_base"))
         for name, snapshot, expected in rows:
             with self.subTest(case=name):
                 result = symbols(compile_snapshot(snapshot))
                 self.assertIn(expected, [change["kind"] for change in result])
-                if name == "unique":
+                if name in {"unique", "repeated link"}:
                     added = next(
                         change
                         for change in result
-                        if change["kind"] == "added"
+                        if (change.get("after") or {}).get("name") == "added"
                     )
                     self.assertIn(
                         "Base path: old.py. Head path: new.py.", added["basis"]
+                    )
+                else:
+                    self.assertTrue(
+                        all(
+                            "Base path:" not in change["basis"]
+                            for change in result
+                        )
                     )
 
     def test_repeated_declaration_blocks_confirmation(self) -> None:
@@ -1032,6 +1063,47 @@ class CompilerTests(unittest.TestCase):
                 }
                 if accepted:
                     compile_snapshot(snapshot)
+                else:
+                    with self.assertRaisesRegex(ValueError, "Overlapping"):
+                        compile_snapshot(snapshot)
+
+    def test_empty_excerpts_do_not_reserve_lines(self) -> None:
+        """Empty text must not block source at the same offset; a blank line must."""
+        cases = [
+            ("empty first", "", False, True),
+            ("empty last", "", True, True),
+            ("blank line first", "\n", False, False),
+            ("blank line last", "\n", True, False),
+        ]
+        for name, text, reverse, accepted in cases:
+            with self.subTest(case=name):
+                snapshot = evidence_snap(
+                    {"x.py": "def target():\n    return 1\n"},
+                    {},
+                    overrides={
+                        ("base", "x.py"): {
+                            "path": "x.py",
+                            "state": "supplied",
+                            "coverage": "partial",
+                        },
+                    },
+                    fragment_options={("base", "x.py"): {"region": "source"}},
+                )
+                empty = {
+                    "path": "x.py",
+                    "side": "base",
+                    "start_line": 1,
+                    "text": text,
+                    "region": "empty",
+                }
+                snapshot["fragments"].insert(0, empty)
+                if reverse:
+                    snapshot["fragments"].reverse()
+                if accepted:
+                    result = compile_snapshot(snapshot)
+                    self.assertEqual(
+                        symbols(result)[0]["before"]["name"], "target"
+                    )
                 else:
                     with self.assertRaisesRegex(ValueError, "Overlapping"):
                         compile_snapshot(snapshot)

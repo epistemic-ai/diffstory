@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,7 @@ from .models import SuppliedFile
 from .models import UnavailableFile
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
 
@@ -45,49 +47,45 @@ class FileCoverage(StrictModel):
     parse_statuses: tuple[ParseStatus, ...]
 
     @property
-    def full_and_parsed(self) -> bool:
-        """Return whether every byte of this file has valid Python AST evidence."""
+    def full_source(self) -> bool:
+        """Return whether the supplied fragment covers the whole file."""
         return (
             isinstance(self.source, SuppliedFile)
             and self.source.coverage == "full"
-            and self.parse_statuses == ("ok",)
         )
+
+    @property
+    def full_and_parsed(self) -> bool:
+        """Return whether the whole file has valid Python AST evidence."""
+        return self.full_source and self.parse_statuses == ("ok",)
 
     @property
     def absent(self) -> bool:
         """Return whether the producer confirmed that this file does not exist."""
         return isinstance(self.source, AbsentFile)
 
-    def blockers(self, side: RevisionSide) -> list[str]:
+    def blockers(self, side: RevisionSide) -> Iterator[str]:
         """Explain why this file cannot establish a definition's absence.
 
         Args:
             side: Revision label used in the returned prose.
 
-        Returns:
-            Deterministic blocker sentences, or none for confirmed absence.
+        Yields:
+            Blocker sentences in a fixed order; none for confirmed absence.
         """
         if isinstance(self.source, AbsentFile):
-            return []
+            return
         if isinstance(self.source, UnavailableFile):
-            return [
-                UNAVAILABLE_DESCRIPTIONS[self.source.reason].format(side=side)
-            ]
-        conditions = (
-            (
-                self.source.coverage != "full",
-                f"Only part of the {side} file is supplied.",
-            ),
-            (
-                "failed" in self.parse_statuses,
-                f"The {side} Python source could not be parsed.",
-            ),
-            (
-                "text_only" in self.parse_statuses,
-                f"The {side} source is text-only; Python parsing is not available.",
-            ),
-        )
-        return [message for blocked, message in conditions if blocked]
+            yield UNAVAILABLE_DESCRIPTIONS[self.source.reason].format(
+                side=side
+            )
+            return
+        if self.source.coverage != "full":
+            yield f"Only part of the {side} file is supplied."
+        if "failed" in self.parse_statuses:
+            yield f"The {side} Python source could not be parsed."
+        if "text_only" in self.parse_statuses:
+            yield f"The {side} source is text-only; Python parsing is not available."
 
 
 class FilePair(StrictModel):
@@ -170,6 +168,14 @@ def _legacy_path_pairs(
 ) -> list[tuple[str | None, str | None]]:
     """Pair old snapshots by equal paths or an unambiguous explicit region.
 
+    Pairing rules, in order:
+        1. Pair equal paths first; a region cannot replace those pairs.
+        2. A shared region proposes an old/new path link only when it names
+           exactly one path on each side. Repeated regions for the same two
+           paths count as one proposed link.
+        3. Accept a link only when neither path has another candidate or an
+           equal-path pair. Leave all other paths single-sided and unresolved.
+
     Args:
         fragments: Validated source records from a snapshot without file evidence.
 
@@ -183,26 +189,27 @@ def _legacy_path_pairs(
         paths[side].add(path)
         if "region" in fragment:
             regions[side][fragment["region"]].add(path)
-    pairs = [(path, path) for path in sorted(paths["base"] & paths["head"])]
-    used_base = {base for base, _ in pairs}
-    used_head = {head for _, head in pairs}
-    candidates, reverse = defaultdict(set), defaultdict(set)
+    same_paths = paths["base"] & paths["head"]
+    pairs = [(path, path) for path in sorted(same_paths)]
+    candidates = set()
     for region in regions["base"].keys() & regions["head"].keys():
         bases, heads = regions["base"][region], regions["head"][region]
         if len(bases) == len(heads) == 1:
             base, head = next(iter(bases)), next(iter(heads))
             if base != head:
-                candidates[base].add(head)
-                reverse[head].add(base)
-    for base, heads in sorted(candidates.items()):
-        if len(heads) != 1 or base in used_base:
-            continue
-        head = next(iter(heads))
-        if head in used_head or len(reverse[head]) != 1:
-            continue
-        pairs.append((base, head))
-        used_base.add(base)
-        used_head.add(head)
+                candidates.add((base, head))
+    # Count distinct links at each endpoint; a one-way match is not enough.
+    base_choices = Counter(base for base, _ in candidates)
+    head_choices = Counter(head for _, head in candidates)
+    pairs.extend(
+        (base, head)
+        for base, head in sorted(candidates)
+        if base_choices[base] == head_choices[head] == 1
+        and base not in same_paths
+        and head not in same_paths
+    )
+    used_base = {base for base, _ in pairs}
+    used_head = {head for _, head in pairs}
     pairs.extend((path, None) for path in sorted(paths["base"] - used_base))
     pairs.extend((None, path) for path in sorted(paths["head"] - used_head))
     return pairs
@@ -241,7 +248,7 @@ def _legacy_side(
 
 def _legacy_evidence(
     fragments: Mapping[str, dict],
-    by_file: Mapping[tuple[str, str], list[str]],
+    by_file: Mapping[tuple[str, str], Sequence[str]],
     *,
     excerpts: bool,
 ) -> list[FileEvidence]:
@@ -263,13 +270,13 @@ def _legacy_evidence(
             FileEvidence(
                 base=_legacy_side(
                     base,
-                    by_file.get(("base", base), []),
+                    by_file.get(("base", base), ()),
                     fragments,
                     excerpts=excerpts,
                 ),
                 head=_legacy_side(
                     head,
-                    by_file.get(("head", head), []),
+                    by_file.get(("head", head), ()),
                     fragments,
                     excerpts=excerpts,
                 ),
@@ -283,6 +290,15 @@ def _assign_regions(
 ) -> None:
     """Assign raw diff regions without merging unrelated source records.
 
+    For each file pair:
+        Choose a default region: the head path for explicit evidence, or the
+        side's own path for legacy evidence.
+        For each fragment, reject a repeated (region, side). With explicit
+        evidence, also reject a region owned by another file pair. Store the
+        accepted region on that fragment.
+        With explicit evidence, require matching region labels when both sides
+        supply a full file.
+
     Args:
         pairs: Validated base/head coverage pairs.
         fragments: Indexed source records to receive ``_raw_region`` values.
@@ -292,9 +308,9 @@ def _assign_regions(
         ValueError: If regions repeat on a side, cross explicit records, or
             fail to pair two full file versions.
     """
-    occupied, owners = set(), {}
+    occupied = set()
+    owners = {}
     for index, pair in enumerate(pairs):
-        regions = {"base": [], "head": []}
         for side_name in ("base", "head"):
             side = getattr(pair, side_name)
             default = pair.head.source.path if explicit else side.source.path
@@ -306,34 +322,34 @@ def _assign_regions(
                     msg = "Duplicate raw region for one revision side"
                     raise ValueError(msg)
                 occupied.add(key)
-                if explicit and owners.setdefault(region, index) != index:
-                    msg = "A raw region cannot join different file evidence records"
-                    raise ValueError(msg)
+                if explicit:
+                    if region in owners and owners[region] != index:
+                        msg = "A raw region cannot join different file evidence records"
+                        raise ValueError(msg)
+                    owners[region] = index
                 fragment["_raw_region"] = region
-                regions[side_name].append(region)
-        full_pair = all(
-            isinstance(side.source, SuppliedFile)
-            and side.source.coverage == "full"
-            for side in (pair.base, pair.head)
-        )
-        if explicit and full_pair and regions["base"] != regions["head"]:
-            msg = "Full file sides in one evidence record must share a region"
-            raise ValueError(msg)
+        if explicit and pair.base.full_source and pair.head.full_source:
+            base_region = fragments[pair.base.fragment_ids[0]]["_raw_region"]
+            head_region = fragments[pair.head.fragment_ids[0]]["_raw_region"]
+            if base_region != head_region:
+                msg = "Full file sides in one evidence record must share a region"
+                raise ValueError(msg)
 
 
 def build_file_coverage(
-    evidence: Sequence[FileEvidence] | None,
     meta: Mapping[str, object],
     fragments: Mapping[str, dict],
     parse_statuses: Mapping[str, ParseStatus],
+    *,
+    evidence: Sequence[FileEvidence] | None = None,
 ) -> dict[tuple[str, str], FileCoverage]:
     """Index file coverage from explicit records or conservative legacy inference.
 
     Args:
-        evidence: Validated explicit records, or ``None`` for an older snapshot.
         meta: Snapshot metadata used only to identify selected excerpts.
         fragments: Validated source records indexed by ID.
         parse_statuses: Parse outcome for every source record.
+        evidence: Validated explicit records, or ``None`` for an older snapshot.
 
     Returns:
         Typed coverage indexed by revision side and path.
@@ -364,7 +380,7 @@ def build_file_coverage(
             side = _coverage_side(
                 source,
                 getattr(record, opposite).path,
-                by_file.get(key, []),
+                by_file.get(key, ()),
                 fragments,
                 parse_statuses,
             )

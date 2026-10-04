@@ -81,7 +81,7 @@ LEAF_OUTPUT_RESERVE = 2_400
 LEAF_PER_CHANGE_OUTPUT_RESERVE = 128
 SUMMARY_OUTPUT_RESERVE = 1_200
 STEP_OUTPUT_RESERVE = 1_400
-DOCUMENT_OUTPUT_RESERVE = 1_400
+DOCUMENT_OUTPUT_RESERVE = 3_200
 ORDER_OUTPUT_RESERVE = 1_200
 
 ASD_STYLE_INSTRUCTION = (
@@ -176,7 +176,9 @@ _DOC_SYSTEM = (
     "then give the supplied reading path. Use about 200 to 450 words when "
     "the change and evidence support that length. Use less for a small "
     "change. Do not pad to reach a word count. Keep the preamble to roughly "
-    "one page and under 4,000 characters. Use separate paragraphs with a "
+    "one page. Allow at most 4,000 characters for prose and a separate "
+    "4,000 characters for all complete sketches, including their fences. "
+    "Keep the whole preamble within 8,000 characters. Use separate paragraphs with a "
     "blank line between them. Do not name real files, paths, functions, "
     "identifiers, commands, or source lines. Do not tour each file or "
     "explain implementation steps. Make only claims supported by the "

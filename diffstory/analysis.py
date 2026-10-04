@@ -1366,13 +1366,15 @@ def _validate_fragment_range(
     Raises:
         ValueError: If nonempty source overlaps an earlier fragment.
     """
-    end = fragment.start_line + max(0, len(fragment.text.splitlines()) - 1)
+    if not fragment.text:
+        return
+    end = fragment.start_line + len(fragment.text.splitlines()) - 1
     key = (fragment.side, fragment.path)
     overlaps = any(
         max(fragment.start_line, start) <= min(end, stop)
         for start, stop in occupied_ranges[key]
     )
-    if fragment.text and overlaps:
+    if overlaps:
         msg = (
             f"Overlapping source fragments: {fragment.path} ({fragment.side})"
         )
@@ -1419,7 +1421,7 @@ def _prepare_snapshot(snapshot: dict) -> PreparedSnapshot:
             target = notes if extracted.status == "text_only" else warnings
             target.append(f"{item.path} ({item.side}): {extracted.note}")
     coverage = build_file_coverage(
-        source.file_evidence, source.meta, indexed, parse_statuses
+        source.meta, indexed, parse_statuses, evidence=source.file_evidence
     )
     return PreparedSnapshot(
         meta=source.meta,

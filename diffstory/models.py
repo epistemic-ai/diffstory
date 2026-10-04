@@ -16,6 +16,13 @@ from pydantic import model_validator
 MAX_SNAPSHOT_SOURCE_BYTES = 64_000_000
 MAX_NARRATIVE_TEXT_CHARS = 6_000
 MAX_PREAMBLE_CHARS = 4_000
+MAX_PREAMBLE_SKETCH_CHARS = 4_000
+MAX_PREAMBLE_TOTAL_CHARS = MAX_PREAMBLE_CHARS + MAX_PREAMBLE_SKETCH_CHARS
+
+# Use the same complete fenced-text blocks that the reader recognizes.
+_PREAMBLE_SKETCH = re.compile(
+    r"(^|\n)```text[ \t]*\n.*?\n```(?=\n|$)", re.DOTALL
+)
 
 RevisionSide = Literal["base", "head"]
 ParseStatus = Literal["ok", "text_only", "failed"]
@@ -277,12 +284,15 @@ class DocumentNarrative(StrictModel):
     """Validate optional authored document prose and retain field omission.
 
     Attributes:
-        preamble: Nonblank overview of at most 4,000 characters, when supplied.
+        preamble: Nonblank overview with at most 4,000 prose characters and
+            a separate 4,000-character allowance for complete text sketches.
         lead: Opening prose of at most 6,000 characters, when supplied.
         closing: Closing prose of at most 6,000 characters, when supplied.
     """
 
-    preamble: str | None = Field(default=None, max_length=MAX_PREAMBLE_CHARS)
+    preamble: str | None = Field(
+        default=None, max_length=MAX_PREAMBLE_TOTAL_CHARS
+    )
     lead: str | None = Field(default=None, max_length=MAX_NARRATIVE_TEXT_CHARS)
     closing: str | None = Field(
         default=None, max_length=MAX_NARRATIVE_TEXT_CHARS
@@ -309,20 +319,34 @@ class DocumentNarrative(StrictModel):
 
     @field_validator("preamble")
     @classmethod
-    def nonblank_preamble(cls, value: str) -> str:
-        """Require a supplied preamble to contain prose.
+    def bounded_preamble(cls, value: str) -> str:
+        """Keep prose and complete fenced sketches within separate allowances.
 
         Args:
             value: Validated preamble string.
 
         Returns:
-            The original text when it contains a non-space character.
+            The original nonblank text without changing its line endings.
 
         Raises:
-            ValueError: If the preamble is blank.
+            ValueError: If the preamble is blank, prose exceeds 4,000 characters,
+                or all sketches together exceed 4,000 characters. Sketch counts
+                include fences. Incomplete fences count as prose.
         """
         if not value.strip():
             msg = "Invalid document preamble"
+            raise ValueError(msg)
+        content = value.replace("\r\n", "\n").replace("\r", "\n")
+        sketch_chars = sum(
+            match.end() - match.start()
+            for match in _PREAMBLE_SKETCH.finditer(content)
+        )
+        prose_chars = len(content) - sketch_chars
+        if prose_chars > MAX_PREAMBLE_CHARS:
+            msg = f"Document preamble prose exceeds {MAX_PREAMBLE_CHARS} characters"
+            raise ValueError(msg)
+        if sketch_chars > MAX_PREAMBLE_SKETCH_CHARS:
+            msg = f"Document preamble sketches exceed {MAX_PREAMBLE_SKETCH_CHARS} characters"
             raise ValueError(msg)
         return value
 
@@ -362,11 +386,11 @@ class ProviderDocument(GeneratedDocument):
     """Require a preamble in newly generated narration.
 
     Attributes:
-        preamble: Required nonblank overview, at most 4,000 characters.
+        preamble: Required overview with separate prose and sketch allowances.
     """
 
     preamble: str = Field(
-        max_length=MAX_PREAMBLE_CHARS,
+        max_length=MAX_PREAMBLE_TOTAL_CHARS,
         description=(
             "Introduce the whole change before a code tour. Use about 200 to 450 words "
             "when the evidence supports that length; use less for a small change. "
@@ -374,7 +398,10 @@ class ProviderDocument(GeneratedDocument):
             "For a multi-part change, include one useful conceptual sketch when "
             "supported. Use a fenced text block; a decision flow chart has a label "
             "and two branches: ├─ condition → outcome, then └─ condition → outcome. "
-            "Keep other sketches as text. Separate prose paragraphs with a blank line."
+            "Keep other sketches as text. Allow at most 4,000 characters of prose "
+            "and a separate 4,000 characters for all complete sketches, including "
+            "their fences. Keep the total within 8,000 characters. "
+            "Separate prose paragraphs with a blank line."
         ),
     )
 

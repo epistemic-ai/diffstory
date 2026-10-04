@@ -24,6 +24,8 @@ from diffstory.analysis import compile_snapshot
 from diffstory.analysis import validate_generated_report
 from diffstory.cli import main
 from diffstory.models import MAX_PREAMBLE_CHARS
+from diffstory.models import MAX_PREAMBLE_SKETCH_CHARS
+from diffstory.models import MAX_PREAMBLE_TOTAL_CHARS
 from diffstory.narrative import ASD_STYLE_INSTRUCTION
 from diffstory.narrative import CODEX_DEFAULT_CONTEXT_TOKENS
 from diffstory.narrative import CODEX_MODEL_CAPACITIES
@@ -444,14 +446,16 @@ class NarrativeTests(unittest.TestCase):
         self.assertIn("blank line", prompt)
         self.assertIn("do not use Mermaid", prompt)
         self.assertEqual(preamble_schema["type"], "string")
-        self.assertEqual(preamble_schema["maxLength"], MAX_PREAMBLE_CHARS)
+        self.assertEqual(
+            preamble_schema["maxLength"], MAX_PREAMBLE_TOTAL_CHARS
+        )
         self.assertIn("about 200 to 450 words", preamble_schema["description"])
         self.assertIn("multi-part change", preamble_schema["description"])
 
     def test_document_output_reserve_covers_a_page_sized_preamble(
         self,
     ) -> None:
-        """Reserve enough response tokens for a page-sized preamble and document fields."""
+        """Reserve response space for a page of prose plus a conceptual sketch."""
         provider = FakeProvider()
         Narrator(provider).generate(compile_snapshot(snapshot()))
         request = next(
@@ -460,7 +464,7 @@ class NarrativeTests(unittest.TestCase):
             if call["name"] == "diffstory_document"
         )
         self.assertEqual(request["max_output_tokens"], DOCUMENT_OUTPUT_RESERVE)
-        self.assertGreaterEqual(request["max_output_tokens"], 1_200)
+        self.assertGreaterEqual(request["max_output_tokens"], 3_200)
 
     def test_document_preamble_enforces_its_character_bound(self) -> None:
         """Accept a preamble at its bound and reject text above the bound."""
@@ -473,18 +477,53 @@ class NarrativeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "preamble"):
             Narrator._validate_document_response(too_long)
 
+    def test_provider_preamble_keeps_separate_sketch_allowance(self) -> None:
+        """A provider sketch must fit its own allowance and preserve prose space."""
+        fence = "\n```text\n{}\n```"
+        cases = [
+            (
+                "prose and sketch",
+                "x" * MAX_PREAMBLE_CHARS + fence.format("diagram"),
+                True,
+            ),
+            (
+                "oversized sketch",
+                "x" + fence.format("y" * MAX_PREAMBLE_SKETCH_CHARS),
+                False,
+            ),
+        ]
+        for name, preamble, accepted in cases:
+            with self.subTest(case=name):
+                document = FakeProvider._document_response({})
+                document["preamble"] = preamble
+                if accepted:
+                    Narrator._validate_document_response(document)
+                else:
+                    with self.assertRaisesRegex(ValueError, "preamble"):
+                        Narrator._validate_document_response(document)
+
     def test_generated_report_rechecks_preamble_bound(self) -> None:
         """Reject an oversized saved preamble after provider validation."""
         source_report = compile_snapshot(snapshot())
         candidate = Narrator(FakeProvider()).generate(source_report)
         generated = apply_annotations(source_report, candidate)
-        for length, valid in (
-            (MAX_PREAMBLE_CHARS, True),
-            (MAX_PREAMBLE_CHARS + 1, False),
+        for name, preamble, valid in (
+            ("prose at limit", "x" * MAX_PREAMBLE_CHARS, True),
+            ("prose over limit", "x" * (MAX_PREAMBLE_CHARS + 1), False),
+            (
+                "prose and sketch",
+                "x" * MAX_PREAMBLE_CHARS + "\n```text\ndiagram\n```",
+                True,
+            ),
+            (
+                "sketch over limit",
+                "x\n```text\n" + "y" * MAX_PREAMBLE_SKETCH_CHARS + "\n```",
+                False,
+            ),
         ):
-            with self.subTest(length=length):
+            with self.subTest(case=name):
                 saved = copy.deepcopy(generated)
-                saved["document"]["preamble"] = "x" * length
+                saved["document"]["preamble"] = preamble
                 if valid:
                     validate_generated_report(saved)
                     render(saved)

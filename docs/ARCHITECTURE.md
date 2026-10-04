@@ -89,7 +89,7 @@ The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_
 }
 ```
 
-The optional preamble introduces the whole change before the code tour. Model narration requires it. It can include one compact conceptual sketch; a two-path decision sketch uses a three-line plain-text flow chart. The preamble has a 4,000-character limit. Other document prose has a 6,000-character limit. The provider JSON schema comes from the same Pydantic document model used for response validation. The annotation, generated-report, and renderer checks share its field rules and limits.
+The optional preamble introduces the whole change before the code tour. Model narration requires it. It can include one compact conceptual sketch; a two-path decision sketch uses a three-line plain-text flow chart. The preamble allows at most 4,000 characters of prose and a separate 4,000 characters for all complete fenced text sketches, including their fences. The whole field is limited to 8,000 characters. Unclosed fences count as prose. Other document prose has a 6,000-character limit. The provider JSON schema comes from the same Pydantic document model used for response validation. The annotation, generated-report, and renderer checks share its field rules and limits.
 
 The compiler rejects a revision mismatch, missing/out-of-group evidence IDs, oversized prose and invalid field types. Annotation fields cannot replace structural matches or claim test execution. The current validator does not prove that a natural-language claim follows from the source. Human review remains necessary.
 

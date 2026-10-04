@@ -7,6 +7,7 @@ from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.analysis import evidence_packet
 from diffstory.models import MAX_PREAMBLE_CHARS
+from diffstory.models import MAX_PREAMBLE_SKETCH_CHARS
 from diffstory.render import render
 
 
@@ -259,6 +260,58 @@ class LiterateReaderTests(unittest.TestCase):
                 saved["document"]["preamble"] = preamble
                 if valid:
                     apply_annotations(source_report, candidate)
+                    render(saved)
+                else:
+                    with self.assertRaises(ValueError):
+                        apply_annotations(source_report, candidate)
+                    with self.assertRaises(ValueError):
+                        render(saved)
+
+    def test_preamble_sketches_have_a_separate_allowance(self) -> None:
+        """Sketches must not consume prose space or bypass the combined sketch cap."""
+        prefix, suffix = "\n```text\n", "\n```"
+        payload_limit = MAX_PREAMBLE_SKETCH_CHARS - len(prefix) - len(suffix)
+        full_sketch = prefix + "y" * payload_limit + suffix
+        half_sketch = prefix + "y" * (payload_limit // 2) + suffix
+        cases = [
+            (
+                "both allowances full",
+                "x" * MAX_PREAMBLE_CHARS + full_sketch,
+                True,
+            ),
+            (
+                "prose over limit",
+                "x" * (MAX_PREAMBLE_CHARS + 1) + prefix + "y" + suffix,
+                False,
+            ),
+            (
+                "sketch over limit",
+                "x" + prefix + "y" * (payload_limit + 1) + suffix,
+                False,
+            ),
+            ("combined sketches over limit", "x" + half_sketch * 2, False),
+            (
+                "unfinished fence is prose",
+                "x" * MAX_PREAMBLE_CHARS + prefix + "y",
+                False,
+            ),
+            (
+                "Windows line endings",
+                "x" * MAX_PREAMBLE_CHARS
+                + (prefix + "y" + suffix).replace("\n", "\r\n"),
+                True,
+            ),
+        ]
+        source_report = report()
+        for name, preamble, accepted in cases:
+            with self.subTest(case=name):
+                candidate = annotations(source_report)
+                candidate["document"]["preamble"] = preamble
+                saved = copy.deepcopy(source_report)
+                saved["document"] = {"preamble": preamble}
+                if accepted:
+                    out = apply_annotations(source_report, candidate)
+                    self.assertEqual(out["document"]["preamble"], preamble)
                     render(saved)
                 else:
                     with self.assertRaises(ValueError):
