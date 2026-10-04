@@ -23,11 +23,11 @@ from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.analysis import validate_generated_report
 from diffstory.cli import main
+from diffstory.models import MAX_PREAMBLE_CHARS
 from diffstory.narrative import ASD_STYLE_INSTRUCTION
 from diffstory.narrative import CODEX_DEFAULT_CONTEXT_TOKENS
 from diffstory.narrative import CODEX_MODEL_CAPACITIES
 from diffstory.narrative import DOCUMENT_OUTPUT_RESERVE
-from diffstory.narrative import MAX_PREAMBLE_CHARS
 from diffstory.narrative import MAX_RESPONSE_BYTES
 from diffstory.narrative import OPENAI_MODEL
 from diffstory.narrative import OPENAI_URL
@@ -695,7 +695,7 @@ class NarrativeTests(unittest.TestCase):
         from unittest.mock import patch
 
         with (
-            patch("diffstory.analysis.MAX_SNAPSHOT_SOURCE_BYTES", 4),
+            patch("diffstory.models.MAX_SNAPSHOT_SOURCE_BYTES", 4),
             self.assertRaisesRegex(ValueError, "aggregate limit"),
         ):
             compile_snapshot(snapshot())

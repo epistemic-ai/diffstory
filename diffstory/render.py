@@ -6,12 +6,11 @@ import json
 import re
 from pathlib import Path
 
-from .analysis import MAX_PREAMBLE_CHARS
 from .analysis import SCHEMA
 from .analysis import validate_generated_report
 from .analysis import validate_passages
+from .models import validate_document
 
-MAX_NARRATIVE_TEXT_CHARS = 6_000
 REPORT_IDENTIFIER = re.compile(r"[a-f0-9]{16}")
 NUMERIC_REPORT_FIELDS = frozenset(
     {
@@ -201,21 +200,7 @@ def validate_report(report: dict) -> None:
         raise ValueError(msg)
     changes_by_id = {c["id"]: c for c in report["changes"]}
     if "document" in report:
-        d = report["document"]
-        if not isinstance(d, dict) or any(
-            k not in {"preamble", "lead", "closing"}
-            or not isinstance(v, str)
-            or len(v)
-            > (
-                MAX_PREAMBLE_CHARS
-                if k == "preamble"
-                else MAX_NARRATIVE_TEXT_CHARS
-            )
-            or (k == "preamble" and not v.strip())
-            for k, v in d.items()
-        ):
-            msg = "Invalid document narrative"
-            raise ValueError(msg)
+        validate_document(report["document"])
     _validate_group_links(report, groups, changes, changes_by_id)
     if "generation" in report:
         validate_generated_report(report)

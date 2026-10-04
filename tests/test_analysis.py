@@ -432,95 +432,64 @@ class CompilerTests(unittest.TestCase):
 
     def test_relevant_limits_leave_kind_observed(self) -> None:
         """Missing, partial, or unparsed counterpart evidence must stay observed."""
-        rows = []
-        for is_addition in (True, False):
-            expected = "observed_head" if is_addition else "observed_base"
-            own_text = (
-                "def keep():\n    return 1\n\ndef target():\n    return 2\n"
-            )
-            other_text = "def keep():\n    return 1\n"
-            for mode in (
-                "missing",
+        own_text = "def keep():\n    return 1\n\ndef target():\n    return 2\n"
+        other_text = "def keep():\n    return 1\n"
+        cases = [
+            ("missing", None, None, {}, False),
+            (
                 "unavailable",
+                None,
+                {"state": "unavailable", "reason": "size_limit"},
+                {},
+                True,
+            ),
+            (
                 "partial",
+                other_text,
+                {"state": "supplied", "coverage": "partial"},
+                {},
+                True,
+            ),
+            (
                 "line 20",
-                "parse failure",
-            ):
-                if mode == "missing":
-                    before = {} if is_addition else {"x.py": own_text}
-                    after = {"x.py": own_text} if is_addition else {}
-                    snapshot = snap(before, after)
-                elif mode == "unavailable":
-                    before = {} if is_addition else {"x.py": own_text}
-                    after = {"x.py": own_text} if is_addition else {}
-                    missing_side = "base" if is_addition else "head"
-                    snapshot = evidence_snap(
-                        before,
-                        after,
-                        overrides={
-                            (missing_side, "x.py"): {
-                                "path": "x.py",
-                                "state": "unavailable",
-                                "reason": "size_limit",
-                            },
-                        },
-                    )
-                elif mode == "partial":
-                    before = (
-                        {"x.py": other_text}
-                        if is_addition
-                        else {"x.py": own_text}
-                    )
-                    after = (
-                        {"x.py": own_text}
-                        if is_addition
-                        else {"x.py": other_text}
-                    )
-                    counterpart_side = "base" if is_addition else "head"
-                    snapshot = evidence_snap(
-                        before,
-                        after,
-                        overrides={
-                            (counterpart_side, "x.py"): {
-                                "path": "x.py",
-                                "state": "supplied",
-                                "coverage": "partial",
-                            },
-                        },
-                    )
-                elif mode == "line 20":
-                    before = (
-                        {"x.py": other_text}
-                        if is_addition
-                        else {"x.py": own_text}
-                    )
-                    after = (
-                        {"x.py": own_text}
-                        if is_addition
-                        else {"x.py": other_text}
-                    )
-                    snapshot = snap(before, after)
-                    for fragment in snapshot["fragments"]:
-                        fragment["start_line"] = 20
-                        fragment["scope"] = "complete"
-                else:
-                    invalid = "def broken(:\n"
-                    before = (
-                        {"x.py": invalid}
-                        if is_addition
-                        else {"x.py": own_text}
-                    )
-                    after = (
-                        {"x.py": own_text}
-                        if is_addition
-                        else {"x.py": invalid}
-                    )
-                    snapshot = evidence_snap(before, after)
-                rows.append((f"{mode} {expected}", snapshot, expected))
-        for name, snapshot, expected in rows:
-            with self.subTest(case=name):
-                report = compile_snapshot(snapshot)
-                self.assertEqual(symbols(report)[0]["kind"], expected)
+                other_text,
+                None,
+                {"start_line": 20, "scope": "complete"},
+                False,
+            ),
+            ("parse failure", "def broken(:\n", None, {}, True),
+        ]
+        for expected, own_side, other_side in (
+            ("observed_head", "head", "base"),
+            ("observed_base", "base", "head"),
+        ):
+            for name, counterpart_text, override, options, explicit in cases:
+                with self.subTest(case=name, expected=expected):
+                    sources = {own_side: {"x.py": own_text}, other_side: {}}
+                    if counterpart_text is not None:
+                        sources[other_side] = {"x.py": counterpart_text}
+                    if explicit:
+                        overrides = (
+                            {
+                                (other_side, "x.py"): {
+                                    "path": "x.py",
+                                    **override,
+                                }
+                            }
+                            if override
+                            else {}
+                        )
+                        snapshot = evidence_snap(
+                            sources["base"],
+                            sources["head"],
+                            overrides=overrides,
+                        )
+                    else:
+                        snapshot = snap(sources["base"], sources["head"])
+                        for fragment in snapshot["fragments"]:
+                            fragment.update(options)
+                    report = compile_snapshot(snapshot)
+                    self.assertEqual(symbols(report)[0]["kind"], expected)
 
     def test_empty_python_is_full_parsed(self) -> None:
         """Empty Python files must support confirmed additions and removals."""
@@ -842,6 +811,22 @@ class CompilerTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "repository-relative"):
                     compile_snapshot(snapshot)
         self.assertGreater(compile_snapshot(valid)["stats"]["units"], 0)
+
+    def test_validation_errors_do_not_echo_source(self) -> None:
+        """Malformed snapshot errors must not expose source or producer metadata."""
+        marker = "private fixture content must stay out of diagnostics"
+        cases = [
+            ("region", {"region": None}),
+            ("line number", {"start_line": True}),
+            ("revision", {"side": "other"}),
+        ]
+        for name, fields in cases:
+            with self.subTest(case=name):
+                snapshot = snap({}, {"x.py": marker}, description=marker)
+                snapshot["fragments"][0].update(fields)
+                with self.assertRaises(ValueError) as caught:
+                    compile_snapshot(snapshot)
+                self.assertNotIn(marker, str(caught.exception))
 
     def test_evidence_side_is_unique(self) -> None:
         """One side/path pair cannot belong to more than one evidence record."""

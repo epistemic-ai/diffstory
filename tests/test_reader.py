@@ -3,10 +3,10 @@
 import copy
 import unittest
 
-from diffstory.analysis import MAX_PREAMBLE_CHARS
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.analysis import evidence_packet
+from diffstory.models import MAX_PREAMBLE_CHARS
 from diffstory.render import render
 
 

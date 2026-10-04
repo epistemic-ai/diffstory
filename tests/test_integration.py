@@ -16,7 +16,6 @@ from pathlib import Path
 from unittest.mock import Mock
 from unittest.mock import patch
 
-from diffstory.analysis import MAX_SNAPSHOT_SOURCE_BYTES
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.cli import main
@@ -24,6 +23,7 @@ from diffstory.ingest import MAX_FILE
 from diffstory.ingest import _github_token
 from diffstory.ingest import from_git
 from diffstory.ingest import from_github
+from diffstory.models import MAX_SNAPSHOT_SOURCE_BYTES
 
 
 class GitIntegrationTests(unittest.TestCase):

@@ -14,23 +14,23 @@ A local-first literate code-review reader by [Epistemic AI](https://www.epistemi
 
 Download or clone this repository and open **`examples/demo.html`** in a browser. Download the HTML first; GitHub's file view does not execute it. No server, account, API key, web fonts, CDN, or internet connection is needed to read it. The example is original synthetic code, not an excerpt from a private repository.
 
-To analyze your own checkout, use Python 3.10+ and Git:
-
-```bash
-python -m diffstory git \
-  --repo /path/to/your/project \
-  --base main --head HEAD \
-  --out walkthrough.html
-```
-
-Or install the CLI from this source checkout:
+To analyze your own checkout, use Python 3.10+ and Git. Install the CLI from this source checkout first:
 
 ```bash
 python -m pip install .
 diffstory --version
 ```
 
-No third-party runtime dependencies. Build and browser-test tools are development-only dependencies.
+Then create a walkthrough:
+
+```bash
+diffstory git \
+  --repo /path/to/your/project \
+  --base main --head HEAD \
+  --out walkthrough.html
+```
+
+Pydantic validates source evidence and narration data. Build and browser-test tools are development-only dependencies.
 
 ## A reading path, not a dashboard
 
