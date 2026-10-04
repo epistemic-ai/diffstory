@@ -10,13 +10,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import __version__
-from .analysis import MAX_SNAPSHOT_SOURCE_BYTES
 from .analysis import SCHEMA
 from .analysis import apply_annotations
 from .analysis import compile_snapshot
 from .analysis import evidence_packet
 from .ingest import from_git
 from .ingest import from_github
+from .models import MAX_SNAPSHOT_SOURCE_BYTES
 from .narrative import OPENAI_MODEL
 from .narrative import CodexCLIProvider
 from .narrative import NarrativeProvider

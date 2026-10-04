@@ -104,6 +104,13 @@
   const CHUNK = 160;
 
   function classification(c) {
+    const fileStatus = {
+      added: ['Added to file', 'move'],
+      removed: ['Removed from file', 'removed'],
+      observed_head: ['Addition unresolved', ''],
+      observed_base: ['Removal unresolved', '']
+    };
+    if (fileStatus[c.kind]) return fileStatus[c.kind];
     if ((c.after || c.before)?.is_test) return ['Test source', ''];
     const kinds = {
       moved: ['Moved · same AST', 'move'],
@@ -112,10 +119,6 @@
       moved_modified: ['Moved + edited', 'edited'],
       modified: ['Edited', 'edited'],
       source_only: ['Source-only edit', ''],
-      observed_head: ['Head excerpt', ''],
-      observed_base: ['Base excerpt', ''],
-      added: ['Added', 'move'],
-      removed: ['Removed', 'removed'],
       wiring: ['Wiring', ''],
       text: ['Source change', '']
     };
@@ -212,7 +215,8 @@
       headURL: options.raw?.after_url || options.test?.url || first?.after?.url,
     };
     blocks.set(spec.id, spec);
-    let badge = options.raw ? ['Source hunk', ''] : options.test ? ['Test source', ''] : cs.length > 1 ? [`${cs.length} moved declarations`, 'move'] : classification(first);
+    const fileStatusChange = cs.find(change => ['added', 'removed', 'observed_head', 'observed_base'].includes(change.kind));
+    let badge = options.raw ? ['Source hunk', ''] : fileStatusChange ? classification(fileStatusChange) : options.test ? ['Test source', ''] : cs.length > 1 ? [`${cs.length} moved declarations`, 'move'] : classification(first);
     const name = options.label || (cs.length > 1 ? 'graph constants' : source?.name === 'module imports / context' ? 'imports' : source?.name === 'file context' ? '' : source?.name || '');
     const symbol = name ? `<span class="symbol-name">· ${esc(name)}</span>` : '';
     const focusedEstimate = spec.focus && spec.view === 'definition'
@@ -231,7 +235,8 @@
         }, 0);
     const estimated = Math.min(PREVIEW_LIMIT, focusedEstimate ?? sourceEstimate);
     const beforeAnchors = cs.filter(c => !anchors.has(c.id)).map(c => { anchors.add(c.id); return `<span id="unit-${c.id}" class="change-anchor"></span>`; }).join('');
-    return `${beforeAnchors}<figure class="code-block" id="${spec.id}" data-block="${spec.id}" data-changes="${cs.map(c => c.id).join(' ')}"><figcaption class="code-header"><span class="filename" title="${esc(primaryPath)}">${esc(basename(primaryPath))}${symbol}</span><span class="classification ${badge[1]}">${esc(badge[0])}</span></figcaption><div class="code-body"><div class="lazy-shell" style="min-height:${Math.max(58, Math.min(430, estimated * 22))}px"><button data-load-preview="${spec.id}">Load ${spec.view === 'diff' ? 'diff' : 'code'} ↓</button></div></div><div class="code-footer"></div></figure>`;
+    const basis = cs.map(change => `<div class="code-note code-basis">${esc(change.basis)}</div>`).join('');
+    return `${beforeAnchors}<figure class="code-block" id="${spec.id}" data-block="${spec.id}" data-changes="${cs.map(c => c.id).join(' ')}"><figcaption class="code-header"><span class="filename" title="${esc(primaryPath)}">${esc(basename(primaryPath))}${symbol}</span><span class="classification ${badge[1]}">${esc(badge[0])}</span></figcaption>${basis}<div class="code-body"><div class="lazy-shell" style="min-height:${Math.max(58, Math.min(430, estimated * 22))}px"><button data-load-preview="${spec.id}">Load ${spec.view === 'diff' ? 'diff' : 'code'} ↓</button></div></div><div class="code-footer"></div></figure>`;
   }
   function blockFooter(spec, shown, total) {
     const first = spec.changes[0];
@@ -292,7 +297,6 @@
       if (c.kind === 'moved') text += ' The declaration has an identical AST at its new location; its surrounding bindings still deserve review.';
       else if (c.kind === 'moved_renamed') text += ` \`${c.before.name}\` becomes \`${c.after.name}\`. The comparison excludes the declaration name and leading docstring, not internal identifiers or literals.`;
       else if (c.kind === 'moved_modified') text += ' This pair contains edits, not just a relocation. Compare its definition and paired diff.';
-      else if (c.kind === 'observed_head') text += ' Only the head-side definition is supplied here; a missing counterpart is not proof of new behavior.';
       return {text, change_ids: [c.id]};
     });
   }
@@ -314,6 +318,65 @@
       ? `<div class="section-context">${context.map(value => `<p>${inline(value)}</p>`).join('')}</div>`
       : '';
     return `<section class="story-section" id="${g.id}" data-story-section="${g.id}" aria-labelledby="heading-${g.id}"><header class="section-heading"><span class="section-number">${String(g.number).padStart(2, '0')}</span><h2 id="heading-${g.id}">${inline(g.title)}<a class="section-anchor" href="#${g.id}" aria-label="Link to ${esc(plainInline(g.title))}">#</a></h2></header>${contextHTML}${passages.map(passageHTML).join('')}${n.transition ? `<div class="section-end">${inline(n.transition)}</div>` : ''}${extra.length ? `<details class="section-extra" data-extra="${g.id}"><summary>Supporting changes <span>· ${extra.length}</span></summary><div class="extra-body"></div></details>` : ''}</section>`;
+  }
+  // Accept one branch with the expected marker; split at its first arrow.
+  function decisionBranch(line, marker) {
+    const match = /^\s*([├└])─\s+([^→]+)→(.+)$/.exec(line);
+    if (!match || match[1] !== marker) return null;
+    const condition = match[2].trim(), outcome = match[3].trim();
+    if (!condition || !outcome || condition.length > 120 || outcome.length > 120) return null;
+    return { condition, outcome };
+  }
+  // Recognize the compact three-line decision format; other sketches stay text.
+  function decisionFlowchart(value) {
+    const lines = value.trim().split('\n');
+    if (lines.length !== 3) return null;
+    const label = lines[0].trim();
+    if (!label || label.length > 36) return null;
+    const paths = [decisionBranch(lines[1], '├'), decisionBranch(lines[2], '└')];
+    return paths.every(Boolean) ? { label, paths } : null;
+  }
+  function sketchHTML(value) {
+    const flowchart = decisionFlowchart(value);
+    if (flowchart) {
+      const branchesHTML = flowchart.paths.map(path => `
+        <div class="flowchart-path">
+          <div class="flowchart-condition">${esc(path.condition)}</div>
+          <span class="flowchart-down" aria-hidden="true">↓</span>
+          <div class="flowchart-outcome">${esc(path.outcome)}</div>
+        </div>`).join('');
+      return `<figure class="preamble-flowchart">
+        <figcaption>Decision flow chart</figcaption>
+        <div class="flowchart-body">
+          <div class="flowchart-decision">
+            <svg viewBox="0 0 240 110" aria-hidden="true"><polygon points="120,2 238,55 120,108 2,55"/></svg>
+            <span>${esc(flowchart.label)}</span>
+          </div>
+          <svg class="flowchart-connectors" viewBox="0 0 100 42" preserveAspectRatio="none" aria-hidden="true">
+            <path d="M50 0 V16 H25 V38 M50 16 H75 V38"/>
+            <path d="M22 35 L25 41 L28 35 M72 35 L75 41 L78 35"/>
+          </svg>
+          <div class="flowchart-paths">${branchesHTML}</div>
+        </div>
+      </figure>`;
+    }
+    return `<figure class="preamble-sketch"><figcaption>Conceptual sketch</figcaption><pre><code>${esc(value)}</code></pre></figure>`;
+  }
+  function preambleHTML() {
+    const preamble = R.document?.preamble;
+    if (typeof preamble !== 'string' || !preamble.trim()) return '';
+    const content = preamble.replace(/\r\n?/g, '\n');
+    const sketchFence = /(^|\n)```text[ \t]*\n([\s\S]*?)\n```(?=\n|$)/g;
+    const paragraphs = value => value.trim().split(/\n\s*\n/).filter(Boolean)
+      .map(part => `<p>${inline(part.trim())}</p>`).join('');
+    let body = '', cursor = 0;
+    for (const match of content.matchAll(sketchFence)) {
+      body += paragraphs(content.slice(cursor, match.index));
+      body += sketchHTML(match[2]);
+      cursor = match.index + match[0].length;
+    }
+    body += paragraphs(content.slice(cursor));
+    return `<section class="preamble" aria-labelledby="preamble-heading"><h2 id="preamble-heading">Before the code</h2><div class="preamble-body">${body}</div></section>`;
   }
   function buildHeader() {
     const m = R.meta, doc = R.document || {};
@@ -353,7 +416,7 @@
       body.innerHTML = `<p>${R.meta.scope === 'selected excerpts' ? 'These are diffs of the supplied excerpts, not the full GitHub patch.' : 'Hunks computed from the supplied before/after file snapshots.'} Open a file to load its hunks. Nothing below changes the reading order above.</p>${[...files.entries()].map(([path, fs], i) => `<details class="raw-file" data-raw="${i}"><summary>${esc(path)} <span class="region-label">· ${fs.length} region${fs.length === 1 ? '' : 's'}</span></summary><div class="raw-body"></div></details>`).join('')}`;
     } else {
       const m = R.meta;
-      body.innerHTML = `<dl><dt>Repository</dt><dd>${link(m.url, m.repository || 'Local Git') || esc(m.repository || 'Local Git')}</dd><dt>Base revision</dt><dd class="mono">${esc(m.base_sha)}</dd><dt>Head revision</dt><dd class="mono">${esc(m.head_sha)}</dd><dt>Scope</dt><dd>${esc(m.scope)}</dd><dt>Captured</dt><dd>${esc(m.captured_at || 'Not recorded')}</dd><dt>Supplied source</dt><dd>${R.stats.supplied_paths} paths · ${R.stats.units} analysis units</dd><dt>Test runs</dt><dd>0 runs verified by this analyzer</dd></dl><h3>What the matches establish</h3><p>An identical AST is structural evidence, not a proof that a move preserves behavior. Changed global bindings, import paths, initialization order and external consumers still need review. An edited pair is not automatically a confirmed behavioral change.</p><h3>Provenance</h3><p>${esc(m.validation || 'No execution evidence was attached.')}</p><p>Narrative paragraphs are authored interpretations linked to immutable source ranges. They cannot override the compiler’s source, structural classifications or test status.</p>${R.warnings.length ? `<h3>Limits of this input</h3><ul>${R.warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}<details><summary>Compiler methods</summary><dl>${Object.entries(R.method).map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('')}</dl></details>${m.description ? `<details><summary>PR description, as captured</summary><pre>${esc(m.description)}</pre></details>` : ''}<h3>Local by design</h3><p>No external fonts, libraries, analytics or network requests are needed. The HTML embeds the source snapshot; keep it private for a private repository. Diffs are rendered lazily from that embedded data, not fetched from a server. Clicking a source link opens GitHub.</p>`;
+      body.innerHTML = `<dl><dt>Repository</dt><dd>${link(m.url, m.repository || 'Local Git') || esc(m.repository || 'Local Git')}</dd><dt>Base revision</dt><dd class="mono">${esc(m.base_sha)}</dd><dt>Head revision</dt><dd class="mono">${esc(m.head_sha)}</dd><dt>Scope</dt><dd>${esc(m.scope)}</dd><dt>Captured</dt><dd>${esc(m.captured_at || 'Not recorded')}</dd><dt>Supplied source</dt><dd>${R.stats.supplied_paths} paths · ${R.stats.units} analysis units</dd><dt>Test runs</dt><dd>0 runs verified by this analyzer</dd></dl><h3>What the matches establish</h3><p>An identical AST is structural evidence, not a proof that a move preserves behavior. Changed global bindings, import paths, initialization order and external consumers still need review. An edited pair is not automatically a confirmed behavioral change.</p><h3>Provenance</h3><p>${esc(m.validation || 'No execution evidence was attached.')}</p><p>Narrative paragraphs are authored interpretations linked to immutable source ranges. They cannot override the compiler’s source, structural classifications or test status.</p>${(R.notes || []).length ? `<h3>Analysis notes</h3><ul>${R.notes.map(note => `<li>${esc(note)}</li>`).join('')}</ul>` : ''}${R.warnings.length ? `<h3>Limits of this input</h3><ul>${R.warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}<details><summary>Compiler methods</summary><dl>${Object.entries(R.method).map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('')}</dl></details>${m.description ? `<details><summary>PR description, as captured</summary><pre>${esc(m.description)}</pre></details>` : ''}<h3>Local by design</h3><p>No external fonts, libraries, analytics or network requests are needed. The HTML embeds the source snapshot; keep it private for a private repository. Diffs are rendered lazily from that embedded data, not fetched from a server. Clicking a source link opens GitHub.</p>`;
     }
     details.dataset.ready = 'true';
   }
@@ -477,7 +540,7 @@
   });
 
   buildHeader();
-  $('#story').innerHTML = R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>';
+  $('#story').innerHTML = `${preambleHTML()}${R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>'}`;
   buildFooter(); contents(); observeBlocks(); updateScroll();
   if (location.hash) requestAnimationFrame(() => navigateTo(location.hash, false));
 })();

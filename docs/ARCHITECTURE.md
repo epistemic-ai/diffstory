@@ -41,11 +41,19 @@ Module environment differences are deliberately not erased. Renaming a reference
       "scope": "full"
     }
   ],
+  "file_evidence": [{
+    "base": {"path": "pkg/module.py", "state": "absent"},
+    "head": {"path": "pkg/module.py", "state": "supplied", "coverage": "full"}
+  }],
   "warnings": []
 }
 ```
 
-Use `scope: "selected excerpts"` for partial snapshots. Each excerpt retains its original line offset. When multiple excerpts are supplied from the same file, set a distinct `region` to identify each before/after pair; source ranges must not overlap. Full snapshots include both sides of modified files and the existing side of truly added/deleted files. Missing data, parse failures and skip warnings cause conservative unresolved-counterpart labels instead of definitive addition/removal claims.
+Pydantic models in `models.py` validate snapshot fields and source states. Each state has its own fields: an absent file has no coverage or reason, an unavailable file requires a reason, and supplied source requires coverage. `evidence.py` then checks these claims against the actual fragments and parse results. The compiler receives named indexes instead of a positional bundle. Legacy inference stays separate from explicit file claims.
+
+`file_evidence` records the source state of each changed path on both revisions. A side is `absent`, `unavailable` with a reason, or `supplied` with `full` coverage. Git and GitHub ingestion create these records from pinned source reads. A copy or rename keeps its old path on the base side and its new path on the head side. The path link lets the compiler compare the correct files. A missing or skipped read cannot prove that a definition is absent.
+
+Use `scope: "selected excerpts"` for partial snapshots. Each excerpt retains its original line offset. When multiple excerpts are supplied from the same file, set a distinct `region` to identify each before/after pair; source ranges must not overlap. Full snapshots include both sides of modified files and the existing side of truly added/deleted files. A confirmed Python definition addition or removal needs full, parsed source for the relevant file pair. A warning about another file, including a Markdown file, does not weaken that evidence. Missing source and parse failures on the relevant file leave the counterpart unresolved. Legacy snapshots without `file_evidence` use conservative coverage rules.
 
 The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_files`, `cycles`, `warnings`, `stats`, `meta` and `method`. Stable IDs join evidence and narrative. Line URLs bind to a commit, not a moving branch. The renderer rejects malformed identifiers, numeric fields, diff tags and missing group references, escapes source/prose and prevents literal script terminators in embedded JSON.
 
@@ -57,6 +65,7 @@ The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_
   "base_sha": "<same effective base as the report>",
   "head_sha": "<same head as the report>",
   "document": {
+    "preamble": "A source-grounded overview of the whole change, before the code tour.",
     "lead": "A short source-grounded opening paragraph.",
     "closing": "The mental model to retain."
   },
@@ -80,6 +89,8 @@ The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_
 }
 ```
 
+The optional preamble introduces the whole change before the code tour. Model narration requires it. It can include one compact conceptual sketch; a two-path decision sketch uses a three-line plain-text flow chart. The preamble allows at most 4,000 characters of prose and a separate 4,000 characters for all complete fenced text sketches, including their fences. The whole field is limited to 8,000 characters. Unclosed fences count as prose. Other document prose has a 6,000-character limit. The provider JSON schema comes from the same Pydantic document model used for response validation. The annotation, generated-report, and renderer checks share its field rules and limits.
+
 The compiler rejects a revision mismatch, missing/out-of-group evidence IDs, oversized prose and invalid field types. Annotation fields cannot replace structural matches or claim test execution. The current validator does not prove that a natural-language claim follows from the source. Human review remains necessary.
 
 When an annotation supplies a step for every group, the step array's order is the reading order. Narrated reports may choose a story order, but the validator keeps prerequisite groups before their dependents and groups in a dependency cycle adjacent. The generated step order is applied to the report's `groups` array, so the contents list and rendered document use the same path. Partial manual annotations retain the report's baseline order.
@@ -100,7 +111,7 @@ Supporting units and original raw hunks are created on demand. Source/prose is e
 
 Python AST support is implemented with the standard library, so parse support follows the interpreter running the CLI. A newer-syntax file falls back to textual evidence. Classes are atomic. Static resolution respects common import aliases and avoids simple local/parameter shadows, but does not claim whole-program completeness.
 
-The default narrative uses deterministic templates. The demo adds authored domain-specific annotations. The opt-in `--narrate` path supports the OpenAI Responses API and the user's signed-in Codex CLI. Both providers return structured output and assemble validated source-bound passages with hierarchical summaries. OpenAI requests use its selected model capacity; known Codex overrides use published model capacity, while the CLI default is packed against a conservative 400,000-token context bound. A planning call chooses a story order from group summaries; dependency constraints and cycle groups are enforced before section prose is written. Long source lines are split into bounded slices without dropping text. If a leaf response omits change citations, Diffstory may make one bounded repair request for that chunk. The Codex adapter runs `codex exec` from a temporary directory, in a read-only sandbox, with local shell, browser, app, and plugin tools disabled. Each provider call has a 900-second timeout. Both adapters use the standard library and add no runtime dependency. Successful calls contribute provider-reported input, cached input, and output token counts to a run summary; no run-wide token, call-count, or elapsed-time budget is imposed.
+The default narrative uses deterministic templates. The demo adds authored domain-specific annotations. The opt-in `--narrate` path supports the OpenAI Responses API and the user's signed-in Codex CLI. Both providers return structured output and assemble validated source-bound passages with hierarchical summaries. OpenAI requests use its selected model capacity; known Codex overrides use published model capacity, while the CLI default is packed against a conservative 400,000-token context bound. A planning call chooses a story order from group summaries; dependency constraints and cycle groups are enforced before section prose is written. Long source lines are split into bounded slices without dropping text. If a leaf response omits change citations, Diffstory may make one bounded repair request for that chunk. The Codex adapter runs `codex exec` from a temporary directory, in a read-only sandbox, with local shell, browser, app, and plugin tools disabled. Each provider call has a 900-second timeout. Both adapters use the standard library for transport. Shared data validation uses Pydantic. Successful calls contribute provider-reported input, cached input, and output token counts to a run summary; no run-wide token, call-count, or elapsed-time budget is imposed.
 
 Git and GitHub ingestion enforce a 64 MB aggregate source limit by default, and snapshot compilation enforces the same limit. The annotation manifest and report retain revisions, measured usage, and chunk coverage without storing credentials. The model-generated warning states that prose remains unverified.
 

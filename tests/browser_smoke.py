@@ -4,38 +4,455 @@ Uses set_content because some managed environments disallow file:// navigation.
 The offline HTML has no runtime network or framework dependency.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from playwright.sync_api import expect
 from playwright.sync_api import sync_playwright
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from playwright.sync_api import Browser
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 # The package path is prepared first so the file also runs as a direct script.
 from diffstory.analysis import (  # noqa: E402, I001
+    apply_annotations,
     compile_snapshot,
 )
 from diffstory.render import render  # noqa: E402
 
 
-def main() -> None:  # noqa: PLR0915  # One sequential browser acceptance flow shares page state.
+def file_evidence_report() -> dict:
+    """Build a reader fixture with confirmed, unresolved, and text-only files.
+
+    Returns:
+        A compiled report with unsafe path text and an unrelated source warning.
+    """
+    rows = [
+        (
+            "config.py",
+            "def keep():\n    return 1\n",
+            "def keep():\n    return 1\n\ndef alpha():\n    return 2\n\ndef beta():\n    return 3\n",
+            None,
+        ),
+        ("removed.py", "def removed():\n    return 4\n", None, None),
+        (
+            "unresolved_head.py",
+            None,
+            "def maybe_new():\n    return 5\n",
+            "not_supplied",
+        ),
+        (
+            "unresolved_base.py",
+            "def maybe_old():\n    return 6\n",
+            None,
+            "size_limit",
+        ),
+        (
+            "tests/test_status.py",
+            None,
+            "def test_new_contract():\n    assert True\n",
+            None,
+        ),
+        (
+            "source<svg onload=alert(1)>.py",
+            None,
+            "def escaped_basis():\n    return 7\n",
+            None,
+        ),
+        ("README.md", None, "Notes stay separate from limits.\n", None),
+    ]
+    fragments, evidence = [], []
+    for path, base_text, head_text, unavailable_reason in rows:
+        pair = {}
+        for side, source in (("base", base_text), ("head", head_text)):
+            if source is not None:
+                pair[side] = {
+                    "path": path,
+                    "state": "supplied",
+                    "coverage": "full",
+                }
+                fragments.append(
+                    {
+                        "path": path,
+                        "side": side,
+                        "start_line": 1,
+                        "scope": "full",
+                        "text": source,
+                    }
+                )
+            elif unavailable_reason:
+                pair[side] = {
+                    "path": path,
+                    "state": "unavailable",
+                    "reason": unavailable_reason,
+                }
+            else:
+                pair[side] = {"path": path, "state": "absent"}
+        evidence.append(pair)
+    return compile_snapshot(
+        {
+            "schema": "diffstory.snapshot.v1",
+            "meta": {
+                "title": "File evidence smoke page",
+                "base_sha": "c" * 40,
+                "head_sha": "d" * 40,
+                "scope": "changed files",
+                "changed_files": len(rows),
+                "input": "synthetic example",
+            },
+            "fragments": fragments,
+            "file_evidence": evidence,
+            "warnings": ["A counterpart file could not be read."],
+        }
+    )
+
+
+def check_file_evidence(
+    browser: Browser, check: Callable, smoke_report: dict
+) -> None:
+    """Check that classification and basis survive rendering and source expansion.
+
+    Args:
+        browser: Open Chromium instance.
+        check: Assertion callback that counts successful checks.
+        smoke_report: Compiled file-evidence fixture.
+    """
+    smoke_changes = {
+        (change.get("after") or change.get("before"))["name"]: change
+        for change in smoke_report["changes"]
+    }
+    expected_labels = {
+        "alpha": ("added", "Added to file"),
+        "beta": ("added", "Added to file"),
+        "removed": ("removed", "Removed from file"),
+        "maybe_new": ("observed_head", "Addition unresolved"),
+        "maybe_old": ("observed_base", "Removal unresolved"),
+        "test_new_contract": ("added", "Added to file"),
+        "escaped_basis": ("added", "Added to file"),
+    }
+    check(
+        all(
+            smoke_changes[name]["kind"] == kind
+            for name, (kind, _) in expected_labels.items()
+        ),
+        "synthetic report has each file status, including test source",
+    )
+    proof_page = browser.new_page(viewport={"width": 1280, "height": 900})
+    proof_page.set_content(render(smoke_report), wait_until="domcontentloaded")
+    for name, (kind, label) in expected_labels.items():
+        change_record = smoke_changes[name]
+        figure = proof_page.locator(
+            f'[data-changes~="{change_record["id"]}"]'
+        ).first
+        check(
+            figure.locator(".classification").inner_text() == label,
+            f"reader label for {name} ({kind})",
+        )
+        expected_basis = change_record["basis"]
+        check(
+            figure.locator(".code-basis").inner_text() == expected_basis,
+            f"basis appears below caption for {name}",
+        )
+        if name == "alpha":
+            figure.evaluate(
+                "(el) => el.querySelector('[data-load-preview]')?.click()"
+            )
+            expect(figure).to_have_attribute("data-loaded", "true")
+            check(
+                figure.locator(".code-line.add .code-text")
+                .first.inner_text()
+                .find("def alpha")
+                >= 0,
+                "added source row appears in the default passage",
+            )
+            check(
+                figure.locator(".code-basis").inner_text() == expected_basis,
+                "basis remains visible after lazy code loading",
+            )
+    escaped_figure = proof_page.locator(
+        f'[data-changes~="{smoke_changes["escaped_basis"]["id"]}"]'
+    )
+    check(
+        escaped_figure.locator(".code-basis script, .code-basis svg").count()
+        == 0,
+        "script-like basis text stays escaped",
+    )
+    proof_page.locator("#evidence summary").click(no_wait_after=True)
+    expect(proof_page.locator("#evidence")).to_contain_text("Analysis notes")
+    expect(proof_page.locator("#evidence")).to_contain_text(
+        "Limits of this input"
+    )
+    proof_page.set_viewport_size({"width": 320, "height": 700})
+    check(
+        proof_page.evaluate(
+            "document.documentElement.scrollWidth <= innerWidth"
+        ),
+        "long basis fits a narrow viewport",
+    )
+
+    proof_page.close()
+
+
+def check_authored_preamble(
+    browser: Browser, check: Callable, smoke_report: dict
+) -> None:
+    """Check that authored prose and sketches retain text without executing markup.
+
+    Args:
+        browser: Open Chromium instance.
+        check: Assertion callback that counts successful checks.
+        smoke_report: Compiled file-evidence fixture used for source passages.
+    """
+    smoke_changes = {
+        (change.get("after") or change.get("before"))["name"]: change
+        for change in smoke_report["changes"]
+    }
+    config_group = next(
+        group
+        for group in smoke_report["groups"]
+        if set(group["change_ids"])
+        & {smoke_changes["alpha"]["id"], smoke_changes["beta"]["id"]}
+    )
+    authored = apply_annotations(
+        smoke_report,
+        {
+            "schema": "diffstory.annotations.v1",
+            "base_sha": smoke_report["meta"]["base_sha"],
+            "head_sha": smoke_report["meta"]["head_sha"],
+            "document": {
+                "preamble": (
+                    "This change connects file evidence to the reader.\n"
+                    "Map: report → sections → source.\n\n"
+                    "The reader keeps the explanation near its source.\n\n"
+                    "```text\n"
+                    "Evidence <svg onload=alert(1)>\n"
+                    "  ↓\n"
+                    "Reader\n"
+                    "```\n\n"
+                    "The sections follow this overview."
+                ),
+            },
+            "steps": [
+                {
+                    "group_id": config_group["id"],
+                    "title": "Read the supplied file changes",
+                    "evidence_change_ids": config_group["change_ids"],
+                    "passages": [
+                        {
+                            "text": "Authored explanation stays visible beside the source.",
+                            "change_ids": [smoke_changes["alpha"]["id"]],
+                            "view": "diff",
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+    authored_page = browser.new_page(viewport={"width": 1280, "height": 900})
+    authored_page.set_content(render(authored), wait_until="domcontentloaded")
+    preamble = authored_page.locator(".preamble")
+    check(preamble.count() == 1, "optional preamble is visible")
+    check(
+        preamble.locator("h2").text_content() == "Before the code",
+        "preamble has its section heading",
+    )
+    preamble_text = preamble.locator(".preamble-body").inner_text()
+    check(
+        "This change connects file evidence to the reader.\n"
+        "Map: report → sections → source." in preamble_text,
+        "preamble keeps authored line breaks",
+    )
+    check(
+        preamble.locator(".preamble-body p").count() == 3,
+        "preamble separates its prose into paragraphs",
+    )
+    check(
+        preamble.locator(".preamble-sketch pre").inner_text()
+        == "Evidence <svg onload=alert(1)>\n  ↓\nReader",
+        "preamble shows its conceptual sketch",
+    )
+    check(
+        preamble.locator(".preamble-sketch code").evaluate(
+            "(el) => getComputedStyle(el).backgroundColor"
+        )
+        == "rgba(0, 0, 0, 0)",
+        "conceptual sketch uses plain diagram styling",
+    )
+    check(
+        preamble.locator("svg, script").count() == 0,
+        "preamble markup stays escaped",
+    )
+    check(
+        preamble.locator(".preamble-body p").first.evaluate(
+            "(el) => getComputedStyle(el).whiteSpace"
+        )
+        == "pre-line",
+        "preamble preserves line breaks in the reader",
+    )
+    check(
+        preamble.evaluate(
+            "(el) => Boolean(el.compareDocumentPosition("
+            "document.querySelector('.code-block')) & "
+            "Node.DOCUMENT_POSITION_FOLLOWING)"
+        ),
+        "preamble appears before the first source block",
+    )
+    authored_section = authored_page.locator(
+        f'[data-story-section="{config_group["id"]}"]'
+    )
+    check(
+        "Authored explanation stays visible beside the source."
+        in authored_section.locator(".prose").inner_text(),
+        "authored passage remains intact",
+    )
+    alpha_figure = authored_section.locator(
+        f'[data-changes~="{smoke_changes["alpha"]["id"]}"]'
+    )
+    check(
+        alpha_figure.locator(".code-basis").inner_text()
+        == smoke_changes["alpha"]["basis"],
+        "basis appears beside an authored passage",
+    )
+    beta = smoke_changes["beta"]
+    support = authored_section.locator("[data-extra]")
+    check(support.count() == 1, "uncited changes remain supporting source")
+    support.locator("summary").click(no_wait_after=True)
+    expect(support).to_have_attribute("data-ready", "true")
+    beta_figure = support.locator(f'[data-changes~="{beta["id"]}"]')
+    check(
+        beta_figure.locator(".code-basis").inner_text() == beta["basis"],
+        "basis appears for a supporting change",
+    )
+    beta_figure.evaluate(
+        "(el) => el.querySelector('[data-load-preview]')?.click()"
+    )
+    expect(beta_figure).to_have_attribute("data-loaded", "true")
+    check(
+        beta_figure.locator(".code-basis").inner_text() == beta["basis"],
+        "supporting basis survives lazy loading",
+    )
+    authored_page.close()
+
+
+def check_decision_flowchart(
+    browser: Browser, check: Callable, smoke_report: dict
+) -> None:
+    """Check decision formatting, escaped labels, mobile fit, and text fallback.
+
+    Args:
+        browser: Open Chromium instance.
+        check: Assertion callback that counts successful checks.
+        smoke_report: Valid report used to host the conceptual sketches.
+    """
+    authored = dict(smoke_report)
+    authored["document"] = {}
+    authored["document"]["preamble"] = (
+        "This change adds a second credential source.\n\n"
+        "```text\n"
+        "Credential lookup\n"
+        "  ├─ Environment token <svg onload=alert(1)> → use first\n"
+        "  └─ Empty token → try client → use its credential\n"
+        "```"
+    )
+    diagram_page = browser.new_page(viewport={"width": 390, "height": 844})
+    diagram_page.set_content(render(authored), wait_until="domcontentloaded")
+    diagram = diagram_page.locator(".preamble-flowchart")
+    check(diagram.count() == 1, "decision sketch becomes a flow chart")
+    check(
+        diagram.locator(".flowchart-decision polygon").count() == 1
+        and diagram.locator(".flowchart-connectors").count() == 1,
+        "flow chart has a decision node and directional connectors",
+    )
+    check(
+        "Environment token <svg onload=alert(1)>"
+        in diagram.locator(".flowchart-condition").first.inner_text(),
+        "flow chart keeps branch conditions",
+    )
+    check(
+        "try client → use its credential"
+        in diagram.locator(".flowchart-outcome").last.inner_text(),
+        "flow chart keeps complete outcomes",
+    )
+    check(
+        diagram.locator(
+            "svg[onload], script, .flowchart-condition svg"
+        ).count()
+        == 0,
+        "flow chart labels stay escaped",
+    )
+    check(
+        not diagram_page.evaluate(
+            "document.documentElement.scrollWidth > innerWidth"
+        ),
+        "flow chart does not overflow a mobile page",
+    )
+    text_sketches = [
+        (
+            "reversed branch markers",
+            "Credential lookup\n  └─ Empty token → try client\n  ├─ Environment token → use first",
+        ),
+        (
+            "empty first condition",
+            "Credential lookup\n  ├─ → first → second\n  └─ Empty token → try client",
+        ),
+        (
+            "empty outcome",
+            "Credential lookup\n  ├─ Token → \n  └─ Empty token → try client",
+        ),
+        (
+            "long decision label",
+            "x" * 37
+            + "\n  ├─ Token → use first\n  └─ Empty token → try client",
+        ),
+        (
+            "long outcome",
+            "Credential lookup\n  ├─ Token → "
+            + "x" * 121
+            + "\n  └─ Empty token → try client",
+        ),
+    ]
+    for name, sketch in text_sketches:
+        authored["document"]["preamble"] = (
+            f"Choose a path.\n\n```text\n{sketch}\n```"
+        )
+        diagram_page.set_content(
+            render(authored), wait_until="domcontentloaded"
+        )
+        check(
+            diagram_page.locator(".preamble-flowchart").count() == 0
+            and diagram_page.locator(".preamble-sketch pre").inner_text()
+            == sketch,
+            f"{name} stays in the text sketch",
+        )
+    diagram_page.close()
+
+
+def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share page state.
     """Exercise the offline reader in Chromium and capture browser screenshots.
 
-    The smoke contract covers narrative structure, accessible navigation,
-    source expansion, responsive layouts, safe embedding, and absence of
-    runtime network requests.
+    The smoke contract covers narrative structure, file labels and basis,
+    accessible navigation, source expansion, responsive layouts, safe
+    embedding, and absence of runtime network requests.
 
     Side Effects:
-        Launches Playwright Chromium and writes desktop and mobile screenshots
-        under ``docs/reader``. Raises an assertion or browser error on failure.
+        Launches Playwright Chromium and writes screenshots to a temporary
+        directory. Raises an assertion or browser error on failure.
     """
     html = (ROOT / "examples/demo.html").read_text(encoding="utf-8")
     report = json.loads((ROOT / "examples/demo.report.json").read_text())
-    (ROOT / "docs/reader").mkdir(parents=True, exist_ok=True)
+    screenshot_dir = Path(tempfile.gettempdir()) / "diffstory-browser-smoke"
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
 
     def change(name: str) -> dict:
         """Find a report change by its before or after symbol name.
@@ -96,6 +513,10 @@ def main() -> None:  # noqa: PLR0915  # One sequential browser acceptance flow s
             "title",
         )
         check(
+            page.locator(".preamble").count() == 0,
+            "legacy reports without a preamble keep the existing layout",
+        )
+        check(
             page.locator(".story-section").count() == 10,
             "all sections present simultaneously",
         )
@@ -149,8 +570,14 @@ def main() -> None:  # noqa: PLR0915  # One sequential browser acceptance flow s
             == "#2563eb",
             "brand palette",
         )
+
+        smoke_report = file_evidence_report()
+        check_file_evidence(browser, check, smoke_report)
+        check_authored_preamble(browser, check, smoke_report)
+        check_decision_flowchart(browser, check, smoke_report)
+
         page.screenshot(
-            path=str(ROOT / "docs/reader/desktop.png"), full_page=False
+            path=str(screenshot_dir / "desktop.png"), full_page=False
         )
 
         # Find is a contents filter, never a replacement of the document.
@@ -184,7 +611,7 @@ def main() -> None:  # noqa: PLR0915  # One sequential browser acceptance flow s
             "reading position tracks scroll",
         )
         page.screenshot(
-            path=str(ROOT / "docs/reader/parsing.png"), full_page=False
+            path=str(screenshot_dir / "parsing.png"), full_page=False
         )
 
         section = page.locator(".story-section").nth(parsing_index)
@@ -348,7 +775,7 @@ def main() -> None:  # noqa: PLR0915  # One sequential browser acceptance flow s
         page.evaluate("scrollTo(0,0)")
         page.wait_for_timeout(100)
         page.screenshot(
-            path=str(ROOT / "docs/reader/mobile.png"), full_page=False
+            path=str(screenshot_dir / "mobile.png"), full_page=False
         )
         check(
             page.evaluate(
