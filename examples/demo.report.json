@@ -1647,7 +1647,7 @@
     {
       "id": "749cab67bd2c6504",
       "kind": "added",
-      "label": "New definition",
+      "label": "Added to file",
       "before": null,
       "after": {
         "id": "91503651c0a47fae",
@@ -1714,7 +1714,7 @@
         "url": null,
         "scope": "full"
       },
-      "basis": "Unmatched in the supplied source set; not a repository-wide identity proof.",
+      "basis": "Definition populate_metrics was added to the supplied file catalog/parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
         {
           "old_start": 1,
@@ -1753,7 +1753,7 @@
     {
       "id": "ec92156828e995bb",
       "kind": "added",
-      "label": "New definition",
+      "label": "Added to file",
       "before": null,
       "after": {
         "id": "addb9b9ed7101a1a",
@@ -1787,7 +1787,7 @@
         "url": null,
         "scope": "full"
       },
-      "basis": "Unmatched in the supplied source set; not a repository-wide identity proof.",
+      "basis": "Definition test_record_preserves_display_contract was added to the supplied file tests/test_parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
         {
           "old_start": 1,
@@ -1826,7 +1826,7 @@
     {
       "id": "189601f74b8680b9",
       "kind": "added",
-      "label": "New definition",
+      "label": "Added to file",
       "before": null,
       "after": {
         "id": "2b4431a78f24bb49",
@@ -1866,7 +1866,7 @@
         "url": null,
         "scope": "full"
       },
-      "basis": "Unmatched in the supplied source set; not a repository-wide identity proof.",
+      "basis": "Definition test_missing_and_zero_views was added to the supplied file tests/test_parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
         {
           "old_start": 1,
@@ -1899,7 +1899,7 @@
     {
       "id": "a3331c56ed891d8c",
       "kind": "added",
-      "label": "New definition",
+      "label": "Added to file",
       "before": null,
       "after": {
         "id": "dc33bfbcccfa55b6",
@@ -1933,7 +1933,7 @@
         "url": null,
         "scope": "full"
       },
-      "basis": "Unmatched in the supplied source set; not a repository-wide identity proof.",
+      "basis": "Definition test_tag_order_and_duplicates was added to the supplied file tests/test_parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
         {
           "old_start": 1,
@@ -1960,7 +1960,7 @@
     {
       "id": "6fab283d650e6f28",
       "kind": "added",
-      "label": "New definition",
+      "label": "Added to file",
       "before": null,
       "after": {
         "id": "80536d493b015b1a",
@@ -2017,7 +2017,7 @@
         "url": null,
         "scope": "full"
       },
-      "basis": "Unmatched in the supplied source set; not a repository-wide identity proof.",
+      "basis": "Definition test_first_record_wins was added to the supplied file tests/test_parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
         {
           "old_start": 1,
@@ -2056,7 +2056,7 @@
     {
       "id": "a7badff14d18e6f6",
       "kind": "added",
-      "label": "New definition",
+      "label": "Added to file",
       "before": null,
       "after": {
         "id": "5097b82a20a56ba8",
@@ -2102,7 +2102,7 @@
         "url": null,
         "scope": "full"
       },
-      "basis": "Unmatched in the supplied source set; not a repository-wide identity proof.",
+      "basis": "Definition test_query_default was added to the supplied file tests/test_query.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
         {
           "old_start": 1,
@@ -2141,7 +2141,7 @@
     {
       "id": "e5b7162fc4b0a209",
       "kind": "added",
-      "label": "New definition",
+      "label": "Added to file",
       "before": null,
       "after": {
         "id": "8ce250d333db724d",
@@ -2200,7 +2200,7 @@
         "url": null,
         "scope": "full"
       },
-      "basis": "Unmatched in the supplied source set; not a repository-wide identity proof.",
+      "basis": "Definition test_term_stays_a_parameter was added to the supplied file tests/test_query.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
         {
           "old_start": 1,
@@ -2245,7 +2245,7 @@
     {
       "id": "6fda0fd2afd4b3ab",
       "kind": "added",
-      "label": "New definition",
+      "label": "Added to file",
       "before": null,
       "after": {
         "id": "0a90355d661697f0",
@@ -2317,7 +2317,7 @@
         "url": null,
         "scope": "full"
       },
-      "basis": "Unmatched in the supplied source set; not a repository-wide identity proof.",
+      "basis": "Definition test_page_size_boundaries was added to the supplied file tests/test_query.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
         {
           "old_start": 1,
@@ -5104,6 +5104,7 @@
     "test_runs": 0
   },
   "warnings": [],
+  "notes": [],
   "method": {
     "version": "0.3.0",
     "matching": "Conservative Python AST matching; no literal or internal-identifier normalization.",

@@ -22,6 +22,16 @@ from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 from . import __version__
+from .evidence import DefinitionEvidence
+from .evidence import FileCoverage
+from .evidence import build_file_coverage
+from .models import MAX_NARRATIVE_TEXT_CHARS
+from .models import GenerationUsage
+from .models import ParseStatus
+from .models import SnapshotInput
+from .models import SourceFragment
+from .models import StrictModel
+from .models import validate_document
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -33,10 +43,8 @@ if TYPE_CHECKING:
 
 SCHEMA = "diffstory.report.v1"
 MAX_SOURCE_BYTES = 8_000_000
-MAX_SNAPSHOT_SOURCE_BYTES = 64_000_000
 MIN_SYMBOL_SIMILARITY = 0.40
 RELATED_SYMBOL_THRESHOLD = 4
-MAX_NARRATIVE_TEXT_CHARS = 6_000
 MAX_QUESTION_CHARS = 2_000
 MAX_TITLE_CHARS = 200
 MAX_PROVIDER_NAME_CHARS = 80
@@ -57,10 +65,10 @@ LABELS = {
     "moved_modified": "Moved + edited · candidate",
     "modified": "Edited · review behavior",
     "source_only": "Source-only edit",
-    "added": "New definition",
-    "removed": "Removed definition",
-    "observed_head": "Head definition · counterpart unresolved",
-    "observed_base": "Base definition · counterpart unresolved",
+    "added": "Added to file",
+    "removed": "Removed from file",
+    "observed_head": "Addition unresolved",
+    "observed_base": "Removal unresolved",
     "wiring": "Import wiring",
     "text": "Text-only change",
     "test": "Test change",
@@ -431,10 +439,26 @@ def _symbol_record(
     }
 
 
+class ExtractionResult(StrictModel):
+    """Keep extracted AST evidence and its parse outcome together.
+
+    Attributes:
+        symbols: Top-level definition and assignment records.
+        imports: Static import records with original source lines.
+        status: ``ok``, ``text_only``, or ``failed``.
+        note: Explanation for text-only or failed parsing, when present.
+    """
+
+    symbols: tuple[dict, ...] = ()
+    imports: tuple[dict, ...] = ()
+    status: ParseStatus
+    note: str | None = None
+
+
 def extract(
     fragment: dict,
     meta: dict,
-) -> tuple[Iterable[dict], Iterable[dict], str | None]:
+) -> ExtractionResult:
     """
     Extract symbols, imports, and parse status from one source fragment.
 
@@ -446,8 +470,7 @@ def extract(
         meta: Revision metadata used to produce source permalinks.
 
     Returns:
-        A tuple of extracted symbol records, import records, and an optional
-        text-only or parse-failure note.
+        Typed symbols, imports, parse status, and any explanatory note.
 
     Raises:
         ValueError: If source exceeds the per-file parsing limit.
@@ -461,13 +484,16 @@ def extract(
         msg = f"Source exceeds the 8 MB parsing limit: {path}"
         raise ValueError(msg)
     if not path.endswith(".py") or fragment.get("syntax") == "text":
-        return [], [], "Text-only evidence; no Python AST classification."
+        return ExtractionResult(
+            status="text_only",
+            note="Text-only evidence; no Python AST classification.",
+        )
 
     try:
         tree = ast.parse(source_text, filename=path, type_comments=True)
     except (SyntaxError, ValueError, RecursionError) as error:
         note = f"AST unavailable: {type(error).__name__}: {str(error)[:180]}"
-        return [], [], note
+        return ExtractionResult(status="failed", note=note)
 
     source_lines = source_text.splitlines()
     symbols = tuple(
@@ -475,7 +501,11 @@ def extract(
         for index, node in enumerate(tree.body)
         if isinstance(node, SYMBOL_TYPES)
     )
-    return symbols, _imports_from_tree(tree, start_line), None
+    return ExtractionResult(
+        symbols=symbols,
+        imports=tuple(_imports_from_tree(tree, start_line)),
+        status="ok",
+    )
 
 
 def match_symbols(
@@ -1300,196 +1330,109 @@ def _narrative(group: dict, changes: Sequence[dict]) -> dict:
     }
 
 
-def _validate_snapshot_input(
-    snapshot: dict,
-) -> tuple[dict, list[dict], int, list[str]]:
+class PreparedSnapshot(StrictModel):
+    """Hold the validated source indexes needed to compile a report.
+
+    Attributes:
+        meta: Snapshot metadata with measured source bytes.
+        fragments: Original source mappings with field omission preserved.
+        fragments_by_id: Indexed fragments with stable IDs and raw regions.
+        symbols_by_side: Parsed declarations and assignments by revision.
+        imports_by_side: Import evidence by revision and source path.
+        coverage_index: File coverage indexed by revision and path.
+        notes: Informational text-only analysis notes.
+        warnings: Producer warnings and Python parse failures.
     """
-    Validate the snapshot envelope and calculate its UTF-8 source size.
 
-    Args:
-        snapshot: ``diffstory.snapshot.v1`` mapping to validate.
-
-    Returns:
-        Metadata, source fragments, aggregate bytes, and initial warnings.
-
-    Raises:
-        ValueError: If the schema, fragment list, or aggregate source limit is
-            invalid.
-    """
-    if snapshot.get("schema") != "diffstory.snapshot.v1":
-        msg = "Expected diffstory.snapshot.v1"
-        raise ValueError(msg)
-
-    meta = dict(snapshot.get("meta", {}))
-    fragments = snapshot.get("fragments", [])
-    if not isinstance(fragments, list):
-        msg = "Snapshot fragments must be a list"
-        raise ValueError(msg)
-
-    source_bytes = 0
-    for fragment in fragments:
-        if not isinstance(fragment, dict) or not isinstance(
-            fragment.get("text"),
-            str,
-        ):
-            msg = "Snapshot fragment text must be a string"
-            raise ValueError(msg)
-
-        source_bytes += len(fragment["text"].encode("utf-8"))
-        if source_bytes > MAX_SNAPSHOT_SOURCE_BYTES:
-            msg = (
-                "Snapshot source exceeds the "
-                f"{MAX_SNAPSHOT_SOURCE_BYTES} byte aggregate limit"
-            )
-            raise ValueError(
-                msg,
-            )
-
-    if not fragments and meta.get("changed_files") != 0:
-        msg = "Snapshot contains no source fragments"
-        raise ValueError(msg)
-    meta["source_bytes"] = source_bytes
-    warnings = list(snapshot.get("warnings", []))
-    return meta, fragments, source_bytes, warnings
+    meta: dict
+    fragments: list[dict]
+    fragments_by_id: dict[str, dict]
+    symbols_by_side: dict[str, list[dict]]
+    imports_by_side: dict[str, dict[str, list[dict]]]
+    coverage_index: dict[tuple[str, str], FileCoverage]
+    notes: list[str]
+    warnings: list[str]
 
 
 def _validate_fragment_range(
-    fragment: dict,
+    fragment: SourceFragment,
     occupied_ranges: dict[tuple[str, str], list[tuple[int, int]]],
-) -> tuple[str, str, str, int, int]:
-    """
-    Validate one fragment's identity and ensure its source range is unique.
+) -> None:
+    """Reject overlapping source excerpts after field validation.
 
     Args:
-        fragment: Source fragment being indexed.
-        occupied_ranges: Previously accepted ranges keyed by side and path.
-
-    Returns:
-        Fragment side, path, text, starting line, and ending line.
+        fragment: Source with validated types and a positive original offset.
+        occupied_ranges: Prior ranges indexed by revision and path.
 
     Raises:
-        ValueError: If side, path, text, start line, or overlap is invalid.
+        ValueError: If nonempty source overlaps an earlier fragment.
     """
-    side = fragment.get("side")
-    path = fragment.get("path")
-    text = fragment.get("text")
-    start_line = fragment.get("start_line", 1)
-    if side not in {"base", "head"}:
-        msg = "Fragment side must be base or head"
-        raise ValueError(msg)
-    if not isinstance(text, str) or not isinstance(path, str):
-        msg = "Fragment path/text must be strings"
-        raise ValueError(msg)
-    if not isinstance(start_line, int) or start_line < 1:
-        msg = "start_line must be a positive integer"
-        raise ValueError(msg)
-
-    end_line = start_line + max(0, len(text.splitlines()) - 1)
-    fragment_key = (side, path)
+    if not fragment.text:
+        return
+    end = fragment.start_line + len(fragment.text.splitlines()) - 1
+    key = (fragment.side, fragment.path)
     overlaps = any(
-        text and max(start_line, occupied_start) <= min(end_line, occupied_end)
-        for occupied_start, occupied_end in occupied_ranges[fragment_key]
+        max(fragment.start_line, start) <= min(end, stop)
+        for start, stop in occupied_ranges[key]
     )
     if overlaps:
-        msg = f"Overlapping source fragments: {path} ({side})"
-        raise ValueError(msg)
-    if text:
-        occupied_ranges[fragment_key].append((start_line, end_line))
-    return side, path, text, start_line, end_line
-
-
-def _index_snapshot_fragments(
-    fragments: Sequence[dict],
-    meta: dict,
-    warnings: list[str],
-) -> tuple[
-    dict[str, dict],
-    dict[str, list[dict]],
-    dict[str, defaultdict[str, list[dict]]],
-    list[str],
-]:
-    """
-    Build symbol, import, and fragment indexes from validated snapshot input.
-
-    Args:
-        fragments: Source fragments whose types and byte sizes are valid.
-        meta: Snapshot revision metadata for source-link construction.
-        warnings: Mutable list of previously collected snapshot warnings.
-
-    Returns:
-        Fragments by ID, symbols by revision side, imports by side and path,
-        and parse warnings.
-    """
-    symbols_by_side = {"base": [], "head": []}
-    imports_by_side = {
-        "base": defaultdict(list),
-        "head": defaultdict(list),
-    }
-    fragments_by_id = {}
-    occupied_ranges = defaultdict(list)
-
-    for index, original_fragment in enumerate(fragments):
-        side, path, _, start_line, _ = _validate_fragment_range(
-            original_fragment,
-            occupied_ranges,
+        msg = (
+            f"Overlapping source fragments: {fragment.path} ({fragment.side})"
         )
-
-        fragment = dict(original_fragment)
-        fragment["id"] = stable_id(side, path, start_line, index)
-        fragments_by_id[fragment["id"]] = fragment
-
-        symbols, imports, parse_note = extract(fragment, meta)
-        symbols_by_side[side].extend(symbols)
-        imports_by_side[side][path].extend(imports)
-        if parse_note:
-            warnings.append(f"{path} ({side}): {parse_note}")
-
-    return (
-        fragments_by_id,
-        symbols_by_side,
-        imports_by_side,
-        warnings,
-    )
+        raise ValueError(msg)
+    occupied_ranges[key].append((fragment.start_line, end))
 
 
-def _prepare_snapshot(
-    snapshot: dict,
-) -> tuple[
-    dict,
-    Sequence[dict],
-    Mapping[str, dict],
-    Mapping[str, Sequence[dict]],
-    Mapping[str, Mapping[str, Sequence[dict]]],
-    Sequence[str],
-]:
-    """
-    Validate and index snapshot fragments for analysis.
+def _prepare_snapshot(snapshot: dict) -> PreparedSnapshot:
+    """Validate, parse, and index a source snapshot without executing it.
 
     Args:
-        snapshot: ``diffstory.snapshot.v1`` mapping to prepare.
+        snapshot: Untrusted v1 snapshot mapping.
 
     Returns:
-        Metadata with the aggregate source size, original fragments, indexed
-        fragments, symbols and imports grouped by revision side, and warnings.
+        Named source indexes with validated file coverage and parse outcomes.
 
     Raises:
-        ValueError: If snapshot fields, fragment ranges, or source limits are
-            invalid.
+        ValueError: If fields, source limits, ranges, or file claims are invalid.
     """
-    meta, fragments, _, warnings = _validate_snapshot_input(snapshot)
-    (
-        fragments_by_id,
-        symbols_by_side,
-        imports_by_side,
-        warnings,
-    ) = _index_snapshot_fragments(fragments, meta, warnings)
-    return (
-        meta,
-        fragments,
-        fragments_by_id,
-        symbols_by_side,
-        imports_by_side,
-        warnings,
+    source = SnapshotInput.model_validate(snapshot)
+    fragments = [
+        item.model_dump(exclude_unset=True) for item in source.fragments
+    ]
+    symbols = {"base": [], "head": []}
+    imports = {"base": defaultdict(list), "head": defaultdict(list)}
+    indexed = {}
+    parse_statuses = {}
+    notes = []
+    warnings = list(source.warnings)
+    occupied_ranges = defaultdict(list)
+    for index, (item, original) in enumerate(
+        zip(source.fragments, fragments, strict=True)
+    ):
+        _validate_fragment_range(item, occupied_ranges)
+        fragment = dict(original)
+        fragment_id = stable_id(item.side, item.path, item.start_line, index)
+        fragment["id"] = fragment_id
+        indexed[fragment_id] = fragment
+        extracted = extract(fragment, source.meta)
+        symbols[item.side].extend(extracted.symbols)
+        imports[item.side][item.path].extend(extracted.imports)
+        parse_statuses[fragment_id] = extracted.status
+        if extracted.note:
+            target = notes if extracted.status == "text_only" else warnings
+            target.append(f"{item.path} ({item.side}): {extracted.note}")
+    coverage = build_file_coverage(
+        indexed, parse_statuses, evidence=source.file_evidence
+    )
+    return PreparedSnapshot(
+        meta=source.meta,
+        fragments=fragments,
+        fragments_by_id=indexed,
+        symbols_by_side=symbols,
+        imports_by_side=imports,
+        coverage_index=coverage,
+        notes=notes,
+        warnings=warnings,
     )
 
 
@@ -1562,96 +1505,88 @@ def _append_change(  # noqa: PLR0913  # Each mutable index and evidence input is
     return change
 
 
-def _collect_symbol_changes(  # noqa: PLR0913  # Matching and scope inputs stay explicit.
+class ChangeIndex(StrictModel):
+    """Keep change records with the source and symbol lookups they update.
+
+    Attributes:
+        changes: Classified report change records in collection order.
+        covered_lines: Original source line numbers covered by symbol changes.
+        symbol_to_change: Lookup from parsed symbol IDs to report change IDs.
+    """
+
+    changes: list[dict]
+    covered_lines: dict[str, set[int]]
+    symbol_to_change: dict[str, str]
+
+
+def _collect_symbol_changes(
     matched: Sequence[tuple[dict, dict, str]],
     removed: Sequence[dict],
     added: Sequence[dict],
-    fragments: Sequence[dict],
-    fragments_by_id: Mapping[str, dict],
-    warnings: Sequence[str],
-    meta: Mapping[str, object],
-) -> tuple[list[dict], dict[str, set[int]], dict[str, str]]:
-    """
-    Classify matched and unmatched symbols into report changes.
+    source: PreparedSnapshot,
+) -> ChangeIndex:
+    """Classify symbol pairs and evaluate unmatched definitions by file.
 
     Args:
-        matched: Matched base/head symbol pairs and their identity evidence.
+        matched: Matched source pairs and their identity evidence.
         removed: Unmatched base symbols.
         added: Unmatched head symbols.
-        fragments: Original snapshot fragments used to determine excerpt scope.
-        fragments_by_id: Snapshot fragments indexed by stable fragment ID.
-        warnings: Snapshot and parse warnings that make identity incomplete.
-        meta: Snapshot metadata used to determine source scope.
+        source: Validated file coverage and all parsed declarations.
 
     Returns:
-        Change records, covered source lines by fragment, and the symbol-to-change
-        lookup.
-
+        Changes with their source-line and symbol indexes.
     """
-    changes = []
-    covered_lines = {fragment_id: set() for fragment_id in fragments_by_id}
-    symbol_to_change = {}
-    is_excerpt = (
-        meta.get("scope") == "selected excerpts"
-        or any(
-            fragment.get("scope", "full") != "full" for fragment in fragments
-        )
-        or bool(warnings)
+    result = ChangeIndex(
+        changes=[],
+        covered_lines={
+            fragment_id: set() for fragment_id in source.fragments_by_id
+        },
+        symbol_to_change={},
     )
-
-    for before_symbol, after_symbol, basis in matched:
-        unchanged_location = (
-            before_symbol["path"] == after_symbol["path"]
-            and before_symbol["source"] == after_symbol["source"]
-        )
-        if unchanged_location:
+    for before, after, basis in matched:
+        if (
+            before["path"] == after["path"]
+            and before["source"] == after["source"]
+        ):
             continue
         _append_change(
-            changes,
-            covered_lines,
-            symbol_to_change,
-            before_symbol,
-            after_symbol,
-            classify(before_symbol, after_symbol),
+            result.changes,
+            result.covered_lines,
+            result.symbol_to_change,
+            before,
+            after,
+            classify(before, after),
             basis,
         )
-
-    unmatched_basis = (
-        "Unmatched in the supplied source set; "
-        "not a repository-wide identity proof."
-    )
-    for symbol in removed:
-        kind = (
-            "observed_base"
-            if is_excerpt and not symbol.get("known_removed")
-            else "removed"
-        )
-        _append_change(
-            changes,
-            covered_lines,
-            symbol_to_change,
-            symbol,
-            None,
-            kind,
-            unmatched_basis,
-        )
-    for symbol in added:
-        kind = (
-            "observed_head"
-            if is_excerpt and not symbol.get("known_added")
-            else "added"
-        )
-        _append_change(
-            changes,
-            covered_lines,
-            symbol_to_change,
-            None,
-            symbol,
-            kind,
-            unmatched_basis,
-        )
-
-    return changes, covered_lines, symbol_to_change
+    declarations = {
+        side: {
+            (item["path"], item["name"], item["node_type"]) for item in symbols
+        }
+        for side, symbols in source.symbols_by_side.items()
+    }
+    for side, unmatched in (("base", removed), ("head", added)):
+        opposite = "head" if side == "base" else "base"
+        for symbol in unmatched:
+            own = source.coverage_index[(side, symbol["path"])]
+            other_path = own.counterpart_path
+            counterpart = source.coverage_index[(opposite, other_path)]
+            declaration_key = (other_path, symbol["name"], symbol["node_type"])
+            evidence = DefinitionEvidence(
+                side=side,
+                own=own,
+                counterpart=counterpart,
+                declaration_remains=declaration_key in declarations[opposite],
+            )
+            _append_change(
+                result.changes,
+                result.covered_lines,
+                result.symbol_to_change,
+                symbol if side == "base" else None,
+                symbol if side == "head" else None,
+                evidence.kind,
+                evidence.basis(symbol["name"]),
+            )
+    return result
 
 
 def _context_symbol(
@@ -1844,7 +1779,9 @@ def _collect_raw_changes(
     """
     fragments_by_region = defaultdict(dict)
     for fragment in fragments_by_id.values():
-        region = fragment.get("region", fragment["path"])
+        region = fragment.get(
+            "_raw_region", fragment.get("region", fragment["path"])
+        )
         fragments_by_region[region][fragment["side"]] = fragment
 
     raw_changes = []
@@ -2341,33 +2278,20 @@ def compile_snapshot(snapshot: dict) -> dict:
             fragment ranges are invalid.
 
     """
-    (
-        meta,
-        fragments,
-        fragments_by_id,
-        symbols_by_side,
-        imports_by_side,
-        warnings,
-    ) = _prepare_snapshot(snapshot)
+    source = _prepare_snapshot(snapshot)
     matched, removed, added = match_symbols(
-        symbols_by_side["base"],
-        symbols_by_side["head"],
+        source.symbols_by_side["base"],
+        source.symbols_by_side["head"],
     )
-    changes, covered_lines, symbol_to_change = _collect_symbol_changes(
-        matched,
-        removed,
-        added,
-        fragments,
-        fragments_by_id,
-        warnings,
-        meta,
-    )
+    change_index = _collect_symbol_changes(matched, removed, added, source)
+    changes = change_index.changes
+    symbol_to_change = change_index.symbol_to_change
     raw_changes = _collect_raw_changes(
-        fragments_by_id,
-        covered_lines,
+        source.fragments_by_id,
+        change_index.covered_lines,
         changes,
         symbol_to_change,
-        meta,
+        source.meta,
     )
 
     groups, group_by_change, changes_by_id = _create_groups(changes)
@@ -2381,10 +2305,10 @@ def compile_snapshot(snapshot: dict) -> dict:
         _DependencyContext(
             groups=groups,
             group_by_change=group_by_change,
-            symbols_by_side=symbols_by_side,
-            imports_by_side=imports_by_side,
+            symbols_by_side=source.symbols_by_side,
+            imports_by_side=source.imports_by_side,
             symbol_to_change=symbol_to_change,
-            meta=meta,
+            meta=source.meta,
         ),
     )
     ordered_groups, cycles = _order_groups(
@@ -2393,7 +2317,7 @@ def compile_snapshot(snapshot: dict) -> dict:
         symbol_edges,
         symbol_to_change,
         changes_by_id,
-        imports_by_side,
+        source.imports_by_side,
     )
 
     kind_counts = Counter(change["kind"] for change in changes)
@@ -2409,7 +2333,9 @@ def compile_snapshot(snapshot: dict) -> dict:
         "units": len(changes),
         "by_kind": dict(kind_counts),
         "identical_ast_moves": kind_counts["moved"],
-        "supplied_paths": len({fragment["path"] for fragment in fragments}),
+        "supplied_paths": len(
+            {fragment["path"] for fragment in source.fragments}
+        ),
         "supplied_additions": raw_counts["add"],
         "supplied_deletions": raw_counts["delete"],
         "test_definitions": len(tests),
@@ -2443,7 +2369,7 @@ def compile_snapshot(snapshot: dict) -> dict:
 
     return {
         "schema": SCHEMA,
-        "meta": meta,
+        "meta": source.meta,
         "changes": changes,
         "groups": ordered_groups,
         "edges": group_edges,
@@ -2453,7 +2379,8 @@ def compile_snapshot(snapshot: dict) -> dict:
         "cycles": cycles,
         "unresolved": unresolved,
         "stats": stats,
-        "warnings": list(dict.fromkeys(warnings)),
+        "warnings": list(dict.fromkeys(source.warnings)),
+        "notes": list(dict.fromkeys(source.notes)),
         "method": method,
     }
 
@@ -2565,7 +2492,7 @@ def evidence_packet(report: dict) -> dict:
 
     Returns:
         A source-grounded request mapping with instructions, metadata, groups,
-        changes, tests, and warnings.
+        changes, tests, notes, and warnings.
 
     Side Effects:
         Makes no network call and does not mutate ``report``.
@@ -2573,6 +2500,13 @@ def evidence_packet(report: dict) -> dict:
     """
     instructions = (
         "Write a guided reading narrative grounded only in the supplied source. "
+        "Use ASD-STE100 principles as a strong guide, with roughly 80 to 90 "
+        "percent adherence across the prose. Do not claim formal compliance. "
+        "Prefer clear, simple words, active constructions, and one main idea "
+        "per sentence. Keep terms consistent and technical names exact. Vary "
+        "sentence length and structure for a natural rhythm; do not use a "
+        "repeated sentence template. Make only claims supported by the "
+        "evidence. "
         "Do not change structural classifications or claim tests passed. "
         "Return diffstory.annotations.v1 with base_sha, head_sha, "
         "steps[{group_id,title,intent,why_now,takeaway,invariants,questions,"
@@ -2580,8 +2514,27 @@ def evidence_packet(report: dict) -> dict:
         "When every group has a step, their array order is the reading order; "
         "choose a coherent order that puts prerequisites before dependents "
         "and keeps groups in a reported cycle adjacent. "
-        "Optional document {lead,closing} supplies the opening and closing "
-        "paragraphs. "
+        "Optional document {preamble,lead,closing} supplies document prose. "
+        "Preamble remains a string. When present, it introduces the whole "
+        "change before any code tour. State the supplied goal only when it is "
+        "known. Explain how the conceptual areas fit, then give the supplied "
+        "reading path. Use about 200 to 450 words when the evidence supports "
+        "that length; use less for a small change and do not pad. Keep it to "
+        "roughly one page and under 4,000 characters. Separate paragraphs "
+        "with a blank line. Do not name real files, paths, functions, "
+        "identifiers, commands, or source lines. Do not tour files, explain "
+        "implementation steps, or claim unverified tests. Choose the smallest "
+        "useful conceptual view: pseudocode, a system architecture sketch, or "
+        "a decision flow chart. For a multi-part change, include at least "
+        "one compact sketch when the evidence supports one. Do not force a "
+        "sketch when it adds no clarity, and do not stack views. Put a sketch "
+        "near its supporting paragraph. Use a fenced plain-text block marked "
+        "text; do not use Mermaid. For a two-path decision flow chart, write "
+        "exactly three lines: a short decision label, then "
+        "├─ condition → outcome and └─ condition → outcome. The reader draws "
+        "a decision node, arrows, and outcome boxes. Other text shapes stay "
+        "monospaced. Use abstract role labels, not "
+        "source identifiers or implementation details. "
         "Each passage alternates plain prose with the referenced code. "
         "In every prose field, wrap code identifiers (including one-letter "
         "variables), paths, filenames, branch names, commands, API names, and "
@@ -2605,6 +2558,7 @@ def evidence_packet(report: dict) -> dict:
         "changes": report["changes"],
         "tests": report["tests"],
         "warnings": report["warnings"],
+        "notes": report["notes"],
     }
 
 
@@ -2742,65 +2696,6 @@ def _validate_cycle_adjacency(
         cycle_positions = [position[group_id] for group_id in cycle]
         if max(cycle_positions) - min(cycle_positions) + 1 != len(cycle):
             msg = "Groups in a dependency cycle must stay adjacent"
-            raise ValueError(msg)
-
-
-def _validate_generation_usage(usage: dict) -> None:
-    """
-    Validate measured or legacy provider-usage metadata without applying caps.
-
-    Args:
-        usage: Token totals and call counts persisted with generated prose.
-
-    Raises:
-        ValueError: If fields, token counts, cached counts, call counts, or an
-            optional legacy elapsed time are invalid.
-
-    """
-    legacy_fields = {
-        "input_tokens",
-        "output_tokens",
-        "calls",
-        "elapsed_seconds",
-    }
-    measured_fields = {
-        "input_tokens",
-        "cached_input_tokens",
-        "output_tokens",
-        "calls",
-        "unreported_calls",
-    }
-    if not isinstance(usage, dict) or frozenset(usage) not in {
-        frozenset(legacy_fields),
-        frozenset(measured_fields),
-    }:
-        msg = "Invalid generated narration usage"
-        raise ValueError(msg)
-
-    for field in ("input_tokens", "output_tokens", "calls"):
-        if type(usage[field]) is not int or usage[field] < 0:
-            msg = "Invalid generated narration usage"
-            raise ValueError(msg)
-
-    cached_input_tokens = usage.get("cached_input_tokens", 0)
-    unreported_calls = usage.get("unreported_calls", 0)
-    if (
-        type(cached_input_tokens) is not int
-        or not 0 <= cached_input_tokens <= usage["input_tokens"]
-        or type(unreported_calls) is not int
-        or not 0 <= unreported_calls <= usage["calls"]
-    ):
-        msg = "Invalid generated narration usage"
-        raise ValueError(msg)
-
-    if "elapsed_seconds" in usage:
-        elapsed_seconds = usage["elapsed_seconds"]
-        if (
-            isinstance(elapsed_seconds, bool)
-            or not isinstance(elapsed_seconds, (int, float))
-            or elapsed_seconds < 0
-        ):
-            msg = "Invalid generated narration elapsed time"
             raise ValueError(msg)
 
 
@@ -2988,10 +2883,10 @@ def validate_generation(report: dict, generation: dict) -> None:
         "chunk_coverage",
         "errors",
     }
-    if not isinstance(generation, dict) or frozenset(generation) not in {
-        frozenset(required_fields),
-        frozenset(required_fields | {"limits"}),
-    }:
+    if (
+        not isinstance(generation, dict)
+        or generation.keys() != required_fields
+    ):
         msg = "Invalid generated narration manifest"
         raise ValueError(msg)
 
@@ -3045,9 +2940,7 @@ def validate_generation(report: dict, generation: dict) -> None:
         msg = "Generated narration does not cover every report change"
         raise ValueError(msg)
 
-    # Older annotations may contain a `limits` record. Treat it as historical
-    # metadata; measured provider usage must not be rejected against old caps.
-    _validate_generation_usage(generation.get("usage"))
+    GenerationUsage.model_validate(generation.get("usage"))
 
     groups_by_id = {group["id"]: group for group in report.get("groups", [])}
     changes_by_id = {
@@ -3079,14 +2972,7 @@ def validate_generated_report(report: dict) -> None:
     """
     generation = report.get("generation")
     validate_generation(report, generation)
-    document = report.get("document")
-    required_document_fields = ("lead", "closing")
-    if not isinstance(document, dict) or any(
-        not isinstance(document.get(field), str) or not document[field].strip()
-        for field in required_document_fields
-    ):
-        msg = "Generated report is missing its document narration"
-        raise ValueError(msg)
+    validate_document(report.get("document"), generated=True)
     changes = {change["id"]: change for change in report["changes"]}
     for group in report["groups"]:
         narrative = group.get("narrative", {})
@@ -3126,39 +3012,20 @@ def _apply_document_annotations(
     Validate and copy document-level narration into a report.
 
     Args:
-        annotations: Annotation document containing optional lead and closing.
+        annotations: Annotation document containing optional preamble, lead,
+            and closing fields.
         result: Deep-copied report being annotated.
         generated: Whether the annotation source is a model provider.
 
     Raises:
         ValueError: If document fields are invalid or generated narration omits
-            its required opening or closing.
+            its required preamble, opening, or closing.
     """
-    if "document" in annotations:
-        document = annotations["document"]
-        allowed_fields = {"lead", "closing"}
-        if not isinstance(document, dict) or any(
-            field not in allowed_fields for field in document
-        ):
-            msg = "Invalid document narrative"
-            raise ValueError(msg)
-        if any(
-            not isinstance(value, str) or len(value) > MAX_NARRATIVE_TEXT_CHARS
-            for value in document.values()
-        ):
-            msg = "Invalid document narrative text"
-            raise ValueError(msg)
-        result["document"] = copy.deepcopy(document)
-
-    if generated:
-        document = annotations.get("document")
-        if not isinstance(document, dict) or any(
-            not isinstance(document.get(field), str)
-            or not document[field].strip()
-            for field in ("lead", "closing")
-        ):
-            msg = "Generated narration requires a nonempty document opening and closing"
-            raise ValueError(msg)
+    if "document" in annotations or generated:
+        document = validate_document(
+            annotations.get("document"), generated=generated
+        )
+        result["document"] = document.model_dump(exclude_unset=True)
 
 
 def _step_evidence_ids(

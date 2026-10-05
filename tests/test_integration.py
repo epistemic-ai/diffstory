@@ -9,19 +9,21 @@ import subprocess
 import tempfile
 import unittest
 from collections.abc import Callable
+from collections.abc import Sequence
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock
 from unittest.mock import patch
 
-from diffstory.analysis import MAX_SNAPSHOT_SOURCE_BYTES
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.cli import main
+from diffstory.ingest import MAX_FILE
 from diffstory.ingest import _github_token
 from diffstory.ingest import from_git
 from diffstory.ingest import from_github
+from diffstory.models import MAX_SNAPSHOT_SOURCE_BYTES
 
 
 class GitIntegrationTests(unittest.TestCase):
@@ -96,6 +98,16 @@ class GitIntegrationTests(unittest.TestCase):
         self.assertEqual(
             compile_snapshot(s)["stats"]["identical_ast_moves"], 1
         )
+        evidence = {
+            record["base"]["path"]: record for record in s["file_evidence"]
+        }
+        self.assertEqual(evidence["new.py"]["base"]["state"], "absent")
+        self.assertEqual(
+            evidence["new.py"]["head"],
+            {"path": "new.py", "state": "supplied", "coverage": "full"},
+        )
+        self.assertEqual(evidence["old.py"]["head"]["state"], "absent")
+        self.assertEqual(evidence["caller.py"]["base"]["coverage"], "full")
 
     def test_cli_roundtrip(self) -> None:
         """Write HTML and snapshot outputs, then export revision-bound evidence."""
@@ -140,6 +152,54 @@ class GitIntegrationTests(unittest.TestCase):
         r = compile_snapshot(s)
         self.assertEqual(r["stats"]["units"], 0)
 
+    def test_git_empty_file_is_supplied(self) -> None:
+        """A zero-byte Git blob is a full supplied file, not an unavailable read."""
+        (self.root / "empty.txt").write_bytes(b"")
+        self.git("add", ".")
+        self.git("commit", "-qm", "empty source")
+        snapshot = from_git(str(self.root), self.head, "HEAD")
+        record = next(
+            item
+            for item in snapshot["file_evidence"]
+            if item["head"]["path"] == "empty.txt"
+        )
+        self.assertEqual(record["base"]["state"], "absent")
+        self.assertEqual(
+            record["head"],
+            {"path": "empty.txt", "state": "supplied", "coverage": "full"},
+        )
+        self.assertEqual(
+            next(f for f in snapshot["fragments"] if f["path"] == "empty.txt")[
+                "text"
+            ],
+            "",
+        )
+
+    def test_git_skip_reason_is_structured(self) -> None:
+        """Git skip branches must set the reason at the branch that detects them."""
+        rows = [
+            ("binary", "binary.py", b"\0binary", "binary_or_non_utf8"),
+            ("size limit", "large.py", b"x" * (MAX_FILE + 1), "size_limit"),
+            ("unsupported object", "linked.py", None, "unsupported_object"),
+        ]
+        for name, path, content, expected_reason in rows:
+            with self.subTest(case=name):
+                target = self.root / path
+                if content is None:
+                    target.symlink_to("missing-target.py")
+                else:
+                    target.write_bytes(content)
+                self.git("add", path)
+                self.git("commit", "-qm", f"add {name}")
+                snapshot = from_git(str(self.root), self.head, "HEAD")
+                record = next(
+                    item
+                    for item in snapshot["file_evidence"]
+                    if item["head"]["path"] == path
+                )
+                self.assertEqual(record["head"]["state"], "unavailable")
+                self.assertEqual(record["head"]["reason"], expected_reason)
+
     def test_file_limit_refuses_partial(self) -> None:
         """Reject a changed-file count above the configured limit."""
         with self.assertRaisesRegex(ValueError, "exceeds"):
@@ -169,6 +229,13 @@ class GitIntegrationTests(unittest.TestCase):
         self.git("commit", "-qm", "binary")
         s = from_git(str(self.root), self.head, "HEAD")
         r = compile_snapshot(s)
+        record = next(
+            item
+            for item in s["file_evidence"]
+            if item["head"]["path"] == "new.py"
+        )
+        self.assertEqual(record["head"]["state"], "unavailable")
+        self.assertEqual(record["head"]["reason"], "binary_or_non_utf8")
         self.assertTrue(r["warnings"])
         self.assertTrue(
             any(c["kind"] == "observed_base" for c in r["changes"])
@@ -242,12 +309,15 @@ class GitHubAuthTests(unittest.TestCase):
 class GitHubTransportTests(unittest.TestCase):
     """These verify transport behavior against fake responses, not a live API."""
 
-    def fake(
+    def fake(  # noqa: PLR0913  # Each API fixture endpoint has an explicit input.
         self,
         n: int = 1,
         *,
         changed_mid_read: bool = False,
         returned: int | None = None,
+        file_records: Sequence[dict] | None = None,
+        content_response: dict | None = None,
+        blob_response: dict | None = None,
     ) -> tuple[Callable[..., object], list[str]]:
         """
         Build a deterministic fake GitHub API response handler.
@@ -256,6 +326,9 @@ class GitHubTransportTests(unittest.TestCase):
             n: Number of changed files advertised by the pull request.
             changed_mid_read: Change the head revision on a repeated PR read when true.
             returned: Optional number of file records actually returned.
+            file_records: Optional exact changed-file records to return.
+            content_response: Optional contents endpoint response for each path.
+            blob_response: Optional blob endpoint response.
 
         Returns:
             A fake ``get`` callable and the list of requested API paths.
@@ -264,7 +337,7 @@ class GitHubTransportTests(unittest.TestCase):
         pr = {
             "base": {"sha": "a" * 40},
             "head": {"sha": "b" * 40, "repo": {"full_name": "org/repo"}},
-            "changed_files": n,
+            "changed_files": n if file_records is None else len(file_records),
             "title": "Example",
             "html_url": "https://github.com/org/repo/pull/1",
             "body": "No tests run.",
@@ -300,18 +373,38 @@ class GitHubTransportTests(unittest.TestCase):
                 return {"merge_base_commit": {"sha": "d" * 40}}
             if "/files?" in path:
                 page = int(path.rsplit("page=", 1)[-1])
-                amount = n if returned is None else returned
-                return [
-                    {"filename": f"f{i}.py", "status": "added"}
-                    for i in range((page - 1) * 100, min(page * 100, amount))
-                ]
+                records = (
+                    file_records
+                    if file_records is not None
+                    else [
+                        {"filename": f"f{i}.py", "status": "added"}
+                        for i in range(n)
+                    ]
+                )
+                amount = len(records) if returned is None else returned
+                return list(
+                    records[(page - 1) * 100 : min(page * 100, amount)]
+                )
             if "/contents/" in path:
-                return {
-                    "type": "file",
-                    "size": 4,
-                    "encoding": "base64",
-                    "content": base64.b64encode(b"x=1\n").decode(),
-                }
+                return (
+                    copy.deepcopy(content_response)
+                    if content_response is not None
+                    else {
+                        "type": "file",
+                        "size": 4,
+                        "encoding": "base64",
+                        "content": base64.b64encode(b"x=1\n").decode(),
+                    }
+                )
+            if "/git/blobs/" in path:
+                return (
+                    copy.deepcopy(blob_response)
+                    if blob_response is not None
+                    else {
+                        "encoding": "base64",
+                        "content": base64.b64encode(b"x=1\n").decode(),
+                    }
+                )
             raise AssertionError(path)
 
         return get, paths
@@ -323,6 +416,159 @@ class GitHubTransportTests(unittest.TestCase):
             s = from_github("org/repo#1")
         self.assertEqual(s["meta"]["base_sha"], "d" * 40)
         self.assertEqual(s["meta"]["requested_base_sha"], "a" * 40)
+
+    def test_ingest_maps_github_file_status_to_evidence(self) -> None:
+        """Each file status must keep its base and head evidence paths."""
+        rows = [
+            (
+                "added",
+                {"filename": "new.py", "status": "added"},
+                {"base": ("new.py", "absent"), "head": ("new.py", "supplied")},
+            ),
+            (
+                "removed",
+                {"filename": "old.py", "status": "removed"},
+                {"base": ("old.py", "supplied"), "head": ("old.py", "absent")},
+            ),
+            (
+                "renamed",
+                {
+                    "filename": "new.py",
+                    "previous_filename": "old.py",
+                    "status": "renamed",
+                },
+                {
+                    "base": ("old.py", "supplied"),
+                    "head": ("new.py", "supplied"),
+                },
+            ),
+            (
+                "copied",
+                {
+                    "filename": "copy.py",
+                    "previous_filename": "original.py",
+                    "status": "copied",
+                },
+                {
+                    "base": ("original.py", "supplied"),
+                    "head": ("copy.py", "supplied"),
+                },
+            ),
+        ]
+        for name, file_info, expected in rows:
+            with self.subTest(status=name):
+                fake, paths = self.fake(file_records=(file_info,))
+                with patch("diffstory.ingest.GitHubClient.get", new=fake):
+                    snapshot = from_github("org/repo#1")
+                record = snapshot["file_evidence"][0]
+                for side_name, (path, state) in expected.items():
+                    self.assertEqual(record[side_name]["path"], path)
+                    self.assertEqual(record[side_name]["state"], state)
+                    if state == "supplied":
+                        self.assertEqual(record[side_name]["coverage"], "full")
+                if name in {"renamed", "copied"}:
+                    self.assertTrue(
+                        any(
+                            "/contents/" + expected["base"][0] in p
+                            for p in paths
+                        )
+                    )
+                    self.assertTrue(
+                        any(
+                            "/contents/" + expected["head"][0] in p
+                            for p in paths
+                        )
+                    )
+
+    def test_github_rename_requires_previous_path(self) -> None:
+        """A copy or rename without its old path must fail without guessing."""
+        for status in ("renamed", "copied"):
+            with self.subTest(status=status):
+                fake, _ = self.fake(
+                    file_records=({"filename": "new.py", "status": status},),
+                )
+                with (
+                    patch("diffstory.ingest.GitHubClient.get", new=fake),
+                    self.assertRaisesRegex(ValueError, "previous_filename"),
+                ):
+                    from_github("org/repo#1")
+
+    def test_github_skip_reason_is_structured(self) -> None:
+        """Each nonfatal GitHub read skip must keep its reason separate from warning text."""
+        rows = [
+            (
+                "unsupported object",
+                {"type": "symlink", "size": 4},
+                None,
+                "unsupported_object",
+            ),
+            (
+                "invalid size",
+                {"type": "file", "size": -1},
+                None,
+                "invalid_content_size",
+            ),
+            (
+                "size limit",
+                {"type": "file", "size": 8_000_001},
+                None,
+                "size_limit",
+            ),
+            (
+                "binary source",
+                {
+                    "type": "file",
+                    "size": 1,
+                    "encoding": "base64",
+                    "content": base64.b64encode(b"\0").decode(),
+                },
+                None,
+                "binary_or_non_utf8",
+            ),
+            (
+                "unsupported encoding",
+                {
+                    "type": "file",
+                    "size": 4,
+                    "encoding": "utf-8",
+                    "sha": "blob",
+                },
+                {"encoding": "utf-8", "content": ""},
+                "unsupported_encoding",
+            ),
+        ]
+        for name, content, blob, expected_reason in rows:
+            with self.subTest(reason=name):
+                fake, _ = self.fake(
+                    file_records=[{"filename": "new.py", "status": "added"}],
+                    content_response=content,
+                    blob_response=blob,
+                )
+                with patch("diffstory.ingest.GitHubClient.get", new=fake):
+                    snapshot = from_github("org/repo#1")
+                side = snapshot["file_evidence"][0]["head"]
+                self.assertEqual(side["state"], "unavailable")
+                self.assertEqual(side["reason"], expected_reason)
+
+    def test_github_empty_source_is_full(self) -> None:
+        """A successfully decoded zero-byte response is supplied full source."""
+        content = {
+            "type": "file",
+            "size": 0,
+            "encoding": "base64",
+            "content": "",
+        }
+        fake, _ = self.fake(
+            file_records=[{"filename": "empty.py", "status": "added"}],
+            content_response=content,
+        )
+        with patch("diffstory.ingest.GitHubClient.get", new=fake):
+            snapshot = from_github("org/repo#1")
+        self.assertEqual(
+            snapshot["file_evidence"][0]["head"],
+            {"path": "empty.py", "state": "supplied", "coverage": "full"},
+        )
+        self.assertEqual(snapshot["fragments"][0]["text"], "")
 
     def test_fork_metadata_and_fetch_paths(self) -> None:
         """Read head source and build links using the contributor fork repository."""

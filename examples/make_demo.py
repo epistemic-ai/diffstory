@@ -259,6 +259,21 @@ def demo_snapshot() -> dict:
             for side, files in (("base", before), ("head", after))
             for path, code in sorted(files.items())
         ],
+        "file_evidence": [
+            {
+                "base": (
+                    {"path": path, "state": "supplied", "coverage": "full"}
+                    if path in before
+                    else {"path": path, "state": "absent"}
+                ),
+                "head": (
+                    {"path": path, "state": "supplied", "coverage": "full"}
+                    if path in after
+                    else {"path": path, "state": "absent"}
+                ),
+            }
+            for path in sorted(before.keys() | after.keys())
+        ],
         "warnings": [],
     }
 

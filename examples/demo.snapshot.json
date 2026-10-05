@@ -84,5 +84,97 @@
       "scope": "full"
     }
   ],
+  "file_evidence": [
+    {
+      "base": {
+        "path": "catalog/labels.py",
+        "state": "absent"
+      },
+      "head": {
+        "path": "catalog/labels.py",
+        "state": "supplied",
+        "coverage": "full"
+      }
+    },
+    {
+      "base": {
+        "path": "catalog/merge.py",
+        "state": "absent"
+      },
+      "head": {
+        "path": "catalog/merge.py",
+        "state": "supplied",
+        "coverage": "full"
+      }
+    },
+    {
+      "base": {
+        "path": "catalog/parsing.py",
+        "state": "absent"
+      },
+      "head": {
+        "path": "catalog/parsing.py",
+        "state": "supplied",
+        "coverage": "full"
+      }
+    },
+    {
+      "base": {
+        "path": "catalog/query.py",
+        "state": "absent"
+      },
+      "head": {
+        "path": "catalog/query.py",
+        "state": "supplied",
+        "coverage": "full"
+      }
+    },
+    {
+      "base": {
+        "path": "catalog/search.py",
+        "state": "supplied",
+        "coverage": "full"
+      },
+      "head": {
+        "path": "catalog/search.py",
+        "state": "supplied",
+        "coverage": "full"
+      }
+    },
+    {
+      "base": {
+        "path": "tests/test_parsing.py",
+        "state": "absent"
+      },
+      "head": {
+        "path": "tests/test_parsing.py",
+        "state": "supplied",
+        "coverage": "full"
+      }
+    },
+    {
+      "base": {
+        "path": "tests/test_query.py",
+        "state": "absent"
+      },
+      "head": {
+        "path": "tests/test_query.py",
+        "state": "supplied",
+        "coverage": "full"
+      }
+    },
+    {
+      "base": {
+        "path": "tools/export.py",
+        "state": "supplied",
+        "coverage": "full"
+      },
+      "head": {
+        "path": "tools/export.py",
+        "state": "supplied",
+        "coverage": "full"
+      }
+    }
+  ],
   "warnings": []
 }

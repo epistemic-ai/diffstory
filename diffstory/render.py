@@ -9,8 +9,8 @@ from pathlib import Path
 from .analysis import SCHEMA
 from .analysis import validate_generated_report
 from .analysis import validate_passages
+from .models import validate_document
 
-MAX_NARRATIVE_TEXT_CHARS = 6_000
 REPORT_IDENTIFIER = re.compile(r"[a-f0-9]{16}")
 NUMERIC_REPORT_FIELDS = frozenset(
     {
@@ -72,14 +72,14 @@ def _validate_nested_value(value: object) -> None:
 
 
 def _validate_report_collections(report: dict) -> None:
-    """Require report collection fields to contain mapping records.
+    """Validate object collections and string-list report fields.
 
     Args:
         report: Parsed Diffstory report mapping.
 
     Raises:
-        ValueError: If a collection is absent, not a list, or contains a
-            non-object record.
+        ValueError: If an object collection contains a non-object, or warnings
+            and notes are not lists of strings.
     """
     for name in (
         "groups",
@@ -87,7 +87,6 @@ def _validate_report_collections(report: dict) -> None:
         "tests",
         "edges",
         "raw_files",
-        "warnings",
     ):
         records = report.get(name)
         if not isinstance(records, list) or any(
@@ -95,6 +94,18 @@ def _validate_report_collections(report: dict) -> None:
         ):
             msg = f"Report {name} must be a list of objects"
             raise ValueError(msg)
+    warnings = report.get("warnings")
+    if not isinstance(warnings, list) or any(
+        not isinstance(value, str) for value in warnings
+    ):
+        msg = "Report warnings must be a list of strings"
+        raise ValueError(msg)
+    notes = report.get("notes")
+    if not isinstance(notes, list) or any(
+        not isinstance(value, str) for value in notes
+    ):
+        msg = "Report notes must be a list of strings"
+        raise ValueError(msg)
 
 
 def _validate_report_stats(stats: object) -> None:
@@ -188,15 +199,7 @@ def validate_report(report: dict) -> None:
         raise ValueError(msg)
     changes_by_id = {c["id"]: c for c in report["changes"]}
     if "document" in report:
-        d = report["document"]
-        if not isinstance(d, dict) or any(
-            k not in {"lead", "closing"}
-            or not isinstance(v, str)
-            or len(v) > MAX_NARRATIVE_TEXT_CHARS
-            for k, v in d.items()
-        ):
-            msg = "Invalid document narrative"
-            raise ValueError(msg)
+        validate_document(report["document"])
     _validate_group_links(report, groups, changes, changes_by_id)
     if "generation" in report:
         validate_generated_report(report)

@@ -6,6 +6,8 @@ import unittest
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.analysis import evidence_packet
+from diffstory.models import MAX_PREAMBLE_CHARS
+from diffstory.models import MAX_PREAMBLE_SKETCH_CHARS
 from diffstory.render import render
 
 
@@ -26,6 +28,28 @@ def report() -> dict:
                 "scope": "full changed files",
                 "changed_files": 2,
             },
+            "file_evidence": [
+                {
+                    "base": {
+                        "path": "query.py",
+                        "state": "unavailable",
+                        "reason": "not_supplied",
+                    },
+                    "head": {
+                        "path": "query.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                },
+                {
+                    "base": {"path": "parse.py", "state": "absent"},
+                    "head": {
+                        "path": "parse.py",
+                        "state": "supplied",
+                        "coverage": "full",
+                    },
+                },
+            ],
             "fragments": [
                 {
                     "path": "query.py",
@@ -96,6 +120,7 @@ class LiterateReaderTests(unittest.TestCase):
             out["groups"][0]["narrative"]["passages"],
             a["steps"][0]["passages"],
         )
+        self.assertNotIn("preamble", out["document"])
         self.assertEqual(out["changes"], r["changes"])
         self.assertEqual(out["stats"], r["stats"])
         self.assertNotIn("document", r)
@@ -188,7 +213,7 @@ class LiterateReaderTests(unittest.TestCase):
             apply_annotations(r, a)
 
     def test_bad_document_rejected(self) -> None:
-        """Reject document fields outside the supported opening and closing contract."""
+        """Reject document fields outside the supported narration contract."""
         r = report()
         a = annotations(r)
         a["document"]["test_runs"] = 100
@@ -211,11 +236,110 @@ class LiterateReaderTests(unittest.TestCase):
         a = annotations(r)
         attack = "</script><script>window.COMPROMISED=true</script>"
         a["document"]["lead"] = attack
+        a["document"]["preamble"] = attack
         a["steps"][0]["passages"][0]["text"] = attack
         h = render(apply_annotations(r, a))
         self.assertNotIn(attack, h)
         self.assertIn("\\u003c/script\\u003e", h)
         self.assertIn("connect-src 'none'", h)
+
+    def test_optional_preamble_is_preserved_and_must_contain_text(
+        self,
+    ) -> None:
+        """Keep an optional authored preamble and reject a blank supplied value."""
+        r = report()
+        a = annotations(r)
+        a["document"]["preamble"] = (
+            "This change joins the report to its source.\n"
+            "Map: report → sections → code."
+        )
+        out = apply_annotations(r, a)
+        self.assertEqual(
+            out["document"]["preamble"], a["document"]["preamble"]
+        )
+        self.assertIn("\\nMap: report", render(out))
+
+        a["document"]["preamble"] = "  "
+        with self.assertRaisesRegex(ValueError, "preamble"):
+            apply_annotations(r, a)
+
+    def test_authored_preamble_limit_applies_to_annotations_and_saved_reports(
+        self,
+    ) -> None:
+        """Reject an authored preamble above its limit at both input boundaries."""
+        source_report = report()
+        for length, valid in (
+            (MAX_PREAMBLE_CHARS, True),
+            (MAX_PREAMBLE_CHARS + 1, False),
+        ):
+            with self.subTest(length=length):
+                preamble = "x" * length
+                candidate = annotations(source_report)
+                candidate["document"]["preamble"] = preamble
+                saved = apply_annotations(
+                    source_report, annotations(source_report)
+                )
+                saved["document"]["preamble"] = preamble
+                if valid:
+                    apply_annotations(source_report, candidate)
+                    render(saved)
+                else:
+                    with self.assertRaises(ValueError):
+                        apply_annotations(source_report, candidate)
+                    with self.assertRaises(ValueError):
+                        render(saved)
+
+    def test_preamble_sketches_have_a_separate_allowance(self) -> None:
+        """Sketches must not consume prose space or bypass the combined sketch cap."""
+        prefix, suffix = "\n```text\n", "\n```"
+        payload_limit = MAX_PREAMBLE_SKETCH_CHARS - len(prefix) - len(suffix)
+        full_sketch = prefix + "y" * payload_limit + suffix
+        half_sketch = prefix + "y" * (payload_limit // 2) + suffix
+        cases = [
+            (
+                "both allowances full",
+                "x" * MAX_PREAMBLE_CHARS + full_sketch,
+                True,
+            ),
+            (
+                "prose over limit",
+                "x" * (MAX_PREAMBLE_CHARS + 1) + prefix + "y" + suffix,
+                False,
+            ),
+            (
+                "sketch over limit",
+                "x" + prefix + "y" * (payload_limit + 1) + suffix,
+                False,
+            ),
+            ("combined sketches over limit", "x" + half_sketch * 2, False),
+            (
+                "unfinished fence is prose",
+                "x" * MAX_PREAMBLE_CHARS + prefix + "y",
+                False,
+            ),
+            (
+                "Windows line endings",
+                "x" * MAX_PREAMBLE_CHARS
+                + (prefix + "y" + suffix).replace("\n", "\r\n"),
+                True,
+            ),
+        ]
+        source_report = report()
+        for name, preamble, accepted in cases:
+            with self.subTest(case=name):
+                candidate = annotations(source_report)
+                candidate["document"]["preamble"] = preamble
+                saved = copy.deepcopy(source_report)
+                saved["document"] = {"preamble": preamble}
+                if accepted:
+                    out = apply_annotations(source_report, candidate)
+                    self.assertEqual(out["document"]["preamble"], preamble)
+                    render(saved)
+                else:
+                    with self.assertRaises(ValueError):
+                        apply_annotations(source_report, candidate)
+                    with self.assertRaises(ValueError):
+                        render(saved)
 
     def test_renderer_validates_loaded_report_passages(self) -> None:
         """Validate persisted passage evidence again when loading a report for rendering."""
@@ -230,6 +354,131 @@ class LiterateReaderTests(unittest.TestCase):
         self.assertIn("passages", i)
         self.assertIn("original line numbers", i)
         self.assertIn("Do not rewrite source", i)
+
+    def test_report_string_lists_render(self) -> None:
+        """Notes and warnings must be present as lists of strings."""
+        compiled = compile_snapshot(
+            {
+                "schema": "diffstory.snapshot.v1",
+                "meta": {"changed_files": 2},
+                "fragments": [
+                    {"path": "README.md", "side": "head", "text": "A note.\n"},
+                    {
+                        "path": "broken.py",
+                        "side": "head",
+                        "text": "def broken(:\n",
+                    },
+                ],
+                "file_evidence": [
+                    {
+                        "base": {"path": path, "state": "absent"},
+                        "head": {
+                            "path": path,
+                            "state": "supplied",
+                            "coverage": "full",
+                        },
+                    }
+                    for path in ("README.md", "broken.py")
+                ],
+                "warnings": ["Incoming source warning."],
+            },
+        )
+        missing_notes = copy.deepcopy(compiled)
+        missing_notes.pop("notes")
+        malformed_warnings = copy.deepcopy(compiled)
+        malformed_warnings["warnings"] = [{"message": "not a string"}]
+        malformed_notes = copy.deepcopy(compiled)
+        malformed_notes["notes"] = [None]
+        rows = [
+            ("valid report", compiled, True),
+            ("missing notes", missing_notes, False),
+            ("object warning", malformed_warnings, False),
+            ("non-string note", malformed_notes, False),
+        ]
+        for name, candidate, valid in rows:
+            with self.subTest(case=name):
+                if valid:
+                    render(candidate)
+                else:
+                    with self.assertRaisesRegex(ValueError, "list of strings"):
+                        render(candidate)
+
+    def test_annotations_preserve_kind_and_basis(self) -> None:
+        """Authored prose must not change the compiler's file status or basis."""
+        source_report = report()
+        before = copy.deepcopy(source_report["changes"])
+        annotated = apply_annotations(
+            source_report, annotations(source_report)
+        )
+        self.assertEqual(annotated["changes"], before)
+        self.assertTrue(
+            all(change["basis"] for change in annotated["changes"])
+        )
+
+    def test_stale_change_ids_are_rejected(self) -> None:
+        """Annotations citing IDs from a corrected kind must fail validation."""
+        source = "def f():\n    return 1\n"
+        unresolved_report = compile_snapshot(
+            {
+                "schema": "diffstory.snapshot.v1",
+                "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+                "file_evidence": [
+                    {
+                        "base": {
+                            "path": "x.py",
+                            "state": "unavailable",
+                            "reason": "not_supplied",
+                        },
+                        "head": {
+                            "path": "x.py",
+                            "state": "supplied",
+                            "coverage": "full",
+                        },
+                    },
+                ],
+                "fragments": [
+                    {
+                        "path": "x.py",
+                        "side": "head",
+                        "text": source,
+                        "start_line": 1,
+                        "scope": "full",
+                    },
+                ],
+            },
+        )
+        new_report = compile_snapshot(
+            {
+                "schema": "diffstory.snapshot.v1",
+                "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40},
+                "fragments": [
+                    {
+                        "path": "x.py",
+                        "side": "head",
+                        "text": source,
+                        "start_line": 1,
+                        "scope": "full",
+                    },
+                ],
+                "file_evidence": [
+                    {
+                        "base": {"path": "x.py", "state": "absent"},
+                        "head": {
+                            "path": "x.py",
+                            "state": "supplied",
+                            "coverage": "full",
+                        },
+                    },
+                ],
+            },
+        )
+        stale_id = unresolved_report["changes"][0]["id"]
+        current = annotations(new_report)
+        current["steps"][0]["evidence_change_ids"] = [stale_id]
+        current["steps"][0]["passages"][0]["change_ids"] = [stale_id]
+        self.assertNotEqual(stale_id, new_report["changes"][0]["id"])
+        with self.assertRaisesRegex(ValueError, "outside its group"):
+            apply_annotations(new_report, current)
 
 
 if __name__ == "__main__":

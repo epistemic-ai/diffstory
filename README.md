@@ -14,23 +14,23 @@ A local-first literate code-review reader by [Epistemic AI](https://www.epistemi
 
 Download or clone this repository and open **`examples/demo.html`** in a browser. Download the HTML first; GitHub's file view does not execute it. No server, account, API key, web fonts, CDN, or internet connection is needed to read it. The example is original synthetic code, not an excerpt from a private repository.
 
-To analyze your own checkout, use Python 3.10+ and Git:
-
-```bash
-python -m diffstory git \
-  --repo /path/to/your/project \
-  --base main --head HEAD \
-  --out walkthrough.html
-```
-
-Or install the CLI from this source checkout:
+To analyze your own checkout, use Python 3.10+ and Git. Install the CLI from this source checkout first:
 
 ```bash
 python -m pip install .
 diffstory --version
 ```
 
-No third-party runtime dependencies. Build and browser-test tools are development-only dependencies.
+Then create a walkthrough:
+
+```bash
+diffstory git \
+  --repo /path/to/your/project \
+  --base main --head HEAD \
+  --out walkthrough.html
+```
+
+Pydantic validates source evidence and narration data. Build and browser-test tools are development-only dependencies.
 
 ## A reading path, not a dashboard
 
@@ -51,6 +51,8 @@ diffstory github 'OWNER/REPO#NUMBER' \
 Replace `OWNER/REPO#NUMBER` with a real PR. For private repositories, Diffstory first uses `GITHUB_TOKEN` (or the variable selected by `--token-env NAME`); if that variable is unset, it reuses the signed-in GitHub CLI account through `gh auth token`. Run `gh auth login` once if needed. Public PRs can be read without credentials, subject to GitHub rate limits. Do not paste tokens into issues, commits, commands saved to a shared history, or reports.
 
 The CLI performs read-only requests, paginates changed files, pins both revisions, and rejects a PR that changes during retrieval. It does not inherit credentials from a chat application. The local Git comparison defaults to **merge-base(base, head) → head**; use `--two-dot` for an endpoint comparison. Uncommitted and untracked work is not included.
+
+Snapshots must include `file_evidence` with an explicit source state for both revisions of each file. The Git and GitHub commands supply these records. Inputs that omit them are rejected.
 
 Every compilation writes standalone HTML plus an adjacent `.report.json`. Binary, oversized, unsupported, or missing source is explicitly reported; it is not silently treated as a complete analysis.
 
@@ -122,6 +124,8 @@ Narration packs bounded evidence chunks to fit the selected model's context and 
 There are no run-wide token, call-count, or elapsed-time ceilings. Each individual provider call has a 15-minute timeout to prevent a stalled request from hanging indefinitely; a run may make as many calls as its source requires.
 
 Successful runs write HTML, `.report.json`, and candidate `.annotations.json` files. Each generated passage is tied to a change ID and checked against its group and source range. The generated report preserves its provider/model, revisions, measured usage, and chunk coverage, and displays a visible **model-generated · unverified** warning. It does not validate whether prose is true.
+
+Generated narration uses ASD-STE100 writing principles as a strong guide while keeping a natural reading rhythm. A required **Before the code** section introduces the whole change before the code walkthrough. It can use several short paragraphs and one compact visual. The model selects the view when the evidence supports it. The reader draws a two-path decision as a flow chart with arrows and outcome boxes; pseudocode and other sketches stay in a text block. The preamble can reach about one page for a larger change. Prose has a 4,000-character limit; complete fenced sketches have a separate 4,000-character allowance, including their fences.
 
 The OpenAI API request sets `store: false`, but this is not a zero-retention promise. OpenAI's API data controls, abuse-monitoring retention, organization settings, and applicable exceptions govern what the API retains; check the current [OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data) before sending confidential source. The API calls are documented in the [Responses API](https://developers.openai.com/api/docs/guides/structured-outputs) documentation. Codex CLI runs follow the signed-in ChatGPT or workspace account's current data and retention controls.
 
