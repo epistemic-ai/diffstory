@@ -371,7 +371,8 @@ class GeneratedDocument(DocumentNarrative):
     """Require the overview, opening, and closing in generated narration.
 
     Attributes:
-        preamble: Required overview with separate prose and sketch allowances.
+        preamble: Required newcomer-facing overview with separate prose and
+            sketch allowances.
         lead: Required nonblank opening, at most 6,000 characters.
         closing: Required nonblank closing, at most 6,000 characters.
     """
@@ -379,11 +380,22 @@ class GeneratedDocument(DocumentNarrative):
     preamble: str = Field(
         max_length=MAX_PREAMBLE_TOTAL_CHARS,
         description=(
-            "Introduce the whole change before a code tour. Use about 200 to 450 words "
-            "when the evidence supports that length; use less for a small change. "
-            "Explain the conceptual areas and reading path without real source names. "
-            "For a multi-part change, include one useful conceptual sketch when "
-            "supported. Use a fenced text block; a decision flow chart has a label "
+            "Newcomer-facing overview before the code tour. Begin with one plain-language "
+            "sentence that states the supported objective and context. If no goal was "
+            "supplied, begin with a neutral statement of what the evidence shows changing. "
+            "Then explain, in order, the system's purpose, concrete inputs, basic operation, "
+            "outputs, and supported roles of its main parts, before technical mechanisms. "
+            "Use a supplied project or system name when useful. A relevant class name may "
+            "appear with its plain-language role. Describe supported before-and-after "
+            "behavior conceptually. Keep file paths, filenames, function and helper names, "
+            "internal return-format changes, and implementation steps in the walkthrough. "
+            "Define each necessary technical term when it first appears, "
+            "including in the reading path. Omit unsupported terms or facts. Do not list files, "
+            "give implementation steps or a code tour, or add unrelated review questions. "
+            "Use about 200 to 450 words when the evidence supports it; use less for "
+            "a small change. One compact conceptual sketch is optional when it "
+            "materially clarifies a supported relationship or decision; no diagram "
+            "is required. Use a fenced text block; a decision flow chart has a label "
             "and two branches: ├─ condition → outcome, then └─ condition → outcome. "
             "Keep other sketches as text. Allow at most 4,000 characters of prose "
             "and a separate 4,000 characters for all complete sketches, including "
