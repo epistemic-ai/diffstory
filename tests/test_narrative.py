@@ -26,6 +26,8 @@ from diffstory.cli import main
 from diffstory.models import MAX_PREAMBLE_CHARS
 from diffstory.models import MAX_PREAMBLE_SKETCH_CHARS
 from diffstory.models import MAX_PREAMBLE_TOTAL_CHARS
+from diffstory.narrative import _LEAF_SYSTEM
+from diffstory.narrative import _SUMMARY_SYSTEM
 from diffstory.narrative import ASD_STYLE_INSTRUCTION
 from diffstory.narrative import CODEX_DEFAULT_CONTEXT_TOKENS
 from diffstory.narrative import CODEX_MODEL_CAPACITIES
@@ -535,7 +537,150 @@ class NarrativeTests(unittest.TestCase):
             preamble_schema["maxLength"], MAX_PREAMBLE_TOTAL_CHARS
         )
         self.assertIn("about 200 to 450 words", preamble_schema["description"])
-        self.assertIn("multi-part change", preamble_schema["description"])
+
+    def test_leaf_and_summary_prompts_preserve_system_basics(self) -> None:
+        """A reduction can discard the system facts needed for a clear overview."""
+        cases = [
+            (
+                "leaf summary basics",
+                _LEAF_SYSTEM,
+                "purpose, inputs, outputs, roles of its main parts",
+            ),
+            (
+                "summary reduction basics",
+                _SUMMARY_SYSTEM,
+                "purpose, inputs, outputs, roles of its main parts",
+            ),
+            (
+                "leaf summary plain language",
+                _LEAF_SYSTEM,
+                "Use plain language",
+            ),
+            (
+                "summary reduction plain language",
+                _SUMMARY_SYSTEM,
+                "plain language for a reader new to the subsystem",
+            ),
+            (
+                "summary reductions retain basics",
+                _SUMMARY_SYSTEM,
+                "through every reduction",
+            ),
+        ]
+        for name, system_prompt, expected in cases:
+            with self.subTest(case=name):
+                self.assertIn(expected, system_prompt)
+
+    def test_document_prompt_requires_plain_language_system_context(
+        self,
+    ) -> None:
+        """The prompt and schema description request newcomer context in order.
+
+        These string checks cover prompt instructions only. They do not prove
+        that a model follows them or that generated prose is accurate.
+        """
+        provider = FakeProvider()
+        Narrator(provider).generate(compile_snapshot(snapshot()))
+        request = next(
+            call
+            for call in provider.calls
+            if call["name"] == "diffstory_document"
+        )
+        prompt = request["system"]
+        description = request["schema"]["properties"]["preamble"][
+            "description"
+        ]
+        prompt_contracts = [
+            "Start the preamble with one plain-language sentence",
+            "states the supplied objective and context",
+            "If no goal was supplied",
+            "concrete inputs",
+            "basic operation",
+            "outputs",
+            "supported roles of its main parts",
+            "before technical mechanisms",
+            "describe before-and-after behavior at a conceptual level",
+            "Keep file paths, filenames, function and helper names, internal ",
+            "return-format changes, and implementation steps in the walkthrough",
+            "A relevant class name is allowed",
+            "Define each necessary technical term the first time it appears",
+            "including in the reading path",
+            "Do not force facts or names that the evidence does not support",
+            "Do not list files",
+            "unrelated review questions",
+        ]
+        description_contracts = [
+            "Begin with one plain-language sentence",
+            "supported objective and context",
+            "If no goal was supplied",
+            "concrete inputs",
+            "basic operation",
+            "outputs",
+            "supported roles of its main parts",
+            "before technical mechanisms",
+            "Describe supported before-and-after behavior conceptually",
+            "Keep file paths, filenames, function and helper names,",
+            "internal return-format changes, and implementation steps in the walkthrough",
+            "A relevant class name may",
+            "Define each necessary technical term when it first appears",
+            "including in the reading path",
+            "Omit unsupported terms or facts",
+            "Do not list files",
+            "unrelated review questions",
+        ]
+        for expected in prompt_contracts:
+            with self.subTest(source="prompt", contract=expected):
+                self.assertIn(expected, prompt)
+        for expected in description_contracts:
+            with self.subTest(source="description", contract=expected):
+                self.assertIn(expected, description)
+        self.assertIn("reader who knows none of its", prompt)
+        self.assertIn("Newcomer-facing overview", description)
+        self.assertNotIn("name the actual", prompt)
+        self.assertNotIn("before-and-after file, function", description)
+
+        ordered_prompt_phrases = [
+            "Start the preamble with one plain-language sentence",
+            "Next explain the affected system",
+            "In this order, state its purpose",
+            "Define each necessary technical term",
+            "After the system overview, give the supplied reading path",
+            "Use about 200 to 450 words",
+        ]
+        positions = [prompt.index(phrase) for phrase in ordered_prompt_phrases]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_document_prompt_does_not_require_a_sketch(self) -> None:
+        """A reader should not receive a diagram when it adds no useful context."""
+        provider = FakeProvider()
+        Narrator(provider).generate(compile_snapshot(snapshot()))
+        request = next(
+            call
+            for call in provider.calls
+            if call["name"] == "diffstory_document"
+        )
+        prompt = request["system"]
+        description = request["schema"]["properties"]["preamble"][
+            "description"
+        ]
+        cases = [
+            ("prompt allows optional sketch", prompt, "is optional"),
+            (
+                "prompt rejects required diagram",
+                prompt,
+                "No diagram is required",
+            ),
+            ("schema allows optional sketch", description, "is optional"),
+            (
+                "schema rejects required diagram",
+                description,
+                "no diagram is required",
+            ),
+        ]
+        for name, text, expected in cases:
+            with self.subTest(contract=name):
+                self.assertIn(expected, text)
+        self.assertNotIn("include at least one compact sketch", prompt)
 
     def test_document_output_reserve_covers_a_page_sized_preamble(
         self,
