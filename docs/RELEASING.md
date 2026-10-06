@@ -18,8 +18,8 @@ Repository creation, pushes, and CI execution require your local GitHub authoriz
 ## Release a new version
 
 1. Update the package version and changelog; keep the rendered footer in sync.
-2. Run unit and browser tests, rebuild the synthetic demo, and run the release checker.
-3. Build with `python -m build` and validate with `python -m twine check dist/*`.
+2. Run unit and browser tests, rebuild the synthetic demo, and run the release checker with `uv run --locked`.
+3. Build with `uv build` and validate with `uv run --locked twine check dist/*`.
 4. Confirm GitHub CI passed on the exact commit, review the release file set, then create a tag and a GitHub release from that commit.
 
 Do not publish a package to PyPI until ownership/availability of the `diffstory` name is confirmed. No PyPI publication workflow or credentials are included.

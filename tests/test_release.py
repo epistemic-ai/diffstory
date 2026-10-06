@@ -160,6 +160,31 @@ class PublicationTests(unittest.TestCase):
         count = checker.check(self.root, write=True)
         self.assertEqual(checker.check(self.root, verify=True), count)
 
+    def test_uv_project_files_are_manifested_and_verified(self) -> None:
+        """Include and hash the uv Python pin and lockfile in release manifests."""
+        files = {
+            ".python-version": "3.13\n",
+            "uv.lock": 'version = 1\nrequires-python = ">=3.10"\n',
+        }
+        for name, content in files.items():
+            (self.root / name).write_text(content)
+
+        count = checker.check(self.root, write=True)
+        manifest = json.loads((self.root / "PUBLICATION.json").read_text())
+        paths = {entry["path"] for entry in manifest["files"]}
+        self.assertTrue(set(files).issubset(paths))
+        self.assertEqual(checker.check(self.root, verify=True), count)
+
+        for name, content in files.items():
+            path = self.root / name
+            path.write_text(content + "# changed\n")
+            with (
+                self.subTest(path=name),
+                self.assertRaisesRegex(ValueError, "manifest"),
+            ):
+                checker.check(self.root, verify=True)
+            path.write_text(content)
+
     def test_modified_file_invalidates_manifest(self) -> None:
         """Detect a file whose contents changed after manifest creation."""
         checker.check(self.root, write=True)
