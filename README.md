@@ -135,15 +135,20 @@ The OpenAI API request sets `store: false`, but this is not a zero-retention pro
 
 ## Develop and verify
 
+Development uses Python 3.13, pinned in `.python-version`. The package supports
+Python 3.10 and newer. `uv sync --locked` creates `.venv` and installs the
+project with its development tools from `uv.lock`; `uv run --locked` runs each
+command in that environment without manual activation.
+
 ```bash
-python -m pip install -e '.[dev]'
-python -m unittest discover -s tests -v
-python examples/make_demo.py
-python scripts/check_release.py
-python -m playwright install chromium
-python tests/browser_smoke.py
-python -m build
-python -m twine check dist/*
+uv sync --locked
+uv run --locked python -m unittest discover -s tests -v
+uv run --locked python examples/make_demo.py
+uv run --locked python scripts/check_release.py
+uv run --locked python -m playwright install chromium
+uv run --locked python tests/browser_smoke.py
+uv build
+uv run --locked twine check dist/*
 ```
 
 For a system Chromium installation, set `DIFFSTORY_CHROMIUM` to its executable path. Browser tests exercise rendering, navigation, expansion, responsive layout, and offline behavior. They do not claim tests passed in the analyzed repository. See [verification](docs/VERIFICATION.md) for the checks actually run on this release.

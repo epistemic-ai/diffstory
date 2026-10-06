@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = ["pydantic>=2.11,<3"]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
   "build>=1.6.1,<2",
   "playwright>=1.63.0,<2",
