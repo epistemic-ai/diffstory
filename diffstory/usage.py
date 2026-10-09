@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -127,6 +128,7 @@ class RunUsage:
 
     def __init__(self) -> None:
         """Initialize zeroed token totals and call counters."""
+        self._lock = threading.Lock()
         self._input_tokens = 0
         self._cached_input_tokens = 0
         self._output_tokens = 0
@@ -146,28 +148,29 @@ class RunUsage:
                 and output counts and cached input no greater than input.
 
         """
-        self._calls += 1
-        if usage is None:
-            self._unreported_calls += 1
-            return
+        with self._lock:
+            self._calls += 1
+            if usage is None:
+                self._unreported_calls += 1
+                return
 
-        input_tokens = usage.get("input_tokens")
-        cached_input_tokens = usage.get("cached_input_tokens", 0)
-        output_tokens = usage.get("output_tokens")
-        if (
-            type(input_tokens) is not int
-            or input_tokens < 0
-            or type(cached_input_tokens) is not int
-            or not 0 <= cached_input_tokens <= input_tokens
-            or type(output_tokens) is not int
-            or output_tokens < 0
-        ):
-            self._unreported_calls += 1
-            return
+            input_tokens = usage.get("input_tokens")
+            cached_input_tokens = usage.get("cached_input_tokens", 0)
+            output_tokens = usage.get("output_tokens")
+            if (
+                type(input_tokens) is not int
+                or input_tokens < 0
+                or type(cached_input_tokens) is not int
+                or not 0 <= cached_input_tokens <= input_tokens
+                or type(output_tokens) is not int
+                or output_tokens < 0
+            ):
+                self._unreported_calls += 1
+                return
 
-        self._input_tokens += input_tokens
-        self._cached_input_tokens += cached_input_tokens
-        self._output_tokens += output_tokens
+            self._input_tokens += input_tokens
+            self._cached_input_tokens += cached_input_tokens
+            self._output_tokens += output_tokens
 
     def report(self) -> dict[str, int]:
         """
@@ -178,10 +181,11 @@ class RunUsage:
             unreported call counts. Mutating it does not change this accumulator.
 
         """
-        return {
-            "input_tokens": self._input_tokens,
-            "cached_input_tokens": self._cached_input_tokens,
-            "output_tokens": self._output_tokens,
-            "calls": self._calls,
-            "unreported_calls": self._unreported_calls,
-        }
+        with self._lock:
+            return {
+                "input_tokens": self._input_tokens,
+                "cached_input_tokens": self._cached_input_tokens,
+                "output_tokens": self._output_tokens,
+                "calls": self._calls,
+                "unreported_calls": self._unreported_calls,
+            }
