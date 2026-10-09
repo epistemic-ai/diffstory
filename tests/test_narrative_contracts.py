@@ -14,12 +14,18 @@ from diffstory.narrative_contracts import DocumentResult
 from diffstory.narrative_contracts import EvidenceUnit
 from diffstory.narrative_contracts import ItemFailure
 from diffstory.narrative_contracts import NarrativeResult
+from diffstory.narrative_contracts import PlanningBounds
 from diffstory.narrative_contracts import PlanningCardResult
 from diffstory.narrative_contracts import ProseBinding
 from diffstory.narrative_contracts import ProseKind
+from diffstory.narrative_contracts import RecordFragment
 from diffstory.narrative_contracts import SectionResult
+from diffstory.narrative_contracts import SourceRecordOwner
+from diffstory.narrative_contracts import SourceSliceRef
 from diffstory.narrative_contracts import SourceSpan
 from diffstory.narrative_contracts import SpanRef
+from diffstory.narrative_contracts import StatementPath
+from diffstory.narrative_contracts import StatementRef
 from diffstory.narrative_contracts import SupportedStatement
 from diffstory.narrative_contracts import SupportedTerminology
 from diffstory.narrative_contracts import result_key
@@ -370,6 +376,109 @@ class ContractTests(unittest.TestCase):
                 pending.extend(node.values())
             elif isinstance(node, list):
                 pending.extend(node)
+
+    def test_production_owner_path_range_and_budget_contracts(self) -> None:
+        """Production extensions remain frozen, discriminated and scalar-strict."""
+        owner = SourceRecordOwner(
+            unit_key="a" * 64, span_id="b" * 64, content_digest="c" * 64
+        )
+        fragment = RecordFragment(
+            id="d" * 64,
+            owner=owner,
+            path="text",
+            encoding="utf8",
+            byte_start=0,
+            byte_end=2,
+            total_bytes=2,
+            field_digest=content_digest(b"ab"),
+            content_digest=content_digest(b"ab"),
+        )
+        self.assertEqual(
+            RecordFragment.model_validate_json(fragment.model_dump_json()),
+            fragment,
+        )
+        for update in (
+            {"path": "arbitrary"},
+            {"encoding": "normalized"},
+            {"byte_start": True},
+            {"byte_end": 3},
+            {"byte_end": 0},
+            {"owner": owner.model_dump() | {"kind": "author"}},
+            {"owner": owner.model_dump() | {"revision": "current"}},
+        ):
+            with self.assertRaises(ValidationError):
+                RecordFragment.model_validate(fragment.model_dump() | update)
+        with self.assertRaises(ValidationError):
+            fragment.owner.span_id = "f" * 64
+        with self.assertRaises(ValidationError):
+            PlanningBounds(
+                card_wire_bytes=100,
+                card_support_bytes=2048,
+                prose_wire_bytes=4096,
+                output_guard=15000,
+            )
+
+    def test_exact_basis_is_typed_and_does_not_change_detail_schema(
+        self,
+    ) -> None:
+        """Only known basis families and statement paths enter supported prose."""
+        ref = StatementRef(
+            producer_item_key="a" * 64,
+            result_digest="b" * 64,
+            statement_path=StatementPath(field="abstraction"),
+            statement_digest="c" * 64,
+        )
+        statement = SupportedStatement(
+            kind="implementation_claim",
+            text="An exact consumed statement supports this.",
+            basis=(ref,),
+        )
+        self.assertEqual(
+            SupportedStatement.model_validate_json(
+                statement.model_dump_json()
+            ),
+            statement,
+        )
+        for update in (
+            {"basis": (ref, ref)},
+            {"basis": ({"kind": "arbitrary"},)},
+        ):
+            with self.assertRaises(ValidationError):
+                SupportedStatement.model_validate(
+                    statement.model_dump() | update
+                )
+        for path in (
+            {"field": "uncertainty"},
+            {"field": "title", "index": 1},
+            {"field": "abstraction", "index": -1},
+        ):
+            with self.assertRaises(ValidationError):
+                StatementPath(**path)
+        span = SpanRef(
+            span_id="1" * 64,
+            unit_key="a" * 64,
+            group_key=None,
+            side="head",
+            path="x.py",
+            byte_start=0,
+            byte_end=2,
+            line_start=1,
+            line_end=1,
+            content_digest=content_digest(b"ab"),
+        )
+        with self.assertRaises(ValidationError):
+            SourceSliceRef(
+                source=span,
+                byte_start=1,
+                byte_end=1,
+                content_digest=content_digest(b""),
+            )
+        self.assertNotIn(
+            "basis", json.dumps(structured_output_schema(DetailResult))
+        )
+        self.assertNotIn(
+            "SourceSliceRef", DetailResult.model_json_schema().get("$defs", {})
+        )
 
 
 if __name__ == "__main__":

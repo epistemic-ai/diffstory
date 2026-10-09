@@ -401,6 +401,84 @@ class Terminology(Contract):
     claims: tuple[ClaimRef, ...]
 
 
+class SourceSliceRef(Contract):
+    """Exact UTF-8 bytes relative to one resolved atomic source, never its remainder."""
+
+    kind: Literal["source_slice"] = "source_slice"
+    source: SpanRef
+    byte_start: Natural
+    byte_end: Natural
+    content_digest: Digest
+
+    @model_validator(mode="after")
+    def bounds(self) -> SourceSliceRef:
+        """Reject empty and reversed slices; current-source checks are separate."""
+        if self.byte_end <= self.byte_start:
+            msg = "Source slice must contain bytes"
+            raise ValueError(msg)
+        return self
+
+
+class StatementPath(Contract):
+    """Allowlisted statement location; terminology indexes its definition."""
+
+    field: Literal[
+        "abstraction",
+        "title",
+        "orientation",
+        "synthesis",
+        "transition",
+        "preamble",
+        "lead",
+        "closing",
+        "terminology",
+    ]
+    index: Natural = 0
+
+    @model_validator(mode="after")
+    def scalar_title(self) -> StatementPath:
+        """A title has one scalar location."""
+        if self.field == "title" and self.index != 0:
+            msg = "Title index must be zero"
+            raise ValueError(msg)
+        return self
+
+
+class StatementRef(Contract):
+    """Bind an exact consumed, validated child statement and complete result."""
+
+    kind: Literal["statement"] = "statement"
+    producer_item_key: Digest
+    result_digest: Digest
+    statement_path: StatementPath
+    statement_digest: Digest
+
+
+SupportBasis = Annotated[
+    SourceSliceRef | StatementRef, Field(discriminator="kind")
+]
+
+
+class SupportSet(Contract):
+    """Only support actually supplied in a request, with separate author provenance."""
+
+    claims: tuple[ClaimRef, ...] = ()
+    citations: tuple[SpanRef, ...] = ()
+    basis: tuple[SupportBasis, ...] = ()
+    author_context_digest: Digest | None = None
+
+    @model_validator(mode="after")
+    def unique(self) -> SupportSet:
+        """Reject duplicate support handles in each typed family."""
+        if any(
+            len(set(values)) != len(values)
+            for values in (self.claims, self.citations, self.basis)
+        ):
+            msg = "Duplicate consumed support"
+            raise ValueError(msg)
+        return self
+
+
 class SupportedStatement(Contract):
     """Retain prose and its support; consumers resolve refs in the current ledger.
 
@@ -415,6 +493,7 @@ class SupportedStatement(Contract):
     text: Text
     claims: tuple[ClaimRef, ...] = ()
     citations: tuple[SpanRef, ...] = ()
+    basis: tuple[SupportBasis, ...] = ()
     effect: Text | None = None
     uncertainty: tuple[Text, ...] = ()
     author_context_digest: Digest | None = None
@@ -424,7 +503,7 @@ class SupportedStatement(Contract):
         """Require evidence for implementation and explicit author attribution."""
         if (
             self.kind == "implementation_claim" or self.effect is not None
-        ) and not (self.claims or self.citations):
+        ) and not (self.claims or self.citations or self.basis):
             msg = "Implementation claims and effects require support"
             raise ValueError(msg)
         if (self.kind == "author_motivation") != (
@@ -432,9 +511,11 @@ class SupportedStatement(Contract):
         ):
             msg = "Author motivation requires an author context digest only"
             raise ValueError(msg)
-        if len(set(self.claims)) != len(self.claims) or len(
-            set(self.citations)
-        ) != len(self.citations):
+        if (
+            len(set(self.claims)) != len(self.claims)
+            or len(set(self.citations)) != len(self.citations)
+            or len(set(self.basis)) != len(self.basis)
+        ):
             msg = "Duplicate statement support"
             raise ValueError(msg)
         return self
@@ -661,6 +742,310 @@ class BatchSpec(Contract):
         return self
 
 
+class AuthorContext(Contract):
+    """Current normalized author fields; empty strings remain explicit."""
+
+    title: str = ""
+    repository: str = ""
+    author_reported_motivation: str = ""
+
+
+class DetailRecordOwner(Contract):
+    """One ordered record in an unchanged validated detail result."""
+
+    kind: Literal["detail"] = "detail"
+    unit_key: Digest
+    detail_digest: Digest
+    record_kind: Literal["detail", "explanation", "observation", "question"]
+    ordinal: Natural
+
+
+class SourceRecordOwner(Contract):
+    """Content-stable source identity; coordinates come from the current registry."""
+
+    kind: Literal["source"] = "source"
+    unit_key: Digest
+    span_id: Digest
+    content_digest: Digest
+
+
+class AuthorRecordOwner(Contract):
+    """Author material cannot confer implementation support."""
+
+    kind: Literal["author"] = "author"
+    context_digest: Digest
+
+
+class HeadingRecordOwner(Contract):
+    """Immutable compiler path/theme, excluding generated group titles."""
+
+    kind: Literal["heading"] = "heading"
+    group_key: Digest
+
+
+RecordOwner = Annotated[
+    DetailRecordOwner
+    | SourceRecordOwner
+    | AuthorRecordOwner
+    | HeadingRecordOwner,
+    Field(discriminator="kind"),
+]
+RecordPath = Literal[
+    "version",
+    "unit_key",
+    "explanations",
+    "observations",
+    "questions",
+    "obligation_ids",
+    "before",
+    "after",
+    "effect",
+    "uncertainty",
+    "citations",
+    "limitations",
+    "id",
+    "text",
+    "reference",
+    "title",
+    "repository",
+    "author_reported_motivation",
+    "path",
+    "theme",
+]
+RecordEncoding = Literal["utf8", "canonical_json"]
+
+
+class RecordFragment(Contract):
+    """A contiguous part of an exact field; material is resolved from current data."""
+
+    id: Digest
+    owner: RecordOwner
+    path: RecordPath
+    encoding: RecordEncoding
+    byte_start: Natural
+    byte_end: Natural
+    total_bytes: Natural
+    field_digest: Digest
+    content_digest: Digest
+
+    @model_validator(mode="after")
+    def bounds(self) -> RecordFragment:
+        """Only empty fields have empty fragments."""
+        if not 0 <= self.byte_start <= self.byte_end <= self.total_bytes or (
+            self.byte_start == self.byte_end and self.total_bytes != 0
+        ):
+            msg = "Invalid record fragment range"
+            raise ValueError(msg)
+        return self
+
+
+class CardBudget(Contract):
+    """Caps on a generated wire record and its immediate forwarded support."""
+
+    result_wire_bytes: Positive
+    support_bytes: Positive
+
+
+class PlanningBounds(Contract):
+    """Frozen planning settings; configured provider output guards never shrink."""
+
+    card_wire_bytes: Positive
+    card_support_bytes: Positive
+    prose_wire_bytes: Positive
+    output_guard: Positive
+    max_fragment_bytes: Positive = 4096
+    max_chapter_groups: Positive = 32
+    min_card_wire_bytes: Positive = 128
+    min_card_support_bytes: Positive = 128
+
+    @model_validator(mode="after")
+    def minimums(self) -> PlanningBounds:
+        """Require declared progress minima at or below configured caps."""
+        if (
+            self.min_card_wire_bytes > self.card_wire_bytes
+            or self.min_card_support_bytes > self.card_support_bytes
+        ):
+            msg = "Minimum planning budgets exceed configured caps"
+            raise ValueError(msg)
+        return self
+
+
+AuxPurpose = Literal[
+    "support", "detail", "metadata", "cycle", "section_context"
+]
+
+
+class ReductionRef(Contract):
+    """Shared auxiliary input, separate from exclusive reduction-tree children."""
+
+    kind: Literal["reduction"] = "reduction"
+    target_key: Digest
+    owner_key: Digest
+    purpose: AuxPurpose
+
+
+class ContextSource(Contract):
+    """One exact compiler-derived relationship to a primary or cycle root."""
+
+    kind: Literal["group", "global", "cycle"]
+    target_key: Digest
+    relationship: Literal[
+        "own",
+        "prerequisite",
+        "previous",
+        "next",
+        "global",
+        "cycle",
+        "cycle_member",
+    ]
+    relationship_key: Digest
+    target_group_key: Digest | None = None
+    source_group_key: Digest | None = None
+    cycle_key: Digest | None = None
+
+    @model_validator(mode="after")
+    def family(self) -> ContextSource:
+        """Keep group, global and cycle relationships in their declared families."""
+        if self.kind == "group":
+            valid = self.source_group_key is not None and (
+                (
+                    self.relationship == "cycle_member"
+                    and self.cycle_key is not None
+                    and self.target_group_key is None
+                )
+                or (
+                    self.relationship
+                    in {"own", "prerequisite", "previous", "next"}
+                    and self.cycle_key is None
+                    and self.target_group_key is not None
+                )
+            )
+            if self.relationship == "own":
+                valid = (
+                    valid and self.source_group_key == self.target_group_key
+                )
+        elif self.kind == "global":
+            valid = (
+                self.relationship == "global"
+                and self.source_group_key is None
+                and self.cycle_key is None
+            )
+        else:
+            valid = (
+                self.relationship == "cycle"
+                and self.source_group_key is None
+                and self.target_group_key is not None
+                and self.cycle_key is not None
+            )
+        if not valid:
+            msg = "Context relationship does not match its family"
+            raise ValueError(msg)
+        return self
+
+
+AuxReference = Annotated[
+    ReductionRef | ContextSource, Field(discriminator="kind")
+]
+
+
+class AuxCard(Contract):
+    """An owner-scoped reduction node with explicit shared input families."""
+
+    id: Digest
+    purpose: AuxPurpose
+    owner_key: Digest
+    fragment_keys: tuple[Digest, ...] = ()
+    child_keys: tuple[Digest, ...] = ()
+    sources: tuple[AuxReference, ...] = ()
+    budget: CardBudget
+
+    @model_validator(mode="after")
+    def inputs(self) -> AuxCard:
+        """A reducer has only children; a leaf has fragments or typed sources."""
+        if (self.child_keys and (self.fragment_keys or self.sources)) or not (
+            self.child_keys or self.fragment_keys or self.sources
+        ):
+            msg = "Invalid auxiliary inputs"
+            raise ValueError(msg)
+        if any(
+            len(set(values)) != len(values)
+            for values in (self.fragment_keys, self.child_keys, self.sources)
+        ):
+            msg = "Duplicate auxiliary inputs"
+            raise ValueError(msg)
+        return self
+
+
+class MaterialProjection(Contract):
+    """Complete inline records or one declared reduction root."""
+
+    record_keys: tuple[Digest, ...] = ()
+    root: ReductionRef | None = None
+
+    @model_validator(mode="after")
+    def exclusive(self) -> MaterialProjection:
+        """Reduced material must not repeat its unbounded inline record list."""
+        if (self.root is not None and self.record_keys) or len(
+            set(self.record_keys)
+        ) != len(self.record_keys):
+            msg = "Invalid material projection"
+            raise ValueError(msg)
+        return self
+
+
+class AtomProjection(Contract):
+    """Bind an unchanged primary atom to its complete or reduced current material."""
+
+    atom_key: Digest
+    material: MaterialProjection
+
+
+class GroupRoot(Contract):
+    """An exact primary subtree for one compiler group."""
+
+    group_key: Digest
+    card_key: Digest
+
+
+class CycleRoot(Contract):
+    """One shared context forest for an exact compiler SCC."""
+
+    cycle_key: Digest
+    group_keys: tuple[Digest, ...] = Field(min_length=1)
+    root: ReductionRef
+
+
+class SectionView(Contract):
+    """Full relationship authority plus an optional bounded provider projection."""
+
+    group_key: Digest
+    position: Natural
+    previous_group_key: Digest | None
+    next_group_key: Digest | None
+    chapter_key: Digest
+    cycle_key: Digest | None
+    final: bool
+    sources: tuple[ContextSource, ...]
+    context_root: ReductionRef | None = None
+
+
+class ProductionHierarchy(Contract):
+    """Frozen production structure; validation requires current source derivation."""
+
+    version: Literal["diffstory.production-hierarchy.v1"] = (
+        "diffstory.production-hierarchy.v1"
+    )
+    bounds: PlanningBounds
+    card_budget: CardBudget
+    fragments: tuple[RecordFragment, ...]
+    auxiliary_cards: tuple[AuxCard, ...]
+    atom_projections: tuple[AtomProjection, ...]
+    author_projection: MaterialProjection
+    group_roots: tuple[GroupRoot, ...]
+    cycle_roots: tuple[CycleRoot, ...]
+    section_views: tuple[SectionView, ...]
+
+
 class StoryPlan(Contract):
     """Validated order and a lossless, bounded planning hierarchy."""
 
@@ -674,6 +1059,7 @@ class StoryPlan(Contract):
     cards: tuple[StoryCard, ...]
     root_card_keys: tuple[Digest, ...]
     requests: tuple[BatchSpec, ...]
+    production: ProductionHierarchy | None = None
 
 
 NarrativeResult = (

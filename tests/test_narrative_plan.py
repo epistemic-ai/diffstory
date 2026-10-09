@@ -1082,6 +1082,34 @@ class LedgerIndexTests(unittest.TestCase):
         self.unit = next(u for u in self.ledger.units if u.change_key)
         self.result = authored_result(self.unit)
 
+    def test_new_derivation_boundary_rejects_deep_mutation_and_index_copies(
+        self,
+    ) -> None:
+        """The production boundary rechecks snapshots without weakening indexed citations."""
+        index = plan_module.build_ledger_index(self.ledger)
+        self.assertIs(index.validated_ledger(), self.ledger)
+        with self.assertRaisesRegex(ValueError, "unregistered_ledger_index"):
+            copy.copy(index).validated_ledger()
+        span = next(iter(index.spans.values()))
+        original = span.text
+        object.__setattr__(span, "text", "tampered cached source")
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                index.validated_ledger()
+        finally:
+            object.__setattr__(span, "text", original)
+        self.assertIs(index.validated_ledger(), self.ledger)
+        original_map = index.spans
+        object.__setattr__(index, "spans", dict(original_map))
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                index.validated_ledger()
+        finally:
+            object.__setattr__(index, "spans", original_map)
+        validate_detail_result(
+            self.result, self.unit, self.ledger, index=index
+        )
+
     def test_index_binding_immutability_and_malicious_copies(self) -> None:
         """Reject wrong instances, changed bindings, altered units, and bad types."""
         index = plan_module.build_ledger_index(self.ledger)

@@ -22,6 +22,7 @@ from difflib import SequenceMatcher
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import TypeVar
+from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel
 from pydantic import Field
@@ -857,7 +858,18 @@ def build_evidence_ledger(
     return ledger
 
 
-@dataclass(frozen=True, slots=True, init=False, eq=False)
+_INDEX_AUTHORITY: WeakKeyDictionary = WeakKeyDictionary()
+_INDEX_MAP_NAMES = (
+    "buffers",
+    "spans",
+    "units",
+    "bindings",
+    "groups",
+    "unit_span_ids",
+)
+
+
+@dataclass(frozen=True, init=False, eq=False)
 class LedgerIndex:
     """Read-only lookup context for one fully validated frozen ledger instance.
 
@@ -903,6 +915,56 @@ class LedgerIndex:
             ),
         ):
             object.__setattr__(self, name, MappingProxyType(values))
+        _INDEX_AUTHORITY[self] = (
+            ledger,
+            content_digest(canonical_bytes(ledger)),
+            content_digest(self._map_bytes()),
+            tuple(getattr(self, name) for name in _INDEX_MAP_NAMES),
+        )
+
+    def _map_bytes(self) -> bytes:
+        return canonical_bytes(
+            (
+                *tuple(
+                    dict(getattr(self, name))
+                    for name in (
+                        "buffers",
+                        "spans",
+                        "units",
+                        "bindings",
+                        "groups",
+                    )
+                ),
+                tuple(
+                    sorted(
+                        (key, tuple(sorted(value)))
+                        for key, value in self.unit_span_ids.items()
+                    )
+                ),
+            )
+        )
+
+    def validated_ledger(self) -> EvidenceLedger:
+        """Check deep current authority once at a new derivation boundary.
+
+        Normal per-citation lookup keeps its constant-time check. This stronger
+        boundary also rejects copied indexes and nested bypass mutation of
+        frozen models or cached maps. Its immutable witness is not on the index.
+        """
+        authority = _INDEX_AUTHORITY.get(self)
+        _require(authority is not None, "unregistered_ledger_index")
+        ledger, snapshot, maps, bindings = authority
+        self.check_ledger(ledger)
+        _require(
+            all(
+                old is getattr(self, name)
+                for name, old in zip(_INDEX_MAP_NAMES, bindings, strict=True)
+            )
+            and content_digest(canonical_bytes(ledger)) == snapshot
+            and content_digest(self._map_bytes()) == maps,
+            "ledger_index_mutated",
+        )
+        return ledger
 
     def check_ledger(self, ledger: EvidenceLedger) -> None:
         """Reject another ledger or rebound current source fields in constant time."""
@@ -2102,14 +2164,14 @@ def build_story_plan(  # noqa: PLR0913 # Keep explicit evidence, serializer, and
     return plan
 
 
-def validate_story_plan(
+def validate_primary_structure(
     plan: StoryPlan, expected_groups: tuple[PlanningGroup, ...]
 ) -> None:
-    """Check external membership, claims, terms, all edges, and hierarchy reachability.
+    """Check only primary membership, facts, chapters, levels and exact traversal.
 
-    expected_groups must come from trusted compiler/detail validation. Supplying
-    the plan's own groups as authority cannot establish compiler preservation.
-    Request byte checks use validate_story_requests with the current serializer.
+    This partial check is not plan acceptance. Generic callers must use
+    validate_story_plan; production callers must rederive current sources with
+    validate_production_plan and audit actual requests before final acceptance.
     """
     plan = StoryPlan.model_validate(plan)
     expected = {g.group.key: g for g in expected_groups}
@@ -2177,23 +2239,6 @@ def validate_story_plan(
         for atom in _atoms(expected[key])
     )
     _require(tuple(atoms) == expected_atoms, "incomplete_planning_atoms")
-    requested = [key for request in plan.requests for key in request.item_keys]
-    _require(
-        Counter(requested) == Counter(cards.keys()),
-        "planning_request_membership_mismatch",
-    )
-    _require(
-        plan.id
-        == semantic_digest(
-            "story-plan.v2",
-            plan.context_digest,
-            plan.ordered_group_keys,
-            plan.cycles,
-            plan.chapters,
-            tuple(c.id for c in plan.cards),
-        ),
-        "story_plan_digest_mismatch",
-    )
     for group in expected.values():
         unit_keys = set(group.group.unit_keys)
         _unique(list(group.group.unit_keys), "duplicate_group_unit")
@@ -2214,6 +2259,54 @@ def validate_story_plan(
         )
 
 
+def validate_story_plan(
+    plan: StoryPlan, expected_groups: tuple[PlanningGroup, ...]
+) -> None:
+    """Validate the complete generic plan; production requires current-data validation."""
+    plan = StoryPlan.model_validate(plan)
+    _require(plan.production is None, "production_validation_required")
+    validate_primary_structure(plan, expected_groups)
+    requested = [key for request in plan.requests for key in request.item_keys]
+    _require(
+        Counter(requested) == Counter(card.id for card in plan.cards),
+        "planning_request_membership_mismatch",
+    )
+    _require(
+        plan.id
+        == semantic_digest(
+            "story-plan.v2",
+            plan.context_digest,
+            plan.ordered_group_keys,
+            plan.cycles,
+            plan.chapters,
+            tuple(c.id for c in plan.cards),
+        ),
+        "story_plan_digest_mismatch",
+    )
+
+
+def planning_atoms(group: PlanningGroup) -> tuple[PlanningAtom, ...]:
+    """Expose the exact ordered primary atoms without changing their semantics."""
+    return _atoms(group)
+
+
+def story_card(
+    level: int,
+    atoms: tuple[PlanningAtom, ...] = (),
+    children: tuple[str, ...] = (),
+) -> StoryCard:
+    """Construct a primary card with the original canonical identity."""
+    return _card(level, atoms, children)
+
+
+def story_chapters(
+    order: tuple[str, ...], groups: tuple[PlanningGroup, ...], maximum: int
+) -> tuple[StoryChapter, ...]:
+    """Derive complete chapter membership and cross-chapter compiler edges."""
+    _require(type(maximum) is int and maximum > 0, "invalid_chapter_limit")
+    return _chapters(order, {g.group.key: g for g in groups}, maximum)
+
+
 def validate_story_requests(
     plan: StoryPlan,
     capacity: ModelCapacity,
@@ -2223,6 +2316,7 @@ def validate_story_requests(
     enforceable_output_cap: bool = False,
 ) -> None:
     """Recheck actual serialization and allowances at every hierarchy level."""
+    _require(plan.production is None, "production_validation_required")
     cards = {card.id: card for card in plan.cards}
     for spec in plan.requests:
         actual = _request_spec(
