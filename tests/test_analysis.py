@@ -3,8 +3,14 @@
 import copy
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from collections import Counter
+from itertools import permutations
+from itertools import product
 from pathlib import Path
 
 from diffstory.analysis import apply_annotations
@@ -86,6 +92,280 @@ def symbols(r: dict) -> list[dict]:
 
     """
     return [c for c in r["changes"] if c["kind"] not in {"wiring", "text"}]
+
+
+def graph_snapshot(size: int, *, cyclic: bool) -> dict:
+    """Build full modules whose functions call the next module in a chain or ring."""
+    sources = {}
+    for index in range(size):
+        following = (index + 1) % size
+        sources[f"m_{index:04d}.py"] = (
+            f"from m_{following:04d} import f_{following}\n"
+            f"def f_{index}():\n    return f_{following}()\n"
+            if cyclic or index + 1 < size
+            else f"def f_{index}():\n    return 1\n"
+        )
+    return snap({}, sources)
+
+
+class GraphOrderingTests(unittest.TestCase):
+    """Check SCC membership, deterministic audits, and compiler priority rules."""
+
+    def test_all_three_node_graphs_match_reachability(self) -> None:
+        """Check every directed graph, including self edges and nested cycles."""
+        nodes = ("a", "b", "c")
+        possible_edges = tuple(product(nodes, repeat=2))
+        for mask in range(1 << len(possible_edges)):
+            with self.subTest(mask=mask):
+                prereqs = {node: set() for node in nodes}
+                for bit, (node, prerequisite) in enumerate(possible_edges):
+                    if mask & (1 << bit):
+                        prereqs[node].add(prerequisite)
+                reachable = {node: {node, *prereqs[node]} for node in nodes}
+                for intermediate in nodes:
+                    for node in nodes:
+                        if intermediate in reachable[node]:
+                            reachable[node].update(reachable[intermediate])
+                components = {
+                    tuple(
+                        other
+                        for other in nodes
+                        if other in reachable[node]
+                        and node in reachable[other]
+                    )
+                    for node in nodes
+                }
+                order, cycles = ordered_components(nodes, prereqs, str)
+                self.assertEqual(Counter(order), Counter(nodes))
+                self.assertEqual(
+                    cycles,
+                    tuple(sorted(c for c in components if len(c) > 1)),
+                )
+                position = {node: i for i, node in enumerate(order)}
+                for component in components:
+                    positions = [position[node] for node in component]
+                    self.assertEqual(
+                        max(positions) - min(positions) + 1, len(component)
+                    )
+                    for node in component:
+                        for prerequisite in prereqs[node] - set(component):
+                            self.assertLess(
+                                position[prerequisite], position[node]
+                            )
+
+    def test_ready_components_and_cycle_members_use_caller_priority(
+        self,
+    ) -> None:
+        """A newly available component can outrank one already in the queue."""
+        priorities = {"a": 9, "b": 1, "c": 8, "d": 0, "e": 4, "f": 3}
+        order, cycles = ordered_components(
+            reversed(priorities),
+            {"b": {"c"}, "c": {"b"}, "d": {"b"}, "f": {"e"}},
+            priorities.__getitem__,
+        )
+        self.assertEqual(order, ("b", "c", "d", "e", "f", "a"))
+        self.assertEqual(cycles, (("b", "c"),))
+
+    def test_shuffled_nodes_and_adjacencies_keep_equal_priority_order(
+        self,
+    ) -> None:
+        """Equal priorities and multiple cycles do not inherit traversal order."""
+        graph = {
+            "a": {"b", "c"},
+            "b": {"a", "c"},
+            "c": set(),
+            "d": {"e"},
+            "e": {"d"},
+        }
+        expected = (("c", "a", "b", "d", "e"), (("a", "b"), ("d", "e")))
+        for nodes in permutations(graph):
+            for reverse in (False, True):
+                # dict_keys is set-like but lets this test vary adjacency order.
+                prereqs = {
+                    node: dict.fromkeys(
+                        sorted(graph[node], reverse=reverse)
+                    ).keys()
+                    for node in nodes
+                }
+                self.assertEqual(
+                    ordered_components(iter(nodes), prereqs, lambda _: 0),
+                    expected,
+                )
+
+    def test_empty_duplicate_and_reachable_nodes(self) -> None:
+        """Retain prerequisite closure and omit singleton self loops from cycles."""
+        self.assertEqual(ordered_components([], {}, str), ((), ()))
+        self.assertEqual(
+            ordered_components(
+                iter(("b", "b")), {"b": {"a"}, "a": {"a", "c"}}, str
+            ),
+            (("c", "a", "b"), ()),
+        )
+
+    def test_public_report_and_graph_audits_are_hash_seed_independent(
+        self,
+    ) -> None:
+        """Subprocess hash seeds cannot change report order or SCC audit arrays."""
+        probe = """
+import hashlib
+import json
+from diffstory.analysis import compile_snapshot, ordered_components
+from test_analysis import snap
+
+nodes = set('abcdefg')
+prereqs = {node: set() for node in nodes}
+for node, prerequisite in {('a', 'b'), ('b', 'a'), ('c', 'd'), ('d', 'c'),
+                            ('e', 'a'), ('e', 'c'), ('g', 'f')}:
+    prereqs[node].add(prerequisite)
+sources = {
+    f'{node}.py': ''.join(f'from {p} import f_{p}\\n' for p in sorted(prereqs[node]))
+    + f'def f_{node}():\\n    return '
+    + (' + '.join(f'f_{p}()' for p in sorted(prereqs[node])) or '1') + '\\n'
+    for node in sorted(nodes)
+}
+payload = {
+    'report': compile_snapshot(snap({}, sources)),
+    'graph': ordered_components(nodes, prereqs, lambda _: 0),
+}
+print(hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest())
+"""
+        digests = []
+        for seed in ("1", "7", "101", "999"):
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                cwd=Path(__file__).resolve().parents[1],
+                env={
+                    **os.environ,
+                    "PYTHONPATH": str(Path(__file__).resolve().parent),
+                    "PYTHONHASHSEED": seed,
+                },
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            digests.append(result.stdout.strip())
+        self.assertRegex(digests[0], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(set(digests)), 1)
+
+
+class CompilerGraphTests(unittest.TestCase):
+    """Exercise deep graphs through the compiler, annotation, and reader APIs."""
+
+    def check_compiled_graph(self, *, cyclic: bool) -> None:
+        """Require exact source changes, graph membership, edges, and ordering."""
+        recursion_limit = sys.getrecursionlimit()
+        size = max(1050, recursion_limit + 50)
+        report = compile_snapshot(graph_snapshot(size, cyclic=cyclic))
+        edge_count = size if cyclic else size - 1
+        expected_paths = {f"m_{index:04d}.py" for index in range(size)}
+        groups = report["groups"]
+        by_path = {group["path"]: group for group in groups}
+        self.assertEqual(len(groups), size)
+        self.assertEqual(by_path.keys(), expected_paths)
+        changes = report["changes"]
+        self.assertEqual(
+            Counter(change["kind"] for change in changes),
+            {"added": size, "wiring": edge_count},
+        )
+        functions = {
+            change["after"]["name"]: change["after"]["id"]
+            for change in changes
+            if change["kind"] == "added"
+        }
+        self.assertEqual(functions.keys(), {f"f_{i}" for i in range(size)})
+        members = {path: [] for path in expected_paths}
+        for change in changes:
+            members[change["after"]["path"]].append(change["id"])
+        self.assertEqual(
+            Counter(cid for group in groups for cid in group["change_ids"]),
+            Counter(c["id"] for c in changes),
+        )
+        for path, group in by_path.items():
+            self.assertEqual(set(group["change_ids"]), set(members[path]))
+        expected_symbol_edges = set()
+        expected_group_edges = set()
+        for index in range(size):
+            group = by_path[f"m_{index:04d}.py"]
+            if not cyclic and index == size - 1:
+                self.assertEqual(group["prerequisites"], [])
+                continue
+            following = (index + 1) % size
+            prerequisite = by_path[f"m_{following:04d}.py"]["id"]
+            self.assertEqual(group["prerequisites"], [prerequisite])
+            expected_symbol_edges.add(
+                (functions[f"f_{index}"], functions[f"f_{following}"], "calls")
+            )
+            expected_group_edges.add((prerequisite, group["id"], "calls"))
+        for field, expected in (
+            ("symbol_edges", expected_symbol_edges),
+            ("edges", expected_group_edges),
+        ):
+            self.assertEqual(len(report[field]), edge_count)
+            self.assertEqual(
+                {(e["from"], e["to"], e["type"]) for e in report[field]},
+                expected,
+            )
+        self.assertEqual(
+            [group["path"] for group in groups],
+            sorted(expected_paths, reverse=not cyclic),
+        )
+        self.assertEqual(
+            report["cycles"],
+            (tuple(sorted(g["id"] for g in groups)),) if cyclic else (),
+        )
+        self.assertEqual(report["tests"], [])
+        self.assertEqual(report["stats"]["test_runs"], 0)
+        annotated = apply_annotations(
+            report,
+            {
+                "schema": "diffstory.annotations.v1",
+                "base_sha": report["meta"]["base_sha"],
+                "head_sha": report["meta"]["head_sha"],
+                "steps": [
+                    {
+                        "group_id": group["id"],
+                        "evidence_change_ids": group["change_ids"],
+                        "passages": [
+                            {
+                                "text": "Follow this function and its import.",
+                                "change_ids": group["change_ids"],
+                                "view": "definition",
+                            }
+                        ],
+                    }
+                    for group in groups
+                ],
+            },
+        )
+        for field in (
+            "changes",
+            "edges",
+            "symbol_edges",
+            "cycles",
+            "source_evidence",
+            "tests",
+        ):
+            self.assertEqual(annotated[field], report[field])
+        for index, group in enumerate(annotated["groups"]):
+            self.assertEqual(group["number"], index + 1)
+            self.assertEqual(
+                group["next_id"],
+                groups[index + 1]["id"] if index + 1 < size else None,
+            )
+        self.assertIn(
+            "Follow this function and its import.",
+            render(json.loads(json.dumps(annotated))),
+        )
+        self.assertEqual(sys.getrecursionlimit(), recursion_limit)
+
+    def test_public_chain_above_recursion_limit(self) -> None:
+        """Compile, annotate, and render a chain longer than the call stack."""
+        self.check_compiled_graph(cyclic=False)
+
+    def test_public_cycle_above_recursion_limit(self) -> None:
+        """Retain the entire large function SCC through public consumers."""
+        self.check_compiled_graph(cyclic=True)
 
 
 class CompilerTests(unittest.TestCase):

@@ -16,6 +16,9 @@ from collections import Counter
 from collections import defaultdict
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from heapq import heapify
+from heapq import heappop
+from heapq import heappush
 from itertools import islice
 from itertools import zip_longest
 from pathlib import PurePosixPath
@@ -39,6 +42,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
     from collections.abc import Set as AbstractSet
@@ -1077,7 +1081,9 @@ def ordered_components(
     Args:
         nodes: Node identifiers to order.
         prereqs: Mapping from node to prerequisite node identifiers.
-        priority: Sort-key function for stable ordering among available nodes.
+        priority: Sort-key function for ordering among available components
+            (by their minimum node priority) and within each component. Equal
+            priorities use node identity, independent of traversal order.
 
     Returns:
         A prerequisite-respecting node order and the multi-node strongly
@@ -1097,9 +1103,7 @@ def ordered_components(
     )
     order = _topological_component_order(components, dependencies, priority)
     cycles = tuple(
-        tuple(sorted(component))
-        for component in components
-        if len(component) > 1
+        sorted(component for component in components if len(component) > 1)
     )
     return order, cycles
 
@@ -1109,14 +1113,15 @@ def _strongly_connected_components(
     prereqs: Mapping[str, AbstractSet[str]],
 ) -> tuple[tuple[str, ...], ...]:
     """
-    Find deterministic Tarjan components for a prerequisite graph.
+    Find deterministic Tarjan components without recursive graph traversal.
 
     Args:
         nodes: Node identifiers to traverse.
         prereqs: Mapping from each node to its prerequisites.
 
     Returns:
-        Strongly connected components in Tarjan traversal order.
+        Components in deterministic DFS completion order, with sorted members.
+        Reachable prerequisites are included even if not listed in nodes.
     """
     next_index = 0
     indices = {}
@@ -1125,36 +1130,55 @@ def _strongly_connected_components(
     active_nodes = set()
     components = []
 
-    def visit(node: str) -> None:
-        """Visit a node and collect its Tarjan strongly connected set."""
+    def enter(node: str) -> tuple[str, Iterator[str]]:
+        """Record a discovered node and return its suspended traversal frame."""
         nonlocal next_index
         indices[node] = next_index
         lowlinks[node] = next_index
         next_index += 1
         stack.append(node)
         active_nodes.add(node)
+        return node, iter(sorted(prereqs.get(node, ())))
 
-        for prerequisite in sorted(prereqs.get(node, set())):
+    for root in sorted(set(nodes)):
+        if root in indices:
+            continue
+        frames = [enter(root)]
+        while frames:
+            node, prerequisites = frames[-1]
+            prerequisite = next(prerequisites, None)
+            if prerequisite is None:
+                frames.pop()
+                if lowlinks[node] == indices[node]:
+                    component = _pop_component(node, stack)
+                    active_nodes.difference_update(component)
+                    components.append(component)
+                if frames:
+                    parent = frames[-1][0]
+                    lowlinks[parent] = min(lowlinks[parent], lowlinks[node])
+                continue
             if prerequisite not in indices:
-                visit(prerequisite)
-                lowlinks[node] = min(lowlinks[node], lowlinks[prerequisite])
+                frames.append(enter(prerequisite))
             elif prerequisite in active_nodes:
                 lowlinks[node] = min(lowlinks[node], indices[prerequisite])
-
-        if lowlinks[node] == indices[node]:
-            component = []
-            while True:
-                member = stack.pop()
-                active_nodes.remove(member)
-                component.append(member)
-                if member == node:
-                    break
-            components.append(tuple(component))
-
-    for node in nodes:
-        if node not in indices:
-            visit(node)
     return tuple(components)
+
+
+def _pop_component(root: str, stack: list[str]) -> tuple[str, ...]:
+    """
+    Remove one completed SCC from the active Tarjan stack.
+
+    Args:
+        root: Component root, which must be on the active stack.
+        stack: Active nodes, mutated by removing members through the root.
+
+    Returns:
+        Component members sorted by stable node identity.
+    """
+    component = [stack.pop()]
+    while component[-1] != root:
+        component.append(stack.pop())
+    return tuple(sorted(component))
 
 
 def _component_prerequisites(
@@ -1199,20 +1223,44 @@ def _topological_component_order(
 
     Returns:
         Nodes in prerequisite-respecting order.
+
+    Raises:
+        ValueError: If component dependencies contain a cycle.
     """
-    remaining = set(range(len(components)))
-    completed = set()
+    # Preserve the caller's minimum-priority choice. Node identity only resolves
+    # ties that previously depended on Tarjan discovery or set iteration order.
+    node_keys = {
+        node: (priority(node), node)
+        for component in components
+        for node in component
+    }
+    component_keys = [
+        min(node_keys[node] for node in component) for component in components
+    ]
+    remaining = {
+        index: len(dependencies[index]) for index in range(len(components))
+    }
+    dependents = defaultdict(set)
+    for index, prerequisites in dependencies.items():
+        for prerequisite in prerequisites:
+            dependents[prerequisite].add(index)
+    ready = [
+        (component_keys[index], index)
+        for index, count in remaining.items()
+        if not count
+    ]
+    heapify(ready)
     order = []
-    while remaining:
-        chosen = min(
-            (index for index in remaining if dependencies[index] <= completed),
-            key=lambda index: min(
-                priority(node) for node in components[index]
-            ),
-        )
-        order.extend(sorted(components[chosen], key=priority))
-        completed.add(chosen)
-        remaining.remove(chosen)
+    while ready:
+        _, chosen = heappop(ready)
+        order.extend(sorted(components[chosen], key=node_keys.__getitem__))
+        for dependent in dependents[chosen]:
+            remaining[dependent] -= 1
+            if not remaining[dependent]:
+                heappush(ready, (component_keys[dependent], dependent))
+    if len(order) != len(node_keys):
+        msg = "Component prerequisites must be acyclic"
+        raise ValueError(msg)
     return tuple(order)
 
 
