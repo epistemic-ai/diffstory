@@ -49,6 +49,7 @@ from diffstory.narrative_hierarchy import validate_production_requests
 from diffstory.narrative_hierarchy import validate_source_slice
 from diffstory.narrative_hierarchy import validate_statement_reference
 from diffstory.narrative_hierarchy import validate_support_chains
+from diffstory.narrative_hierarchy import validate_support_forest
 from diffstory.narrative_plan import PackingError
 from diffstory.narrative_plan import build_evidence_ledger
 from diffstory.narrative_plan import build_ledger_index
@@ -1146,6 +1147,74 @@ class SupportTests(unittest.TestCase):
             ValueError, "unconsumed_statement_producer"
         ):
             validate_support_chains(current, self.sources, producers)
+
+    def test_forest_checks_current_authority_once_and_shares_deep_branches(
+        self,
+    ) -> None:
+        """Many roots share one deep source check and one iterative traversal."""
+        current = prose(
+            semantic_digest("forest", 0),
+            SupportedStatement(
+                kind="implementation_claim",
+                text="Source endpoint.",
+                citations=(self.ref,),
+            ),
+        )
+        producers = {current.item_key: current}
+        roots = []
+        for number in range(1100):
+            current = prose(
+                semantic_digest("forest", number + 1),
+                SupportedStatement(
+                    kind="implementation_claim",
+                    text="Consumed child.",
+                    basis=(
+                        statement_reference(
+                            current, StatementPath(field="abstraction")
+                        ),
+                    ),
+                ),
+            )
+            producers[current.item_key] = current
+            if number >= 1088:
+                roots.append(current)
+        with mock.patch.object(
+            PlanningSources,
+            "check_current",
+            autospec=True,
+            side_effect=PlanningSources.check_current,
+        ) as checked:
+            validate_support_forest(tuple(roots), self.sources, producers)
+            self.assertEqual(checked.call_count, 1)
+        for sources in (copy.copy(self.sources), PlanningSources()):
+            with self.assertRaisesRegex(
+                ValueError, "unregistered_planning_sources"
+            ):
+                validate_support_forest(tuple(roots), sources, producers)
+        endpoint = next(iter(producers))
+        missing = dict(producers)
+        missing.pop(endpoint)
+        with self.assertRaisesRegex(
+            ValueError, "unconsumed_statement_producer"
+        ):
+            validate_support_forest(tuple(roots), self.sources, missing)
+        changed = dict(producers)
+        changed[endpoint] = prose(
+            semantic_digest("forged endpoint"),
+            SupportedStatement(
+                kind="editorial", text="No implementation support."
+            ),
+        )
+        with self.assertRaises(ValueError):
+            validate_support_forest(tuple(roots), self.sources, changed)
+        span = next(iter(self.index.spans.values()))
+        original = span.text
+        object.__setattr__(span, "text", "changed current authority")
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                validate_support_forest(tuple(roots), self.sources, producers)
+        finally:
+            object.__setattr__(span, "text", original)
 
 
 if __name__ == "__main__":

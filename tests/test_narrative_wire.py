@@ -172,6 +172,166 @@ class CompactWireTests(unittest.TestCase):
             for span in value["spans"]:
                 self.assertEqual(set(span), {"handle", "side", "path", "text"})
 
+    def test_typed_basis_handles_reject_unconsumed_and_stale_proof(  # noqa: PLR0915 # Exercise both actual consumed support families.
+        self,
+    ) -> None:
+        """Whole spans, unseen slices and changed child endpoints grant no support."""
+        from dataclasses import replace
+        from types import MappingProxyType
+
+        from diffstory.narrative_contracts import DetailResult
+        from diffstory.narrative_contracts import PlanningCardResult
+        from diffstory.narrative_contracts import SourceSliceRef
+        from diffstory.narrative_contracts import SupportSet
+        from diffstory.narrative_hierarchy import planning_waves
+        from diffstory.narrative_manifest import validate_prose_support
+        from diffstory.narrative_plan import canonical_bytes
+        from diffstory.narrative_plan import content_digest
+
+        inputs = ProductionInputs(
+            golden_report(1),
+            Transport(
+                FixtureProvider(),
+                V2Options(
+                    card_wire_bytes=1024,
+                    card_support_bytes=2048,
+                    prose_wire_bytes=4096,
+                ),
+            ),
+        )
+        inputs.transport.provider.context_tokens = 40000
+        # Capacity/configuration is captured; construct again after explicit limits.
+        inputs.transport.provider.max_output_tokens = 15000
+        inputs = ProductionInputs(
+            golden_report(1),
+            Transport(inputs.transport.provider, inputs.options),
+        )
+        detail = StageInputs(inputs, "detail", inputs.detail_items())
+        request = detail.prepare(
+            tuple(detail.items), repair=False, partition=0
+        )
+        raw = FixtureProvider.respond(strict_json(request.body)["data"])
+        raw["items"][0]["explanations"][0]["before"] = (
+            "field continuation " * 3000
+        )
+        envelope = inputs.wire.envelope(raw, request.metadata.batch, {})
+        details = tuple(
+            DetailResult.model_validate_json(canonical_bytes(v))
+            for v in envelope.items
+        )
+        plan = inputs.build_plan(inputs.bind_details(details))
+        produced, sampled = {}, {}
+        for wave in planning_waves(plan):
+            stage = StageInputs(
+                inputs,
+                "planning",
+                tuple(
+                    inputs.card_item(inputs.cards[k], produced) for k in wave
+                ),
+            )
+            for batch in stage.pack(tuple(stage.items)):
+                request = stage.prepare(
+                    batch.item_keys, repair=False, partition=batch.partition
+                )
+                raw = FixtureProvider.respond(
+                    strict_json(request.body)["data"]
+                )
+                envelope = inputs.wire.envelope(
+                    raw, request.metadata.batch, stage.contexts
+                )
+                self.assertEqual(envelope.failures, ())
+                for value in envelope.items:
+                    result = PlanningCardResult.model_validate_json(
+                        canonical_bytes(value)
+                    )
+                    stage.validate(stage.lookups[result.item_key], result)
+                    produced[result.binding.subject_key] = result
+                    context = stage.contexts[result.item_key]
+                    for ref in context.support.basis:
+                        sampled.setdefault(ref.kind, (result, context, ref))
+            if set(sampled) == {"source_slice", "statement"}:
+                break
+        self.assertEqual(set(sampled), {"source_slice", "statement"})
+        result, context, ref = sampled["source_slice"]
+        alias = inputs.wire.basis_alias(ref)
+        self.assertTrue(alias.startswith("x"))
+        with self.assertRaisesRegex(ArtifactRuntimeError, "citation"):
+            inputs.wire.aliases.resolve("b", alias)
+        statement = result.abstraction[0]
+        for bad in (
+            statement.model_copy(
+                update={"basis": (), "citations": (ref.source,)}
+            ),
+            statement.model_copy(
+                update={
+                    "basis": (
+                        SourceSliceRef(
+                            source=ref.source,
+                            byte_start=0,
+                            byte_end=1,
+                            content_digest=content_digest(
+                                inputs.index.spans[
+                                    ref.source.span_id
+                                ].text.encode()[:1]
+                            ),
+                        ),
+                    )
+                }
+            ),
+        ):
+            altered = result.model_copy(update={"abstraction": (bad,)})
+            with self.assertRaisesRegex(ArtifactRuntimeError, "citation"):
+                validate_prose_support(altered, context, inputs.wire)
+        author = statement.model_copy(
+            update={
+                "kind": "author_motivation",
+                "basis": (),
+                "author_context_digest": inputs.author_digest,
+            }
+        )
+        with self.assertRaisesRegex(ArtifactRuntimeError, "citation"):
+            validate_prose_support(
+                result.model_copy(update={"abstraction": (author,)}),
+                context,
+                inputs.wire,
+            )
+        result, context, ref = sampled["statement"]
+        self.assertTrue(inputs.wire.basis_alias(ref).startswith("b"))
+        for update in (
+            {"result_digest": "0" * 64},
+            {"statement_digest": "0" * 64},
+            {"producer_item_key": "0" * 64},
+            {
+                "statement_path": ref.statement_path.model_copy(
+                    update={"index": 999}
+                )
+            },
+        ):
+            bad = ref.model_copy(update=update)
+            inputs.wire.basis_alias(bad)
+            altered = result.model_copy(
+                update={
+                    "abstraction": (
+                        result.abstraction[0].model_copy(
+                            update={
+                                "claims": (),
+                                "citations": (),
+                                "basis": (bad,),
+                            }
+                        ),
+                    )
+                }
+            )
+            forged = replace(context, support=SupportSet(basis=(bad,)))
+            with self.assertRaisesRegex(ArtifactRuntimeError, "citation"):
+                validate_prose_support(altered, forged, inputs.wire)
+        with self.assertRaisesRegex(ArtifactRuntimeError, "citation"):
+            validate_prose_support(
+                result,
+                replace(context, consumed=MappingProxyType({})),
+                inputs.wire,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

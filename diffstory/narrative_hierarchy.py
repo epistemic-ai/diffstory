@@ -1760,6 +1760,15 @@ def validate_support_chains(
     sources: PlanningSources,
     producers: Mapping[str, ProseResult],
 ) -> None:
+    """Validate one root through the shared current-source forest boundary."""
+    validate_support_forest((result,), sources, producers)
+
+
+def validate_support_forest(
+    results: tuple[ProseResult, ...],
+    sources: PlanningSources,
+    producers: Mapping[str, ProseResult],
+) -> None:
     """Iteratively validate complete inherited chains to valid current endpoints.
 
     This does not establish consumption or receipts; validate_consumed_support
@@ -1767,15 +1776,24 @@ def validate_support_chains(
     Nonimplementation statements cannot establish implementation support.
     """
     sources.check_current()
-    _require(
-        type(result) in {PlanningCardResult, SectionResult, DocumentResult},
-        "invalid_prose_family",
-    )
-    result = type(result).model_validate(result)
+    # The visited set belongs to this immutable endpoint map and this call only.
+    producers = MappingProxyType(dict(producers))
+    _require(type(results) is tuple, "invalid_prose_roots")
+    for result in results:
+        _require(
+            type(result)
+            in {PlanningCardResult, SectionResult, DocumentResult},
+            "invalid_prose_family",
+        )
+        type(result).model_validate(result)
     state = _state(sources)
     visited: set[StatementRef] = set()
     active: set[StatementRef] = set()
-    pending = [(s, None, False) for _, s in statement_entries(result)]
+    pending = [
+        (s, None, False)
+        for result in results
+        for _, s in statement_entries(result)
+    ]
     while pending:
         statement, identity, leaving = pending.pop()
         if leaving:
@@ -1804,5 +1822,9 @@ def validate_support_chains(
             if isinstance(ref, SourceSliceRef):
                 validate_source_slice(ref, sources)
             else:
+                # Shared completed branches already passed exact endpoint checks
+                # in this boundary. Never reuse this set across calls.
+                if ref in visited:
+                    continue
                 child = validate_statement_reference(ref, producers)
                 pending.append((child, ref, False))

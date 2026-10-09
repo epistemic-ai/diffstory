@@ -8,6 +8,7 @@ Legacy generation.v1 retains its existing guarantees.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import defaultdict
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -25,6 +26,7 @@ from .narrative_contracts import Natural
 from .narrative_contracts import PlanningCardResult
 from .narrative_contracts import ResultKind
 from .narrative_contracts import SectionResult
+from .narrative_contracts import SourceSliceRef
 from .narrative_contracts import StoryPlan
 from .narrative_contracts import result_key
 from .narrative_contracts import result_kind
@@ -297,10 +299,22 @@ class GenerationManifest(Contract):
             len({card.id for card in self.plan.cards}) == len(self.plan.cards),
             "duplicate_plan_card",
         )
+        subjects = (
+            *self.plan.cards,
+            *(
+                self.plan.production.auxiliary_cards
+                if self.plan.production
+                else ()
+            ),
+        )
         _require(
-            len(self.planning) == len(self.plan.cards)
+            len({c.id for c in subjects}) == len(subjects),
+            "duplicate_plan_card",
+        )
+        _require(
+            len(self.planning) == len(subjects)
             and {card.binding.subject_key for card in self.planning}
-            == {card.id for card in self.plan.cards},
+            == {card.id for card in subjects},
             "planning_coverage",
         )
         prose = (*self.planning, *self.sections, self.document)
@@ -428,6 +442,7 @@ def validate_prose_support(
     against the current ledger. A result cannot grant itself extra support.
     These checks establish references and coverage, not semantic truth.
     """
+    from .narrative_hierarchy import validate_consumed_support
     from .narrative_runtime import ArtifactRuntimeError
 
     def require(condition: bool, reason: str = "citation") -> None:  # noqa: FBT001
@@ -436,6 +451,14 @@ def validate_prose_support(
 
     require(result.binding == context.binding, "dependencies_changed")
     require(result.item_key == context.binding.key, "dependencies_changed")
+    if context.sources is not None:
+        try:
+            validate_consumed_support(
+                result, context.support, context.sources, context.consumed
+            )
+        except ValueError:
+            msg = "citation"
+            raise ArtifactRuntimeError(msg) from None
     allowed_claims = frozenset(context.claims)
     allowed_citations = frozenset(context.citations)
     values = [term.definition for term in result.terminology]
@@ -455,6 +478,7 @@ def validate_prose_support(
     for statement in values:
         require(set(statement.claims) <= allowed_claims)
         require(set(statement.citations) <= allowed_citations)
+        require(set(statement.basis) <= set(context.support.basis))
         require(
             statement.author_context_digest
             == (
@@ -518,7 +542,7 @@ def build_receipts(
     return tuple(producers), tuple(receipts)
 
 
-def assemble_candidate(  # noqa: C901 # Assemble all typed families and exact source bindings.
+def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed families, slice coordinates and immediate provenance.
     report: dict,
     manifest: GenerationManifest,
     *,
@@ -533,10 +557,13 @@ def assemble_candidate(  # noqa: C901 # Assemble all typed families and exact so
     Without them, source is rebuilt from the report and declared parameters.
     """
     from .analysis import source_url
+    from .narrative_hierarchy import statement_at
+    from .narrative_hierarchy import statement_entries
     from .narrative_plan import build_evidence_ledger
     from .narrative_plan import build_ledger_index
     from .narrative_plan import resolve_span_ref
     from .narrative_plan import validate_detail_results
+    from .source_lines import split_source_lines
 
     _require(
         compiler_fact_signature(report) == manifest.compiler_fact_signature,
@@ -554,6 +581,10 @@ def assemble_candidate(  # noqa: C901 # Assemble all typed families and exact so
     group_ids = {g.group_key: g.group_id for g in ledger.group_bindings}
     details = {d.unit_key: d for d in manifest.details}
     references = {}
+    slices = {}
+    provenance = {}
+    prose = (*manifest.planning, *manifest.sections, manifest.document)
+    producers = {r.item_key: r for r in prose}
     for detail in manifest.details:
         for value in (
             *detail.explanations,
@@ -562,24 +593,23 @@ def assemble_candidate(  # noqa: C901 # Assemble all typed families and exact so
         ):
             for ref in value.citations:
                 references[semantic_digest(ref)] = ref
-    for result in (*manifest.planning, *manifest.sections, manifest.document):
-        values = [term.definition for term in result.terminology]
-        for name in (
-            "abstraction",
-            "title",
-            "orientation",
-            "synthesis",
-            "transition",
-            "preamble",
-            "lead",
-            "closing",
-        ):
-            if hasattr(result, name):
-                value = getattr(result, name)
-                values.extend((value,) if name == "title" else value)
-        for value in values:
+    for result in prose:
+        for _, value in statement_entries(result):
             for ref in value.citations:
                 references[semantic_digest(ref)] = ref
+            for ref in value.basis:
+                if isinstance(ref, SourceSliceRef):
+                    slices[semantic_digest(ref)] = ref
+                else:
+                    statement = statement_at(
+                        producers[ref.producer_item_key], ref.statement_path
+                    )
+                    provenance[semantic_digest(ref)] = {
+                        "key": semantic_digest(ref),
+                        "reference": ref.model_dump(mode="json"),
+                        "statement": statement.model_dump(mode="json"),
+                        "consumption": "inherited_statement",
+                    }
     resolved = []
     for key, ref in sorted(references.items()):
         span = resolve_span_ref(
@@ -601,6 +631,48 @@ def assemble_candidate(  # noqa: C901 # Assemble all typed families and exact so
                     span.side,
                     span.line_start,
                     span.line_end,
+                ),
+            }
+        )
+    physical_starts = {}
+    original_fragments = {
+        f["key"]: f for f in report["source_evidence"]["fragments"]
+    }
+    for key, ref in sorted(slices.items()):
+        span = resolve_span_ref(
+            ref.source, index.units[ref.source.unit_key], ledger, index=index
+        )
+        binding = index.bindings[span.buffer_key]
+        if binding.fragment_key not in physical_starts:
+            starts, offset = [], 0
+            for line in split_source_lines(
+                original_fragments[binding.fragment_key]["text"], keepends=True
+            ):
+                starts.append(offset)
+                offset += len(line.encode("utf-8"))
+            physical_starts[binding.fragment_key] = starts
+        starts = physical_starts[binding.fragment_key]
+        byte_start = span.byte_start + ref.byte_start
+        byte_end = span.byte_start + ref.byte_end
+        origin = bisect_right(starts, span.byte_start)
+        line_start = (
+            span.line_start + bisect_right(starts, byte_start) - origin
+        )
+        line_end = (
+            span.line_start + bisect_right(starts, byte_end - 1) - origin
+        )
+        resolved.append(
+            {
+                "key": key,
+                "reference": ref.model_dump(mode="json"),
+                "consumption": "source_slice",
+                "fragment_key": binding.fragment_key,
+                "byte_start": byte_start,
+                "byte_end": byte_end,
+                "line_start": line_start,
+                "line_end": line_end,
+                "url": source_url(
+                    report["meta"], span.path, span.side, line_start, line_end
                 ),
             }
         )
@@ -638,6 +710,7 @@ def assemble_candidate(  # noqa: C901 # Assemble all typed families and exact so
             if d.unit_key not in assigned
         ],
         "citations": resolved,
+        "support_provenance": [provenance[key] for key in sorted(provenance)],
         "generation": manifest.model_dump(mode="json"),
     }
 

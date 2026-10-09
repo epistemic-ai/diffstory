@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from dataclasses import field
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import Literal
 
@@ -21,8 +23,11 @@ from .narrative_contracts import EvidenceQuestion
 from .narrative_contracts import Explanation
 from .narrative_contracts import FactualObservation
 from .narrative_contracts import ItemFailure
+from .narrative_contracts import SourceSliceRef
+from .narrative_contracts import StatementRef
 from .narrative_contracts import SupportedStatement
 from .narrative_contracts import SupportedTerminology
+from .narrative_contracts import SupportSet
 from .narrative_contracts import Text
 from .narrative_contracts import result_model
 from .narrative_contracts import structured_output_schema
@@ -39,6 +44,8 @@ if TYPE_CHECKING:
     from .narrative_contracts import EvidenceUnit
     from .narrative_contracts import ProseBinding
     from .narrative_contracts import SpanRef
+    from .narrative_hierarchy import PlanningSources
+    from .narrative_hierarchy import ProseResult
     from .narrative_plan import LedgerIndex
 
 WIRE_VERSION = "diffstory.wire.v2"
@@ -152,6 +159,7 @@ class WireStatement(Contract):
     text: Text
     claims: tuple[str, ...]
     citations: tuple[str, ...]
+    basis: tuple[str, ...] = ()
     effect: Text | None
     uncertainty: tuple[Text, ...]
 
@@ -239,9 +247,15 @@ class ProseContext:
     binding: ProseBinding
     claims: tuple[ClaimRef, ...]
     citations: tuple[SpanRef, ...]
-    author_digest: str
+    author_digest: str | None
     final: bool = False
     max_wire_bytes: int = 4096
+    support: SupportSet = field(default_factory=SupportSet)
+    consumed: Mapping[str, ProseResult] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    sources: PlanningSources | None = None
+    max_support_bytes: int = 16384
 
 
 class WireAdapter:
@@ -253,6 +267,7 @@ class WireAdapter:
         self.aliases = Aliases()
         self.references: dict[str, SpanRef] = {}
         self.claims: dict[str, ClaimRef] = {}
+        self.bases: dict[str, SourceSliceRef | StatementRef] = {}
         self.limitations: dict[str, object] = {}
         self.unit_references: dict[str, dict[str, str]] = {}
         for group in index.groups.values():
@@ -285,6 +300,65 @@ class WireAdapter:
         self.claims[alias] = claim
         return alias
 
+    def basis_alias(self, ref: SourceSliceRef | StatementRef) -> str:
+        """Keep source slices and exact child statements in distinct namespaces."""
+        if type(ref) not in {SourceSliceRef, StatementRef}:
+            msg = "citation"
+            raise ArtifactRuntimeError(msg)
+        ref = type(ref).model_validate(ref)
+        alias = self.aliases.add(
+            "x" if isinstance(ref, SourceSliceRef) else "b",
+            semantic_digest(ref),
+        )
+        if alias in self.bases and self.bases[alias] != ref:
+            msg = "citation"
+            raise ArtifactRuntimeError(msg)
+        self.bases[alias] = ref
+        return alias
+
+    def support_input(self, support: SupportSet) -> dict:
+        """Describe immediate handles only; source and child text stay in material.
+
+        Hash aliases retain collision-checked full identities locally. They do
+        not authorize any support outside the item's consumed SupportSet.
+        """
+        basis = []
+        for ref in support.basis:
+            value = {"handle": self.basis_alias(ref), "kind": ref.kind}
+            if isinstance(ref, SourceSliceRef):
+                value.update(
+                    source=self.reference_alias(ref.source),
+                    byte_start=ref.byte_start,
+                    byte_end=ref.byte_end,
+                    digest=self.aliases.add("d", ref.content_digest),
+                )
+            else:
+                value.update(
+                    producer=self.aliases.add("i", ref.producer_item_key),
+                    result=self.aliases.add("r", ref.result_digest),
+                    path=ref.statement_path.model_dump(mode="json"),
+                    digest=self.aliases.add("d", ref.statement_digest),
+                )
+            basis.append(value)
+        return {
+            "claims": [
+                {
+                    "handle": self.claim_alias(c),
+                    "unit": self.aliases.add("u", c.unit_key),
+                    "observation": c.observation_id,
+                }
+                for c in support.claims
+            ],
+            "citations": [
+                {"handle": self.reference_alias(r), "span": r.span_id}
+                for r in support.citations
+            ],
+            "basis": basis,
+            "author": self.aliases.add("a", support.author_context_digest)
+            if support.author_context_digest
+            else None,
+        }
+
     def statement_input(self, statement: SupportedStatement) -> dict:
         """Serialize validated supported prose with compact current handles."""
         return {
@@ -294,6 +368,7 @@ class WireAdapter:
             "citations": [
                 self.reference_alias(c) for c in statement.citations
             ],
+            "basis": [self.basis_alias(ref) for ref in statement.basis],
             "effect": statement.effect,
             "uncertainty": list(statement.uncertainty),
         }
@@ -485,7 +560,9 @@ class WireAdapter:
     def _statement(
         self, item: WireStatement, context: ProseContext
     ) -> SupportedStatement:
-        if any(h not in self.claims for h in item.claims):
+        if any(h not in self.claims for h in item.claims) or any(
+            h not in self.bases for h in item.basis
+        ):
             msg = "citation"
             raise ArtifactRuntimeError(msg)
         return SupportedStatement(
@@ -493,6 +570,7 @@ class WireAdapter:
             text=item.text,
             claims=tuple(self.claims[h] for h in item.claims),
             citations=self._refs(item.citations),
+            basis=tuple(self.bases[h] for h in item.basis),
             effect=item.effect,
             uncertainty=item.uncertainty,
             author_context_digest=context.author_digest

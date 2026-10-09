@@ -63,11 +63,15 @@ def statement(text: str, support: dict | None = None) -> dict:
     support = support or {"claims": [], "citations": []}
     claims = [c["handle"] for c in support["claims"][:1]]
     citations = [c["handle"] for c in support["citations"][:2]]
+    basis = [c["handle"] for c in support.get("basis", [])[:1]]
     return {
-        "kind": "implementation_claim" if claims or citations else "editorial",
+        "kind": "implementation_claim"
+        if claims or citations or basis
+        else "editorial",
         "text": text,
         "claims": claims,
         "citations": citations,
+        "basis": basis,
         "effect": None,
         "uncertainty": [],
     }
@@ -1495,6 +1499,573 @@ class BatchedNarratorTests(unittest.TestCase):
         self.assertEqual(len(provider.calls), 2)
         self.assertEqual(narrator.usage.report()["calls"], 2)
         self.assertEqual(narrator.v2_counters["repairs"], 0)
+
+
+class ProductionRepairTests(unittest.TestCase):
+    """Public-path closures for frozen production reductions and exact details."""
+
+    def setUp(self) -> None:
+        """Keep each reproduction in an isolated local artifact directory."""
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.options = V2Options(
+            card_wire_bytes=1024,
+            card_support_bytes=2048,
+            prose_wire_bytes=4096,
+            packing=RequestPackingLimits(stable_partition_count=1),
+        )
+
+    def run_public(
+        self, report: dict, provider: FixtureProvider, *, name: str = "run"
+    ) -> tuple:
+        """Generate and independently rebuild the current manifest without sends."""
+        from diffstory.narrative_v2 import validate_production
+
+        provider.context_tokens = 40000
+        provider.max_output_tokens = 15000
+        narrator = Narrator(
+            provider,
+            architecture="v2",
+            concurrency=1,
+            v2_options=self.options,
+            recovery_dir=self.root / name,
+            checkpoint_dir=self.root / "cache",
+        )
+        candidate = narrator.generate(report)
+        manifest = GenerationManifest.model_validate_json(
+            canonical_bytes(candidate["generation"])
+        )
+        calls = len(provider.calls)
+        validate_production(
+            report,
+            manifest,
+            provider=provider,
+            options=self.options,
+            candidate=candidate,
+        )
+        self.assertEqual(len(provider.calls), calls)
+        for producer in manifest.producers:
+            for request in producer.requests:
+                self.assertLessEqual(
+                    request.batch.input_bound
+                    + request.batch.output_guard
+                    + request.safety_tokens,
+                    40000,
+                )
+                self.assertLessEqual(request.batch.output_reservation, 15000)
+                self.assertLessEqual(
+                    request.batch.estimated_response_bytes,
+                    request.response_byte_limit,
+                )
+                self.assertLessEqual(
+                    request.batch.estimated_seconds, request.timeout_seconds
+                )
+        subjects = {
+            c.id
+            for c in (
+                *manifest.plan.cards,
+                *manifest.plan.production.auxiliary_cards,
+            )
+        }
+        self.assertEqual(
+            Counter(k for r in manifest.plan.requests for k in r.item_keys),
+            Counter(subjects),
+        )
+        self.assertEqual(
+            {r.binding.subject_key for r in manifest.planning}, subjects
+        )
+        self.assertEqual(
+            {
+                r.binding.plan_key
+                for r in (
+                    *manifest.planning,
+                    *manifest.sections,
+                    manifest.document,
+                )
+            },
+            {manifest.plan.id},
+        )
+        self.assertEqual(
+            len(manifest.receipts),
+            len(manifest.details)
+            + len(manifest.planning)
+            + len(manifest.sections)
+            + 1,
+        )
+        self.assertEqual(manifest.sections[-1].transition, ())
+        self.assertEqual(
+            [d for step in candidate["steps"] for d in step["details"]],
+            [
+                d.model_dump(mode="json")
+                for group in manifest.plan.groups
+                for unit in group.group.unit_keys
+                for d in manifest.details
+                if d.unit_key == unit
+            ],
+        )
+        return narrator, candidate, manifest
+
+    def assert_shapes_bound_actual(
+        self, narrator: Narrator, manifest: GenerationManifest
+    ) -> None:
+        """Each sizing-only shape dominates its actual singleton, including repair."""
+        from diffstory.narrative_hierarchy import planning_shapes
+
+        inputs = narrator._v2.inputs  # noqa: SLF001 # Inspect the public gate's actual stage audit.
+        stages = {
+            i.subject: (stage, i)
+            for stage in narrator._v2.stages  # noqa: SLF001
+            for i in stage.items.values()
+            if i.context is not None
+        }
+        body = inputs.transport.body
+        captured = []
+
+        def measured(*args: object) -> bytes:
+            result = body(*args)
+            captured.append(result)
+            return result
+
+        for shape in planning_shapes(manifest.plan, inputs.sources):
+            subject = (
+                manifest.plan.id
+                if shape.stage == "document"
+                else shape.subject_key
+            )
+            stage, item = stages[subject]
+            with patch.object(inputs.transport, "body", side_effect=measured):
+                inputs.check_shape(shape)
+            upper = len(captured[-1])
+            for repair in (False, True):
+                request = stage.prepare(
+                    (item.key,),
+                    repair=repair,
+                    reason="citation" if repair else None,
+                    partition=0,
+                )
+                self.assertLessEqual(len(request.body), upper)
+
+    def test_original_normal_and_47267_byte_handoff_and_warm_new_directory(
+        self,
+    ) -> None:
+        """Accept one exact provider-valid long detail before lossless planning."""
+        from diffstory.narrative_contracts import DetailResult
+        from diffstory.narrative_v2 import ProductionInputs
+        from diffstory.narrative_v2 import StageInputs
+        from diffstory.narrative_v2 import Transport
+
+        normal, _, _ = self.run_public(
+            golden_report(1), FixtureProvider(), name="normal"
+        )
+        self.assertEqual(len(normal._v2.inputs.plan.production.fragments), 0)  # noqa: SLF001
+        accepted = []
+
+        def long_detail(
+            _provider: FixtureProvider, data: dict, raw: dict
+        ) -> dict:
+            if data["stage"] == "detail":
+                raw["items"][0]["explanations"][0]["before"] = (
+                    "Authored long-detail handoff fixture. " * 1200
+                )
+                accepted.append(copy.deepcopy(raw))
+            return raw
+
+        # Use a separate cache so the reproduction truly consumes the long response.
+        self.root = self.root / "long"
+        provider = FixtureProvider(long_detail)
+        narrator, _, manifest = self.run_public(golden_report(1), provider)
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(len(canonical_bytes(accepted[0])), 47267)
+        self.assertEqual(
+            Counter(c["data"]["stage"] for c in provider.calls)["detail"], 1
+        )
+        inputs = ProductionInputs(
+            golden_report(1), Transport(provider, self.options)
+        )
+        stage = StageInputs(inputs, "detail", inputs.detail_items())
+        request = stage.prepare(tuple(stage.items), repair=False, partition=0)
+        envelope = inputs.wire.envelope(
+            accepted[0], request.metadata.batch, {}
+        )
+        details = tuple(
+            DetailResult.model_validate_json(canonical_bytes(r))
+            for r in envelope.items
+        )
+        self.assertEqual(details, manifest.details)
+        self.assertTrue(manifest.plan.production.fragments)
+        self.assert_shapes_bound_actual(narrator, manifest)
+        warm = FixtureProvider(long_detail)
+        _, _, reused = self.run_public(
+            golden_report(1), warm, name="new-recovery"
+        )
+        self.assertEqual(warm.calls, [])
+        self.assertEqual(reused.details, details)
+        self.assertEqual(reused.current_usage.calls, 0)
+        self.assertTrue(
+            all(r.disposition == "reused" for r in reused.receipts)
+        )
+
+    def test_original_64_group_fanin_and_64_member_cycle(self) -> None:
+        """Large complete compiler relationships reduce before terminal requests."""
+        for mode in ("fanin", "cycle"):
+            with self.subTest(mode=mode):
+                report = golden_report(64)
+                if mode == "fanin":
+                    report["groups"][-1]["prerequisites"] = [
+                        g["id"] for g in report["groups"][:-1]
+                    ]
+                else:
+                    for number, group in enumerate(report["groups"]):
+                        group["prerequisites"] = [
+                            report["groups"][(number + 1) % 64]["id"]
+                        ]
+                narrator, _, manifest = self.run_public(
+                    report, FixtureProvider(), name=mode
+                )
+                hierarchy = manifest.plan.production
+                self.assertTrue(hierarchy.auxiliary_cards)
+                if mode == "fanin":
+                    target = next(
+                        g.group.key
+                        for g in manifest.plan.groups
+                        if len(g.group.prerequisites) == 63
+                    )
+                    view = next(
+                        v
+                        for v in hierarchy.section_views
+                        if v.group_key == target
+                    )
+                    self.assertEqual(
+                        sum(
+                            s.relationship == "prerequisite"
+                            for s in view.sources
+                        ),
+                        63,
+                    )
+                    self.assertIsNotNone(view.context_root)
+                else:
+                    self.assertEqual(len(manifest.plan.cycles), 1)
+                    self.assertEqual(len(manifest.plan.cycles[0]), 64)
+                    self.assertEqual(
+                        len(hierarchy.cycle_roots[0].group_keys), 64
+                    )
+                self.assert_shapes_bound_actual(narrator, manifest)
+
+    def test_unicode_records_author_heading_and_source_slice_provenance(
+        self,
+    ) -> None:
+        """Preserve mixed physical endings and all fields through metadata reductions."""
+        from diffstory.narrative_hierarchy import fragment_material
+        from diffstory.narrative_hierarchy import record_key
+        from diffstory.narrative_hierarchy import record_material
+
+        text = ('é😀\r\nCR\rLF\nLS\u2028PS\u2029"\\  ' * 700) + "terminal  "
+        report = golden_report(1)
+        report["meta"]["title"] = "Authored title 😀 " * 2200
+        report["meta"]["repository"] = "example/project/" * 1800
+        report["meta"]["description"] = "Author motivation\r\n" * 2200
+        report["groups"][0]["theme"] = "Compiler heading " * 2500
+        accepted = []
+
+        def expanded(
+            _provider: FixtureProvider, data: dict, raw: dict
+        ) -> dict:
+            if data["stage"] == "detail":
+                item = raw["items"][0]
+                item["explanations"][0]["before"] = text
+                item["observations"][0]["text"] = (
+                    "Observation β\r\n\u2028  " * 700
+                )
+                item["observations"].extend(
+                    {
+                        "text": f"Additional observation {n}.",
+                        "citations": list(
+                            item["observations"][0]["citations"]
+                        ),
+                    }
+                    for n in range(32)
+                )
+                accepted.append(copy.deepcopy(raw))
+            elif data["stage"] == "planning":
+                for output, item in zip(
+                    raw["items"], data["items"], strict=True
+                ):
+                    if item["support"]["author"] and not any(
+                        item["support"][k]
+                        for k in ("claims", "citations", "basis")
+                    ):
+                        output["abstraction"][0]["kind"] = "author_motivation"
+                        output["abstraction"][0]["text"] = (
+                            "The author reports a motivation for the change."
+                        )
+            return raw
+
+        narrator, candidate, manifest = self.run_public(
+            report, FixtureProvider(expanded)
+        )
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(manifest.details[0].explanations[0].before, text)
+        self.assertEqual(len(manifest.details[0].observations), 33)
+        h = manifest.plan.production
+        self.assertEqual(
+            {f.owner.kind for f in h.fragments},
+            {"source", "detail", "author", "heading"},
+        )
+        inputs = narrator._v2.inputs  # noqa: SLF001
+        fields = {}
+        for f in h.fragments:
+            fields.setdefault((record_key(f.owner), f.path), []).append(f)
+        for (key, path), fragments in fields.items():
+            actual = b"".join(
+                fragment_material(inputs.sources, f) for f in fragments
+            )
+            expected = next(
+                f.data
+                for f in record_material(inputs.sources, key).fields
+                if f.path == path
+            )
+            self.assertEqual(actual, expected)
+        self.assertTrue(candidate["support_provenance"])
+        slices = [
+            c
+            for c in candidate["citations"]
+            if c.get("consumption") == "source_slice"
+        ]
+        self.assertTrue(slices)
+        source_fragments = {
+            f["key"]: f["text"].encode()
+            for f in report["source_evidence"]["fragments"]
+        }
+        from diffstory.narrative_plan import content_digest
+
+        for entry in slices:
+            raw = source_fragments[entry["fragment_key"]][
+                entry["byte_start"] : entry["byte_end"]
+            ]
+            self.assertEqual(
+                content_digest(raw), entry["reference"]["content_digest"]
+            )
+        self.assert_shapes_bound_actual(narrator, manifest)
+
+    def test_additional_json_layer_bounds_escaping_and_reduces_budgets(
+        self,
+    ) -> None:
+        """Provider framing and an extra JSON string layer enter every size check."""
+
+        class LayeredFixture(FixtureProvider):
+            request_prefix = b"local fixture framing\n"
+            input_overhead_bytes = 113
+
+            def prepare(self, *args: object) -> bytes:
+                inner = super().prepare(*args)
+                return canonical_bytes({"payload": inner.decode("utf-8")})
+
+            def complete_reply(
+                self, body: bytes, timeout: float, *, response_byte_limit: int
+            ) -> ProviderReply:
+                return super().complete_reply(
+                    json.loads(body)["payload"].encode(),
+                    timeout,
+                    response_byte_limit=response_byte_limit,
+                )
+
+        def escaping(
+            _provider: FixtureProvider, data: dict, raw: dict
+        ) -> dict:
+            if data["stage"] == "detail":
+                raw["items"][0]["explanations"][0]["before"] = (
+                    '😀"\\\r\n\u2028\u2029  ' * 1200
+                )
+            elif data["stage"] == "planning":
+                for output, item in zip(
+                    raw["items"], data["items"], strict=True
+                ):
+                    if item["max_support_bytes"] < 1024:
+                        support = item["support"]
+                        compact = {
+                            "claims": [],
+                            "citations": support["citations"][:1],
+                            "basis": support["basis"][:1],
+                        }
+                        output["abstraction"] = [
+                            statement(
+                                "A supplied input supports this abstraction.",
+                                compact,
+                            )
+                        ]
+                    # Fill the wire budget with escaping-heavy complete text.
+                    # The next request must remain below its frozen shape bound.
+                    text = "Supported "
+                    while True:
+                        candidate = text + '\\"😀\u2028'
+                        output["abstraction"][0]["text"] = candidate
+                        if (
+                            len(canonical_bytes(output))
+                            > item["max_result_bytes"]
+                        ):
+                            output["abstraction"][0]["text"] = text
+                            break
+                        text = candidate
+            return raw
+
+        narrator, _, manifest = self.run_public(
+            golden_report(1), LayeredFixture(escaping)
+        )
+        self.assertTrue(manifest.plan.production.fragments)
+        self.assertLess(
+            manifest.plan.production.card_budget.support_bytes,
+            self.options.card_support_bytes,
+        )
+        self.assertGreaterEqual(
+            manifest.plan.production.card_budget.support_bytes, 516
+        )
+        self.assert_shapes_bound_actual(narrator, manifest)
+
+    def test_large_source_and_citation_collections_rebind_30_lines_without_calls(
+        self,
+    ) -> None:
+        """Many physical source records keep exact slices and historical producers."""
+        before = (
+            "def source():\r\n"
+            + "".join(
+                f'    v{n} = "' + ("\u03b1" * 900) + '"\r\n' for n in range(12)
+            )
+            + "    return 1\r\n"
+        )
+        after = before.replace("\u03b1", "β").replace("return 1", "return 2")
+        source = snap(
+            {"source.py": before},
+            {"source.py": after},
+            overrides={
+                (side, "source.py"): {
+                    "state": "supplied",
+                    "coverage": "partial",
+                }
+                for side in ("base", "head")
+            },
+            fragment_options={
+                (side, "source.py"): {"start_line": 31}
+                for side in ("base", "head")
+            },
+        )
+        self.options = self.options.model_copy(
+            update={
+                "ledger": LedgerParameters(
+                    max_span_bytes=4096, max_unit_spans=2
+                )
+            }
+        )
+
+        def observations(
+            _provider: FixtureProvider, data: dict, raw: dict
+        ) -> dict:
+            if data["stage"] == "detail":
+                for output, item in zip(
+                    raw["items"],
+                    (i for i in data["items"] if i["obligations"]),
+                    strict=True,
+                ):
+                    output["observations"] = [
+                        {
+                            "text": f"Supplied record {n} retains its source text.",
+                            "citations": [s["handle"] for s in item["spans"]],
+                        }
+                        for n in range(12)
+                    ]
+            return raw
+
+        report = compile_snapshot(source)
+        narrator, candidate, manifest = self.run_public(
+            report, FixtureProvider(observations)
+        )
+        self.assertGreater(len(manifest.details), 10)
+        self.assertTrue(manifest.plan.production.fragments)
+        self.assertTrue(
+            any(
+                f.owner.kind == "source" and f.path == "text"
+                for f in manifest.plan.production.fragments
+            )
+        )
+        source_slices = [
+            c
+            for c in candidate["citations"]
+            if c.get("consumption") == "source_slice"
+        ]
+        self.assertTrue(source_slices)
+        for entry in source_slices:
+            self.assertGreaterEqual(entry["line_start"], 31)
+            self.assertLessEqual(entry["line_end"], 44)
+        for fragment in source["fragments"]:
+            fragment["start_line"] += 30
+        source["meta"]["base_sha"] = "c" * 40
+        source["meta"]["head_sha"] = "d" * 40
+        current = compile_snapshot(source)
+        provider = FixtureProvider(observations)
+        _, rebound, reused = self.run_public(current, provider, name="shifted")
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(manifest.details, reused.details)
+        self.assertEqual(manifest.plan, reused.plan)
+        self.assertEqual(
+            [
+                (c["key"], c["byte_start"], c["byte_end"])
+                for c in candidate["citations"]
+            ],
+            [
+                (c["key"], c["byte_start"], c["byte_end"])
+                for c in rebound["citations"]
+            ],
+        )
+        for old, new in zip(
+            candidate["citations"], rebound["citations"], strict=True
+        ):
+            self.assertEqual(new["line_start"], old["line_start"] + 30)
+            self.assertEqual(new["line_end"], old["line_end"] + 30)
+        self.assert_shapes_bound_actual(narrator, manifest)
+
+    def test_large_prose_batch_reserves_complete_response_envelope(
+        self,
+    ) -> None:
+        """Many tiny valid outputs still need all JSON array separators reserved."""
+        from diffstory.narrative_plan import semantic_digest
+        from diffstory.narrative_v2 import InputItem
+        from diffstory.narrative_v2 import ProductionInputs
+        from diffstory.narrative_v2 import StageInputs
+        from diffstory.narrative_v2 import Transport
+
+        inputs = ProductionInputs(
+            golden_report(1), Transport(FixtureProvider(), self.options)
+        )
+        outputs, items = [], []
+        for number in range(300):
+            key = semantic_digest("local envelope capacity fixture", number)
+            target = inputs.wire.aliases.add("i", key)
+            result = {
+                "target": target,
+                "abstraction": [statement("x")],
+                "terminology": [],
+            }
+            outputs.append(result)
+            items.append(
+                InputItem(
+                    key,
+                    key,
+                    (),
+                    canonical_bytes({"target": target}),
+                    len(canonical_bytes(result)),
+                )
+            )
+        stage = StageInputs(inputs, "planning", tuple(items))
+        request = stage.prepare(tuple(stage.items), repair=False, partition=0)
+        response = canonical_bytes(
+            {"version": "diffstory.wire.v2", "items": outputs}
+        )
+        # One token per serialized byte is the declared conservative allowance.
+        # The older fixed 64-byte envelope margin missed these 299 commas,
+        # even after adding the ordinary 256-token repair reserve.
+        self.assertLessEqual(
+            len(response), request.metadata.batch.output_reservation
+        )
 
 
 if __name__ == "__main__":

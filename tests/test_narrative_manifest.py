@@ -550,3 +550,112 @@ class ProductionManifestTests(unittest.TestCase):
                 provider=self.provider,
                 candidate=candidate,
             )
+
+    def test_missing_union_audit_and_unconsumed_whole_source_fail_public_validation(
+        self,
+    ) -> None:
+        """An empty final audit or available-but-unconsumed source cannot pass."""
+        manifest = self.manifest
+        empty = changed_record(
+            manifest, plan=changed_record(manifest.plan, requests=())
+        )
+        with self.assertRaisesRegex(
+            ValueError, "planning_request_membership_mismatch"
+        ):
+            validate_generation(self.report, empty, provider=self.provider)
+        original = manifest.sections[0]
+        direct = manifest.details[0].explanations[0].citations[0]
+        statement = changed_record(
+            original.synthesis[0], claims=(), basis=(), citations=(direct,)
+        )
+        section = changed_record(original, synthesis=(statement,))
+        altered = changed_record(
+            manifest,
+            sections=(section, *manifest.sections[1:]),
+            receipts=tuple(
+                changed_record(r, result_digest=result_digest(section))
+                if r.item_key == section.item_key
+                else r
+                for r in manifest.receipts
+            ),
+        )
+        with self.assertRaisesRegex(ArtifactRuntimeError, "citation"):
+            validate_generation(self.report, altered, provider=self.provider)
+
+    def test_rehashed_stale_statement_endpoints_fail_public_validation(
+        self,
+    ) -> None:
+        """Rehashed receipts cannot authorize a changed producer, path or digest."""
+        from diffstory.narrative_contracts import StatementPath
+
+        original = self.manifest.sections[0]
+        ref = original.synthesis[0].basis[0]
+        for update in (
+            {"producer_item_key": "0" * 64},
+            {"result_digest": "0" * 64},
+            {"statement_digest": "0" * 64},
+            {"statement_path": StatementPath(field="abstraction", index=999)},
+        ):
+            with self.subTest(fields=tuple(update)):
+                statement = changed_record(
+                    original.synthesis[0],
+                    basis=(changed_record(ref, **update),),
+                )
+                section = changed_record(original, synthesis=(statement,))
+                altered = changed_record(
+                    self.manifest,
+                    sections=(section, *self.manifest.sections[1:]),
+                    receipts=tuple(
+                        changed_record(r, result_digest=result_digest(section))
+                        if r.item_key == section.item_key
+                        else r
+                        for r in self.manifest.receipts
+                    ),
+                )
+                with self.assertRaisesRegex(ArtifactRuntimeError, "citation"):
+                    validate_generation(
+                        self.report, altered, provider=self.provider
+                    )
+
+    def test_rederived_context_and_final_transition_reject_self_declarations(
+        self,
+    ) -> None:
+        """Persisted relationship facts and a valid receipt cannot replace current facts."""
+        hierarchy = self.manifest.plan.production
+        view = hierarchy.section_views[0]
+        changed = changed_record(view, chapter_key="0" * 64)
+        altered = changed_record(
+            self.manifest,
+            plan=changed_record(
+                self.manifest.plan,
+                production=changed_record(
+                    hierarchy,
+                    section_views=(changed, *hierarchy.section_views[1:]),
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(
+            ArtifactRuntimeError, "dependencies_changed"
+        ):
+            validate_generation(self.report, altered, provider=self.provider)
+        final = self.manifest.sections[-1]
+        changed = changed_record(
+            final,
+            transition=(
+                SupportedStatement(
+                    kind="editorial", text="Invented next section."
+                ),
+            ),
+        )
+        altered = changed_record(
+            self.manifest,
+            sections=(*self.manifest.sections[:-1], changed),
+            receipts=tuple(
+                changed_record(r, result_digest=result_digest(changed))
+                if r.item_key == changed.item_key
+                else r
+                for r in self.manifest.receipts
+            ),
+        )
+        with self.assertRaisesRegex(ArtifactRuntimeError, "coverage"):
+            validate_generation(self.report, altered, provider=self.provider)
