@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -21,6 +22,7 @@ from diffstory.analysis import validate_generated_report
 from diffstory.analysis import validate_generation
 from diffstory.narrative import Narrator
 from diffstory.narrative_contracts import ClaimRef
+from diffstory.narrative_contracts import SourceSliceRef
 from diffstory.narrative_contracts import StatementPath
 from diffstory.narrative_contracts import SupportedStatement
 from diffstory.narrative_hierarchy import PlanningSources
@@ -32,9 +34,12 @@ from diffstory.narrative_manifest import (
     validate_generation as validate_v2_generation,
 )
 from diffstory.narrative_plan import RequestPackingLimits
+from diffstory.narrative_plan import build_evidence_ledger
 from diffstory.narrative_plan import build_ledger_index
 from diffstory.narrative_plan import canonical_bytes
 from diffstory.narrative_plan import content_digest
+from diffstory.narrative_plan import semantic_digest
+from diffstory.narrative_plan import span_reference
 from diffstory.narrative_runtime import ArtifactRuntimeError
 from diffstory.narrative_v2 import V2Options
 from diffstory.render import render
@@ -74,6 +79,532 @@ def replace_result(
             for r in manifest.receipts
         ),
     )
+
+
+def retained_context_snapshot() -> dict:
+    """Supply grouped and unassigned context, empty files and exact delimiters."""
+    # Nine-byte spans cut after CR, before LF, without splitting UTF-8.
+    context = "caféabc\r\n" + "\u03b1" * 15 + "\u2028tail\rnext\n"
+    before = (
+        "def source():\r\n"
+        '    value = "' + "\u03b1" * 15 + '"\r\n'
+        "    # unchanged context\r"
+        "    return 1\n"
+    )
+    base = {"source.py": before, "context.txt": context, "empty.txt": ""}
+    head = {**base, "source.py": before.replace("return 1", "return 2")}
+    return snap(
+        base,
+        head,
+        overrides={
+            (side, path): {"state": "supplied", "coverage": "partial"}
+            for side in ("base", "head")
+            for path in base
+        },
+        fragment_options={
+            (side, path): {"start_line": 31}
+            for side in ("base", "head")
+            for path in base
+        },
+        repository="example/project",
+    )
+
+
+class RetainedContextBoundaryTests(unittest.TestCase):
+    """Require exact compiler source links for retained details at public gates."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Generate with real public v2 calls and keep an original artifact cache."""
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.directory.cleanup)
+        cls.source = retained_context_snapshot()
+        cls.original = compile_snapshot(cls.source)
+        cls.options = V2Options(
+            ledger=LedgerParameters(max_span_bytes=9, max_unit_spans=2)
+        )
+        cls.provider = FixtureProvider()
+        cls.candidate = cls.generate_cached(cls.original, cls.provider, "cold")
+        cls.ledger = build_evidence_ledger(
+            cls.original, **cls.options.ledger.model_dump()
+        )
+        cls.index = build_ledger_index(cls.ledger)
+        cls.assigned = {
+            key
+            for group in cls.index.groups.values()
+            for key in group.unit_keys
+        }
+        cls.retained = {
+            detail["unit_key"]
+            for detail in cls.candidate["generation"]["details"]
+            if detail["unit_key"] not in cls.assigned
+            or not any(
+                detail[name]
+                for name in ("explanations", "observations", "questions")
+            )
+        }
+
+    @classmethod
+    def generate_cached(
+        cls, report: dict, provider: FixtureProvider, name: str
+    ) -> dict:
+        """Use a fresh recovery run against the same immutable source artifacts."""
+        return Narrator(
+            provider,
+            architecture="v2",
+            recovery_dir=Path(cls.directory.name) / name,
+            checkpoint_dir=Path(cls.directory.name) / "cache",
+            concurrency=1,
+            v2_options=cls.options,
+        ).generate(report)
+
+    def assert_catalog(self, report: dict, candidate: dict) -> None:
+        """Compare exact owned spans and independent physical byte coordinates."""
+        ledger = build_evidence_ledger(
+            report, **self.options.ledger.model_dump()
+        )
+        index = build_ledger_index(ledger)
+        expected = {
+            semantic_digest(ref): ref.model_dump(mode="json")
+            for unit in ledger.units
+            if unit.id in self.retained
+            for span in unit.spans
+            for ref in (span_reference(span, unit),)
+        }
+        entries = [
+            c
+            for c in candidate["citations"]
+            if c["consumption"] == "direct_source"
+            and c["reference"]["unit_key"] in self.retained
+        ]
+        self.assertEqual(len(entries), len(expected))
+        self.assertEqual({c["key"]: c["reference"] for c in entries}, expected)
+        fragments = {
+            f["key"]: f for f in report["source_evidence"]["fragments"]
+        }
+        halves = 0
+        same_line = {}
+        empty_sides = set()
+        for entry in entries:
+            ref = entry["reference"]
+            span = index.spans[ref["span_id"]]
+            self.assertEqual(
+                entry["fragment_key"],
+                index.bindings[span.buffer_key].fragment_key,
+            )
+            fragment = fragments[entry["fragment_key"]]
+            raw = fragment["text"].encode("utf-8")
+            start, end = entry["byte_start"], entry["byte_end"]
+            self.assertEqual((start, end), (span.byte_start, span.byte_end))
+            self.assertEqual(raw[start:end].decode("utf-8"), span.text)
+            self.assertEqual(
+                content_digest(raw[start:end]), ref["content_digest"]
+            )
+            ends = [m.end() for m in re.finditer(rb"\r\n|\r|\n", raw)]
+            self.assertEqual(
+                entry["line_start"],
+                fragment["start_line"] + sum(p <= start for p in ends),
+            )
+            self.assertEqual(
+                entry["line_end"],
+                fragment["start_line"]
+                + sum(p <= max(start, end - 1) for p in ends),
+            )
+            self.assertEqual(entry["side"], fragment["side"])
+            self.assertEqual(entry["path"], fragment["path"])
+            revision = report["meta"][entry["side"] + "_sha"]
+            self.assertEqual(entry["revision"], revision)
+            self.assertIn("/" + revision + "/" + entry["path"], entry["url"])
+            self.assertTrue(
+                entry["url"].endswith(
+                    f"#L{entry['line_start']}-L{entry['line_end']}"
+                )
+            )
+            for offset in (start, end):
+                halves += raw[max(0, offset - 1) : offset + 1] == b"\r\n"
+            same_line.setdefault(
+                (entry["fragment_key"], entry["line_start"]), set()
+            ).add((start, end))
+            if not raw:
+                self.assertEqual((start, end), (0, 0))
+                empty_sides.add(entry["side"])
+        self.assertEqual(empty_sides, {"base", "head"})
+        self.assertGreater(halves, 0)
+        self.assertTrue(any(len(ranges) > 1 for ranges in same_line.values()))
+
+    def test_all_retained_spans_roundtrip_offline(self) -> None:
+        """Unassigned context and section acknowledgements survive saved rendering."""
+        self.assertTrue(self.retained & self.assigned)
+        self.assertTrue(self.retained - self.assigned)
+        blocked = (
+            "test_narrative_v2.FixtureProvider.require_credentials",
+            "test_narrative_v2.FixtureProvider.prepare",
+            "test_narrative_v2.FixtureProvider.complete_reply",
+            "diffstory.narrative.OpenAIResponsesProvider.__init__",
+            "subprocess.Popen",
+            "subprocess.run",
+            "shutil.which",
+            "socket.socket",
+            "urllib.request.urlopen",
+        )
+        with ExitStack() as stack:
+            for target in blocked:
+                stack.enter_context(
+                    patch(target, side_effect=AssertionError(target))
+                )
+            validate_generation(self.original, self.candidate["generation"])
+            applied = apply_annotations(self.original, self.candidate)
+            with tempfile.TemporaryDirectory() as directory:
+                saved = Path(directory) / "report.json"
+                saved.write_text(json.dumps(applied), encoding="utf-8")
+                loaded = json.loads(saved.read_text(encoding="utf-8"))
+            validate_generated_report(loaded)
+            validate_report(loaded)
+            self.assertIn("diffstory.presentation.v2", render(loaded))
+        self.assertEqual(loaded["generation"], self.candidate["generation"])
+        self.assertEqual(
+            compiler_fact_signature(loaded),
+            compiler_fact_signature(self.original),
+        )
+        self.assertEqual(
+            loaded["narrative_v2"]["citations"], self.candidate["citations"]
+        )
+        self.assert_catalog(self.original, self.candidate)
+
+    def test_shifted_revision_and_warm_reuse_keep_original_identities(
+        self,
+    ) -> None:
+        """Assembly rebinds current fragments without another provider attempt."""
+        source = copy.deepcopy(self.source)
+        for fragment in source["fragments"]:
+            fragment["start_line"] += 30
+        source["meta"].update(base_sha="c" * 40, head_sha="d" * 40)
+        current = compile_snapshot(source)
+        for name, report in (("shifted", current), ("warm", self.original)):
+            with self.subTest(name=name):
+                provider = FixtureProvider()
+                candidate = self.generate_cached(report, provider, name)
+                self.assertEqual(provider.calls, [])
+                self.assertEqual(
+                    candidate["generation"]["current_usage"]["calls"], 0
+                )
+                for field in (
+                    "details",
+                    "producers",
+                    "plan",
+                    "request_configuration",
+                ):
+                    self.assertEqual(
+                        candidate["generation"][field],
+                        self.candidate["generation"][field],
+                    )
+                self.assertEqual(
+                    [
+                        {**r, "disposition": "reused"}
+                        for r in self.candidate["generation"]["receipts"]
+                    ],
+                    candidate["generation"]["receipts"],
+                )
+                self.assert_catalog(report, candidate)
+                for old, new in zip(
+                    self.candidate["citations"],
+                    candidate["citations"],
+                    strict=True,
+                ):
+                    self.assertEqual(old["key"], new["key"])
+                    self.assertEqual(old["reference"], new["reference"])
+                    delta = 30 if name == "shifted" else 0
+                    self.assertEqual(
+                        new["line_start"], old["line_start"] + delta
+                    )
+                    self.assertEqual(new["line_end"], old["line_end"] + delta)
+                    if name == "shifted":
+                        self.assertNotEqual(
+                            old["fragment_key"], new["fragment_key"]
+                        )
+                self.assertIn(
+                    "diffstory.presentation.v2",
+                    render(
+                        json.loads(
+                            json.dumps(apply_annotations(report, candidate))
+                        )
+                    ),
+                )
+
+    def test_catalog_forgery_fails_application_and_render(self) -> None:
+        """No persisted catalog can omit source or invent current coordinates."""
+        position = next(
+            i
+            for i, c in enumerate(self.candidate["citations"])
+            if c["consumption"] == "direct_source"
+            and c["reference"]["unit_key"] in self.retained
+            and c["byte_end"] > 0
+        )
+        mutations = {
+            "omitted": lambda cs: cs.pop(position),
+            "duplicate": lambda cs: cs.append(copy.deepcopy(cs[position])),
+            "side": lambda cs: cs[position].update(
+                side="head" if cs[position]["side"] == "base" else "base"
+            ),
+            "range": lambda cs: cs[position].update(
+                byte_end=cs[position]["byte_end"] + 1
+            ),
+            "fragment": lambda cs: cs[position].update(fragment_key="unknown"),
+            "line": lambda cs: cs[position].update(
+                line_start=cs[position]["line_start"] + 1
+            ),
+            "revision": lambda cs: cs[position].update(revision="f" * 40),
+            "url": lambda cs: cs[position].update(
+                url="https://example.invalid/forged"
+            ),
+            "zero_range": lambda cs: cs[position].update(
+                byte_start=0, byte_end=0
+            ),
+            "zero_reference": lambda cs: cs[position]["reference"].update(
+                byte_end=0
+            ),
+            "unit": lambda cs: cs[position]["reference"].update(
+                unit_key="0" * 64
+            ),
+            "group": lambda cs: cs[position]["reference"].update(
+                group_key="0" * 64
+            ),
+        }
+        applied = apply_annotations(self.original, self.candidate)
+        for name, mutate in mutations.items():
+            candidate = copy.deepcopy(self.candidate)
+            mutate(candidate["citations"])
+            with (
+                self.subTest(name=name, boundary="apply"),
+                self.assertRaises((ValueError, ArtifactRuntimeError)),
+            ):
+                apply_annotations(self.original, candidate)
+            corrupted = copy.deepcopy(applied)
+            mutate(corrupted["narrative_v2"]["citations"])
+            with (
+                self.subTest(name=name, boundary="render"),
+                self.assertRaises((ValueError, ArtifactRuntimeError)),
+            ):
+                render(corrupted)
+
+    def test_source_slice_stays_nonempty(self) -> None:
+        """An empty direct source entry does not authorize an empty source slice."""
+        empty = next(
+            span_reference(s, u)
+            for u in self.ledger.units
+            for s in u.spans
+            if not s.text
+        )
+        with self.assertRaises(ValueError):
+            SourceSliceRef(
+                source=empty,
+                byte_start=0,
+                byte_end=0,
+                content_digest=content_digest(b""),
+            )
+
+    def test_full_empty_files_and_ordinary_context(self) -> None:
+        """Full supplied empty files have real zero-byte entries on both sides."""
+        base = {
+            "x.py": "def f():\n    return 1\n",
+            "empty.txt": "",
+            "context.txt": "ordinary unchanged context\n",
+        }
+        report = compile_snapshot(
+            snap(base, {**base, "x.py": base["x.py"].replace("1", "2")})
+        )
+        candidate = generate(report)
+        for path in ("empty.txt", "context.txt"):
+            entries = [c for c in candidate["citations"] if c["path"] == path]
+            self.assertEqual(len(entries), 2)
+            self.assertEqual({c["side"] for c in entries}, {"base", "head"})
+            for entry in entries:
+                self.assertEqual(entry["consumption"], "direct_source")
+                self.assertEqual(
+                    (entry["line_start"], entry["line_end"]), (1, 1)
+                )
+                self.assertEqual(
+                    (entry["byte_start"], entry["byte_end"]),
+                    (0, len(base[path].encode("utf-8"))),
+                )
+        applied = apply_annotations(report, candidate)
+        self.assertIn(
+            "diffstory.presentation.v2",
+            render(json.loads(json.dumps(applied))),
+        )
+
+    def test_context_with_observations_deduplicates_exact_references(
+        self,
+    ) -> None:
+        """A context claim can cite one span while the catalog retains them all."""
+
+        def observations(
+            _provider: FixtureProvider, data: dict, response: dict
+        ) -> dict:
+            if data["stage"] == "detail":
+                for item in data["items"]:
+                    if not item["obligations"] and all(
+                        s["path"] == "context.txt" for s in item["spans"]
+                    ):
+                        response["acknowledgements"].remove(item["target"])
+                        response["items"].append(
+                            {
+                                "target": item["target"],
+                                "explanations": [],
+                                "observations": [
+                                    {
+                                        "text": text,
+                                        "citations": [
+                                            item["spans"][0]["handle"]
+                                        ],
+                                    }
+                                    for text in (
+                                        "The source excerpt is supplied.",
+                                        "The excerpt is retained as context.",
+                                    )
+                                ],
+                                "questions": [],
+                            }
+                        )
+            return response
+
+        candidate = generate(
+            self.original,
+            options=self.options,
+            provider=FixtureProvider(observations),
+        )
+        self.assertTrue(
+            any(d["observations"] for d in candidate["context_details"])
+        )
+        self.assert_catalog(self.original, candidate)
+        self.assertEqual(
+            len(candidate["citations"]), len(self.candidate["citations"])
+        )
+        self.assertIn(
+            "diffstory.presentation.v2",
+            render(apply_annotations(self.original, candidate)),
+        )
+
+    def test_shared_spans_keep_distinct_unit_ownership(self) -> None:
+        """Overlapping compiler units retain separate semantic reference keys."""
+        before = (
+            'print("old")\n\ndef f():\n'
+            '    marker = "unchanged context"\n    return 1\n\nprint("old")\n'
+        )
+        after = before.replace('"old"', '"new"').replace(
+            "return 1", "return 2"
+        )
+        report = compile_snapshot(snap({"x.py": before}, {"x.py": after}))
+        candidate = generate(report, options=self.options)
+        ledger = build_evidence_ledger(
+            report, **self.options.ledger.model_dump()
+        )
+        acknowledgements = {
+            d["unit_key"]
+            for d in candidate["generation"]["details"]
+            if not any(
+                d[field]
+                for field in ("explanations", "observations", "questions")
+            )
+        }
+        expected = {
+            semantic_digest(ref): ref.model_dump(mode="json")
+            for unit in ledger.units
+            if unit.id in acknowledgements
+            for span in unit.spans
+            for ref in (span_reference(span, unit),)
+        }
+        actual = {
+            c["key"]: c["reference"]
+            for c in candidate["citations"]
+            if c["consumption"] == "direct_source"
+        }
+        for key, ref in expected.items():
+            self.assertEqual(actual[key], ref)
+        shared = [
+            owner
+            for owner in ledger.ownership
+            if len(set(owner.unit_keys) & acknowledgements) > 1
+        ]
+        self.assertTrue(shared)
+        for owner in shared:
+            entries = [
+                ref
+                for ref in actual.values()
+                if ref["span_id"] == owner.span_id
+            ]
+            self.assertEqual(
+                {ref["unit_key"] for ref in entries}, set(owner.unit_keys)
+            )
+        self.assertEqual(len(actual), len(candidate["citations"]))
+        render(apply_annotations(report, candidate))
+
+    def test_unavailable_side_keeps_limitation_without_source_link(
+        self,
+    ) -> None:
+        """Unavailable source cannot gain an empty-buffer or absent-file claim."""
+        report = compile_snapshot(
+            snap(
+                {},
+                {
+                    "x.py": 'def f():\n    value = "unchanged context"\n    return 2\n'
+                },
+                overrides={
+                    ("base", "x.py"): {
+                        "state": "unavailable",
+                        "reason": "read_failed",
+                    }
+                },
+            )
+        )
+        candidate = generate(report, options=self.options)
+        limits = [
+            limit
+            for detail in candidate["generation"]["details"]
+            for explanation in detail["explanations"]
+            for limit in explanation["limitations"]
+        ]
+        self.assertTrue(limits)
+        self.assertEqual({limit["code"] for limit in limits}, {"unavailable"})
+        self.assertEqual({limit["side"] for limit in limits}, {"base"})
+        self.assertEqual({c["side"] for c in candidate["citations"]}, {"head"})
+        self.assertTrue(all(c["byte_end"] > 0 for c in candidate["citations"]))
+        applied = apply_annotations(report, candidate)
+        self.assertEqual(
+            applied["generation"]["details"],
+            candidate["generation"]["details"],
+        )
+        render(json.loads(json.dumps(applied)))
+
+    def test_one_ledger_index_at_each_public_boundary(self) -> None:
+        """Retained context never causes an index build for each source span."""
+        applied = apply_annotations(self.original, self.candidate)
+        boundaries = {
+            "generate": lambda: generate(self.original, options=self.options),
+            "validate_generation": lambda: validate_generation(
+                self.original, self.candidate["generation"]
+            ),
+            "apply": lambda: apply_annotations(self.original, self.candidate),
+            "validate_report": lambda: validate_report(copy.deepcopy(applied)),
+            "render": lambda: render(copy.deepcopy(applied)),
+        }
+        for name, boundary in boundaries.items():
+            with (
+                self.subTest(boundary=name),
+                patch(
+                    "diffstory.narrative_v2.build_ledger_index",
+                    wraps=build_ledger_index,
+                ) as production,
+                patch(
+                    "diffstory.narrative_plan.build_ledger_index",
+                    wraps=build_ledger_index,
+                ) as fallback,
+            ):
+                boundary()
+            self.assertEqual(production.call_count, 1)
+            # Ledger construction has its own existing validation. Consumers
+            # then share one production index, including the entire assembly.
+            self.assertEqual(fallback.call_count, 1)
 
 
 class PublicBoundaryTests(unittest.TestCase):

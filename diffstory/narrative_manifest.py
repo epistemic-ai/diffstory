@@ -568,6 +568,7 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
     from .narrative_plan import build_evidence_ledger
     from .narrative_plan import build_ledger_index
     from .narrative_plan import resolve_span_ref
+    from .narrative_plan import span_reference
     from .narrative_plan import validate_detail_results
     from .source_lines import split_source_lines
 
@@ -586,6 +587,7 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
     validate_detail_results(manifest.details, ledger, index=index)
     group_ids = {g.group_key: g.group_id for g in ledger.group_bindings}
     details = {d.unit_key: d for d in manifest.details}
+    assigned = {u for g in index.groups.values() for u in g.unit_keys}
     references = {}
     slices = {}
     provenance = {}
@@ -593,6 +595,15 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
     producers = {r.item_key: r for r in prose}
     receipts = {r.item_key: r for r in manifest.receipts}
     for detail in manifest.details:
+        # Retained context and empty acknowledgements need exact source links
+        # even when no model statement cites them. Keep their original results.
+        if detail.unit_key not in assigned or not (
+            detail.explanations or detail.observations or detail.questions
+        ):
+            unit = index.units[detail.unit_key]
+            for span in unit.spans:
+                ref = span_reference(span, unit)
+                references[semantic_digest(ref)] = ref
         for value in (
             *detail.explanations,
             *detail.observations,
@@ -718,7 +729,6 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
                 ],
             }
         )
-    assigned = {u for g in index.groups.values() for u in g.unit_keys}
     return {
         "schema": "diffstory.annotations.v2",
         "base_sha": report["meta"]["base_sha"],
@@ -770,7 +780,7 @@ class ResolvedCitation(Contract):
     path: str
     revision: str
     byte_start: Natural
-    byte_end: Positive
+    byte_end: Natural
     line_start: Positive
     line_end: Positive
     url: str | None
