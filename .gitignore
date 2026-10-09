@@ -15,6 +15,8 @@ dist/
 *.key
 *.review.json
 *.report.json
+*.narration-cache/
+*.narration-state/
 *.snapshot.json
 *.annotations.json
 *.html

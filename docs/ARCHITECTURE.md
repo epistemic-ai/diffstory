@@ -111,7 +111,17 @@ Supporting units and original raw hunks are created on demand. Source/prose is e
 
 Python AST support is implemented with the standard library, so parse support follows the interpreter running the CLI. A newer-syntax file falls back to textual evidence. Classes are atomic. Static resolution respects common import aliases and avoids simple local/parameter shadows, but does not claim whole-program completeness.
 
+### Legacy narration and shared source limits
+
+The following narration description covers the legacy CLI default. The explicit v2 mode is described below.
+
 The default narrative uses deterministic templates. The demo adds authored domain-specific annotations. The opt-in `--narrate` path supports the OpenAI Responses API and the user's signed-in Codex CLI. Both providers return structured output and assemble validated source-bound passages with hierarchical summaries. OpenAI requests use its selected model capacity; known Codex overrides use published model capacity, while the CLI default is packed against a conservative 400,000-token context bound. A planning call chooses a story order from group summaries; dependency constraints and cycle groups are enforced before section prose is written. Long source lines are split into bounded slices without dropping text. If a leaf response omits change citations, Diffstory may make one bounded repair request for that chunk. The Codex adapter runs `codex exec` from a temporary directory, in a read-only sandbox, with local shell, browser, app, and plugin tools disabled. Each provider call has a 900-second timeout. Both adapters use the standard library for transport. Shared data validation uses Pydantic. Successful calls contribute provider-reported input, cached input, and output token counts to a run summary; no run-wide token, call-count, or elapsed-time budget is imposed.
+
+Narration tasks run concurrently, with a default limit of four. `--concurrency N` sets a positive limit. Persistent result checkpoints are enabled by default and use `Path(out).with_suffix('.narration-cache')`; `--cache-dir PATH` overrides this location and `--no-cache` disables checkpointing. These options cannot be combined.
+
+The run identity includes the exact base and head revisions, the canonical report input, provider destination, and model. The report input includes its source and pull-request context; only `meta.captured_at` is removed before it is hashed. Each checkpoint key also includes the exact prepared request, response schema, output reservation, task, and validation version. Diffstory validates a saved result again before reuse. A Codex CLI default model has no explicit model identity, so that mode runs without persistence; an explicit `--cache-dir` requires an explicit `--model`.
+
+Progress events report the current stage, active calls, completed and planned tasks, reused checkpoints, provider calls, and elapsed time. Reused checkpoints are counted separately from provider calls and provider-reported cached input tokens. On a stage failure, Diffstory stops new submissions, cancels work that has not started, and waits for active work to finish. Validated results remain checkpointed for a later run.
 
 Git and GitHub ingestion enforce a 64 MB aggregate source limit by default, and snapshot compilation enforces the same limit. The annotation manifest and report retain revisions, measured usage, and chunk coverage without storing credentials. The model-generated warning states that prose remains unverified.
 
@@ -126,3 +136,197 @@ First add full-repository symbol indexing with explicit resolution confidence an
 - Python AST API: https://docs.python.org/3/library/ast.html
 - GitHub pull-request file pagination: https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files
 - GitHub contents API: https://docs.github.com/en/rest/repos/contents
+
+## Explicit narration architecture v2
+
+`--narrate --architecture v2` selects the new pipeline. The CLI and the
+`Narrator` library still default to legacy narration. Default activation is gated
+on the remaining integration, benchmark, and independent acceptance checks.
+`--architecture legacy` remains an explicit compatibility option. An ordinary
+command without `--narrate` still produces the deterministic baseline narrative.
+
+```text
+Compiled report → evidence ledger → packed detail requests → detailed results
+                                                             ↓
+                                  bounded hierarchical plan → section requests
+                                                             ↓
+                                         document → validated complete report
+```
+
+An evidence unit accounts for supplied source spans and explanation obligations.
+An obligation describes a changed region, a structural change, or an explicit
+evidence limitation. Unchanged context must remain accounted for but does not
+require an invented change explanation. Spans retain side, content, byte range,
+and source line bindings. Byte ranges distinguish pieces of the same long line.
+Unavailable source cannot prove absence.
+
+A presentation group is a reading step. A provider request can contain units
+from several groups, or prose for several sections. Group count therefore does
+not determine request count. Packing checks the actual serialized instructions,
+schemas, evidence, context, framing, and repair fields. Both input capacity and
+output reservations must fit. Response byte and timeout bounds also apply.
+Codex retains its maximum output guard because its adapter cannot enforce a
+smaller requested output cap. The direct API uses an enforceable output cap.
+
+Detail requests consume source evidence and compiler facts. They produce
+separate before/after explanations, supported effects, uncertainty, observations,
+and questions. Source-only details do not consume the PR author's motivation or
+story order. Later planning, section, and document requests consume validated
+support and relevant author context. Their abstractions and synthesis do not
+replace or shorten the detailed results. The compiler retains authority over
+classification, dependencies, source availability, and test status.
+
+Planning uses bounded cards and a hierarchy over a valid dependency order.
+Complete group membership, cross-chapter prerequisites, cycle adjacency,
+terminology, and claim references survive each level. Large inputs require more
+levels; they are not silently truncated. Sections share the same plan and
+receive relevant prerequisite facts and neighboring context. The final section
+has no outgoing transition. Inherited statements retain a typed chain of
+support to the original source or observation, including the actual producer
+request. Assembly retains every detail result, including empty acknowledgements
+for supplied context.
+
+### Persisted validation and artifact reuse
+
+New candidates use `diffstory.annotations.v2` and a
+`diffstory.generation.v2` manifest. The manifest records the exact run, ledger
+parameters, declared request configuration, details, plan, prose, original
+producers, and result receipts. Its closed types reject unknown fields.
+Production, reuse, annotation application, and rendering validate complete
+coverage and exact citations. Wrong sides, ranges, content, unknown handles,
+duplicates, and cross-group citations fail validation.
+
+Saved v2 annotations and reports can be applied, reloaded, and rendered offline.
+Validation reconstructs the declared request protocol as data; it needs no
+provider credentials, executable lookup, subprocess, or provider request. The
+reader uses a validated source catalog with current fragment, side, byte range,
+line number, revision, and URL bindings. It preserves original detailed prose
+and support provenance. These checks establish coverage and reference validity;
+the prose still carries the model-generated, unverified label. They do not prove
+natural-language correctness or test execution.
+
+Run identity remains bound to exact revisions and report input. Artifact
+identity includes relevant evidence, context, provider/model/configuration,
+prompt, schema, and validator dependencies. Each item keeps all original
+co-batched dependencies and the original invocation and producer. A change to a
+peer can invalidate that item's reuse. A changed reading order can invalidate
+section context and transitions. Source-only details can remain reusable when
+author context changes. Content-stable handles resolve to current source
+bindings during assembly; reuse does not preserve stale revision URLs.
+
+V2 uses a separate artifact format with atomic writes and validation on reuse.
+The legacy exact-run cache reader remains available. Old records are not
+relabeled as v2 proof. Compatibility reuse must meet the current obligations and
+retain the original producer, request, dependencies, and validation history.
+
+### Recovery, optional payload storage, and deliberate fresh state
+
+Every CLI v2 run has durable recovery state, by default
+`Path(out).with_suffix('.narration-state')`. `--state-dir PATH` selects a stable
+alternative. Keep that path across restarts. Changing the output path changes
+the default state path, so use `--state-dir` when renaming outputs for the same
+work. Recovery records retain attempt budgets, partial completion, and original
+producer history. They can contain source-derived audit data; treat them with
+the same care as saved reports.
+
+The optional result payload cache still defaults to
+`Path(out).with_suffix('.narration-cache')`. `--cache-dir PATH` changes it;
+`--no-cache` disables it. Recovery remains active with `--no-cache`. An unresolved
+Codex default model also disables payload caching, but retains recovery budgets.
+An explicit Codex `--cache-dir` still requires an explicit `--model`.
+
+Recovery metadata alone cannot reconstruct unavailable result prose. A later
+run without the needed payloads stops with `results_unavailable`; it does not
+receive new attempts automatically. Restore the matching payload cache when
+available. If a new budget is intentional, use `--fresh-state NEW_DIRECTORY`.
+This option requires a directory that does not yet exist and cannot be combined
+with `--state-dir`. It retains the old directory and does not clear the payload
+cache. Valid cached results can still be reused. A later restart uses
+`--state-dir NEW_DIRECTORY`, not another fresh-state action. No additional
+confirmation prompt is introduced; the existing source-transfer confirmation
+still applies.
+
+Each original batch lineage has a durable total-attempt limit. Each node allows
+at most one transient retry and one targeted repair. A valid partial response
+keeps successful items and repairs only missing or invalid items. A malformed
+envelope does not yield guessed partial results. Persistent size failures may
+split at declared item boundaries, subject to split depth and the original
+shared budget. Restarting and splitting do not reset spent attempts.
+Authentication and prohibited-tool failures stop immediately. The scheduler
+stops new submissions, cancels queued work, and drains active work before the
+CLI reports usage. A failure exits with status 2; an interruption exits with 130.
+Storage errors, corrupt state, exhaustion, and missing payloads never trigger
+automatic deletion, reset, or selection of a fallback recovery directory.
+
+Diagnostics expose only fixed reason codes and validated stage, task digest,
+position, attempt, input/output bounds, response bytes, usage availability,
+item counts, and retry/repair/split/reuse counters. They do not print response
+bodies, source, secrets, arbitrary exception text, or untrusted validation field
+names and locations. This boundary also applies to saved-report rendering and
+annotation application. Credential errors give provider setup guidance without
+printing keys or raw adapter errors.
+
+### Preview, progress, usage, and JSON limits
+
+The local v2 preview freezes the actual report, options, and provider
+configuration used by generation. Mutation after approval fails before a send.
+The preview prints logical evidence units, presentation groups, and the actual
+packed base detail plan. Its initial-send count describes that plan before
+cache reuse, recovery, and repairs. It does not audit stored state and does not
+promise that a warm run will send that count. Planning, section, and document
+request counts remain unknown until validated outputs exist. There is no exact
+full-run call estimate and no calibration model request.
+
+Progress counts completed/planned provider batch lineages, active requests,
+actual current attempts, retries, targeted repairs, splits, and artifact lookup
+hits. Lineage counts and lookup hits are not logical evidence/result counts.
+Progress is throttled between stage boundaries. A successful summary separately
+counts validated logical results and unique reused results from final receipts.
+Current provider-reported tokens exclude historical producer usage. Original
+producers are retained for audit; their prior work is not charged to the new
+run. Provider cached-input tokens are a separate provider measurement.
+
+Report and annotation JSON have a default encoded file limit of 256,000,000
+bytes. `--max-report-bytes N` selects an explicit positive bound for reading and
+writing these files. Saved snapshots keep the 80,000,000-byte JSON input bound,
+and compilation and ingestion retain the 64,000,000-byte aggregate source cap.
+Raising a report bound does not raise the source cap or weaken field validation.
+Reads are bounded even if the file grows after its size check. Invalid JSON
+objects and non-finite constants are rejected without printing their contents.
+
+Generation checks encoded report and annotation sizes before writing output.
+If a result exceeds the selected limit, the error gives the required byte bound.
+Use that explicit bound for generation and subsequent reload if intended. This
+provides a supported reload route without silent truncation or an unbounded
+read. The default accommodates the known 109,957,391-byte compiled-report size;
+final narrated size, memory use, and pinned cold/resumed performance remain to
+be measured in the later benchmark. No call target, current-PR benchmark
+success, or live-model quality result is claimed here.
+
+### Supported UV commands
+
+The existing source-limit and source-transfer confirmation behavior is retained.
+Both repository/PR-number and URL forms are supported. These commands select v2
+explicitly while the default remains gated:
+
+```sh
+uv run --locked diffstory github 'owner/repo#123' --narrate --architecture v2 --provider codex --model gpt-6.1-sol --out walkthrough.html
+uv run --locked diffstory github https://github.com/owner/repo/pull/123 --narrate --architecture v2 --provider codex --model gpt-6.1-sol --out walkthrough.html
+uv run --locked diffstory git --repo . --base BASE --head HEAD --narrate --architecture v2 --provider codex --model gpt-6.1-sol --out walkthrough.html
+```
+
+Approve the displayed source transfer interactively, or supply the existing
+`--yes` option after approving the destination and scope. `--max-source-bytes N`
+can lower the source limit. `--concurrency N` controls active narration jobs.
+
+```sh
+uv run --locked diffstory github 'owner/repo#123' --narrate --architecture v2 --provider codex --model gpt-6.1-sol --state-dir walkthrough.narration-state --no-cache --out walkthrough.html
+uv run --locked diffstory github 'owner/repo#123' --narrate --architecture v2 --provider codex --model gpt-6.1-sol --fresh-state retry.narration-state --out walkthrough.html
+uv run --locked diffstory render walkthrough.report.json --out reloaded.html
+uv run --locked diffstory render compiler.report.json --annotations walkthrough.annotations.json --out annotated.html
+uv run --locked diffstory render large.report.json --max-report-bytes 512000000 --out reloaded.html
+```
+
+The two default state/cache suffixes are ignored by Git. Custom paths should be
+kept outside version control. No command above publishes a report or changes
+repository source.
