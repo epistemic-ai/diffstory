@@ -104,6 +104,45 @@ def snapshot(
     }
 
 
+def two_group_report() -> dict:
+    """Build two independent groups to exercise ordered parallel stages."""
+    source = snapshot()
+    source["meta"]["changed_files"] = 2
+    source["fragments"].extend(
+        [
+            {
+                "path": "other.py",
+                "side": "base",
+                "text": "def normalize(value):\n    return value\n",
+                "start_line": 1,
+                "scope": "full",
+            },
+            {
+                "path": "other.py",
+                "side": "head",
+                "text": "def normalize(value):\n    return value.strip()\n",
+                "start_line": 1,
+                "scope": "full",
+            },
+        ],
+    )
+    source["file_evidence"].append(
+        {
+            "base": {
+                "path": "other.py",
+                "state": "supplied",
+                "coverage": "full",
+            },
+            "head": {
+                "path": "other.py",
+                "state": "supplied",
+                "coverage": "full",
+            },
+        },
+    )
+    return compile_snapshot(source)
+
+
 class FakeProvider:
     """Provide deterministic structured responses without external calls."""
 

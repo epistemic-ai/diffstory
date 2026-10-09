@@ -48,6 +48,51 @@ class ModelCapacity:
         """
         return self.context_tokens - self.max_output_tokens
 
+    def output_guard(
+        self,
+        output_reservation: int | None = None,
+        *,
+        enforceable_output_cap: bool = False,
+    ) -> int:
+        """Reserve maximum output unless the adapter can enforce a smaller cap.
+
+        Args:
+            output_reservation: Requested output tokens, or the model maximum.
+            enforceable_output_cap: Whether the adapter enforces this request.
+
+        Returns:
+            Output tokens that must be held out of the context window.
+
+        Raises:
+            ValueError: If the reservation or enforcement flag is invalid.
+        """
+        requested = (
+            self.max_output_tokens
+            if output_reservation is None
+            else output_reservation
+        )
+        if (
+            type(requested) is not int
+            or not 0 < requested <= self.max_output_tokens
+        ):
+            msg = "Output reservation must fit the model output capacity"
+            raise ValueError(msg)
+        if type(enforceable_output_cap) is not bool:
+            msg = "Output cap enforcement must be a boolean"
+            raise ValueError(msg)
+        return requested if enforceable_output_cap else self.max_output_tokens
+
+    def input_bound_for(
+        self,
+        output_reservation: int | None = None,
+        *,
+        enforceable_output_cap: bool = False,
+    ) -> int:
+        """Return input capacity after the adapter's enforceable output guard."""
+        return self.context_tokens - self.output_guard(
+            output_reservation, enforceable_output_cap=enforceable_output_cap
+        )
+
 
 def estimate_input(request_body: bytes, *, overhead_bytes: int = 0) -> int:
     """

@@ -17,6 +17,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from itertools import islice
+from itertools import zip_longest
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 from urllib.parse import quote
@@ -32,6 +33,7 @@ from .models import SnapshotInput
 from .models import SourceFragment
 from .models import StrictModel
 from .models import validate_document
+from .source_lines import split_source_lines
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -42,6 +44,7 @@ if TYPE_CHECKING:
     from collections.abc import Set as AbstractSet
 
 SCHEMA = "diffstory.report.v1"
+SOURCE_EVIDENCE_SCHEMA = "diffstory.source-evidence.v1"
 MAX_SOURCE_BYTES = 8_000_000
 MIN_SYMBOL_SIMILARITY = 0.40
 RELATED_SYMBOL_THRESHOLD = 4
@@ -495,7 +498,7 @@ def extract(
         note = f"AST unavailable: {type(error).__name__}: {str(error)[:180]}"
         return ExtractionResult(status="failed", note=note)
 
-    source_lines = source_text.splitlines()
+    source_lines = split_source_lines(source_text)
     symbols = tuple(
         _symbol_record(fragment, meta, node, index, source_lines)
         for index, node in enumerate(tree.body)
@@ -714,12 +717,14 @@ def classify(a: dict, b: dict) -> str:
     return "moved_modified" if moved else "modified"
 
 
-def make_hunks(
+def make_hunks(  # noqa: PLR0913  # Text, offsets, and diff display options are independent.
     a: str,
     b: str,
     astart: int = 1,
     bstart: int = 1,
     context: int = 3,
+    *,
+    keep_line_endings: bool = False,
 ) -> Sequence[dict]:
     """
     Create line-based diff hunks with original line numbers and row tags.
@@ -730,14 +735,15 @@ def make_hunks(
         astart: Original line number of the first base line.
         bstart: Original line number of the first head line.
         context: Number of equal lines retained around each changed region.
+        keep_line_endings: Compare exact source lines, including their endings.
 
     Returns:
         Hunks containing ``context``, ``delete``, and ``add`` rows with their
         original line numbers.
 
     """
-    old_lines = a.splitlines()
-    new_lines = b.splitlines()
+    old_lines = split_source_lines(a, keepends=keep_line_endings)
+    new_lines = split_source_lines(b, keepends=keep_line_endings)
     matcher = difflib.SequenceMatcher(
         None,
         old_lines,
@@ -807,15 +813,19 @@ def _public(s: dict | None) -> dict | None:
         s: Internal symbol record, or ``None`` for an absent side.
 
     Returns:
-        A shallow copy without fingerprints and fragment linkage, or ``None``.
+        A shallow copy without fingerprints, with a public fragment binding,
+        or ``None``.
 
     """
     if s is None:
         return None
     internal_fields = {"fingerprint", "rename_fingerprint", "fragment_id"}
-    return {
+    public = {
         key: value for key, value in s.items() if key not in internal_fields
     }
+    if "fragment_id" in s:
+        public["fragment_key"] = s["fragment_id"]
+    return public
 
 
 def _theme(change: dict) -> str:
@@ -1369,7 +1379,7 @@ def _validate_fragment_range(
     """
     if not fragment.text:
         return
-    end = fragment.start_line + len(fragment.text.splitlines()) - 1
+    end = fragment.start_line + len(split_source_lines(fragment.text)) - 1
     key = (fragment.side, fragment.path)
     overlaps = any(
         max(fragment.start_line, start) <= min(end, stop)
@@ -1434,6 +1444,66 @@ def _prepare_snapshot(snapshot: dict) -> PreparedSnapshot:
         notes=notes,
         warnings=warnings,
     )
+
+
+def _source_evidence(source: PreparedSnapshot) -> dict:
+    """Project validated file states and exact original UTF-8 source buffers.
+
+    Fragment keys bind records within this report; they are not content keys.
+    Line offsets refer to the original file. Any later byte offsets must be
+    relative to the explicit fragment buffer, including for partial excerpts.
+    Omitted producer scope is null; only file coverage establishes completeness.
+
+    Args:
+        source: Prepared source with validated coverage and region pairing.
+
+    Returns:
+        Versioned public evidence without producer extras or AST bookkeeping.
+    """
+    files = []
+    statuses = {}
+    for (side, _path), base in source.coverage_index.items():
+        if side != "base":
+            continue
+        head = source.coverage_index[("head", base.counterpart_path)]
+        record = {}
+        for side_name, coverage in (("base", base), ("head", head)):
+            record[side_name] = {
+                **coverage.source.model_dump(
+                    include={"path", "state", "coverage", "reason"},
+                ),
+                "fragment_keys": list(coverage.fragment_ids),
+                "parse_statuses": list(coverage.parse_statuses),
+                "full_source": coverage.full_source,
+                "full_and_parsed": coverage.full_and_parsed,
+            }
+            statuses.update(
+                zip(
+                    coverage.fragment_ids, coverage.parse_statuses, strict=True
+                ),
+            )
+        files.append(record)
+    fragments = [
+        {
+            "key": key,
+            "side": fragment["side"],
+            "path": fragment["path"],
+            "start_line": fragment.get("start_line", 1),
+            "region": fragment["_raw_region"],
+            "scope": fragment.get("scope"),
+            "text": fragment["text"],
+            "content_digest": hashlib.sha256(
+                fragment["text"].encode("utf-8"),
+            ).hexdigest(),
+            "parse_status": statuses[key],
+        }
+        for key, fragment in source.fragments_by_id.items()
+    ]
+    return {
+        "schema": SOURCE_EVIDENCE_SCHEMA,
+        "file_evidence": files,
+        "fragments": fragments,
+    }
 
 
 def _append_change(  # noqa: PLR0913  # Each mutable index and evidence input is explicit.
@@ -1595,6 +1665,7 @@ def _context_symbol(
     *,
     is_wiring: bool,
     meta: dict,
+    raw_only: bool = False,
 ) -> dict | None:
     """
     Build a symbol record for unclassified changed lines on one side.
@@ -1604,6 +1675,8 @@ def _context_symbol(
         unassigned_rows: Changed rows outside already classified symbols.
         is_wiring: Whether the rows contain import wiring.
         meta: Revision metadata used to construct a source permalink.
+        raw_only: Include blank rows and retain exact line endings in new text
+            records; use a distinct ID from the existing context record.
 
     Returns:
         A context symbol for relevant unclassified lines, or ``None``.
@@ -1615,7 +1688,7 @@ def _context_symbol(
     origin = fragment.get("start_line", 1)
     line_numbers = []
     for row in unassigned_rows:
-        if not row["text"].strip():
+        if not raw_only and not row["text"].strip():
             continue
         line_number = row["old"] if fragment["side"] == "base" else row["new"]
         if line_number is not None:
@@ -1625,10 +1698,15 @@ def _context_symbol(
 
     start = min(line_numbers)
     end = max(line_numbers)
-    fragment_lines = fragment["text"].splitlines()
-    source = "\n".join(fragment_lines[start - origin : end - origin + 1])
+    fragment_lines = split_source_lines(fragment["text"], keepends=raw_only)
+    separator = "" if raw_only else "\n"
+    source = separator.join(fragment_lines[start - origin : end - origin + 1])
     return {
-        "id": stable_id(fragment["id"], "context"),
+        "id": (
+            stable_id(fragment["id"], "raw-text", start, end)
+            if raw_only
+            else stable_id(fragment["id"], "context")
+        ),
         "path": fragment["path"],
         "name": "module imports / context" if is_wiring else "file context",
         "side": fragment["side"],
@@ -1717,7 +1795,7 @@ def _fragment_url(
     if fragment is None:
         return None
     start = fragment.get("start_line", 1)
-    end = start + max(0, len(source_text.splitlines()) - 1)
+    end = start + max(0, len(split_source_lines(source_text)) - 1)
     return source_url(meta, fragment["path"], side, start, end)
 
 
@@ -1753,22 +1831,127 @@ def _unassigned_changed_rows(
     return rows
 
 
+def _raw_text_basis(
+    sides: Mapping[str, dict], source: PreparedSnapshot
+) -> str:
+    """Describe raw text evidence without treating missing source as absence.
+
+    Args:
+        sides: Supplied fragments for one validated raw region.
+        source: Prepared file states used to distinguish absence from no source.
+
+    Returns:
+        A text-only basis with an explicit limitation for an unpaired region.
+    """
+    basis = (
+        "Raw source lines differ outside existing change spans. This comparison "
+        "includes blank lines, line endings, and terminal newline bytes. "
+        "No behavior change is inferred from this text evidence."
+    )
+    if "base" in sides and "head" in sides:
+        return basis
+    side, fragment = next(iter(sides.items()))
+    opposite = "head" if side == "base" else "base"
+    own = source.coverage_index[(side, fragment["path"])]
+    counterpart = source.coverage_index[(opposite, own.counterpart_path)]
+    if counterpart.absent:
+        return basis + f" The {opposite} file is confirmed absent."
+    return (
+        basis + f" No {opposite} fragment was supplied for this region; "
+        "this comparison does not establish file addition or removal."
+    )
+
+
+def _raw_row_groups(rows: Sequence[dict]) -> list[list[dict]]:
+    """Pair contiguous unowned runs without spanning classified source lines.
+
+    Args:
+        rows: Exact changed rows after existing ownership has been removed.
+
+    Returns:
+        Before/after runs paired in source order within one validated region.
+        A run with no counterpart stays one-sided; pairing asserts no AST match.
+    """
+    runs = {"old": [], "new": []}
+    for row in rows:
+        side = "old" if row["tag"] == "delete" else "new"
+        side_runs = runs[side]
+        if not side_runs or row[side] != side_runs[-1][-1][side] + 1:
+            side_runs.append([])
+        side_runs[-1].append(row)
+    return [
+        [*before, *after]
+        for before, after in zip_longest(
+            runs["old"], runs["new"], fillvalue=()
+        )
+    ]
+
+
+def _append_context_change(  # noqa: PLR0913  # Explicit compiler state and region ownership.
+    source: PreparedSnapshot,
+    index: ChangeIndex,
+    sides: Mapping[str, dict],
+    raw_id: str,
+    rows: Sequence[dict],
+    *,
+    raw_only: bool,
+) -> None:
+    """Assign one context span or raw line run to a compiler-owned change.
+
+    Args:
+        source: Validated source and file states.
+        index: Mutable changes and coverage indexes.
+        sides: Supplied fragments in the current raw region.
+        raw_id: ID of the raw diff that owns these rows.
+        rows: Unassigned changed rows for this change record.
+        raw_only: Preserve exact raw lines without assigning AST meaning.
+    """
+    is_wiring = not raw_only and any(
+        row["text"].strip().startswith(("from ", "import ")) for row in rows
+    )
+    basis = (
+        _raw_text_basis(sides, source)
+        if raw_only
+        else (
+            f"{len(rows)} changed line(s) outside classified symbol "
+            "spans. Full region shown for context; overlapping code is not counted "
+            "twice in AST metrics."
+        )
+    )
+    change = _append_change(
+        index.changes,
+        index.covered_lines,
+        index.symbol_to_change,
+        _context_symbol(
+            sides.get("base"),
+            rows,
+            is_wiring=is_wiring,
+            meta=source.meta,
+            raw_only=raw_only,
+        ),
+        _context_symbol(
+            sides.get("head"),
+            rows,
+            is_wiring=is_wiring,
+            meta=source.meta,
+            raw_only=raw_only,
+        ),
+        "wiring" if is_wiring else "text",
+        basis,
+    )
+    change["raw_id"] = raw_id
+
+
 def _collect_raw_changes(
-    fragments_by_id: Mapping[str, dict],
-    covered_lines: dict[str, set[int]],
-    changes: list[dict],
-    symbol_to_change: dict[str, str],
-    meta: dict,
+    source: PreparedSnapshot,
+    index: ChangeIndex,
 ) -> Sequence[dict]:
     """
     Preserve raw diffs and classify source lines outside matched symbols.
 
     Args:
-        fragments_by_id: Snapshot fragments indexed by stable fragment ID.
-        covered_lines: Lines already covered by symbol-level changes.
-        changes: Mutable report changes to extend with context changes.
-        symbol_to_change: Symbol ID to change ID lookup to update.
-        meta: Revision metadata used to construct source permalinks.
+        source: Validated fragments, region pairing, file states, and metadata.
+        index: Changes and coverage indexes to extend with context changes.
 
     Returns:
         Raw file diffs, each retaining its complete changed-line evidence.
@@ -1778,11 +1961,10 @@ def _collect_raw_changes(
 
     """
     fragments_by_region = defaultdict(dict)
-    for fragment in fragments_by_id.values():
-        region = fragment.get(
-            "_raw_region", fragment.get("region", fragment["path"])
+    for fragment in source.fragments_by_id.values():
+        fragments_by_region[fragment["_raw_region"]][fragment["side"]] = (
+            fragment
         )
-        fragments_by_region[region][fragment["side"]] = fragment
 
     raw_changes = []
     for region, sides in fragments_by_region.items():
@@ -1796,54 +1978,46 @@ def _collect_raw_changes(
             region,
             before_fragment,
             after_fragment,
-            meta,
+            source.meta,
         )
         raw_changes.append(raw_record)
-        unassigned_rows = _unassigned_changed_rows(
-            hunks,
-            before_fragment,
-            after_fragment,
-            covered_lines,
+        exact_hunks = make_hunks(
+            before_text,
+            after_text,
+            (before_fragment or {}).get("start_line", 1),
+            (after_fragment or {}).get("start_line", 1),
+            context=0,
+            keep_line_endings=True,
         )
-
-        has_changed_text = any(row["text"].strip() for row in unassigned_rows)
-        if not unassigned_rows or not has_changed_text:
-            continue
-
-        nonblank_code = (
-            row["text"].strip()
-            for row in unassigned_rows
-            if row["text"].strip() and not row["text"].lstrip().startswith("#")
-        )
-        is_wiring = any(
-            line.startswith(("from ", "import ")) for line in nonblank_code
-        )
-        context_kind = "wiring" if is_wiring else "text"
-        context_basis = (
-            f"{len(unassigned_rows)} changed line(s) outside classified symbol "
-            "spans. Full region shown for context; overlapping code is not counted "
-            "twice in AST metrics."
-        )
-        change = _append_change(
-            changes,
-            covered_lines,
-            symbol_to_change,
-            _context_symbol(
+        # Keep existing context records and IDs, then assign only remaining raw
+        # lines. A classified span already owns its original line-ending bytes.
+        for raw_only, region_hunks in ((False, hunks), (True, exact_hunks)):
+            unassigned_rows = _unassigned_changed_rows(
+                region_hunks,
                 before_fragment,
-                unassigned_rows,
-                is_wiring=is_wiring,
-                meta=meta,
-            ),
-            _context_symbol(
                 after_fragment,
-                unassigned_rows,
-                is_wiring=is_wiring,
-                meta=meta,
-            ),
-            context_kind,
-            context_basis,
-        )
-        change["raw_id"] = raw_id
+                index.covered_lines,
+            )
+            has_changed_text = any(
+                row["text"].strip() for row in unassigned_rows
+            )
+            if not unassigned_rows or (not raw_only and not has_changed_text):
+                continue
+
+            row_groups = (
+                _raw_row_groups(unassigned_rows)
+                if raw_only
+                else [unassigned_rows]
+            )
+            for rows in row_groups:
+                _append_context_change(
+                    source,
+                    index,
+                    sides,
+                    raw_id,
+                    rows,
+                    raw_only=raw_only,
+                )
 
     return raw_changes
 
@@ -2286,13 +2460,7 @@ def compile_snapshot(snapshot: dict) -> dict:
     change_index = _collect_symbol_changes(matched, removed, added, source)
     changes = change_index.changes
     symbol_to_change = change_index.symbol_to_change
-    raw_changes = _collect_raw_changes(
-        source.fragments_by_id,
-        change_index.covered_lines,
-        changes,
-        symbol_to_change,
-        source.meta,
-    )
+    raw_changes = _collect_raw_changes(source, change_index)
 
     groups, group_by_change, changes_by_id = _create_groups(changes)
     (
@@ -2376,6 +2544,7 @@ def compile_snapshot(snapshot: dict) -> dict:
         "symbol_edges": symbol_edges,
         "tests": tests,
         "raw_files": raw_changes,
+        "source_evidence": _source_evidence(source),
         "cycles": cycles,
         "unresolved": unresolved,
         "stats": stats,

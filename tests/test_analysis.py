@@ -1,6 +1,8 @@
 """Deterministic semantic analysis and annotation regression tests."""
 
 import copy
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,7 @@ from pathlib import Path
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.analysis import evidence_packet
+from diffstory.analysis import make_hunks
 from diffstory.analysis import ordered_components
 from diffstory.ingest import parse_pr
 from diffstory.render import render
@@ -1293,6 +1296,586 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("roughly 80 to 90 percent", instructions)
         self.assertIn("Do not claim formal compliance", instructions)
         self.assertIn("natural rhythm", instructions)
+
+
+class SourceEvidenceTests(unittest.TestCase):
+    """Check original source bindings, validated states, and raw text ownership."""
+
+    def test_projection_preserves_original_buffers_and_public_bindings(
+        self,
+    ) -> None:
+        """Reconstruct partial UTF-8 excerpts without inventing full-file bytes."""
+        snapshot = snap(
+            {"x.py": '# café\r\ndef f():\r\n    return "é"\r\n'},
+            {"x.py": '# changé\r\ndef f():\r\n    return "λ"'},
+            overrides={
+                (side, "x.py"): {"state": "supplied", "coverage": "partial"}
+                for side in ("base", "head")
+            },
+            fragment_options={
+                (side, "x.py"): {
+                    "start_line": 51,
+                    "region": "excerpt",
+                    "scope": "selected excerpts",
+                    "producer_secret": "must not escape",
+                    "id": "spoofed",
+                    "_raw_region": "spoofed",
+                    "parse_status": "spoofed",
+                    "content_digest": "spoofed",
+                }
+                for side in ("base", "head")
+            },
+        )
+        original = copy.deepcopy(snapshot)
+        report = compile_snapshot(snapshot)
+        self.assertEqual(snapshot, original)
+        projection = report["source_evidence"]
+        self.assertEqual(
+            set(projection),
+            {"schema", "file_evidence", "fragments"},
+        )
+        self.assertEqual(projection["schema"], "diffstory.source-evidence.v1")
+        self.assertEqual(json.loads(json.dumps(projection)), projection)
+        self.assertNotIn("must not escape", json.dumps(projection))
+        fragments = {item["key"]: item for item in projection["fragments"]}
+        self.assertEqual(len(fragments), 2)
+        for supplied, fragment in zip(
+            snapshot["fragments"],
+            projection["fragments"],
+            strict=True,
+        ):
+            self.assertEqual(
+                set(fragment),
+                {
+                    "key",
+                    "side",
+                    "path",
+                    "start_line",
+                    "region",
+                    "scope",
+                    "text",
+                    "content_digest",
+                    "parse_status",
+                },
+            )
+            self.assertRegex(fragment["key"], r"^[0-9a-f]{16}$")
+            raw = supplied["text"].encode("utf-8")
+            self.assertEqual(fragment["text"].encode("utf-8"), raw)
+            self.assertEqual(
+                fragment["content_digest"], hashlib.sha256(raw).hexdigest()
+            )
+            self.assertEqual(fragment["parse_status"], "ok")
+            self.assertEqual(fragment["region"], "excerpt")
+            self.assertEqual(fragment["scope"], "selected excerpts")
+            self.assertEqual(fragment["start_line"], 51)
+            # These offsets are relative to this fragment, even at file line 51.
+            encoded_lines = [
+                line.encode("utf-8")
+                for line in fragment["text"].splitlines(keepends=True)
+            ]
+            offset = 0
+            recovered = []
+            for line in encoded_lines:
+                stop = offset + len(line)
+                recovered.append(raw[offset:stop])
+                offset = stop
+            self.assertEqual(b"".join(recovered), raw)
+            self.assertEqual(offset, len(raw))
+        for change in report["changes"]:
+            for side, name in (("base", "before"), ("head", "after")):
+                record = change[name]
+                self.assertIsNotNone(record)
+                fragment = fragments[record["fragment_key"]]
+                self.assertEqual(fragment["side"], side)
+                self.assertEqual(fragment["path"], record["path"])
+                start = record["start"] - fragment["start_line"]
+                stop = record["end"] - fragment["start_line"] + 1
+                recovered = "".join(
+                    fragment["text"].splitlines(keepends=True)[start:stop]
+                )
+                self.assertEqual(
+                    recovered.splitlines(), record["source"].splitlines()
+                )
+                self.assertNotIn("fragment_id", record)
+                self.assertNotIn("fingerprint", record)
+        for state in projection["file_evidence"][0].values():
+            self.assertEqual(
+                set(state),
+                {
+                    "path",
+                    "state",
+                    "coverage",
+                    "fragment_keys",
+                    "parse_statuses",
+                    "full_source",
+                    "full_and_parsed",
+                },
+            )
+            self.assertEqual(state["coverage"], "partial")
+            self.assertEqual(state["parse_statuses"], ["ok"])
+            self.assertFalse(state["full_source"])
+            self.assertFalse(state["full_and_parsed"])
+            self.assertEqual(len(state["fragment_keys"]), 1)
+            self.assertIn(state["fragment_keys"][0], fragments)
+        render(report)
+
+    def test_empty_absent_and_unavailable_are_distinct(self) -> None:
+        """Keep empty supplied buffers even when no lines or changes exist."""
+        for state in (
+            {"state": "supplied", "coverage": "full"},
+            {"state": "absent"},
+            {"state": "unavailable", "reason": "read_failed"},
+        ):
+            with self.subTest(state=state["state"]):
+                snapshot = snap(
+                    {"empty.py": ""} if state["state"] == "supplied" else {},
+                    {"empty.py": ""},
+                    overrides={("base", "empty.py"): state},
+                )
+                report = compile_snapshot(snapshot)
+                evidence = report["source_evidence"]
+                pair = evidence["file_evidence"][0]
+                self.assertEqual(pair["base"]["state"], state["state"])
+                self.assertEqual(pair["head"]["state"], "supplied")
+                self.assertTrue(pair["head"]["full_and_parsed"])
+                self.assertEqual(pair["head"]["parse_statuses"], ["ok"])
+                self.assertEqual(report["changes"], [])
+                self.assertEqual(report["raw_files"], [])
+                if state["state"] != "supplied":
+                    self.assertEqual(pair["base"]["fragment_keys"], [])
+                    self.assertEqual(pair["base"]["parse_statuses"], [])
+                    self.assertFalse(pair["base"]["full_source"])
+                    self.assertFalse(pair["base"]["full_and_parsed"])
+                if state["state"] == "unavailable":
+                    self.assertEqual(pair["base"]["reason"], "read_failed")
+                for fragment in evidence["fragments"]:
+                    self.assertEqual(fragment["text"], "")
+                    self.assertEqual(
+                        fragment["content_digest"],
+                        hashlib.sha256(b"").hexdigest(),
+                    )
+                    self.assertIsNone(fragment["scope"])
+
+    def test_parse_states_are_compiler_owned(self) -> None:
+        """Expose actual parse results despite false producer metadata or warnings."""
+        snapshot = snap(
+            {"x.py": "def broken(:\n", "notes.txt": "old\r\n"},
+            {"x.py": "value = 1\n", "notes.txt": "new\r\n"},
+            fragment_options={
+                ("base", "x.py"): {
+                    "parse_status": "ok",
+                    "full_and_parsed": True,
+                },
+                ("head", "x.py"): {"parse_status": "failed"},
+            },
+            warnings=["All base definitions are confirmed absent."],
+        )
+        snapshot["file_evidence"].append(
+            {
+                side: {
+                    "path": "unread.py",
+                    "state": "unavailable",
+                    "reason": "size_limit",
+                }
+                for side in ("base", "head")
+            }
+        )
+        projection = compile_snapshot(snapshot)["source_evidence"]
+        pairs = {
+            item["base"]["path"]: item for item in projection["file_evidence"]
+        }
+        self.assertEqual(pairs["x.py"]["base"]["parse_statuses"], ["failed"])
+        self.assertFalse(pairs["x.py"]["base"]["full_and_parsed"])
+        self.assertTrue(pairs["x.py"]["base"]["full_source"])
+        self.assertTrue(pairs["x.py"]["head"]["full_and_parsed"])
+        self.assertEqual(
+            pairs["notes.txt"]["head"]["parse_statuses"], ["text_only"]
+        )
+        self.assertFalse(pairs["notes.txt"]["head"]["full_and_parsed"])
+        self.assertEqual(pairs["unread.py"]["head"]["fragment_keys"], [])
+        self.assertEqual(pairs["unread.py"]["head"]["reason"], "size_limit")
+        self.assertNotIn("warnings", projection)
+
+    def test_projection_rejects_invalid_source_claims(self) -> None:
+        """Producer projection fields cannot bypass source-state validation."""
+        valid = snap({"x.py": "value = 1\n"}, {"x.py": "value = 2\n"})
+        candidates = []
+        for fields in (
+            {"text": "\ud800"},
+            {"start_line": True},
+            {"start_line": 20},
+            {"region": "unpaired-full-file"},
+        ):
+            candidate = copy.deepcopy(valid)
+            candidate["fragments"][0].update(fields)
+            candidates.append(candidate)
+        candidate = copy.deepcopy(valid)
+        candidate["file_evidence"][0]["base"] = {
+            "path": "x.py",
+            "state": "unavailable",
+            "reason": "not_supplied",
+        }
+        candidates.append(candidate)
+        for index, candidate in enumerate(candidates):
+            with self.subTest(case=index):
+                candidate["source_evidence"] = {
+                    "schema": "spoofed",
+                    "fragments": [],
+                }
+                with self.assertRaises(ValueError):
+                    compile_snapshot(candidate)
+
+    def test_projection_keeps_separate_regions_and_renamed_paths(self) -> None:
+        """Keep fragment order, partial offsets, and cross-path file pairing."""
+        snapshot = {
+            "schema": "diffstory.snapshot.v1",
+            "fragments": [
+                {
+                    "side": "head",
+                    "path": "new.py",
+                    "start_line": 40,
+                    "region": "later",
+                    "text": "value = 2\r\n",
+                },
+                {
+                    "side": "base",
+                    "path": "old.py",
+                    "start_line": 10,
+                    "region": "first",
+                    "text": "def broken(:\r\n",
+                },
+                {
+                    "side": "head",
+                    "path": "new.py",
+                    "start_line": 20,
+                    "region": "first",
+                    "text": "\r\n",
+                },
+                {
+                    "side": "base",
+                    "path": "old.py",
+                    "start_line": 30,
+                    "region": "later",
+                    "text": "value = 1\r\n",
+                },
+            ],
+            "file_evidence": [
+                {
+                    "base": {
+                        "path": "old.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                    "head": {
+                        "path": "new.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                }
+            ],
+        }
+        projection = compile_snapshot(snapshot)["source_evidence"]
+        fragments = projection["fragments"]
+        self.assertEqual(
+            [item["text"] for item in fragments],
+            [item["text"] for item in snapshot["fragments"]],
+        )
+        self.assertEqual(
+            [item["start_line"] for item in fragments], [40, 10, 20, 30]
+        )
+        self.assertEqual(
+            [item["region"] for item in fragments],
+            ["later", "first", "first", "later"],
+        )
+        pair = projection["file_evidence"][0]
+        self.assertEqual(pair["base"]["path"], "old.py")
+        self.assertEqual(pair["head"]["path"], "new.py")
+        self.assertEqual(
+            pair["base"]["fragment_keys"],
+            [fragments[1]["key"], fragments[3]["key"]],
+        )
+        self.assertEqual(pair["base"]["parse_statuses"], ["failed", "ok"])
+        self.assertEqual(
+            pair["head"]["fragment_keys"],
+            [fragments[0]["key"], fragments[2]["key"]],
+        )
+        self.assertEqual(pair["head"]["parse_statuses"], ["ok", "ok"])
+        self.assertFalse(pair["head"]["full_and_parsed"])
+
+    def test_raw_formatting_changes_get_group_ownership(self) -> None:
+        """Retain blank-only and newline-only changes as bound text records."""
+        cases = [
+            (
+                "line endings",
+                "def f():\r\n    return 1\r\n",
+                "def f():\n    return 1\n",
+            ),
+            (
+                "final newline",
+                "def f():\n    return 1",
+                "def f():\n    return 1\n",
+            ),
+            ("empty to blank", "", "\n"),
+            ("blank to empty", "\r\n", ""),
+            ("blank whitespace", " \n", "\t\r\n"),
+            (
+                "trailing blank",
+                "def f():\n    return 1\n",
+                "def f():\n    return 1\n\n",
+            ),
+        ]
+        for name, before, after in cases:
+            with self.subTest(case=name):
+                snapshot = snap({"x.py": before}, {"x.py": after})
+                report = compile_snapshot(snapshot)
+                self.assertEqual(report, compile_snapshot(snapshot))
+                self.assertEqual(
+                    [item["kind"] for item in report["changes"]], ["text"]
+                )
+                change = report["changes"][0]
+                self.assertEqual(
+                    report["groups"][0]["change_ids"], [change["id"]]
+                )
+                self.assertEqual(
+                    change["raw_id"], report["raw_files"][0]["id"]
+                )
+                self.assertIn("terminal newline bytes", change["basis"])
+                self.assertIn(
+                    "No behavior change is inferred", change["basis"]
+                )
+                fragments = {
+                    item["key"]: item
+                    for item in report["source_evidence"]["fragments"]
+                }
+                for side in ("before", "after"):
+                    record = change[side]
+                    if record is None:
+                        continue
+                    fragment = fragments[record["fragment_key"]]
+                    lines = fragment["text"].splitlines(keepends=True)
+                    self.assertEqual(
+                        record["source"],
+                        "".join(lines[record["start"] - 1 : record["end"]]),
+                    )
+                render(report)
+
+    def test_existing_structural_changes_own_their_raw_bytes(self) -> None:
+        """Line endings inside edited declarations must not duplicate AST changes."""
+        original = compile_snapshot(
+            snap(
+                {"x.py": "def f():\n    return 1\n"},
+                {"x.py": "def f():\n    return 2\n"},
+            )
+        )
+        changed = compile_snapshot(
+            snap(
+                {"x.py": "def f():\r\n    return 1\r\n"},
+                {"x.py": "def f():\n    return 2"},
+            )
+        )
+        self.assertEqual(len(changed["changes"]), 1)
+        self.assertEqual(changed["changes"][0]["kind"], "modified")
+        original.pop("source_evidence")
+        changed.pop("source_evidence")
+        self.assertEqual(original["meta"].pop("source_bytes"), 44)
+        self.assertEqual(changed["meta"].pop("source_bytes"), 45)
+        self.assertEqual(original, changed)
+
+    def test_blank_changes_outside_edited_symbols_remain_owned(self) -> None:
+        """A substantive edit must not hide a separate changed blank region."""
+        report = compile_snapshot(
+            snap(
+                {"x.py": "def f():\n    return 1\n"},
+                {"x.py": "\ndef f():\n    return 2\n\n"},
+            )
+        )
+        self.assertEqual(
+            [item["kind"] for item in report["changes"]],
+            ["modified", "text", "text"],
+        )
+        text_changes = report["changes"][1:]
+        self.assertEqual(
+            [item["after"]["start"] for item in text_changes], [1, 4]
+        )
+        self.assertEqual(
+            [item["after"]["end"] for item in text_changes], [1, 4]
+        )
+        self.assertEqual(
+            [item["after"]["source"] for item in text_changes], ["\n", "\n"]
+        )
+        self.assertEqual(len({item["id"] for item in report["changes"]}), 3)
+        owned = [
+            key for group in report["groups"] for key in group["change_ids"]
+        ]
+        self.assertCountEqual(
+            owned, [item["id"] for item in report["changes"]]
+        )
+        self.assertEqual(
+            report["stats"]["by_kind"], {"modified": 1, "text": 2}
+        )
+
+    def test_unpaired_blank_region_does_not_claim_absence(self) -> None:
+        """Keep unavailable and supplied-partial counterpart states explicit."""
+        for direction in ("base", "head"):
+            other = "head" if direction == "base" else "base"
+            with self.subTest(side=direction):
+                snapshot = snap(
+                    {"x.py": "\r\n"} if direction == "base" else {},
+                    {"x.py": "\r\n"} if direction == "head" else {},
+                    overrides={
+                        (other, "x.py"): {
+                            "state": "unavailable",
+                            "reason": "not_supplied",
+                        }
+                    },
+                )
+                report = compile_snapshot(snapshot)
+                change = report["changes"][0]
+                self.assertEqual(change["kind"], "text")
+                self.assertIn(
+                    "does not establish file addition or removal",
+                    change["basis"],
+                )
+                self.assertNotIn("confirmed absent", change["basis"])
+                self.assertEqual(
+                    report["source_evidence"]["file_evidence"][0][other][
+                        "state"
+                    ],
+                    "unavailable",
+                )
+        snapshot = snap(
+            {"x.py": "\r\n"},
+            {"x.py": "\n"},
+            overrides={
+                (side, "x.py"): {"state": "supplied", "coverage": "partial"}
+                for side in ("base", "head")
+            },
+            fragment_options={
+                ("base", "x.py"): {"region": "first", "start_line": 10},
+                ("head", "x.py"): {"region": "second", "start_line": 20},
+            },
+        )
+        report = compile_snapshot(snapshot)
+        self.assertEqual(len(report["changes"]), 2)
+        for change in report["changes"]:
+            self.assertIn(
+                "does not establish file addition or removal", change["basis"]
+            )
+        self.assertEqual(
+            {
+                item["region"]
+                for item in report["source_evidence"]["fragments"]
+            },
+            {"first", "second"},
+        )
+
+    def test_unchanged_raw_source_has_no_changes(self) -> None:
+        """Store unchanged and empty source without adding narrative units."""
+        for text in ("", "\r\n", "def f():\r\n    return 'é'\r\n"):
+            with self.subTest(text=text):
+                report = compile_snapshot(snap({"x.py": text}, {"x.py": text}))
+                self.assertEqual(report["changes"], [])
+                self.assertEqual(report["groups"], [])
+                self.assertEqual(report["raw_files"], [])
+                fragments = report["source_evidence"]["fragments"]
+                self.assertEqual(
+                    [item["text"] for item in fragments], [text, text]
+                )
+                self.assertEqual(
+                    fragments[0]["content_digest"],
+                    fragments[1]["content_digest"],
+                )
+                self.assertNotEqual(fragments[0]["key"], fragments[1]["key"])
+
+
+class PhysicalSourceAnalysisTests(unittest.TestCase):
+    """Use physical source coordinates for extraction, excerpts, and display."""
+
+    def test_unicode_string_keeps_modified_function_and_return(self) -> None:
+        """Legal string characters must not remove the final function line."""
+        for separator in ("\u2028", "\u2029", "\x85", "\v", "\f"):
+            for eol in ("\n", "\r\n", "\r"):
+                with self.subTest(separator=separator, eol=eol):
+                    before = eol.join(
+                        (
+                            "def f():",
+                            f"    value = 'a{separator}b'",
+                            "    return 1",
+                            "",
+                        )
+                    )
+                    after = before.replace("return 1", "return 2")
+                    report = compile_snapshot(
+                        snap(
+                            {"example.py": before},
+                            {"example.py": after},
+                            repository="example/project",
+                        )
+                    )
+                    change = next(
+                        c for c in report["changes"] if c["kind"] == "modified"
+                    )
+                    self.assertEqual(change["after"]["name"], "f")
+                    self.assertEqual(change["after"]["end"], 3)
+                    self.assertIn("return 2", change["after"]["source"])
+                    self.assertIn(separator, change["after"]["source"])
+                    self.assertTrue(change["after"]["url"].endswith("#L1-L3"))
+                    rows = [r for h in change["hunks"] for r in h["rows"]]
+                    self.assertIn(
+                        3, [r["new"] for r in rows if "return 2" in r["text"]]
+                    )
+
+    def test_partial_adjacent_and_overlapping_unicode_excerpts(self) -> None:
+        """Only CR and LF reserve lines in partial source fragments."""
+        for eol in ("\n", "\r\n", "\r"):
+            source = snap(
+                {"x.py": "value = 'a\u2028b'" + eol},
+                {},
+                overrides={
+                    ("base", "x.py"): {
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                },
+                fragment_options={
+                    ("base", "x.py"): {"start_line": 20, "region": "one"}
+                },
+            )
+            source["fragments"].append(
+                {
+                    "path": "x.py",
+                    "side": "base",
+                    "text": "next_value = 2" + eol,
+                    "start_line": 21,
+                    "region": "two",
+                }
+            )
+            compile_snapshot(source)
+            source["fragments"][-1]["start_line"] = 20
+            with self.assertRaisesRegex(ValueError, "Overlapping"):
+                compile_snapshot(source)
+
+    def test_text_hunks_context_and_fragment_url_use_physical_lines(
+        self,
+    ) -> None:
+        """Non-Python source display and raw-file links keep exact line bounds."""
+        before = "a\u2028b\nold\n"
+        after = before.replace("old", "new")
+        report = compile_snapshot(
+            snap(
+                {"x.txt": before},
+                {"x.txt": after},
+                repository="example/project",
+            )
+        )
+        for change in report["changes"]:
+            if change["after"]:
+                self.assertLessEqual(change["after"]["end"], 2)
+                self.assertTrue(change["after"]["url"].endswith("-L2"))
+        self.assertTrue(report["raw_files"][0]["after_url"].endswith("#L1-L2"))
+        hunks = make_hunks(before, after)
+        rows = [r for h in hunks for r in h["rows"]]
+        self.assertIn(2, [r["new"] for r in rows if r["text"] == "new"])
 
 
 if __name__ == "__main__":
