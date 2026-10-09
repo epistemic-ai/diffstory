@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -14,12 +15,14 @@ import threading
 import time
 import traceback
 import unittest
+import weakref
 from dataclasses import FrozenInstanceError
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import ClassVar
 from unittest.mock import Mock
+from unittest.mock import call
 from unittest.mock import patch
 
 from pydantic import ValidationError
@@ -957,6 +960,86 @@ class ArtifactRuntimeTests(unittest.TestCase):
         return runtime_v2.BatchCallbacks(
             prepare=prepare_v2, send=send, validate=validate_v2
         )
+
+    def test_stage_prefetch_validates_only_each_original_batch_matches(
+        self,
+    ) -> None:
+        """Whole-stage hits require one full validation per selected artifact."""
+        for count in (4, 8, 16):
+            with (
+                self.subTest(count=count),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                full, registry, results = fixture_v2(count)
+                invocations = tuple(
+                    runtime_v2.ArtifactInvocation(
+                        batch=prepared_v2((lookup.item_key,)).metadata.batch,
+                        lookups=(lookup,),
+                        dependencies=tuple(
+                            d
+                            for d in full.dependencies
+                            if d.kind not in {"evidence", "peer"}
+                            or d.key == lookup.item_key
+                        ),
+                    )
+                    for lookup in full.lookups
+                )
+                sends = []
+                callbacks = self.callbacks(results, sends)
+                cold = runtime_v2.ArtifactRuntime(
+                    identity(), recovery_dir=directory, artifact_dir=directory
+                )
+                expected = tuple(
+                    cold.execute_batch(invocation, registry, callbacks)
+                    for invocation in invocations
+                )
+                self.assertEqual(len(sends), count)
+                states = tuple(
+                    cold.recovery.load(invocation.semantic_key)
+                    for invocation in invocations
+                )
+                warm = runtime_v2.ArtifactRuntime(
+                    identity(), recovery_dir=directory, artifact_dir=directory
+                )
+                hits = warm.prefetch(
+                    full.lookups, registry, callbacks.validate
+                )
+                self.assertEqual(hits, tuple(o.artifacts[0] for o in expected))
+                sends.clear()
+                audit = Mock(return_value=True)
+                with (
+                    patch.object(
+                        runtime_v2.StoredArtifact,
+                        "model_validate",
+                        wraps=runtime_v2.StoredArtifact.model_validate,
+                    ) as full_validate,
+                    patch.object(
+                        runtime_v2.ArtifactLookup,
+                        "model_validate",
+                        wraps=runtime_v2.ArtifactLookup.model_validate,
+                    ) as header_validate,
+                ):
+                    actual = tuple(
+                        warm.execute_batch(
+                            invocation,
+                            registry,
+                            callbacks,
+                            available=hits,
+                            audit_candidate=audit,
+                        )
+                        for invocation in invocations
+                    )
+                self.assertEqual(actual, expected)
+                self.assertEqual(full_validate.call_count, count)
+                self.assertEqual(header_validate.call_count, count)
+                self.assertEqual(audit.call_count, count)
+                self.assertEqual(sends, [])
+                self.assertEqual(warm.usage.report()["calls"], 0)
+                self.assertEqual(warm.counters["attempts"], 0)
+                self.assertEqual(
+                    tuple(warm.recovery.load(state.key) for state in states),
+                    states,
+                )
 
     def test_v2_requires_durable_state_and_keeps_unresolved_legacy_rule(
         self,
@@ -2731,6 +2814,40 @@ except ArtifactRuntimeError as error:
         self.assertFalse(copied.contains((old,)))
         self.assertTrue(copied.contains((new,)))
 
+    def test_revalidated_registries_do_not_need_cyclic_collection(
+        self,
+    ) -> None:
+        """Discard full registry copies while cyclic collection is disabled."""
+        invocation, registry, _results = fixture_v2(8)
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            copies = [
+                runtime_v2.DependencyRegistry.model_validate(registry)
+                for _ in range(8)
+            ]
+            observations = [weakref.ref(value) for value in copies]
+            self.assertTrue(
+                all(
+                    value.contains(invocation.dependencies) for value in copies
+                )
+            )
+            self.assertTrue(
+                all(
+                    value.dependencies is not registry.dependencies
+                    for value in copies
+                )
+            )
+            self.assertEqual(
+                len({id(value.dependencies) for value in copies}), 8
+            )
+            copies.clear()
+            self.assertEqual(sum(ref() is not None for ref in observations), 0)
+            self.assertTrue(registry.contains(invocation.dependencies))
+        finally:
+            if enabled:
+                gc.enable()
+
     def test_public_cache_rejects_unbound_and_invalid_registry_contexts(
         self,
     ) -> None:
@@ -2810,6 +2927,13 @@ except ArtifactRuntimeError as error:
             variants["validated changed context"].dependencies,
         )
         variants["rebound dependency field"] = rebound
+        equal_tuple = runtime_v2.DependencyRegistry(
+            dependencies=registry.dependencies
+        )
+        object.__setattr__(
+            equal_tuple, "dependencies", (*equal_tuple.dependencies,)
+        )
+        variants["equal but replaced dependency tuple"] = equal_tuple
 
         with tempfile.TemporaryDirectory() as directory:
             writer = runtime_v2.ArtifactRuntime(
@@ -3857,6 +3981,498 @@ class ProseArtifactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AvailableArtifactTests(unittest.TestCase):
+    """Supplied records cannot bypass validation or reopen completed work."""
+
+    def setUp(self) -> None:
+        """Complete a real lineage without a disk cache that could mask misses."""
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.invocation, self.registry, results = fixture_v2()
+        self.sends = []
+        self.callbacks = ArtifactRuntimeTests().callbacks(results, self.sends)
+        self.runtime = runtime_v2.ArtifactRuntime(
+            identity(), recovery_dir=self.temp.name
+        )
+        self.outcome = self.runtime.execute_batch(
+            self.invocation, self.registry, self.callbacks
+        )
+        self.artifact, self.peer = self.outcome.artifacts
+        self.state = self.runtime.recovery.load(self.invocation.semantic_key)
+        self.sends.clear()
+
+    def assert_history_unchanged(self) -> None:
+        """Compare the complete durable state and ensure no additional send."""
+        self.assertEqual(self.sends, [])
+        self.assertEqual(
+            self.runtime.recovery.load(self.state.key), self.state
+        )
+        self.assertIsNone(self.runtime.artifacts)
+
+    def execute(self, available: tuple, **kwargs: object) -> object:
+        """Reuse the completed original and check its entire durable history."""
+        try:
+            return self.runtime.execute_batch(
+                self.invocation,
+                self.registry,
+                kwargs.pop("callbacks", self.callbacks),
+                available=available,
+                **kwargs,
+            )
+        finally:
+            self.assert_history_unchanged()
+
+    def test_same_item_other_static_contracts_skip_full_validation(
+        self,
+    ) -> None:
+        """Another valid config or validator cannot supply the requested item."""
+        alternatives = []
+        for dimension in ("configuration", "validator_version"):
+            static = tuple(
+                changed_record(d, digest=digest("other configuration"))
+                if d.kind == dimension
+                else d
+                for d in self.artifact.lookup.static_dependencies
+            )
+            lookups = tuple(
+                changed_record(
+                    lookup,
+                    static_dependencies=static,
+                    validator_version=(
+                        "other" if dimension == "validator_version" else "v2"
+                    ),
+                )
+                for lookup in self.invocation.lookups
+            )
+            invocation = changed_record(
+                self.invocation,
+                lookups=lookups,
+                dependencies=static
+                + tuple(
+                    d
+                    for d in self.invocation.dependencies
+                    if d.kind not in {s.kind for s in static}
+                ),
+            )
+            registry = runtime_v2.DependencyRegistry(
+                dependencies=invocation.dependencies
+            )
+            issuer = runtime_v2.ArtifactRuntime(
+                identity(), recovery_dir=Path(self.temp.name) / dimension
+            )
+            alternatives.append(
+                issuer.execute_batch(
+                    invocation,
+                    registry,
+                    ArtifactRuntimeTests().callbacks(
+                        {
+                            a.lookup.item_key: a.record.result
+                            for a in self.outcome.artifacts
+                        },
+                        [],
+                    ),
+                ).artifacts[0]
+            )
+        audit = Mock(return_value=True)
+        with patch.object(
+            runtime_v2.StoredArtifact,
+            "model_validate",
+            wraps=runtime_v2.StoredArtifact.model_validate,
+        ) as validate:
+            self.assertEqual(
+                self.execute(
+                    (*alternatives, *self.outcome.artifacts),
+                    audit_candidate=audit,
+                ),
+                self.outcome,
+            )
+        self.assertEqual(validate.call_count, 2)
+        self.assertEqual(audit.call_count, 2)
+        for alternative in alternatives:
+            with (
+                self.subTest(lookup=alternative.lookup.key),
+                self.assertRaisesRegex(
+                    runtime_v2.ArtifactRuntimeError, "results_unavailable"
+                ),
+            ):
+                self.execute((alternative, self.peer))
+
+    def test_reordered_static_header_is_canonicalized_before_selection(
+        self,
+    ) -> None:
+        """An equivalent unnormalized header stays eligible for full checks."""
+        lookup = self.artifact.lookup.model_copy(
+            update={
+                "static_dependencies": tuple(
+                    reversed(self.artifact.lookup.static_dependencies)
+                )
+            }
+        )
+        self.assertNotEqual(lookup.key, self.artifact.lookup.key)
+        artifact = self.artifact.model_copy(update={"lookup": lookup})
+        self.assertEqual(self.execute((artifact, self.peer)), self.outcome)
+
+    def test_other_producer_requires_all_current_dependencies(self) -> None:
+        """A matching valid lookup cannot hide stale original peer content."""
+        dependencies = tuple(
+            changed_record(d, digest=digest("changed peer content"))
+            if d.kind in {"evidence", "peer"}
+            and d.key == self.peer.lookup.item_key
+            else d
+            for d in self.invocation.dependencies
+        )
+        invocation = changed_record(self.invocation, dependencies=dependencies)
+        registry = runtime_v2.DependencyRegistry(dependencies=dependencies)
+        issuer = runtime_v2.ArtifactRuntime(
+            identity(), recovery_dir=Path(self.temp.name) / "changed-peer"
+        )
+        artifact = issuer.execute_batch(
+            invocation,
+            registry,
+            ArtifactRuntimeTests().callbacks(
+                {
+                    a.lookup.item_key: a.record.result
+                    for a in self.outcome.artifacts
+                },
+                [],
+            ),
+        ).artifacts[0]
+        self.assertEqual(artifact.lookup, self.artifact.lookup)
+        audit = Mock(return_value=True)
+        with self.assertRaisesRegex(
+            runtime_v2.ArtifactRuntimeError, "results_unavailable"
+        ):
+            self.execute((artifact, self.peer), audit_candidate=audit)
+        self.assertEqual(audit.call_args_list, [call(self.peer)])
+
+    def test_lookup_is_checked_again_after_full_validation(self) -> None:
+        """Selection does not authenticate fields replaced before validation."""
+        full, registry, results = fixture_v2(3)
+        issuer = runtime_v2.ArtifactRuntime(
+            identity(), recovery_dir=Path(self.temp.name) / "other-producer"
+        )
+        unrelated = issuer.execute_batch(
+            full, registry, ArtifactRuntimeTests().callbacks(results, [])
+        ).artifacts[-1]
+        self.registry = registry
+        artifact = self.artifact.model_copy()
+        validate = runtime_v2.StoredArtifact.model_validate
+
+        def replace_before_validation(candidate: object) -> object:
+            if candidate is artifact:
+                for name in runtime_v2.StoredArtifact.model_fields:
+                    object.__setattr__(
+                        candidate, name, getattr(unrelated, name)
+                    )
+            return validate(candidate)
+
+        audit = Mock(return_value=True)
+        with (
+            patch.object(
+                runtime_v2.StoredArtifact,
+                "model_validate",
+                side_effect=replace_before_validation,
+            ) as validated,
+            self.assertRaisesRegex(
+                runtime_v2.ArtifactRuntimeError, "results_unavailable"
+            ),
+        ):
+            self.execute((artifact, self.peer), audit_candidate=audit)
+        self.assertEqual(validated.call_count, 2)
+        self.assertEqual(audit.call_args_list, [call(self.peer)])
+
+    def test_matching_corruption_and_duplicate_orders_fail_closed(
+        self,
+    ) -> None:
+        """A valid earlier duplicate cannot hide damaged payload or provenance."""
+        artifact = self.artifact
+        corruptions = {
+            "invalid result": artifact.model_copy(
+                update={
+                    "record": artifact.record.model_copy(
+                        update={"result": "bad"}
+                    )
+                }
+            ),
+            "wrong result": artifact.model_copy(
+                update={
+                    "record": artifact.record.model_copy(
+                        update={"result": self.peer.record.result}
+                    )
+                }
+            ),
+            "missing peer": artifact.model_copy(
+                update={
+                    "invocation": artifact.invocation.model_copy(
+                        update={
+                            "dependencies": tuple(
+                                d
+                                for d in artifact.invocation.dependencies
+                                if not (
+                                    d.kind == "peer"
+                                    and d.key == self.peer.lookup.item_key
+                                )
+                            )
+                        }
+                    )
+                }
+            ),
+            "inconsistent dependency": artifact.model_copy(
+                update={
+                    "record": artifact.record.model_copy(
+                        update={
+                            "dependencies": tuple(
+                                d.model_copy(
+                                    update={"digest": digest("changed")}
+                                )
+                                if d.kind == "context"
+                                else d
+                                for d in artifact.record.dependencies
+                            )
+                        }
+                    )
+                }
+            ),
+            "original request": artifact.model_copy(
+                update={
+                    "record": artifact.record.model_copy(
+                        update={
+                            "original_request_digest": digest("wrong request")
+                        }
+                    )
+                }
+            ),
+            "producer request": artifact.model_copy(
+                update={
+                    "production_request": artifact.production_request.model_copy(
+                        update={
+                            "batch": artifact.production_request.batch.model_copy(
+                                update={"item_keys": (digest("other item"),)}
+                            )
+                        }
+                    )
+                }
+            ),
+        }
+        for name, invalid in corruptions.items():
+            for available in (
+                (invalid, self.peer),
+                (invalid, *self.outcome.artifacts),
+                (*self.outcome.artifacts, invalid),
+            ):
+                with (
+                    self.subTest(
+                        name=name, invalid_last=available[-1] is invalid
+                    ),
+                    self.assertRaises(
+                        (ValidationError, runtime_v2.ArtifactRuntimeError)
+                    ),
+                ):
+                    self.execute(available)
+
+    def test_current_result_and_citation_rejection_cannot_regenerate(
+        self,
+    ) -> None:
+        """Current validation still runs after selection and complete structure."""
+        for rejected in (False, runtime_v2.ArtifactRuntimeError("citation")):
+            validate = Mock()
+            if isinstance(rejected, Exception):
+                validate.side_effect = rejected
+            else:
+                validate.return_value = rejected
+            callbacks = replace(self.callbacks, validate=validate)
+            with self.assertRaisesRegex(
+                runtime_v2.ArtifactRuntimeError, "results_unavailable"
+            ):
+                self.execute(self.outcome.artifacts, callbacks=callbacks)
+            self.assertEqual(validate.call_count, 2)
+
+    def test_every_matching_duplicate_reaches_candidate_audit(self) -> None:
+        """Duplicate selection never short circuits later consumer checks."""
+        audit = Mock(return_value=True)
+        available = self.outcome.artifacts * 2
+        self.assertEqual(
+            self.execute(available, audit_candidate=audit), self.outcome
+        )
+        self.assertEqual(audit.call_count, 4)
+        for rejected in (False, None, 1, "true", ValueError("audit failed")):
+            for position in (0, 2):
+                values = [True] * len(available)
+                values[position] = rejected
+                audit = Mock(side_effect=values)
+                with self.subTest(rejected=repr(rejected), position=position):
+                    if rejected is False:
+                        self.assertEqual(
+                            self.execute(available, audit_candidate=audit),
+                            self.outcome,
+                        )
+                        self.assertEqual(audit.call_count, 4)
+                    else:
+                        error = (
+                            ValueError
+                            if isinstance(rejected, Exception)
+                            else runtime_v2.ArtifactRuntimeError
+                        )
+                        reason = (
+                            "audit failed"
+                            if error is ValueError
+                            else "request_mismatch"
+                        )
+                        with self.assertRaisesRegex(error, reason):
+                            self.execute(available, audit_candidate=audit)
+                        self.assertEqual(audit.call_count, position + 1)
+        with self.assertRaisesRegex(
+            runtime_v2.ArtifactRuntimeError, "results_unavailable"
+        ):
+            self.execute(
+                self.outcome.artifacts, audit_candidate=lambda _a: False
+            )
+
+    def test_header_changes_after_selection_are_read_again(self) -> None:
+        """Earlier success cannot authenticate a copied or mutated header."""
+        for mutation in (
+            "item",
+            "config",
+            "version",
+            "dict",
+            "list",
+            "missing",
+        ):
+            with self.subTest(mutation=mutation):
+                lookup = self.artifact.lookup.model_copy()
+                artifact = self.artifact.model_copy(update={"lookup": lookup})
+                self.assertEqual(
+                    self.execute((artifact, self.peer)), self.outcome
+                )
+                error = runtime_v2.ArtifactRuntimeError
+                reason = "results_unavailable"
+                if mutation == "item":
+                    object.__setattr__(lookup, "item_key", digest("unrelated"))
+                elif mutation == "config":
+                    object.__setattr__(
+                        lookup,
+                        "static_dependencies",
+                        tuple(
+                            changed_record(d, digest=digest("other"))
+                            if d.kind == "configuration"
+                            else d
+                            for d in lookup.static_dependencies
+                        ),
+                    )
+                elif mutation == "version":
+                    object.__setattr__(
+                        artifact,
+                        "lookup",
+                        changed_record(lookup, validator_version="other"),
+                    )
+                else:
+                    error, reason = ValidationError, ""
+                    if mutation == "dict":
+                        object.__setattr__(
+                            artifact, "lookup", {"item_key": lookup.item_key}
+                        )
+                    elif mutation == "list":
+                        object.__setattr__(
+                            lookup,
+                            "static_dependencies",
+                            list(lookup.static_dependencies),
+                        )
+                    else:
+                        object.__delattr__(lookup, "item_key")
+                with self.assertRaisesRegex(error, reason):
+                    self.execute((artifact, self.peer))
+
+    def test_ambiguous_records_retain_full_validation(self) -> None:
+        """Dicts, lists and incomplete construction cannot bypass structure."""
+
+        class ExtendedLookup(runtime_v2.ArtifactLookup):
+            """An unexpected header type must retain full record validation."""
+
+        artifact = self.artifact
+        self.assertEqual(
+            self.execute((artifact.model_dump(), self.peer)), self.outcome
+        )
+        self.assertEqual(
+            self.execute(
+                (
+                    runtime_v2.StoredArtifact.model_construct(
+                        **artifact.model_dump()
+                    ),
+                    self.peer,
+                )
+            ),
+            self.outcome,
+        )
+        invalid = (
+            (
+                "incomplete construction",
+                runtime_v2.StoredArtifact.model_construct(
+                    lookup=artifact.lookup
+                ),
+                1,
+            ),
+            (
+                "mutable item key",
+                artifact.model_copy(
+                    update={
+                        "lookup": artifact.lookup.model_copy(
+                            update={"item_key": [artifact.lookup.item_key]}
+                        )
+                    }
+                ),
+                0,
+            ),
+            (
+                "malformed matching dict",
+                {**artifact.model_dump(), "record": {}},
+                1,
+            ),
+            ("list record", list(artifact), 1),
+            (
+                "malformed unrelated dict",
+                {
+                    **artifact.model_dump(),
+                    "lookup": {
+                        **artifact.lookup.model_dump(),
+                        "item_key": digest("unrelated"),
+                    },
+                    "record": {},
+                },
+                1,
+            ),
+            (
+                "unexpected header type",
+                artifact.model_copy(
+                    update={
+                        "lookup": ExtendedLookup.model_validate(
+                            {
+                                **artifact.lookup.model_dump(),
+                                "item_key": digest("unrelated"),
+                            }
+                        ),
+                        "record": {},
+                    }
+                ),
+                1,
+            ),
+        )
+        for name, candidate, validations in invalid:
+            with (
+                self.subTest(name=name),
+                patch.object(
+                    runtime_v2.StoredArtifact,
+                    "model_validate",
+                    wraps=runtime_v2.StoredArtifact.model_validate,
+                ) as validate,
+                self.assertRaises(
+                    (ValidationError, runtime_v2.ArtifactRuntimeError)
+                ),
+            ):
+                self.execute((candidate, self.peer))
+            # Malformed typed headers can reject before the full record call.
+            self.assertEqual(validate.call_count, validations)
 
 
 class CandidateAuditTests(unittest.TestCase):

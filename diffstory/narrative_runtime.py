@@ -10,6 +10,7 @@ import re
 import tempfile
 import threading
 import time
+import weakref
 from collections.abc import Sequence
 from concurrent.futures import FIRST_COMPLETED
 from concurrent.futures import Future
@@ -17,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait
 from contextlib import contextmanager
 from contextlib import suppress
+from dataclasses import InitVar
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -1338,18 +1340,20 @@ def _dependencies(
 class _DependencyIndex:
     """Bind a validated map to one registry and its exact dependency tuple."""
 
-    registry: DependencyRegistry
+    registry: InitVar[DependencyRegistry]
+    owner: weakref.ReferenceType[DependencyRegistry] = field(init=False)
     dependencies: tuple[ArtifactDependency, ...] = field(init=False)
     values: Mapping[tuple[str, str], str] = field(init=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, registry: DependencyRegistry) -> None:
         """Derive the map from current immutable records, never supplied values."""
-        dependencies = self.registry.dependencies
+        dependencies = registry.dependencies
         _require_v2(type(dependencies) is tuple)
         _require_v2(all(type(d) is ArtifactDependency for d in dependencies))
         validated = _dependencies(
             tuple(ArtifactDependency.model_validate(d) for d in dependencies)
         )
+        object.__setattr__(self, "owner", weakref.ref(registry))
         object.__setattr__(self, "dependencies", dependencies)
         object.__setattr__(
             self,
@@ -1390,7 +1394,7 @@ class DependencyRegistry(Contract):
         index = getattr(self, "_index", None)
         if (
             type(index) is not _DependencyIndex
-            or index.registry is not self
+            or index.owner() is not self
             or index.dependencies is not self.dependencies
         ):
             return False
@@ -2915,9 +2919,33 @@ class ArtifactRuntime(GenerationRuntime):
     ) -> dict[str, StoredArtifact]:
         results = {}
         desired = {lookup.key: lookup for lookup in invocation.lookups}
+        item_keys = {lookup.item_key for lookup in invocation.lookups}
         for candidate in available:
+            lookup = (
+                getattr(candidate, "lookup", None)
+                if type(candidate) is StoredArtifact
+                else None
+            )
+            if (
+                type(candidate) is StoredArtifact
+                and type(lookup) is ArtifactLookup
+            ):
+                item_key = getattr(lookup, "item_key", None)
+                # Only a current primitive header can exclude unrelated work
+                # without traversing its original peers and dependencies.
+                if (
+                    type(item_key) is str
+                    and _HEX_DIGEST.fullmatch(item_key)
+                    and item_key not in item_keys
+                ):
+                    continue
+                lookup = ArtifactLookup.model_validate(lookup)
+                if lookup.key not in desired:
+                    continue
             artifact = StoredArtifact.model_validate(candidate)
-            if artifact.lookup.key in desired and registry.contains(
+            if desired.get(
+                artifact.lookup.key
+            ) == artifact.lookup and registry.contains(
                 artifact.invocation.dependencies
             ):
                 try:
