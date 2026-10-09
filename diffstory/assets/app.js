@@ -4,8 +4,8 @@
   const R = JSON.parse(document.getElementById('report-data').textContent);
   const $ = (selector, parent = document) => parent.querySelector(selector);
   const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
-  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  const esc = value => String(value ?? '').replace(/[&<>"'\r]/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '\r': '&#13;'
   }[c]));
   const basename = path => String(path || '').split('/').pop();
   // Explicit backticks are preferred; report-backed code tokens are the rendering fallback.
@@ -103,6 +103,161 @@
   const PREVIEW_TAIL = 5;
   const CHUNK = 160;
 
+  // The backend validates this closed presentation against source and generation.
+  // Legacy annotations never enter this branch by a label or a matching field name.
+  const V2 = R.generation?.version === 'diffstory.generation.v2'
+    && R.narrative_v2?.version === 'diffstory.presentation.v2' ? R.narrative_v2 : null;
+  const refKey = ref => {
+    if (ref.kind === 'statement') return JSON.stringify([
+      ref.kind, ref.producer_item_key, ref.result_digest,
+      ref.statement_path.field, ref.statement_path.index, ref.statement_digest
+    ]);
+    if (ref.kind === 'source_slice') return JSON.stringify([
+      ref.kind, refKey(ref.source), ref.byte_start, ref.byte_end, ref.content_digest
+    ]);
+    return JSON.stringify([ref.span_id, ref.unit_key, ref.group_key, ref.side,
+      ref.path, ref.byte_start, ref.byte_end, ref.line_start, ref.line_end, ref.content_digest]);
+  };
+  const claimKey = ref => JSON.stringify([ref.unit_key, ref.observation_id]);
+  const citations = new Map(), observations = new Map(), inherited = new Map();
+  const unitSources = new Map(), inheritedEndpoints = new Map(), fragmentData = new Map();
+  const fragments = new Map((V2 ? R.source_evidence.fragments : []).map(f => [f.key, f]));
+  function directEndpoints(statement) {
+    const found = new Map();
+    const add = ref => { const c = citations.get(refKey(ref)); found.set(c.key, c); };
+    statement.citations.forEach(add);
+    for (const ref of statement.claims) observations.get(claimKey(ref)).citations.forEach(add);
+    for (const ref of statement.basis) if (ref.kind === 'source_slice') add(ref);
+    return found;
+  }
+  if (V2) {
+    for (const c of V2.citations) {
+      citations.set(refKey(c.reference), c);
+      const unit = (c.reference.source || c.reference).unit_key;
+      if (!unitSources.has(unit)) unitSources.set(unit, []);
+      unitSources.get(unit).push(c);
+    }
+    for (const d of [...V2.sections.flatMap(s => s.details), ...V2.context_details]) {
+      for (const o of d.observations) observations.set(claimKey({unit_key: d.unit_key, observation_id: o.id}), o);
+    }
+    for (const p of V2.support_provenance) inherited.set(refKey(p.reference), p);
+    // One iterative DAG walk, shared by all displayed statements. Keep every branch.
+    for (const root of inherited.keys()) {
+      const stack = [[root, false]];
+      while (stack.length) {
+        const [key, ready] = stack.pop();
+        if (inheritedEndpoints.has(key)) continue;
+        const statement = inherited.get(key).statement;
+        const children = statement.basis.filter(r => r.kind === 'statement').map(refKey);
+        if (!ready) {
+          stack.push([key, true]);
+          for (const child of children) if (!inheritedEndpoints.has(child)) stack.push([child, false]);
+        } else {
+          const endpoints = directEndpoints(statement);
+          for (const child of children) for (const [id, citation] of inheritedEndpoints.get(child)) endpoints.set(id, citation);
+          inheritedEndpoints.set(key, endpoints);
+        }
+      }
+    }
+  }
+  const sideLabel = side => side === 'base' ? 'Base' : 'Head';
+  function citationLabel(c) {
+    return `${sideLabel(c.side)} · ${c.path} · L${c.line_start}–${c.line_end} · bytes ${c.byte_start}–${c.byte_end} (end excluded)${c.byte_start === c.byte_end ? ' · Empty supplied fragment' : ''}`;
+  }
+  function sourceLinks(values, inheritedSource = false) {
+    if (!values.length) return '';
+    return `<ul class="v2-source-links">${values.map(c => `<li><a href="#source-${c.key}" data-citation="${c.key}" data-consumption="${c.consumption}">${inheritedSource ? 'Inherited · ' : ''}${c.consumption === 'source_slice' ? 'Exact source slice' : 'Direct source'} · ${esc(citationLabel(c))}</a></li>`).join('')}</ul>`;
+  }
+  const refsHTML = refs => sourceLinks(refs.map(ref => citations.get(refKey(ref))));
+  const kindLabels = {
+    implementation_claim: 'Source-linked interpretation · unverified',
+    author_motivation: 'Author-reported motivation · not implementation evidence',
+    editorial: 'Reading guidance · not implementation evidence',
+    uncertainty: 'Uncertainty · not implementation evidence'
+  };
+  const typedText = (text, field) => `<div class="v2-text" data-field="${field}">${inline(text)}</div>`;
+  function statementBody(s) {
+    return `${typedText(s.text, 'text')}${s.effect !== null ? `<div class="v2-field"><span class="v2-label">Supported effect · unverified</span>${typedText(s.effect, 'effect')}</div>` : ''}${s.uncertainty.map(text => `<div class="v2-field"><span class="v2-label">Uncertainty</span>${typedText(text, 'uncertainty')}</div>`).join('')}`;
+  }
+  function statementSupport(s) {
+    const claims = s.claims.map(ref => {
+      const o = observations.get(claimKey(ref));
+      return `<div class="v2-claim"><span class="v2-label">Supporting observation</span>${typedText(o.text, 'observation')}${refsHTML(o.citations)}</div>`;
+    }).join('');
+    const basis = s.basis.map(ref => {
+      if (ref.kind === 'source_slice') return refsHTML([ref]);
+      const key = refKey(ref), p = inherited.get(key);
+      return `<div class="v2-inherited" data-inherited="${p.key}"><span class="v2-label">Inherited statement · ${esc(kindLabels[p.statement.kind])}</span>${statementBody(p.statement)}${sourceLinks([...inheritedEndpoints.get(key).values()], true)}${!inheritedEndpoints.get(key).size ? '<p class="v2-label">No implementation source endpoints in this inherited statement.</p>' : ''}</div>`;
+    }).join('');
+    return `${refsHTML(s.citations)}${claims}${basis}`;
+  }
+  function statementHTML(s) {
+    return `<div class="v2-statement" data-kind="${s.kind}"><span class="v2-label">${kindLabels[s.kind]}</span>${statementBody(s)}${statementSupport(s)}</div>`;
+  }
+  const statementsHTML = statements => statements.map(statementHTML).join('');
+  function termsHTML(terms) {
+    return terms.length ? `<div class="v2-terms"><h3>Terms used here</h3>${terms.map(t => `<div class="v2-term"><h4>${inline(t.term)}</h4>${statementHTML(t.definition)}</div>`).join('')}</div>` : '';
+  }
+  function detailHTML(d) {
+    const explanations = d.explanations.map(e => `<div class="v2-explanation">${['before', 'after', 'effect', 'uncertainty'].map(field => `<div class="v2-field"><span class="v2-label">${{before: 'Before', after: 'After', effect: 'Effect · interpretation', uncertainty: 'Uncertainty'}[field]}</span>${typedText(e[field], field)}</div>`).join('')}${refsHTML(e.citations)}${e.limitations.map(l => `<div class="v2-limitation"><span class="v2-label">Evidence limitation · ${esc(sideLabel(l.side))} · ${esc(l.path)}</span>${typedText(l.reason.replace(/_/g, ' '), 'reason')}<span class="v2-label">${esc(l.code.replace(/_/g, ' '))} · This limit does not establish absence or behavior.</span></div>`).join('')}</div>`).join('');
+    const observed = d.observations.map(o => `<div class="v2-observation" id="observation-${d.unit_key}-${o.id}"><span class="v2-label">Source-linked observation · unverified</span>${typedText(o.text, 'observation')}${refsHTML(o.citations)}</div>`).join('');
+    const questions = d.questions.map(q => `<div class="v2-question"><span class="v2-label">Open question · not implementation evidence</span>${typedText(q.text, 'question')}${refsHTML(q.citations)}</div>`).join('');
+    const empty = !d.explanations.length && !d.observations.length && !d.questions.length;
+    return `<article class="v2-detail prose" data-detail="${d.unit_key}">${empty ? `<p class="v2-context-ack">Supplied context was retained; no change explanation was required for this evidence.</p>${sourceLinks(unitSources.get(d.unit_key) || [])}` : explanations + observed + questions}</article>`;
+  }
+  function typedSectionHTML(section) {
+    const g = G.get(section.group_id), p = section.prose;
+    const prerequisites = g.prerequisites.length ? `<p class="v2-label">Compiler prerequisites: ${g.prerequisites.map(id => `<a href="#${id}">${inline(G.get(id).title)}</a>`).join(', ')}</p>` : '';
+    return `<section class="story-section" id="${g.id}" data-story-section="${g.id}" aria-labelledby="heading-${g.id}"><header class="section-heading"><span class="section-number">${String(section.number).padStart(2, '0')}</span><h2 id="heading-${g.id}">${inline(p.title.text)}<a class="section-anchor" href="#${g.id}" aria-label="Link to ${esc(plainInline(p.title.text))}">#</a></h2></header><div class="prose v2-title-support"><span class="v2-label">Heading · ${kindLabels[p.title.kind]}</span>${p.title.effect !== null ? typedText(p.title.effect, 'effect') : ''}${p.title.uncertainty.map(t => typedText(t, 'uncertainty')).join('')}${statementSupport(p.title)}${prerequisites}</div><div class="section-context">${statementsHTML(p.orientation)}</div>${section.details.map(detailHTML).join('')}<div class="prose">${statementsHTML(p.synthesis)}${termsHTML(p.terminology)}</div>${g.change_ids.map(id => blockHTML([id], {view: 'diff'})).join('')}<div class="section-end">${statementsHTML(p.transition)}</div></section>`;
+  }
+  function sourceBlockHTML(c) {
+    const id = `block-${++blockCounter}`;
+    blocks.set(id, {id, citation: c, expanded: false, loaded: 0, materialized: false});
+    return `<details class="v2-source" id="source-${c.key}"><summary>${c.consumption === 'source_slice' ? 'Exact source slice' : 'Direct source'} · ${esc(citationLabel(c))}</summary><figure class="code-block exact-code" id="${id}" data-block="${id}" data-citation="${c.key}" data-fragment="${esc(c.fragment_key)}" data-side="${c.side}" data-byte-start="${c.byte_start}" data-byte-end="${c.byte_end}"><figcaption class="code-header">${esc(sideLabel(c.side))} · ${esc(c.path)}</figcaption><div class="code-body"><div class="lazy-shell"><button data-load-preview="${id}">Load cited source ↓</button></div></div><div class="code-footer">${link(c.url, `${sideLabel(c.side)} source`, 'code-source-link')}</div></figure></details>`;
+  }
+  function typedStoryHTML() {
+    return `<section class="preamble"><h2>Before the code</h2><div class="preamble-body">${statementsHTML(V2.document.preamble)}${termsHTML(V2.document.terminology)}</div></section>${V2.sections.map(typedSectionHTML).join('')}${V2.context_details.length ? `<section class="v2-context"><div class="prose"><h2>Retained source context</h2></div>${V2.context_details.map(detailHTML).join('')}</section>` : ''}<section class="v2-catalog"><div class="prose"><h2>Source references</h2><p>Each excerpt uses the named revision and exact byte range. Open it to inspect the source, then load the full supplied fragment if needed.</p></div>${V2.citations.map(sourceBlockHTML).join('')}</section>`;
+  }
+  function sourceData(c) {
+    if (!fragmentData.has(c.fragment_key)) {
+      const fragment = fragments.get(c.fragment_key);
+      const bytes = new TextEncoder().encode(fragment.text), starts = [0];
+      // CRLF is one delimiter. LS and PS are ordinary source characters.
+      for (let i = 0; i < bytes.length; i++) {
+        if (bytes[i] === 13) { if (bytes[i + 1] === 10) i++; starts.push(i + 1); }
+        else if (bytes[i] === 10) starts.push(i + 1);
+      }
+      if (starts.at(-1) === bytes.length) starts.pop();
+      fragmentData.set(c.fragment_key, {fragment, bytes, starts});
+    }
+    return fragmentData.get(c.fragment_key);
+  }
+  function exactRows(c, full = false) {
+    const {fragment, bytes, starts} = sourceData(c);
+    const start = full ? 0 : c.byte_start, end = full ? bytes.length : c.byte_end;
+    let lo = 0, hi = starts.length;
+    while (lo < hi) { const mid = (lo + hi) >>> 1; if (starts[mid] <= start) lo = mid + 1; else hi = mid; }
+    const rows = [], decoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true});
+    for (let i = Math.max(0, lo - 1); i < starts.length && starts[i] < end; i++) {
+      rows.push({type: 'line', new: fragment.start_line + i,
+        text: decoder.decode(bytes.subarray(Math.max(start, starts[i]), Math.min(end, starts[i + 1] ?? bytes.length)))});
+    }
+    return rows;
+  }
+  function paintSourceBlock(spec) {
+    const element = document.getElementById(spec.id), c = spec.citation;
+    const selected = exactRows(c, spec.expanded);
+    const shown = spec.expanded ? selected.slice(0, spec.loaded) : selected.length <= PREVIEW_LIMIT ? selected
+      : [...selected.slice(0, PREVIEW_HEAD), {type: 'gap', text: `… ${selected.length - PREVIEW_HEAD - PREVIEW_TAIL} cited lines folded`}, ...selected.slice(-PREVIEW_TAIL)];
+    const empty = sourceData(c).bytes.length === 0;
+    const load = empty ? '' : spec.expanded ? (spec.loaded < selected.length ? `<button class="load-bar" data-expand="${spec.id}">Load next ${Math.min(CHUNK, selected.length - spec.loaded)} source lines</button>` : '')
+      : `<button class="load-bar" data-expand="${spec.id}">Read full supplied ${sideLabel(c.side).toLowerCase()} source · loaded in chunks</button>`;
+    $('.code-body', element).innerHTML = `${empty ? '<p class="code-note v2-empty-source">Empty supplied fragment (0 bytes). This does not establish whether the whole file or its counterpart is empty.</p>' : ''}<div class="code-region" tabindex="0" role="region" aria-label="${esc(sideLabel(c.side) + ' ' + c.path)}"><div class="code-lines">${rowsHTML(shown, false)}</div></div>${load}`;
+    $('.code-footer', element).innerHTML = `<span class="code-location">${esc(citationLabel(c))}</span>${spec.expanded ? `<button class="text-button" data-collapse="${spec.id}">Return to cited excerpt</button>` : ''}${link(c.url, `${sideLabel(c.side)} source`, 'code-source-link')}`;
+    spec.materialized = true; element.dataset.loaded = 'true';
+    element.dataset.sourceView = spec.expanded ? 'full' : 'excerpt';
+  }
+
   function classification(c) {
     const fileStatus = {
       added: ['Added to file', 'move'],
@@ -150,6 +305,7 @@
     return rows;
   }
   function allRows(spec) {
+    if (spec.citation) return exactRows(spec.citation, true);
     if (spec.cache[spec.view]) return spec.cache[spec.view];
     let rows = [];
     if (spec.raw) rows = diffRows(spec.raw.hunks);
@@ -254,6 +410,7 @@
     return `<span class="code-location">${esc(location)}</span>${modeButton}${collapse}${base}${head}`;
   }
   function paintBlock(spec) {
+    if (spec.citation) { paintSourceBlock(spec); return; }
     const element = document.getElementById(spec.id);
     if (!element) return;
     spec.materialized = true;
@@ -383,13 +540,15 @@
     const title = m.title || 'Read the change, one idea at a time';
     document.title = `Diffstory · ${m.number ? '#' + m.number : plainInline(title)} · Reader`;
     const lead = doc.lead || 'Read the change in one continuous thread: the idea, its code, then what follows from it. Source stays close to the explanation.';
+    const provider = V2 ? R.generation.request_configuration.name : R.generation?.provider;
+    const model = V2 ? R.generation.request_configuration.model : R.generation?.model;
     const generationNotice = R.generation
-      ? `<p class="generation-notice" role="status"><strong>Model-generated narration · unverified.</strong> Provider: ${esc(R.generation.provider)} · model: ${esc(R.generation.model)}. Check every claim against the linked source.</p>` : '';
-    $('#documentHeader').innerHTML = `<div class="document-kicker">${link(m.url, m.repository || 'Local repository') || esc(m.repository || 'Local repository')}<span class="kicker-dot">/</span><span>${m.number ? 'PR ' + m.number : m.input === 'synthetic example' ? 'SYNTHETIC EXAMPLE' : 'COMMITTED COMPARISON'}</span></div><h1>${inline(title)}</h1><p class="lead">${inline(lead)}</p>${generationNotice}<div class="document-meta"><span>${R.groups.length} sections</span><span class="sep">·</span><span>${R.stats.supplied_paths} source paths</span><span class="sep">·</span><span class="revisions">${esc((m.base_sha || 'base').slice(0, 7))} → ${esc((m.head_sha || 'head').slice(0, 7))}</span></div><p class="document-scope">${m.input === 'synthetic example' ? 'Original synthetic example. No private repository source.' : m.scope === 'selected excerpts' ? 'Selected source excerpts, not the complete PR.' : 'Committed, changed-file snapshot.'} <a href="#evidence">Evidence & scope</a></p><div class="header-rule"></div>`;
+      ? `<p class="generation-notice" role="status"><strong>Model-generated narration · unverified.</strong> Provider: ${esc(provider)} · model: ${esc(model)}. Check every claim against the linked source.</p>` : '';
+    $('#documentHeader').innerHTML = `<div class="document-kicker">${link(m.url, m.repository || 'Local repository') || esc(m.repository || 'Local repository')}<span class="kicker-dot">/</span><span>${m.number ? 'PR ' + m.number : m.input === 'synthetic example' ? 'SYNTHETIC EXAMPLE' : 'COMMITTED COMPARISON'}</span></div><h1>${inline(title)}</h1>${V2 ? `<div class="lead">${statementsHTML(V2.document.lead)}</div>` : `<p class="lead">${inline(lead)}</p>`}${generationNotice}<div class="document-meta"><span>${R.groups.length} sections</span><span class="sep">·</span><span>${R.stats.supplied_paths} source paths</span><span class="sep">·</span><span class="revisions">${esc((m.base_sha || 'base').slice(0, 7))} → ${esc((m.head_sha || 'head').slice(0, 7))}</span></div><p class="document-scope">${m.input === 'synthetic example' ? 'Original synthetic example. No private repository source.' : m.scope === 'selected excerpts' ? 'Selected source excerpts, not the complete PR.' : 'Committed, changed-file snapshot.'} <a href="#evidence">Evidence & scope</a></p><div class="header-rule"></div>`;
   }
   function buildFooter() {
     const closing = R.document?.closing || 'The definitions, their callers, and the available tests are now in one reading path. Structural matches and test references guide review; they do not substitute for execution evidence.';
-    $('#documentFooter').innerHTML = `<div class="closing"><span class="closing-label">The shape of the change</span>${inline(closing)}</div><details id="source-hunks" class="appendix" data-appendix="raw"><summary>Original source hunks</summary><div class="appendix-content"></div></details><details id="evidence" class="appendix" data-appendix="evidence"><summary>Evidence, revisions & scope</summary><div class="appendix-content"></div></details><div class="bottom-line"><span>Diffstory 0.3 · by Epistemic AI · stored locally</span><a href="#top">Back to top ↑</a></div>`;
+    $('#documentFooter').innerHTML = `<div class="closing"><span class="closing-label">The shape of the change</span>${V2 ? statementsHTML(V2.document.closing) : inline(closing)}</div><details id="source-hunks" class="appendix" data-appendix="raw"><summary>Original source hunks</summary><div class="appendix-content"></div></details><details id="evidence" class="appendix" data-appendix="evidence"><summary>Evidence, revisions & scope</summary><div class="appendix-content"></div></details><div class="bottom-line"><span>Diffstory 0.3 · by Epistemic AI · stored locally</span><a href="#top">Back to top ↑</a></div>`;
   }
   function contents() {
     const q = $('#search').value.trim().toLowerCase();
@@ -540,7 +699,7 @@
   });
 
   buildHeader();
-  $('#story').innerHTML = `${preambleHTML()}${R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>'}`;
+  $('#story').innerHTML = V2 ? typedStoryHTML() : `${preambleHTML()}${R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>'}`;
   buildFooter(); contents(); observeBlocks(); updateScroll();
   if (location.hash) requestAnimationFrame(() => navigateTo(location.hash, false));
 })();

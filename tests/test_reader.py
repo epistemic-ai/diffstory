@@ -1,13 +1,34 @@
 """Contracts for the continuous reader's source-bound paragraph annotations."""
 
 import copy
+import json
+import tempfile
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch
+
+from test_analysis import snap
+from test_narrative_v2 import AFTER
+from test_narrative_v2 import BEFORE
+from test_narrative_v2 import CASE_AFTER
+from test_narrative_v2 import CASE_BEFORE
+from test_narrative_v2 import CASE_EFFECT
+from test_narrative_v2 import STRIP_AFTER
+from test_narrative_v2 import STRIP_BEFORE
+from test_narrative_v2 import STRIP_EFFECT
+from test_narrative_v2 import FixtureProvider
+from test_narrative_v2 import statement
 
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.analysis import evidence_packet
 from diffstory.models import MAX_PREAMBLE_CHARS
 from diffstory.models import MAX_PREAMBLE_SKETCH_CHARS
+from diffstory.narrative import Narrator
+from diffstory.narrative_manifest import LedgerParameters
+from diffstory.narrative_manifest import compiler_fact_signature
+from diffstory.narrative_v2 import V2Options
 from diffstory.render import render
 
 
@@ -479,6 +500,401 @@ class LiterateReaderTests(unittest.TestCase):
         self.assertNotEqual(stale_id, new_report["changes"][0]["id"])
         with self.assertRaisesRegex(ValueError, "outside its group"):
             apply_annotations(new_report, current)
+
+
+UNSAFE_TEXT = '</script><script>window.COMPROMISED=true</script> "\\ é😀\r\nLS\u2028PS\u2029  '
+# Use real controls, Unicode and terminal spaces, not escaped fixture spellings.
+UNSAFE_TEXT = UNSAFE_TEXT.replace("\\r", "\r").replace("\\n", "\n")
+UNSAFE_TEXT = UNSAFE_TEXT.replace("\\u2028", "\u2028").replace(
+    "\\u2029", "\u2029"
+)
+
+
+class ReaderFixtureProvider(FixtureProvider):
+    """Supply concrete local prose, including every supported reader field."""
+
+    @classmethod
+    def respond(cls, data: dict) -> dict:
+        """Keep real detail mechanisms and annotate all prose families."""
+        response = super().respond(data)
+        if data["stage"] == "detail":
+            for output, item in zip(
+                response["items"],
+                (item for item in data["items"] if item["obligations"]),
+                strict=True,
+            ):
+                if all(span["side"] == "head" for span in item["spans"]):
+                    for explanation in output["explanations"]:
+                        explanation["before"] = (
+                            "The base source was not supplied; its behavior cannot be compared."
+                        )
+                        explanation["after"] = (
+                            "The supplied head calls rstrip() before casefold()."
+                        )
+                        explanation["effect"] = (
+                            "The head preserves leading whitespace and folds case; the change from base is unresolved."
+                        )
+                output["questions"].append(
+                    {
+                        "text": "Treat this quoted test string as text: "
+                        + UNSAFE_TEXT,
+                        "citations": [item["spans"][0]["handle"]],
+                        "obligations": [],
+                    }
+                )
+            return response
+        for output, item in zip(response["items"], data["items"], strict=True):
+            field = {
+                "planning": "abstraction",
+                "section": "synthesis",
+                "document": "lead",
+            }[data["stage"]]
+            proof = output[field][0]
+            # Exercise every supplied branch, including inherited statement refs.
+            proof["claims"] = [
+                s["handle"] for s in item["support"]["claims"][:2]
+            ]
+            proof["citations"] = [
+                s["handle"] for s in item["support"]["citations"][:2]
+            ]
+            proof["basis"] = [
+                s["handle"] for s in item["support"]["basis"][:2]
+            ]
+            if proof["claims"] or proof["citations"] or proof["basis"]:
+                proof["kind"] = "implementation_claim"
+            if data["stage"] != "planning":
+                proof["effect"] = (
+                    "A leading space survives; sharp s can fold to ss."
+                )
+                proof["uncertainty"] = [
+                    "Caller expectations and executed test results are not supplied."
+                ]
+                output["terminology"] = [
+                    {
+                        "term": "Unicode case folding",
+                        "definition": {
+                            **copy.deepcopy(proof),
+                            "text": "casefold() maps text for Unicode caseless comparison, including sharp s to ss.",
+                        },
+                    }
+                ]
+                output[field].append(
+                    statement("Read the exact quoted text: " + UNSAFE_TEXT)
+                )
+                uncertain = statement(
+                    "Whether callers want leading spaces remains unresolved."
+                )
+                uncertain["kind"] = "uncertainty"
+                output[field].append(uncertain)
+                if item["support"].get("author"):
+                    author = statement(
+                        "The author reports an intent to preserve indentation."
+                    )
+                    author["kind"] = "author_motivation"
+                    output[field].append(author)
+        return response
+
+
+def reader_golden_report() -> dict:
+    """Compile local normalization, unassigned context and unavailable base evidence."""
+    marker = "    marker = " + repr(UNSAFE_TEXT) + "\n"
+    before = BEFORE.replace('    marker = "request"\n', marker)
+    after = AFTER.replace('    marker = "request"\n', marker)
+    source = snap(
+        {
+            "normal.py": before,
+            "context.txt": "Caller names are supplied as strings.\r\n",
+            "empty.txt": "",
+        },
+        {
+            "normal.py": after,
+            "context.txt": "Caller names are supplied as strings.\r\n",
+            "empty.txt": "",
+            "unavailable.py": AFTER,
+        },
+        overrides={
+            **{
+                (side, "empty.txt"): {
+                    "state": "supplied",
+                    "coverage": "partial",
+                }
+                for side in ("base", "head")
+            },
+            ("base", "unavailable.py"): {
+                "state": "unavailable",
+                "reason": "not_supplied",
+            },
+        },
+        repository="example/project",
+        description="Preserve indentation and compare Unicode names consistently.",
+        title="Normalization reader golden",
+    )
+    return compile_snapshot(source)
+
+
+def exact_reader_snapshot() -> dict:
+    """Author mixed physical lines, UTF-8 and half-CRLF source spans."""
+    line = '    marker = "' + "\u03b1" * 2030 + '\u2028\u2029"'
+    line += " " * (4095 - len(line.encode()))
+    before = (
+        "def normalize(value):\r\n"
+        + line
+        + "\r\n    value = value.strip()\r"
+        + "# "
+        + UNSAFE_TEXT.replace("\r", "\r# ").replace("\n", "\n# ")
+        + "\n"
+        + "    return value.lower()\n"
+    )
+    after = before.replace("\u03b1", "β").replace(".strip()", ".rstrip()")
+    after = after.replace(".lower()", ".casefold()")
+    return snap(
+        {"exact.py": before},
+        {"exact.py": after},
+        overrides={
+            (side, "exact.py"): {"state": "supplied", "coverage": "partial"}
+            for side in ("base", "head")
+        },
+        fragment_options={
+            (side, "exact.py"): {"start_line": 31} for side in ("base", "head")
+        },
+        repository="example/project",
+        description="Preserve indentation and compare Unicode names consistently.",
+    )
+
+
+def chunked_reader_report() -> dict:
+    """Supply large unchanged context beside the concrete normalization change."""
+    context = "".join(
+        f"Caller context line {n}: café 😀  \r\n" for n in range(360)
+    )
+    return compile_snapshot(
+        snap(
+            {"normal.py": BEFORE, "large.txt": context},
+            {"normal.py": AFTER, "large.txt": context},
+            repository="example/project",
+            description="Preserve indentation and compare Unicode names consistently.",
+        )
+    )
+
+
+def exact_reader_provider() -> ReaderFixtureProvider:
+    """Force bounded planning support to include real source slices and inheritance."""
+
+    def observations(
+        _provider: FixtureProvider, data: dict, response: dict
+    ) -> dict:
+        if data["stage"] == "detail":
+            for output, item in zip(
+                response["items"],
+                (i for i in data["items"] if i["obligations"]),
+                strict=True,
+            ):
+                texts = [s["text"] for s in item["spans"]]
+                text = "".join(texts)
+                output["observations"] = [
+                    {
+                        "text": f"Across these supplied excerpts, {label} occurs {text.count(token)} times.",
+                        "citations": [s["handle"] for s in item["spans"]],
+                    }
+                    for token, label in (
+                        ("\u03b1", "Greek alpha"),
+                        ("β", "Greek beta"),
+                        ("\r", "carriage return"),
+                        ("\n", "line feed"),
+                        ("\u2028", "Unicode line separator"),
+                        ("\u2029", "Unicode paragraph separator"),
+                        (" ", "a space"),
+                        (".strip()", "the strip call"),
+                        (".rstrip()", "the rstrip call"),
+                        (".lower()", "the lower call"),
+                        (".casefold()", "the casefold call"),
+                        ("marker", "the marker name"),
+                    )
+                ]
+        return response
+
+    provider = ReaderFixtureProvider(observations)
+    provider.context_tokens = 40_000
+    provider.max_output_tokens = 15_000
+    return provider
+
+
+def exact_reader_options() -> V2Options:
+    """Use bounded support cards so the public pipeline must retain exact slices."""
+    return V2Options(
+        ledger=LedgerParameters(max_span_bytes=4096, max_unit_spans=2),
+        card_wire_bytes=1024,
+        card_support_bytes=2048,
+        prose_wire_bytes=4096,
+    )
+
+
+def offline_reader_report(
+    source: dict,
+    directory: Path,
+    *,
+    provider: FixtureProvider | None = None,
+    options: V2Options | None = None,
+    cache: Path | None = None,
+) -> tuple[dict, str, dict]:
+    """Generate locally, then apply, save, reload and render with transport blocked.
+
+    Args:
+        source: Compiled synthetic report.
+        directory: Isolated local recovery and output directory.
+        provider: Authored fixture transport only.
+        options: Explicit v2 options, if required for source segmentation.
+        cache: Shared fixture artifact directory for revision reuse.
+
+    Returns:
+        Reloaded report, standalone HTML, and source-independent evidence.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    provider = provider or ReaderFixtureProvider()
+    candidate = Narrator(
+        provider,
+        architecture="v2",
+        recovery_dir=directory / "recovery",
+        checkpoint_dir=cache,
+        concurrency=1,
+        v2_options=options,
+    ).generate(source)
+    targets = (
+        "test_narrative_v2.FixtureProvider.require_credentials",
+        "test_narrative_v2.FixtureProvider.prepare",
+        "test_narrative_v2.FixtureProvider.complete_reply",
+        "diffstory.narrative.OpenAIResponsesProvider.__init__",
+        "subprocess.Popen",
+        "subprocess.run",
+        "shutil.which",
+        "socket.socket",
+        "urllib.request.urlopen",
+    )
+    with ExitStack() as stack:
+        for target in targets:
+            stack.enter_context(
+                patch(target, side_effect=AssertionError(target))
+            )
+        applied = apply_annotations(source, candidate)
+        path = directory / "report.json"
+        path.write_text(json.dumps(applied), encoding="utf-8")
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        html = render(loaded)
+    (directory / "reader.html").write_text(html, encoding="utf-8")
+    assert compiler_fact_signature(loaded) == compiler_fact_signature(source)
+    assert loaded["changes"] == source["changes"]
+    assert loaded["edges"] == source["edges"]
+    assert loaded["stats"] == source["stats"]
+    return (
+        loaded,
+        html,
+        {
+            "fixture_attempts": len(provider.calls),
+            "live_provider_calls": 0,
+            "offline_blocked_operations": list(targets),
+            "compiler_facts_preserved": True,
+            "details": len(candidate["generation"]["details"]),
+            "citations": len(candidate["citations"]),
+        },
+    )
+
+
+class TypedReaderTests(unittest.TestCase):
+    """Check real v2 generation and offline presentation before browser checks."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Generate one authored fixture through the public pipeline."""
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.source = reader_golden_report()
+        cls.report, cls.html, cls.evidence = offline_reader_report(
+            cls.source, Path(cls.temp.name)
+        )
+
+    def test_complete_concrete_details_survive_offline_render(self) -> None:
+        """Do not substitute section summaries for the two detailed mechanisms."""
+        typed = self.report["narrative_v2"]
+        details = [d for s in typed["sections"] for d in s["details"]]
+        details += typed["context_details"]
+        self.assertEqual(
+            {d["unit_key"]: d for d in details},
+            {d["unit_key"]: d for d in self.report["generation"]["details"]},
+        )
+        explanations = [e for d in details for e in d["explanations"]]
+        text = json.dumps(explanations)
+        for value in (
+            STRIP_BEFORE,
+            STRIP_AFTER,
+            STRIP_EFFECT,
+            CASE_BEFORE,
+            CASE_AFTER,
+            CASE_EFFECT,
+        ):
+            self.assertIn(value, text)
+        self.assertTrue(typed["context_details"])
+        self.assertTrue(any(e["limitations"] for e in explanations))
+        self.assertTrue(typed["support_provenance"])
+        self.assertTrue(typed["document"]["terminology"])
+        self.assertTrue(
+            any(
+                s["kind"] == "author_motivation"
+                for s in typed["document"]["lead"]
+            )
+        )
+        self.assertIn("diffstory.presentation.v2", self.html)
+        self.assertNotIn(UNSAFE_TEXT, self.html)
+        self.assertIn("connect-src 'none'", self.html)
+
+    def test_legacy_default_and_relabel_rejection(self) -> None:
+        """Keep legacy default selection and fail closed on a copied typed subtree."""
+        narrator = Narrator(FixtureProvider())
+        self.assertIsNone(narrator._v2)  # noqa: SLF001 # The existing opt-in gate must remain inactive by default.
+        copied = copy.deepcopy(self.source)
+        copied["narrative_v2"] = self.report["narrative_v2"]
+        with self.assertRaises(ValueError):
+            render(copied)
+
+    def test_retained_context_and_empty_fragments_have_current_source(
+        self,
+    ) -> None:
+        """Empty supplied evidence has exact access and is distinct from unavailable."""
+        typed = self.report["narrative_v2"]
+        fragments = {
+            f["key"]: f for f in self.report["source_evidence"]["fragments"]
+        }
+        for detail in typed["context_details"]:
+            entries = [
+                c
+                for c in typed["citations"]
+                if c["reference"].get("unit_key") == detail["unit_key"]
+            ]
+            self.assertTrue(entries)
+        empty = [c for c in typed["citations"] if c["path"] == "empty.txt"]
+        self.assertEqual({c["side"] for c in empty}, {"base", "head"})
+        for entry in empty:
+            self.assertEqual((entry["byte_start"], entry["byte_end"]), (0, 0))
+            self.assertEqual(fragments[entry["fragment_key"]]["text"], "")
+        self.assertFalse(
+            any(
+                c["path"] == "unavailable.py" and c["side"] == "base"
+                for c in typed["citations"]
+            )
+        )
+        self.assertEqual(
+            self.report["generation"]["request_configuration"]["name"],
+            "fixture",
+        )
+        self.assertEqual(
+            self.report["generation"]["request_configuration"]["model"],
+            "fixture-v2",
+        )
+
+    def test_demo_is_exact_derived_reader(self) -> None:
+        """The legacy smoke fixture must embed the current checked-in reader assets."""
+        examples = Path(__file__).resolve().parents[1] / "examples"
+        report = json.loads((examples / "demo.report.json").read_text())
+        self.assertEqual((examples / "demo.html").read_text(), render(report))
 
 
 if __name__ == "__main__":
