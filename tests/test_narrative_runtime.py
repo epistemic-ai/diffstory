@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 from test_analysis import snap
+from test_narrative_contracts import prose_result
 from test_narrative_plan import AFTER
 from test_narrative_plan import BEFORE
 from test_narrative_plan import authored_result
@@ -33,8 +34,15 @@ from diffstory.analysis import compile_snapshot
 from diffstory.narrative_contracts import ArtifactDependency
 from diffstory.narrative_contracts import BatchSpec
 from diffstory.narrative_contracts import DetailResult
+from diffstory.narrative_contracts import NarrativeResult
+from diffstory.narrative_contracts import result_key
+from diffstory.narrative_contracts import result_kind
+from diffstory.narrative_contracts import result_stage
+from diffstory.narrative_contracts import structured_output_schema
+from diffstory.narrative_plan import RequestPackingLimits
 from diffstory.narrative_plan import build_evidence_ledger
 from diffstory.narrative_plan import build_ledger_index
+from diffstory.narrative_plan import prepare_request_items
 from diffstory.narrative_plan import resolve_span_ref
 from diffstory.narrative_plan import span_reference
 from diffstory.narrative_plan import validate_detail_result
@@ -47,6 +55,7 @@ from diffstory.narrative_runtime import ProgressEvent
 from diffstory.narrative_runtime import RunIdentity
 from diffstory.narrative_runtime import RuntimeCallError
 from diffstory.narrative_runtime import RuntimeStageError
+from diffstory.usage import ModelCapacity
 from diffstory.usage import RunUsage
 
 
@@ -1118,6 +1127,12 @@ class ArtifactRuntimeTests(unittest.TestCase):
                         runtime.execute_batch(invocation, registry, callbacks)
                     self.assertEqual(len(sends), 1)
                     self.assertEqual(runtime.diagnostics[-1].unknown_items, 1)
+                    self.assertEqual(runtime.counters["repairs"], 0)
+                    state = runtime.pending_lineages(registry)[0]
+                    self.assertEqual(state.consumed_attempts, 1)
+                    self.assertEqual(state.nodes[0].status, "failed")
+                    self.assertEqual(state.nodes[0].reason, "unknown_item")
+                    self.assertEqual(state.nodes[0].missing_keys, ())
                 self.assertEqual(
                     len(
                         runtime.prefetch(
@@ -2097,41 +2112,375 @@ except ArtifactRuntimeError as error:
                     2,
                 )
 
-    def test_unknown_extra_with_missing_target_fails_and_preserves_known_item(
+    def test_unknown_extra_repairs_only_missing_target_with_original_evidence(
         self,
     ) -> None:
-        """Do not hide unknown keys by repairing a different missing target."""
+        """Keep valid peers and unknown diagnostics while repairing known gaps."""
         invocation, registry, results = fixture_v2()
-        first, _second = invocation.batch.item_keys
+        first, second = invocation.batch.item_keys
+
+        class EvidenceItem(runtime_v2.Contract):
+            """Bind fixture evidence to one known request target."""
+
+            unit_key: str
+            evidence: str
+
+        evidence = {
+            key: EvidenceItem(
+                unit_key=key, evidence=f"fixture evidence {index}"
+            )
+            for index, key in enumerate(invocation.batch.item_keys)
+        }
+        capacity = ModelCapacity(1_000_000, 100_000)
+        limits = RequestPackingLimits()
+
+        def prepare(
+            keys: tuple[str, ...], purpose: str
+        ) -> runtime_v2.PreparedArtifactRequest:
+            request = prepare_request_items(
+                tuple(evidence[key] for key in keys),
+                stage="detail",
+                keys=lambda item: item.unit_key,
+                groups=lambda _item: (),
+                serializer=lambda items, output: json.dumps(
+                    {
+                        "items": [
+                            item.model_dump(mode="json") for item in items
+                        ],
+                        "purpose": purpose,
+                        "output": output,
+                    }
+                ).encode(),
+                allowance=lambda _items: 300,
+                capacity=capacity,
+                limits=limits,
+            )
+            return runtime_v2.bind_prepared_request(request, capacity, limits)
+
+        invocation = changed_record(
+            invocation,
+            batch=prepare(
+                invocation.batch.item_keys, "initial"
+            ).metadata.batch,
+        )
+        unknown = changed_record(results[second], unit_key=digest("unknown"))
+        send = Mock(
+            side_effect=[
+                replace(
+                    wire_v2(
+                        [
+                            results[first].model_dump(mode="json"),
+                            unknown.model_dump(mode="json"),
+                        ]
+                    ),
+                    usage={"input_tokens": 11, "output_tokens": 3},
+                ),
+                replace(
+                    wire_v2([results[second].model_dump(mode="json")]),
+                    usage={"input_tokens": 7, "output_tokens": 2},
+                ),
+            ]
+        )
+        callbacks = runtime_v2.BatchCallbacks(
+            lambda _inv, node, purpose: prepare(node.missing_keys, purpose),
+            send,
+            validate_v2,
+        )
         with tempfile.TemporaryDirectory() as directory:
             runtime = runtime_v2.ArtifactRuntime(
                 identity(), recovery_dir=directory, artifact_dir=directory
             )
+            outcome = runtime.execute_batch(invocation, registry, callbacks)
+            self.assertEqual(
+                outcome.detail_batch().items, tuple(results.values())
+            )
+            requests = [call.args[0] for call in send.call_args_list]
+            self.assertEqual(
+                [request.metadata.batch.item_keys for request in requests],
+                [(first, second), (second,)],
+            )
+            self.assertEqual(
+                json.loads(requests[1].body),
+                {
+                    "items": [evidence[second].model_dump(mode="json")],
+                    "purpose": "repair",
+                    "output": requests[1].metadata.batch.output_reservation,
+                },
+            )
+            self.assertEqual(
+                runtime.usage.report(),
+                {
+                    "calls": 2,
+                    "input_tokens": 18,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 5,
+                    "unreported_calls": 0,
+                },
+            )
+            diagnostic = runtime.diagnostics[0]
+            self.assertEqual(diagnostic.reason, "unknown_item")
+            self.assertEqual(diagnostic.attempt, 1)
+            self.assertEqual(diagnostic.valid_items, 1)
+            self.assertEqual(diagnostic.missing_items, 1)
+            self.assertEqual(diagnostic.invalid_items, 0)
+            self.assertEqual(diagnostic.unknown_items, 1)
+            self.assertTrue(diagnostic.usage_available)
+            self.assertEqual(runtime.diagnostics[1].reason, "generic")
+            state = runtime.pending_lineages(registry)[0]
+            self.assertEqual(state.invocation, invocation)
+            self.assertEqual(state.consumed_attempts, 2)
+            self.assertEqual(state.nodes[0].repair_count, 1)
+            self.assertEqual(state.nodes[0].status, "succeeded")
+            self.assertEqual(state.nodes[0].missing_keys, ())
+            self.assertEqual(state.nodes[0].attempts[0].reason, "unknown_item")
+            self.assertEqual(state.nodes[0].attempts[0].outcome, "failed")
+            self.assertEqual(
+                len(list(Path(directory).glob("artifacts-v2/*/*.json"))), 2
+            )
+            for artifact, request in zip(
+                outcome.artifacts, requests, strict=True
+            ):
+                self.assertEqual(artifact.invocation, invocation)
+                self.assertEqual(
+                    artifact.record.dependencies, invocation.dependencies
+                )
+                self.assertEqual(artifact.production_request, request.metadata)
+            resumed = runtime_v2.ArtifactRuntime(
+                identity(), recovery_dir=directory, artifact_dir=directory
+            )
+            self.assertEqual(
+                resumed.execute_batch(invocation, registry, callbacks), outcome
+            )
+            self.assertEqual(send.call_count, 2)
+            self.assertEqual(resumed.usage.report()["calls"], 0)
+            self.assertEqual(resumed.usage.report()["input_tokens"], 0)
+            self.assertEqual(resumed.usage.report()["output_tokens"], 0)
 
-            def send(_prepared: object) -> runtime_v2.ProviderReply:
-                return wire_v2(
-                    [
-                        results[first].model_dump(mode="json"),
-                        {"unit_key": digest("unknown")},
+    def test_unknown_extra_bad_repair_exhausts_original_lineage_on_restart(
+        self,
+    ) -> None:
+        """Unknown or invalid repairs cannot reset budgets or erase valid peers."""
+        invocation, registry, results = fixture_v2()
+        first, second = invocation.batch.item_keys
+        unknown = {"unit_key": digest("unknown")}
+        invalid = {"unit_key": second, "explanations": "malformed"}
+        for repair_items, reason in (
+            ([unknown], "unknown_item"),
+            ([invalid], "schema"),
+        ):
+            with (
+                self.subTest(reason=reason),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                send = Mock(
+                    side_effect=[
+                        wire_v2(
+                            [
+                                results[first].model_dump(mode="json"),
+                                invalid,
+                                unknown,
+                            ]
+                        ),
+                        wire_v2(repair_items),
                     ]
                 )
-
-            with self.assertRaisesRegex(
-                runtime_v2.ArtifactRuntimeError, "unknown_item"
-            ):
-                runtime.execute_batch(
-                    invocation,
-                    registry,
-                    runtime_v2.BatchCallbacks(prepare_v2, send, validate_v2),
+                callbacks = runtime_v2.BatchCallbacks(
+                    prepare_v2, send, validate_v2
                 )
-            self.assertEqual(runtime.usage.report()["calls"], 1)
-            self.assertEqual(
-                len(
-                    runtime.prefetch(invocation.lookups, registry, validate_v2)
-                ),
-                1,
-            )
-            self.assertEqual(runtime.diagnostics[-1].missing_items, 1)
+                runtime = runtime_v2.ArtifactRuntime(
+                    identity(), recovery_dir=directory, artifact_dir=directory
+                )
+                with self.assertRaisesRegex(
+                    runtime_v2.ArtifactRuntimeError, reason
+                ):
+                    runtime.execute_batch(invocation, registry, callbacks)
+                self.assertEqual(
+                    [
+                        call.args[0].metadata.batch.item_keys
+                        for call in send.call_args_list
+                    ],
+                    [(first, second), (second,)],
+                )
+                self.assertEqual(runtime.usage.report()["calls"], 2)
+                self.assertEqual(runtime.usage.report()["unreported_calls"], 2)
+                self.assertEqual(runtime.diagnostics[0].reason, "unknown_item")
+                self.assertEqual(runtime.diagnostics[0].invalid_items, 1)
+                self.assertEqual(runtime.diagnostics[0].unknown_items, 1)
+                state = runtime.pending_lineages(registry)[0]
+                self.assertEqual(state.consumed_attempts, 2)
+                self.assertEqual(state.nodes[0].repair_count, 1)
+                self.assertEqual(state.nodes[0].status, "failed")
+                self.assertEqual(state.nodes[0].missing_keys, (second,))
+                saved = runtime.prefetch(
+                    invocation.lookups, registry, validate_v2
+                )
+                self.assertEqual(
+                    tuple(a.lookup.item_key for a in saved), (first,)
+                )
+                self.assertEqual(
+                    len(list(Path(directory).glob("artifacts-v2/*/*.json"))), 1
+                )
+                resumed = runtime_v2.ArtifactRuntime(
+                    identity(report_signature="changed"),
+                    recovery_dir=directory,
+                    artifact_dir=directory,
+                )
+                with self.assertRaisesRegex(
+                    runtime_v2.ArtifactRuntimeError, reason
+                ):
+                    resumed.execute_batch(invocation, registry, callbacks)
+                with self.assertRaisesRegex(
+                    runtime_v2.ArtifactRuntimeError, "policy_conflict"
+                ):
+                    resumed.execute_batch(
+                        invocation,
+                        registry,
+                        callbacks,
+                        policy=runtime_v2.RetryPolicy(total_attempts=13),
+                    )
+                subset = changed_record(
+                    invocation,
+                    batch=prepared_v2((second,)).metadata.batch,
+                    lookups=invocation.lookups[1:],
+                    dependencies=tuple(
+                        dependency
+                        for dependency in invocation.dependencies
+                        if dependency.kind not in {"peer", "evidence"}
+                        or dependency.key == second
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    runtime_v2.ArtifactRuntimeError, "pending_lineage"
+                ):
+                    resumed.execute_batch(subset, registry, callbacks)
+                self.assertEqual(send.call_count, 2)
+                self.assertEqual(resumed.usage.report()["calls"], 0)
+                self.assertEqual(resumed.counters["repairs"], 0)
+                self.assertEqual(resumed.pending_lineages(registry), (state,))
+                self.assertEqual(
+                    resumed.prefetch(
+                        invocation.lookups, registry, validate_v2
+                    ),
+                    saved,
+                )
+
+    def test_unknown_extra_interruption_before_repair_keeps_reservations(
+        self,
+    ) -> None:
+        """Interrupt before or after repair reservation without renewing its slot."""
+        invocation, registry, results = fixture_v2()
+        first, second = invocation.batch.item_keys
+        for stop_event in ("call_completed", "call_started"):
+            with (
+                self.subTest(stop_event=stop_event),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+
+                def interrupt(
+                    event: ProgressEvent, *, stop: str = stop_event
+                ) -> None:
+                    if event.event == stop and event.provider_calls == 1:
+                        raise KeyboardInterrupt
+
+                send = Mock(
+                    side_effect=[
+                        wire_v2(
+                            [
+                                results[first].model_dump(mode="json"),
+                                {"unit_key": digest("unknown")},
+                            ]
+                        ),
+                        wire_v2([{"unit_key": digest("unknown")}]),
+                    ]
+                )
+                callbacks = runtime_v2.BatchCallbacks(
+                    prepare_v2, send, validate_v2
+                )
+                runtime = runtime_v2.ArtifactRuntime(
+                    identity(),
+                    recovery_dir=directory,
+                    artifact_dir=directory,
+                    on_progress=interrupt,
+                )
+                with self.assertRaises(KeyboardInterrupt):
+                    runtime.execute_batch(invocation, registry, callbacks)
+                reserved_repair = int(stop_event == "call_started")
+                state = runtime.pending_lineages(registry)[0]
+                self.assertEqual(state.consumed_attempts, 1 + reserved_repair)
+                self.assertEqual(state.nodes[0].repair_count, reserved_repair)
+                self.assertEqual(state.nodes[0].missing_keys, (second,))
+                self.assertEqual(
+                    state.nodes[0].attempts[0].reason, "unknown_item"
+                )
+                self.assertEqual(runtime.diagnostics[0].unknown_items, 1)
+                self.assertEqual(
+                    runtime.usage.report()["calls"], 1 + reserved_repair
+                )
+                self.assertEqual(send.call_count, 1)
+                if reserved_repair:
+                    self.assertEqual(
+                        state.nodes[0].attempts[-1].outcome, "cancelled"
+                    )
+                resumed = runtime_v2.ArtifactRuntime(
+                    identity(report_signature="changed"),
+                    recovery_dir=directory,
+                    artifact_dir=directory,
+                )
+                with self.assertRaisesRegex(
+                    runtime_v2.ArtifactRuntimeError, "unknown_item"
+                ):
+                    resumed.execute_batch(
+                        state.invocation,
+                        registry,
+                        callbacks,
+                        policy=state.policy,
+                    )
+                self.assertEqual(
+                    [
+                        call.args[0].metadata.batch.item_keys
+                        for call in send.call_args_list
+                    ],
+                    [(first, second), (second,)],
+                )
+                self.assertEqual(resumed.usage.report()["calls"], 1)
+                self.assertEqual(
+                    resumed.counters["repairs"], 1 - reserved_repair
+                )
+                self.assertEqual(resumed.counters["retries"], reserved_repair)
+                final_state = resumed.pending_lineages(registry)[0]
+                self.assertEqual(final_state.invocation, invocation)
+                self.assertEqual(
+                    final_state.consumed_attempts, 2 + reserved_repair
+                )
+                self.assertEqual(final_state.nodes[0].repair_count, 1)
+                self.assertEqual(final_state.nodes[0].status, "failed")
+                self.assertEqual(
+                    tuple(a.purpose for a in final_state.nodes[0].attempts),
+                    ("initial", "repair", "transient")
+                    if reserved_repair
+                    else ("initial", "repair"),
+                )
+                again = runtime_v2.ArtifactRuntime(
+                    identity(), recovery_dir=directory, artifact_dir=directory
+                )
+                with self.assertRaisesRegex(
+                    runtime_v2.ArtifactRuntimeError, "unknown_item"
+                ):
+                    again.execute_batch(invocation, registry, callbacks)
+                self.assertEqual(send.call_count, 2)
+                self.assertEqual(again.usage.report()["calls"], 0)
+                self.assertEqual(
+                    again.pending_lineages(registry), (final_state,)
+                )
+                self.assertEqual(
+                    tuple(
+                        a.lookup.item_key
+                        for a in again.prefetch(
+                            invocation.lookups, registry, validate_v2
+                        )
+                    ),
+                    (first,),
+                )
 
     def test_failed_repair_never_repeats_or_discards_valid_result(
         self,
@@ -3196,6 +3545,314 @@ except ArtifactRuntimeError as error:
             self.assertNotIn("credential-like-value", encoded)
             self.assertEqual(runtime.usage.report()["calls"], 2)
             self.assertEqual(caught.exception.diagnostic.reason, "generic")
+
+
+def prepared_family(
+    keys: tuple[str, ...], stage: str, purpose: str = "initial"
+) -> runtime_v2.PreparedArtifactRequest:
+    """Retain actual fixture bytes while naming the correct prose stage."""
+    request = prepared_v2(keys, purpose)
+    return changed_record(
+        request,
+        metadata=changed_record(
+            request.metadata,
+            batch=changed_record(request.metadata.batch, stage=stage),
+        ),
+    )
+
+
+def invocation_for_results(
+    results: tuple[NarrativeResult, ...],
+    run_identity: RunIdentity | None = None,
+) -> runtime_v2.ArtifactInvocation:
+    """Describe every original peer using the supplied family's actual schema."""
+    run = identity() if run_identity is None else run_identity
+    template, _, _ = fixture_v2(1, run)
+    static = runtime_v2.static_artifact_dependencies(
+        run,
+        configuration_digest=digest("configuration"),
+        prompt_digest=digest("prose-prompt.v2"),
+        schema_digest=digest(structured_output_schema(type(results[0]))),
+        validator_digest=digest("prose-validator.v2"),
+    )
+    keys = tuple(result_key(result) for result in results)
+    lookups = tuple(
+        runtime_v2.ArtifactLookup(
+            item_key=result_key(result),
+            result_kind=result_kind(result),
+            static_dependencies=static,
+            validator_version="prose.v2",
+        )
+        for result in results
+    )
+    peers = tuple(
+        ArtifactDependency(
+            kind=kind, key=key, digest=digest(["trusted-context", key])
+        )
+        for key in keys
+        for kind in ("evidence", "peer")
+    )
+    context = tuple(
+        dependency
+        for dependency in template.dependencies
+        if dependency.kind in {"context", "order", "terminology"}
+    )
+    return runtime_v2.ArtifactInvocation(
+        batch=prepared_family(
+            keys, result_stage(result_kind(results[0]))
+        ).metadata.batch,
+        lookups=lookups,
+        dependencies=static + peers + context,
+    )
+
+
+class ProseArtifactTests(unittest.TestCase):
+    """All new families retain M2's independent validation and mandatory reuse checks."""
+
+    def test_each_family_repairs_one_item_preserves_peers_and_revalidates_cache(
+        self,
+    ) -> None:
+        """A malformed peer cannot erase accepted supported prose or its producer."""
+        for kind in ("planning_card", "section", "document"):
+            results = tuple(
+                prose_result(
+                    kind,
+                    digest(["subject", i]),
+                    context=digest(["context", i]),
+                )
+                for i in range(2)
+            )
+            invocation = invocation_for_results(results)
+            registry = runtime_v2.DependencyRegistry(
+                dependencies=invocation.dependencies
+            )
+            keys = invocation.batch.item_keys
+            sends = []
+
+            def prepare(
+                inv: runtime_v2.ArtifactInvocation,
+                node: runtime_v2.RecoveryNode,
+                purpose: str,
+            ) -> runtime_v2.PreparedArtifactRequest:
+                return prepared_family(
+                    node.missing_keys, inv.batch.stage, purpose
+                )
+
+            def send(
+                request: runtime_v2.PreparedArtifactRequest,
+                outputs: tuple = results,
+                targets: tuple = keys,
+                sent: list = sends,
+            ) -> runtime_v2.ProviderReply:
+                sent.append(request.metadata.batch.item_keys)
+                if len(sent) == 1:
+                    bad = outputs[1].model_dump(mode="json") | {
+                        "unsupported_extra": "rejected"
+                    }
+                    return wire_v2([outputs[0].model_dump(mode="json"), bad])
+                self.assertEqual(
+                    request.metadata.batch.item_keys, (targets[1],)
+                )
+                return wire_v2([outputs[1].model_dump(mode="json")])
+
+            validate = Mock(return_value=None)
+            callbacks = runtime_v2.BatchCallbacks(prepare, send, validate)
+            with (
+                self.subTest(kind=kind),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runtime = runtime_v2.ArtifactRuntime(
+                    identity(), recovery_dir=directory, artifact_dir=directory
+                )
+                outcome = runtime.execute_batch(
+                    invocation, registry, callbacks
+                )
+                self.assertEqual(
+                    tuple(
+                        artifact.record.result
+                        for artifact in outcome.artifacts
+                    ),
+                    results,
+                )
+                self.assertEqual(sends, [keys, (keys[1],)])
+                self.assertEqual(validate.call_count, 2)
+                self.assertEqual(
+                    outcome.artifacts[1].invocation.batch.item_keys, keys
+                )
+                self.assertEqual(
+                    outcome.artifacts[1].production_request.batch.item_keys,
+                    (keys[1],),
+                )
+                for artifact in outcome.artifacts:
+                    self.assertEqual(
+                        runtime_v2.StoredArtifact.model_validate_json(
+                            artifact.model_dump_json()
+                        ),
+                        artifact,
+                    )
+                with self.assertRaises(runtime_v2.ArtifactRuntimeError):
+                    outcome.detail_batch()
+                recheck = Mock(return_value=None)
+                resumed = runtime_v2.ArtifactRuntime(
+                    identity(), recovery_dir=directory, artifact_dir=directory
+                )
+                self.assertEqual(
+                    len(
+                        resumed.prefetch(invocation.lookups, registry, recheck)
+                    ),
+                    2,
+                )
+                self.assertEqual(recheck.call_count, 2)
+                self.assertEqual(resumed.usage.report()["calls"], 0)
+                reject = Mock(
+                    side_effect=ValueError("invalid current support")
+                )
+                self.assertEqual(
+                    resumed.prefetch(invocation.lookups, registry, reject), ()
+                )
+                self.assertEqual(reject.call_count, 2)
+                with self.assertRaises(TypeError):
+                    resumed.prefetch(invocation.lookups, registry)
+
+    def test_prose_schema_validator_and_peer_changes_invalidate_artifacts(
+        self,
+    ) -> None:
+        """A kind label cannot upgrade stale schemas, validators, or original peers."""
+        results = (
+            prose_result("section", digest("first")),
+            prose_result("section", digest("second")),
+        )
+        invocation = invocation_for_results(results)
+        registry = runtime_v2.DependencyRegistry(
+            dependencies=invocation.dependencies
+        )
+
+        def prepare(
+            inv: runtime_v2.ArtifactInvocation,
+            node: runtime_v2.RecoveryNode,
+            purpose: str,
+        ) -> runtime_v2.PreparedArtifactRequest:
+            return prepared_family(node.missing_keys, inv.batch.stage, purpose)
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = runtime_v2.ArtifactRuntime(
+                identity(), recovery_dir=directory, artifact_dir=directory
+            )
+            runtime.execute_batch(
+                invocation,
+                registry,
+                runtime_v2.BatchCallbacks(
+                    prepare,
+                    lambda _request: wire_v2(
+                        [result.model_dump(mode="json") for result in results]
+                    ),
+                    Mock(return_value=None),
+                ),
+            )
+            for dimension in ("schema", "validator", "context", "peer"):
+                dependencies = tuple(
+                    changed_record(
+                        dependency, digest=digest(["changed", dimension])
+                    )
+                    if dependency.kind == dimension
+                    else dependency
+                    for dependency in invocation.dependencies
+                )
+                current = runtime_v2.DependencyRegistry(
+                    dependencies=dependencies
+                )
+                validate = Mock(return_value=None)
+                self.assertEqual(
+                    runtime.prefetch(invocation.lookups, current, validate), ()
+                )
+                validate.assert_not_called()
+            for dimension in ("schema", "validator"):
+                lookups = tuple(
+                    changed_record(
+                        lookup,
+                        static_dependencies=tuple(
+                            changed_record(
+                                dependency,
+                                digest=digest(["new-contract", dimension]),
+                            )
+                            if dependency.kind == dimension
+                            else dependency
+                            for dependency in lookup.static_dependencies
+                        ),
+                    )
+                    for lookup in invocation.lookups
+                )
+                self.assertEqual(
+                    runtime.prefetch(
+                        lookups, registry, Mock(return_value=None)
+                    ),
+                    (),
+                )
+            incompatible = changed_record(
+                invocation.lookups[0], result_kind="detail"
+            )
+            self.assertEqual(
+                runtime.prefetch(
+                    (incompatible,), registry, Mock(return_value=None)
+                ),
+                (),
+            )
+
+    def test_wrong_prose_key_family_and_document_stage_are_rejected(
+        self,
+    ) -> None:
+        """Wrong keys and stages cannot be hidden behind generic result parsing."""
+        result = prose_result("document", digest("subject"))
+        invocation = invocation_for_results((result,))
+        with self.assertRaises(runtime_v2.ArtifactRuntimeError):
+            changed_record(
+                invocation,
+                batch=changed_record(invocation.batch, stage="detail"),
+            )
+        self.assertEqual(
+            invocation.artifact_keys()[result.item_key],
+            invocation.artifact_key(invocation.lookups[0]),
+        )
+        with self.assertRaises(runtime_v2.ArtifactRuntimeError):
+            runtime_v2.BatchCallbacks(
+                lambda *_args: None, lambda _request: None, None
+            )
+
+    def test_public_preparation_adapter_checks_actual_repair_body(
+        self,
+    ) -> None:
+        """The runtime accepts the public single-node preparation without private arithmetic."""
+        items = (prose_result("section", digest("first")),)
+        limits = RequestPackingLimits()
+        capacity = ModelCapacity(1_000_000, 100_000)
+        request = prepare_request_items(
+            items,
+            stage="section",
+            keys=result_key,
+            groups=lambda item: (item.binding.subject_key,),
+            serializer=lambda values, output: json.dumps(
+                {
+                    "items": [
+                        value.model_dump(mode="json") for value in values
+                    ],
+                    "output": output,
+                    "repair": "missing_item",
+                }
+            ).encode(),
+            allowance=lambda _values: 300,
+            capacity=capacity,
+            limits=limits,
+        )
+        prepared = runtime_v2.bind_prepared_request(request, capacity, limits)
+        prepared.metadata.check(prepared.body)
+        self.assertEqual(prepared.body, request.body)
+        self.assertEqual(
+            prepared.metadata.batch.output_guard, capacity.max_output_tokens
+        )
+        with self.assertRaisesRegex(
+            runtime_v2.ArtifactRuntimeError, "request_mismatch"
+        ):
+            prepared.metadata.check(prepared.body + b"changed")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ Pydantic's strict JSON parser; Python callers must supply tuples themselves.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from typing import Annotated
 from typing import Literal
@@ -48,6 +50,11 @@ RepositoryPath = Annotated[str, AfterValidator(_path)]
 Natural = Annotated[int, Field(ge=0)]
 Positive = Annotated[int, Field(ge=1)]
 Side = Literal["base", "head"]
+BatchStage = Literal["detail", "planning", "section", "document"]
+ProseKind = Literal["planning_card", "section", "document"]
+ResultKind = Literal[
+    "detail", "story_plan", "planning_card", "section", "document"
+]
 
 
 class Contract(BaseModel):
@@ -394,6 +401,153 @@ class Terminology(Contract):
     claims: tuple[ClaimRef, ...]
 
 
+class SupportedStatement(Contract):
+    """Retain prose and its support; consumers resolve refs in the current ledger.
+
+    Author motivation refers to supplied author context, not source proof.
+    Editorial text and uncertainty cannot establish implementation behavior.
+    Support shape alone does not prove that the text follows from the evidence.
+    """
+
+    kind: Literal[
+        "implementation_claim", "author_motivation", "editorial", "uncertainty"
+    ]
+    text: Text
+    claims: tuple[ClaimRef, ...] = ()
+    citations: tuple[SpanRef, ...] = ()
+    effect: Text | None = None
+    uncertainty: tuple[Text, ...] = ()
+    author_context_digest: Digest | None = None
+
+    @model_validator(mode="after")
+    def support(self) -> SupportedStatement:
+        """Require evidence for implementation and explicit author attribution."""
+        if (
+            self.kind == "implementation_claim" or self.effect is not None
+        ) and not (self.claims or self.citations):
+            msg = "Implementation claims and effects require support"
+            raise ValueError(msg)
+        if (self.kind == "author_motivation") != (
+            self.author_context_digest is not None
+        ):
+            msg = "Author motivation requires an author context digest only"
+            raise ValueError(msg)
+        if len(set(self.claims)) != len(self.claims) or len(
+            set(self.citations)
+        ) != len(self.citations):
+            msg = "Duplicate statement support"
+            raise ValueError(msg)
+        return self
+
+
+class SupportedTerminology(Contract):
+    """Carry proposed terminology with a source-supported definition."""
+
+    term: Text
+    definition: SupportedStatement
+
+    @model_validator(mode="after")
+    def support(self) -> SupportedTerminology:
+        """Do not treat editorial definitions as validated implementation terms."""
+        if self.definition.kind != "implementation_claim":
+            msg = "Proposed terminology requires an implementation claim"
+            raise ValueError(msg)
+        return self
+
+
+class ProseBinding(Contract):
+    """Content identity supplied by the consumer for a card, group, or document.
+
+    subject_key is the trusted card/group key, or plan_key for a document.
+    context_digest covers consumed content and boundary facts, including actual
+    child prose. It is not a digest of the result. Original batch dependencies
+    remain in ArtifactInvocation; this item key does not assert independence.
+    """
+
+    version: Literal["diffstory.prose-binding.v2"] = (
+        "diffstory.prose-binding.v2"
+    )
+    kind: ProseKind
+    subject_key: Digest
+    plan_key: Digest
+    context_digest: Digest
+
+    @model_validator(mode="after")
+    def document_subject(self) -> ProseBinding:
+        """A document belongs to its complete deterministic plan."""
+        if self.kind == "document" and self.subject_key != self.plan_key:
+            msg = "Document subject must be its plan"
+            raise ValueError(msg)
+        return self
+
+    @property
+    def key(self) -> str:
+        """Hash the versioned trusted context, independent of generated text."""
+        return hashlib.sha256(
+            json.dumps(
+                self.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+
+
+class _ProseResult(Contract):
+    item_key: Digest
+    binding: ProseBinding
+    terminology: tuple[SupportedTerminology, ...] = ()
+
+    @model_validator(mode="after")
+    def context_key(self) -> _ProseResult:
+        if self.item_key != self.binding.key or type(self) is not result_model(
+            self.binding.kind
+        ):
+            msg = "Prose result does not match its context or family"
+            raise ValueError(msg)
+        if len({term.term for term in self.terminology}) != len(
+            self.terminology
+        ):
+            msg = "Duplicate proposed terminology"
+            raise ValueError(msg)
+        return self
+
+
+class PlanningCardResult(_ProseResult):
+    """Supported planning abstraction; never a substitute for DetailResult."""
+
+    version: Literal["diffstory.planning-card-result.v2"] = (
+        "diffstory.planning-card-result.v2"
+    )
+    abstraction: tuple[SupportedStatement, ...] = Field(min_length=1)
+
+
+class SectionResult(_ProseResult):
+    """Prose for one group; an empty tuple explicitly represents no transition.
+
+    The consumer checks that the actual final section has an empty transition.
+    Its trusted binding includes neighbors, order, terms, and prerequisites.
+    """
+
+    version: Literal["diffstory.section-result.v2"] = (
+        "diffstory.section-result.v2"
+    )
+    title: SupportedStatement
+    orientation: tuple[SupportedStatement, ...] = Field(min_length=1)
+    synthesis: tuple[SupportedStatement, ...] = Field(min_length=1)
+    transition: tuple[SupportedStatement, ...]
+
+
+class DocumentResult(_ProseResult):
+    """Whole-document prose using the same deterministic plan and support."""
+
+    version: Literal["diffstory.document-result.v2"] = (
+        "diffstory.document-result.v2"
+    )
+    preamble: tuple[SupportedStatement, ...] = Field(min_length=1)
+    lead: tuple[SupportedStatement, ...] = Field(min_length=1)
+    closing: tuple[SupportedStatement, ...] = Field(min_length=1)
+
+
 class PlanningGroup(Contract):
     """Complete compiler membership and reusable planning facts for a group."""
 
@@ -482,7 +636,7 @@ class BatchSpec(Contract):
 
     version: Literal["diffstory.batch-spec.v2"] = "diffstory.batch-spec.v2"
     id: Digest
-    stage: Literal["detail", "planning", "section"]
+    stage: BatchStage
     item_keys: tuple[Digest, ...] = Field(min_length=1)
     group_keys: tuple[Digest, ...]
     request_digest: Digest
@@ -520,6 +674,63 @@ class StoryPlan(Contract):
     cards: tuple[StoryCard, ...]
     root_card_keys: tuple[Digest, ...]
     requests: tuple[BatchSpec, ...]
+
+
+NarrativeResult = (
+    DetailResult
+    | StoryPlan
+    | PlanningCardResult
+    | SectionResult
+    | DocumentResult
+)
+
+
+def result_model(kind: ResultKind) -> type[Contract]:
+    """Select an explicit family; unknown kinds never fall through to a plan."""
+    return {
+        "detail": DetailResult,
+        "story_plan": StoryPlan,
+        "planning_card": PlanningCardResult,
+        "section": SectionResult,
+        "document": DocumentResult,
+    }[kind]
+
+
+def result_key_field(kind: ResultKind) -> str:
+    """Return the wire key field for a known result family."""
+    result_model(kind)
+    return {"detail": "unit_key", "story_plan": "id"}.get(kind, "item_key")
+
+
+def result_kind(result: NarrativeResult) -> ResultKind:
+    """Return the exact typed family without duck typing untrusted payloads."""
+    for kind in (
+        "detail",
+        "story_plan",
+        "planning_card",
+        "section",
+        "document",
+    ):
+        if type(result) is result_model(kind):
+            return kind
+    msg = "Unsupported narrative result type"
+    raise ValueError(msg)
+
+
+def result_key(result: NarrativeResult) -> str:
+    """Get a result key through the shared family selector."""
+    return getattr(result, result_key_field(result_kind(result)))
+
+
+def result_stage(kind: ResultKind) -> BatchStage:
+    """Map every result family to its actual provider stage."""
+    return {
+        "detail": "detail",
+        "story_plan": "planning",
+        "planning_card": "planning",
+        "section": "section",
+        "document": "document",
+    }[kind]
 
 
 class ItemFailure(Contract):
@@ -587,7 +798,7 @@ class ArtifactRecord(Contract):
     dependencies: tuple[ArtifactDependency, ...]
     original_request_digest: Digest
     validator_version: Text
-    result: DetailResult | StoryPlan
+    result: NarrativeResult
 
     @model_validator(mode="after")
     def unique_dependencies(self) -> ArtifactRecord:

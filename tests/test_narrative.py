@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr
@@ -31,6 +32,8 @@ from diffstory.narrative import CODEX_DEFAULT_CONTEXT_TOKENS
 from diffstory.narrative import CODEX_MODEL_CAPACITIES
 from diffstory.narrative import DOCUMENT_OUTPUT_RESERVE
 from diffstory.narrative import MAX_RESPONSE_BYTES
+from diffstory.narrative import MAX_SOURCE_SLICE_BYTES
+from diffstory.narrative import MAX_STDERR_BYTES
 from diffstory.narrative import OPENAI_MODEL
 from diffstory.narrative import OPENAI_URL
 from diffstory.narrative import ORDER_OUTPUT_RESERVE
@@ -40,8 +43,14 @@ from diffstory.narrative import CodexCLIProvider
 from diffstory.narrative import Narrator
 from diffstory.narrative import OpenAIResponsesProvider
 from diffstory.narrative import ProviderResponseError
+from diffstory.narrative import _classify_codex_stderr
+from diffstory.narrative import _decode_codex_events
+from diffstory.narrative import _NarrativeCall
 from diffstory.narrative import _ProcessRequest
 from diffstory.narrative import _run_bounded_subprocess
+from diffstory.narrative import _split_source
+from diffstory.narrative_runtime import CallSpec
+from diffstory.narrative_runtime import ProgressEvent
 from diffstory.render import render
 
 if TYPE_CHECKING:
@@ -362,8 +371,260 @@ class FakeProvider:
         }
 
 
+class ConcurrentProvider(FakeProvider):
+    """Track overlap while keeping deterministic fake responses."""
+
+    def __init__(self) -> None:
+        """Set counters for active and overlapping provider calls."""
+        super().__init__()
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+
+    def complete(
+        self, body: bytes, timeout: float | None
+    ) -> tuple[dict, dict]:
+        """Delay a deterministic request while measuring active calls."""
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.03)
+            return super().complete(body, timeout)
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
+class FailOnOrderProvider(FakeProvider):
+    """Fail one semantic stage with measured, categorized usage."""
+
+    def complete(
+        self, body: bytes, timeout: float | None
+    ) -> tuple[dict, dict]:
+        """Return normal results until the story-order request fails."""
+        request = json.loads(body)
+        if request["name"] == "diffstory_story_order":
+            self.timeouts.append(timeout)
+            self.calls.append(request)
+            message = "private provider body"
+            usage = {
+                "input_tokens": 12,
+                "cached_input_tokens": 3,
+                "output_tokens": 0,
+            }
+            raise ProviderResponseError(
+                message,
+                usage,
+                category="rate_limit",
+            )
+        return super().complete(body, timeout)
+
+
 class NarrativeTests(unittest.TestCase):
     """Verify narration providers, source packing, preflight, and coverage."""
+
+    def test_report_signature_ignores_only_capture_time(self) -> None:
+        """Keep source and all other report metadata in the run identity."""
+        report = compile_snapshot(snapshot())
+        report["meta"]["captured_at"] = "2026-01-01T12:00:00Z"
+        refreshed = copy.deepcopy(report)
+        refreshed["meta"]["captured_at"] = "2026-01-02T12:00:00Z"
+        self.assertEqual(
+            Narrator._report_signature(report),
+            Narrator._report_signature(refreshed),
+        )
+
+        refreshed["changes"][0]["label"] += " changed"
+        self.assertNotEqual(
+            Narrator._report_signature(report),
+            Narrator._report_signature(refreshed),
+        )
+
+    def test_codex_prompt_prefix_is_in_checkpoint_request_digest(self) -> None:
+        """Include Codex's fixed framing in the request that names a cache."""
+        provider = CodexCLIProvider(model=OPENAI_MODEL)
+        narrator = Narrator(provider)
+        narrator._start_runtime(compile_snapshot(snapshot()))
+        call = _NarrativeCall(
+            task_id="prefix-check",
+            schema_name="diffstory_summary",
+            system="Summarize the supplied evidence.",
+            data={"observations": []},
+            response_schema={"type": "object"},
+            output_reservation=100,
+            validation_version="summary-v1",
+        )
+        with patch.object(
+            narrator.runtime, "invoke", return_value={}
+        ) as invoke:
+            narrator._invoke(call, lambda response: response)
+
+        actual = invoke.call_args.args[0]
+        body = provider.prepare(
+            call.system,
+            call.data,
+            call.schema_name,
+            call.response_schema,
+            call.output_reservation,
+        )
+        expected = CallSpec.from_request(
+            task_id=call.task_id,
+            schema_name=call.schema_name,
+            request=provider.request_prefix + body,
+            schema=call.response_schema,
+            output_reservation=call.output_reservation,
+            validation_version=call.validation_version,
+        )
+        body_only = CallSpec.from_request(
+            task_id=call.task_id,
+            schema_name=call.schema_name,
+            request=body,
+            schema=call.response_schema,
+            output_reservation=call.output_reservation,
+            validation_version=call.validation_version,
+        )
+        self.assertEqual(actual.request_digest, expected.request_digest)
+        self.assertNotEqual(actual.request_digest, body_only.request_digest)
+
+    def test_parallel_stages_preserve_story_order_and_progress_safety(
+        self,
+    ) -> None:
+        """Run independent work together and retain input order in results."""
+        report = two_group_report()
+        provider = ConcurrentProvider()
+        events: list[ProgressEvent] = []
+        callback_threads = []
+        coordinator = threading.get_ident()
+
+        def record_progress(event: ProgressEvent) -> None:
+            events.append(event)
+            callback_threads.append(threading.get_ident())
+
+        annotations = Narrator(
+            provider,
+            concurrency=3,
+            on_progress=record_progress,
+        ).generate(report)
+
+        self.assertGreaterEqual(provider.max_active, 2)
+        self.assertEqual(
+            [step["group_id"] for step in annotations["steps"]],
+            [group["id"] for group in report["groups"]],
+        )
+        self.assertTrue(events)
+        self.assertEqual(set(callback_threads), {coordinator})
+        self.assertTrue(
+            all(isinstance(event, ProgressEvent) for event in events)
+        )
+        self.assertTrue(any(event.stage == "chunks" for event in events))
+
+    def test_interrupted_generation_resumes_cached_work_and_usage(
+        self,
+    ) -> None:
+        """Resume after a provider failure without reusing historical usage."""
+        report = compile_snapshot(snapshot())
+        report["meta"]["captured_at"] = "fetch-one"
+        with tempfile.TemporaryDirectory() as directory:
+            first_provider = FailOnOrderProvider()
+            first_narrator = Narrator(
+                first_provider,
+                checkpoint_dir=directory,
+            )
+            self.assertEqual(first_narrator.reused_checkpoints, 0)
+            with self.assertRaises(ProviderResponseError) as raised:
+                first_narrator.generate(report)
+
+            self.assertEqual(raised.exception.category, "rate_limit")
+            self.assertNotIn("private provider body", str(raised.exception))
+            self.assertEqual(
+                first_narrator.usage.report(),
+                {
+                    "input_tokens": 132,
+                    "cached_input_tokens": 3,
+                    "output_tokens": 60,
+                    "calls": 2,
+                    "unreported_calls": 0,
+                },
+            )
+
+            resumed_report = copy.deepcopy(report)
+            resumed_report["meta"]["captured_at"] = "fetch-two"
+            resumed_provider = FakeProvider()
+            resumed_narrator = Narrator(
+                resumed_provider,
+                checkpoint_dir=directory,
+            )
+            resumed_narrator.generate(resumed_report)
+
+        self.assertCountEqual(
+            [call["name"] for call in resumed_provider.calls],
+            [
+                "diffstory_story_order",
+                "diffstory_step",
+                "diffstory_document",
+            ],
+        )
+        self.assertEqual(resumed_narrator.reused_checkpoints, 1)
+        self.assertEqual(resumed_narrator.usage.report()["calls"], 3)
+
+    def test_completed_generation_reuses_all_validated_checkpoints(
+        self,
+    ) -> None:
+        """Expose completed-run cache reuse without importing old usage."""
+        report = compile_snapshot(snapshot())
+        with tempfile.TemporaryDirectory() as directory:
+            first_provider = FakeProvider()
+            first_narrator = Narrator(
+                first_provider,
+                checkpoint_dir=directory,
+            )
+            first = first_narrator.generate(report)
+
+            resumed_provider = FakeProvider()
+            resumed_narrator = Narrator(
+                resumed_provider,
+                checkpoint_dir=directory,
+            )
+            self.assertEqual(resumed_narrator.reused_checkpoints, 0)
+            resumed = resumed_narrator.generate(report)
+
+        self.assertEqual(len(first_provider.calls), 4)
+        self.assertEqual(resumed_provider.calls, [])
+        self.assertEqual(first["document"], resumed["document"])
+        self.assertEqual(first["steps"], resumed["steps"])
+        self.assertEqual(resumed_narrator.reused_checkpoints, 4)
+        self.assertEqual(resumed_narrator.usage.report()["calls"], 0)
+
+    def test_invalid_cached_focus_is_rejected_and_regenerated(self) -> None:
+        """Recheck cached focus against source before accepting a chunk."""
+        report = compile_snapshot(snapshot())
+        with tempfile.TemporaryDirectory() as directory:
+            Narrator(FakeProvider(), checkpoint_dir=directory).generate(report)
+            changed_checkpoint = False
+            for path in Path(directory).glob("*/*.json"):
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                result = saved.get("result")
+                if not isinstance(result, dict) or "passages" not in result:
+                    continue
+                result["passages"][0]["focus"] = {
+                    "start": 9000,
+                    "end": 9000,
+                }
+                path.write_text(json.dumps(saved), encoding="utf-8")
+                changed_checkpoint = True
+                break
+            self.assertTrue(changed_checkpoint)
+
+            provider = FakeProvider()
+            resumed = Narrator(provider, checkpoint_dir=directory)
+            resumed.generate(report)
+
+        self.assertEqual(
+            [call["name"] for call in provider.calls], ["diffstory_chunk"]
+        )
+        self.assertEqual(resumed.reused_checkpoints, 3)
+        self.assertEqual(resumed.usage.report()["calls"], 1)
 
     def test_generation_and_report_roundtrip_keep_provenance(self) -> None:
         """Retain revision binding and evidence when narrations are rendered."""
@@ -819,8 +1080,9 @@ class NarrativeTests(unittest.TestCase):
         report = compile_snapshot(snapshot())
         provider = FakeProvider(mode="malformed")
         narrator = Narrator(provider)
-        with self.assertRaisesRegex(ValueError, "no source-bound passages"):
+        with self.assertRaises(ProviderResponseError) as raised:
             narrator.generate(report)
+        self.assertEqual(raised.exception.category, "validation_error")
         self.assertEqual(len(provider.calls), 1)
 
     def test_generated_annotations_reject_wrong_revision(self) -> None:
@@ -986,7 +1248,7 @@ class NarrativeTests(unittest.TestCase):
                     ]
                 )
             self.assertEqual(result, 2)
-            self.assertIn("source-bound passages", error_output.getvalue())
+            self.assertIn("validation_error", error_output.getvalue())
             self.assertFalse(out.exists())
             self.assertFalse(out.with_suffix(".report.json").exists())
             self.assertFalse(out.with_suffix(".annotations.json").exists())
@@ -1132,6 +1394,7 @@ class NarrativeTests(unittest.TestCase):
             ],
             [
                 "shell_tool",
+                "multi_agent",
                 "code_mode_host",
                 "apps",
                 "plugins",
@@ -1143,7 +1406,7 @@ class NarrativeTests(unittest.TestCase):
         )
         self.assertEqual(
             (options["stdin"], options["stdout"], options["stderr"]),
-            (subprocess.PIPE, subprocess.PIPE, subprocess.DEVNULL),
+            (subprocess.PIPE, subprocess.PIPE, subprocess.PIPE),
         )
         if os.name == "nt":
             self.assertTrue(
@@ -1289,7 +1552,7 @@ class NarrativeTests(unittest.TestCase):
             CodexCLIProvider._parse_response(b"not-json\n")
 
     def test_codex_nonzero_exit_is_sanitized(self) -> None:
-        """Report a safe error when Codex exits unsuccessfully."""
+        """Bound stderr, classify its category, and hide its raw contents."""
         provider = CodexCLIProvider()
         body = provider.prepare(
             "system", {}, "summary", {"type": "object"}, 100
@@ -1300,6 +1563,10 @@ class NarrativeTests(unittest.TestCase):
             provider._PROMPT.encode()
         ) + len(body)
         process.stdout = io.BytesIO(b"")
+        private_stderr = b"unauthorized private-error-secret " + b"x" * (
+            MAX_STDERR_BYTES * 4
+        )
+        process.stderr = io.BytesIO(private_stderr)
         process.wait.return_value = 1
         process.returncode = 1
         with (
@@ -1307,9 +1574,19 @@ class NarrativeTests(unittest.TestCase):
             patch(
                 "diffstory.narrative.subprocess.Popen", return_value=process
             ),
-            self.assertRaisesRegex(ProviderResponseError, "request failed"),
+            patch(
+                "diffstory.narrative._classify_codex_stderr",
+                wraps=_classify_codex_stderr,
+            ) as classify_stderr,
+            self.assertRaises(ProviderResponseError) as raised,
         ):
             provider.complete(body, 7)
+        self.assertEqual(raised.exception.category, "authentication")
+        self.assertNotIn("private-error-secret", str(raised.exception))
+        self.assertLessEqual(
+            len(classify_stderr.call_args.args[0]),
+            MAX_STDERR_BYTES,
+        )
 
     def test_openai_adapter_uses_structured_output_and_one_attempt(
         self,
@@ -1403,6 +1680,262 @@ class NarrativeTests(unittest.TestCase):
         self.assertIn("invalid header characters", str(raised.exception))
         self.assertNotIn("review-test-secret", str(raised.exception))
         build_opener.assert_not_called()
+
+
+class PhysicalSourceNarrativeTests(unittest.TestCase):
+    """Source slicing and JSONL retain Unicode characters within a line."""
+
+    def test_source_slices_preserve_unicode_long_lines_and_eols(self) -> None:
+        """Keep exact bytes and physical line numbers, even across byte splits."""
+        for eol in ("\n", "\r\n", "\r"):
+            for text, lines in (
+                ("", 1),
+                (eol, 1),
+                ("a\u2028b\u2029c\x85d\ve\ff" + eol + "end" + eol, 2),
+                ("é\u2028" * 9000 + eol + "end", 2),
+            ):
+                with self.subTest(eol=eol, length=len(text)):
+                    parts = _split_source({"source": text, "start": 17})
+                    self.assertEqual(
+                        "".join(p["source"] for p in parts).encode(),
+                        text.encode(),
+                    )
+                    self.assertEqual(
+                        max(p["end"] for p in parts), 17 + lines - 1
+                    )
+                    self.assertTrue(
+                        all(
+                            len(p["source"].encode()) <= MAX_SOURCE_SLICE_BYTES
+                            for p in parts
+                        )
+                    )
+
+    def test_unicode_focus_accepts_physical_line_and_rejects_phantom_line(
+        self,
+    ) -> None:
+        """A definition slice can focus its last actual line only."""
+        report = compile_snapshot(
+            snapshot(
+                "def calculate(value):\n    marker = 'a\u2028b'\n    return value + 1\n"
+            )
+        )
+        narrator = Narrator(FakeProvider())
+        chunk = narrator._chunks(report)[0]
+        ranges = Narrator._source_ranges(chunk)
+        change_id = chunk.change_ids[0]
+        focus = {"start": 3, "end": 3}
+        self.assertEqual(
+            Narrator._passage_focus(
+                focus, "definition", [change_id], ranges, chunk.id
+            ),
+            focus,
+        )
+        with self.assertRaisesRegex(ValueError, "outside the supplied"):
+            Narrator._passage_focus(
+                {"start": 4, "end": 4},
+                "definition",
+                [change_id],
+                ranges,
+                chunk.id,
+            )
+
+    def test_codex_jsonl_unicode_raw_and_structured_agent_messages(
+        self,
+    ) -> None:
+        """Legal JSON string contents survive raw and escaped event encodings."""
+        text = "a\u2028b\u2029c\x85d\ve\ff"
+        for ascii_only in (False, True):
+            for eol in ("\n", "\r\n", "\r"):
+                event = {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": text},
+                }
+                raw = (
+                    json.dumps(event, ensure_ascii=ascii_only) + eol
+                ).encode()
+                self.assertEqual(_decode_codex_events(raw), (event,))
+                event["item"]["text"] = json.dumps(
+                    {"summary": text}, ensure_ascii=ascii_only
+                )
+                raw = (
+                    json.dumps(event, ensure_ascii=ascii_only) + eol
+                ).encode()
+                self.assertEqual(
+                    CodexCLIProvider._parse_response(raw)[0], {"summary": text}
+                )
+        for raw in (
+            b'{"text":"a\nb"}\n',
+            b'{"text":"a\rb"}\n',
+            b'{"text":"a\x0bb"}\n',
+        ):
+            with self.assertRaises(ProviderResponseError):
+                _decode_codex_events(raw)
+
+
+class ProviderWireMetadataTests(unittest.TestCase):
+    """Keep raw parser reasons, usage, and measured transport sizes."""
+
+    def test_openai_duplicate_output_preserves_usage_and_raw_size(
+        self,
+    ) -> None:
+        """A valid provider envelope cannot hide duplicate structured fields."""
+        provider = OpenAIResponsesProvider(api_key="fixture-key")
+        usage = {"input_tokens": 12, "output_tokens": 6}
+        raw = json.dumps(
+            {
+                "status": "completed",
+                "usage": usage,
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": '{"items":[],"items":["private"]}',
+                            }
+                        ],
+                    }
+                ],
+            }
+        ).encode()
+        with (
+            patch(
+                "diffstory.narrative._post_openai_request", return_value=raw
+            ),
+            self.assertRaises(ProviderResponseError) as caught,
+        ):
+            provider.complete_reply(b"{}", 10)
+        self.assertEqual(caught.exception.reason, "malformed_json")
+        self.assertEqual(caught.exception.response_bytes, len(raw))
+        self.assertEqual(caught.exception.usage["output_tokens"], 6)
+        self.assertNotIn("private", str(caught.exception))
+
+    def test_openai_outer_duplicate_fails_before_dict_conversion(self) -> None:
+        """Ambiguous provider envelopes have no trusted usage or partial data."""
+        provider = OpenAIResponsesProvider(api_key="fixture-key")
+        raw = b'{"status":"completed","status":"private"}'
+        with (
+            patch(
+                "diffstory.narrative._post_openai_request", return_value=raw
+            ),
+            self.assertRaises(ProviderResponseError) as caught,
+        ):
+            provider.complete_reply(b"{}", 10)
+        self.assertEqual(caught.exception.reason, "malformed_json")
+        self.assertEqual(caught.exception.response_bytes, len(raw))
+        self.assertIsNone(caught.exception.usage)
+
+    def test_codex_duplicate_physical_event_or_final_json(self) -> None:
+        """Distinguish malformed JSONL from malformed final JSON."""
+        usage = {"input_tokens": 12, "output_tokens": 6}
+        completed = (
+            json.dumps({"type": "turn.completed", "usage": usage}).encode()
+            + b"\n"
+        )
+        event = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": '{"items":[],"items":["private"]}',
+                },
+            }
+        ).encode()
+        for raw, reason in (
+            (
+                completed + b'{"type":"item.completed","type":"private"}',
+                "malformed_jsonl",
+            ),
+            (event + b"\n" + completed, "malformed_json"),
+            (completed, "missing_final"),
+        ):
+            with (
+                self.subTest(reason=reason),
+                self.assertRaises(ProviderResponseError) as caught,
+            ):
+                CodexCLIProvider._parse_response(raw)
+            self.assertEqual(caught.exception.reason, reason)
+            self.assertEqual(caught.exception.response_bytes, len(raw))
+            self.assertEqual(caught.exception.usage["output_tokens"], 6)
+            self.assertNotIn("private", str(caught.exception))
+
+    def test_codex_prohibited_type_names_remain_private(self) -> None:
+        """An arbitrary tool type cannot enter diagnostics or discard usage."""
+        raw = b'{"type":"item.completed","item":{"type":"private_secret_call"}}\n{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":6}}'
+        with self.assertRaises(ProviderResponseError) as caught:
+            CodexCLIProvider._parse_response(raw)
+        self.assertEqual(caught.exception.reason, "prohibited_tools")
+        self.assertEqual(caught.exception.response_bytes, len(raw))
+        self.assertEqual(caught.exception.usage["output_tokens"], 6)
+        self.assertNotIn("private_secret", str(caught.exception))
+
+    def test_codex_nonzero_exit_keeps_recognized_usage_and_size(self) -> None:
+        """Failed CLI authentication retains safe physical-output metadata."""
+        provider = CodexCLIProvider(executable="fixture-codex")
+        raw = b'{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":6}}\n'
+        with (
+            patch.object(provider, "require_credentials"),
+            patch(
+                "diffstory.narrative._run_bounded_subprocess",
+                return_value=(1, raw, b"authentication private-secret"),
+            ),
+            self.assertRaises(ProviderResponseError) as caught,
+        ):
+            provider.complete_reply(b'{"schema":{}}', 10)
+        self.assertEqual(caught.exception.reason, "auth")
+        self.assertEqual(caught.exception.response_bytes, len(raw))
+        self.assertEqual(caught.exception.usage["output_tokens"], 6)
+        self.assertNotIn("private-secret", str(caught.exception))
+
+    def test_codex_nonobject_and_invalid_event_type_keep_safe_metadata(
+        self,
+    ) -> None:
+        """Malformed physical records cannot lose previously recognized usage."""
+        prefix = b'{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":6}}\n'
+        for suffix in (
+            b"[]",
+            b'{"type":[]}',
+            b'{"type":"item.completed","item":[]}',
+            b"\xff",
+            b'{"type":"turn.completed","usage":null}\n[]',
+        ):
+            raw = prefix + suffix
+            with (
+                self.subTest(suffix=suffix),
+                self.assertRaises(ProviderResponseError) as caught,
+            ):
+                CodexCLIProvider._parse_response(raw)
+            self.assertEqual(caught.exception.reason, "malformed_jsonl")
+            self.assertEqual(caught.exception.response_bytes, len(raw))
+            self.assertEqual(caught.exception.usage["output_tokens"], 6)
+
+    def test_bounded_process_overflow_reports_specific_reason_usage_and_bytes(
+        self,
+    ) -> None:
+        """The real subprocess collector reports overflow without exposing stdout."""
+        raw_usage = '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":6}}\n'
+        command = [
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdout.write({raw_usage!r}); sys.stdout.write('x' * 10000); sys.stdout.flush()",
+        ]
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            self.assertRaises(ProviderResponseError) as caught,
+        ):
+            _run_bounded_subprocess(
+                _ProcessRequest(
+                    command=command,
+                    prompt=b"",
+                    cwd=directory,
+                    environment={},
+                    timeout=10,
+                    output_limit=200,
+                )
+            )
+        self.assertEqual(caught.exception.reason, "response_limit")
+        self.assertEqual(caught.exception.response_bytes, 201)
+        self.assertEqual(caught.exception.usage["output_tokens"], 6)
 
 
 if __name__ == "__main__":

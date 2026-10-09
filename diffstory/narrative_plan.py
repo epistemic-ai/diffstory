@@ -12,6 +12,7 @@ import hashlib
 import heapq
 import json
 import math
+import re
 from bisect import bisect_right
 from collections import Counter
 from collections import defaultdict
@@ -23,8 +24,10 @@ from typing import TYPE_CHECKING
 from typing import TypeVar
 
 from pydantic import BaseModel
+from pydantic import Field
 
 from diffstory.narrative_contracts import BatchSpec
+from diffstory.narrative_contracts import BatchStage
 from diffstory.narrative_contracts import BufferBinding
 from diffstory.narrative_contracts import ChangeBinding
 from diffstory.narrative_contracts import ClaimRef
@@ -1441,24 +1444,70 @@ def detail_output_allowance(
     return total
 
 
-Item = TypeVar("Item")
+Item = TypeVar("Item", bound=Contract)
+_REQUEST_KEY = re.compile(r"[0-9a-f]{64}")
 
 
-def _request_spec(  # noqa: PLR0913 # Keep explicit evidence, serializer, and capacity inputs.
+def _request_keys(
+    items: tuple[Item, ...], keys: Callable[[Item], str]
+) -> tuple[str, ...]:
+    item_keys = tuple(keys(item) for item in items)
+    _require(
+        all(
+            type(key) is str and _REQUEST_KEY.fullmatch(key) is not None
+            for key in item_keys
+        ),
+        "invalid_request_key",
+    )
+    _unique(item_keys, "duplicate_request_item")
+    return item_keys
+
+
+class PreparedRequest(Contract):
+    """Keep the exact actual provider bytes with their checked request bounds.
+
+    Bytes are ephemeral and excluded from dumps. A serializer must include its
+    full provider framing and schema; a preview is not send authority.
+    """
+
+    body: bytes = Field(exclude=True, repr=False)
+    batch: BatchSpec
+
+
+def prepare_request_items(  # noqa: PLR0913 # Explicit serializer and capacity form the send boundary.
     items: tuple[Item, ...],
     *,
-    stage: str,
+    stage: BatchStage,
     keys: Callable[[Item], str],
     groups: Callable[[Item], tuple[str, ...]],
     serializer: Callable[[tuple[Item, ...], int], bytes],
     allowance: Callable[[tuple[Item, ...]], int],
     capacity: ModelCapacity,
     limits: RequestPackingLimits,
-    enforceable_output_cap: bool,
-    partition: int,
-) -> BatchSpec:
-    output = allowance(items) + limits.repair_output_tokens
-    item_keys = tuple(keys(item) for item in items)
+    enforceable_output_cap: bool = False,
+    partition: int = 0,
+) -> PreparedRequest:
+    """Prepare one actual initial/repair/split/resume node without repacking.
+
+    Supply exactly the immutable current items and a serializer for this node's
+    purpose, including repair fields when applicable. The explicit allowance
+    excludes limits.repair_output_tokens, which is reserved here. Nothing is
+    clipped or split. Recreate this value at each send boundary.
+    """
+    _require(type(items) is tuple and bool(items), "invalid_request_items")
+    _require(
+        stage in {"detail", "planning", "section", "document"}, "invalid_stage"
+    )
+    for item in items:
+        _require(isinstance(item, Contract), "mutable_request_item")
+        type(item).model_validate(item)
+    limits = RequestPackingLimits.model_validate(limits)
+    requested = allowance(items)
+    _require(
+        type(requested) is int and requested > 0, "invalid_output_allowance"
+    )
+    output = requested + limits.repair_output_tokens
+    item_keys = _request_keys(items, keys)
     if output > capacity.max_output_tokens:
         msg = "output_limit"
         raise PackingError(msg, item_keys[0])
@@ -1466,6 +1515,7 @@ def _request_spec(  # noqa: PLR0913 # Keep explicit evidence, serializer, and ca
         output, enforceable_output_cap=enforceable_output_cap
     )
     body = serializer(items, output)
+    _require(type(body) is bytes, "invalid_serialized_request")
     bound = estimate_input(
         body,
         overhead_bytes=limits.framing_bytes
@@ -1486,7 +1536,7 @@ def _request_spec(  # noqa: PLR0913 # Keep explicit evidence, serializer, and ca
         msg = "timeout_limit"
         raise PackingError(msg, item_keys[0])
     request_digest = content_digest(body)
-    return BatchSpec(
+    batch = BatchSpec(
         id=semantic_digest(
             "batch.v2", stage, item_keys, request_digest, output, guard, limits
         ),
@@ -1502,6 +1552,74 @@ def _request_spec(  # noqa: PLR0913 # Keep explicit evidence, serializer, and ca
         estimated_response_bytes=response_bytes,
         estimated_seconds=seconds,
         partition=partition,
+    )
+    return PreparedRequest(body=body, batch=batch)
+
+
+def _request_spec(items: tuple[Item, ...], **kwargs: object) -> BatchSpec:
+    return prepare_request_items(items, **kwargs).batch
+
+
+def pack_request_items(  # noqa: PLR0913 # Keep all actual provider bounds explicit.
+    items: tuple[Item, ...],
+    *,
+    stage: BatchStage,
+    keys: Callable[[Item], str],
+    groups: Callable[[Item], tuple[str, ...]],
+    serializer: Callable[[tuple[Item, ...], int], bytes],
+    allowance: Callable[[tuple[Item, ...]], int],
+    capacity: ModelCapacity,
+    limits: RequestPackingLimits,
+    enforceable_output_cap: bool = False,
+) -> tuple[BatchSpec, ...]:
+    """Pack actual immutable cards or adjacent sections with no request floor.
+
+    Whole-fit input uses one request. Section/document order is retained;
+    evidence/planning use fixed digest partitions when the whole set cannot
+    fit. Serialize complete produced child prose in parent items; the consumer
+    must build another hierarchy level if whole parent input cannot fit.
+    An indivisible oversized item fails instead of slicing text or references.
+    """
+    _require(type(items) is tuple, "invalid_request_items")
+    _require(
+        stage in {"detail", "planning", "section", "document"}, "invalid_stage"
+    )
+    limits = RequestPackingLimits.model_validate(limits)
+    if not items:
+        return ()
+    _request_keys(items, keys)
+    ordered = (
+        items
+        if stage in {"section", "document"}
+        else tuple(sorted(items, key=keys))
+    )
+    kwargs = {
+        "stage": stage,
+        "keys": keys,
+        "groups": groups,
+        "serializer": serializer,
+        "allowance": allowance,
+        "capacity": capacity,
+        "limits": limits,
+        "enforceable_output_cap": enforceable_output_cap,
+    }
+    try:
+        return (_request_spec(ordered, partition=0, **kwargs),)
+    except PackingError:
+        pass
+    if stage in {"section", "document"}:
+        return _pack(ordered, **kwargs)
+    buckets = defaultdict(list)
+    for item in ordered:
+        buckets[int(keys(item), 16) % limits.stable_partition_count].append(
+            item
+        )
+    return tuple(
+        batch
+        for partition in sorted(buckets)
+        for batch in _pack(
+            tuple(buckets[partition]), partition=partition, **kwargs
+        )
     )
 
 
@@ -1914,9 +2032,11 @@ def build_story_plan(  # noqa: PLR0913 # Keep explicit evidence, serializer, and
     """Build lossless bounded cards over contiguous SCC/topological order.
 
     A group can span leaf cards only between complete atoms. Parents reference
-    all child cards, never sliced summaries. Every hierarchy request uses the
-    actual serializer and output limits. Large cycles can span cards/chapters;
-    their groups remain adjacent in the complete story order.
+    all child cards, never sliced summaries. Structural requests use the supplied
+    serializer and output limits. After generation, consumers must repack actual
+    child prose and add a bounded level when needed; this function does not run
+    that production loop. Large cycles can span cards/chapters; their groups
+    remain adjacent in the complete story order.
     """
     _require(
         type(max_chapter_groups) is int and max_chapter_groups > 0,

@@ -14,7 +14,9 @@ from test_narrative import two_group_report
 from diffstory import narrative_plan as plan_module
 from diffstory.analysis import compile_snapshot
 from diffstory.narrative_contracts import ClaimRef
+from diffstory.narrative_contracts import Contract
 from diffstory.narrative_contracts import DetailResult
+from diffstory.narrative_contracts import Digest
 from diffstory.narrative_contracts import EvidenceLedger
 from diffstory.narrative_contracts import EvidenceQuestion
 from diffstory.narrative_contracts import EvidenceUnit
@@ -23,6 +25,7 @@ from diffstory.narrative_contracts import FactualObservation
 from diffstory.narrative_contracts import GroupSpec
 from diffstory.narrative_contracts import PlanningGroup
 from diffstory.narrative_contracts import SourceSpan
+from diffstory.narrative_contracts import SupportedStatement
 from diffstory.narrative_contracts import Terminology
 from diffstory.narrative_plan import PackingError
 from diffstory.narrative_plan import RequestPackingLimits
@@ -33,8 +36,10 @@ from diffstory.narrative_plan import check_evidence_batch
 from diffstory.narrative_plan import detail_output_allowance
 from diffstory.narrative_plan import ordered_components
 from diffstory.narrative_plan import pack_evidence_units
+from diffstory.narrative_plan import pack_request_items
 from diffstory.narrative_plan import planning_groups
 from diffstory.narrative_plan import planning_groups_from_details
+from diffstory.narrative_plan import prepare_request_items
 from diffstory.narrative_plan import reconstruct_buffer
 from diffstory.narrative_plan import resolve_span_ref
 from diffstory.narrative_plan import semantic_digest
@@ -1365,6 +1370,287 @@ class LedgerIndexTests(unittest.TestCase):
         # for each citation exceeds this bound by several orders of magnitude.
         self.assertLessEqual(unit_equality_calls, 100)
         self.assertLessEqual(equality_calls, 100 * len(unit.spans))
+
+
+class ProseInputFixture(Contract):
+    """Complete immutable request atoms containing already-produced child prose."""
+
+    key: Digest
+    group_key: Digest
+    statements: tuple[SupportedStatement, ...]
+
+
+class PublicProsePackingTests(unittest.TestCase):
+    """Use actual child text to exercise request count, order, and hard bounds."""
+
+    def setUp(self) -> None:
+        """Create immutable inputs whose text is retained by the serializer."""
+        self.items = tuple(
+            ProseInputFixture(
+                key=semantic_digest("section-context", i),
+                group_key=semantic_digest("presentation", i),
+                statements=(
+                    SupportedStatement(
+                        kind="editorial",
+                        text=f"Read section {i} before its dependent callers.",
+                    ),
+                ),
+            )
+            for i in range(40)
+        )
+        self.capacity = ModelCapacity(1_000_000, 100_000)
+        self.limits = RequestPackingLimits(
+            repair_output_tokens=0, timeout_seconds=10_000
+        )
+        self.options = {
+            "stage": "section",
+            "keys": lambda item: item.key,
+            "groups": lambda item: (item.group_key,),
+            "serializer": body,
+            "allowance": lambda items: 300 * len(items),
+            "capacity": self.capacity,
+            "limits": self.limits,
+        }
+
+    def test_two_and_many_sections_and_cards_use_one_actual_request(
+        self,
+    ) -> None:
+        """Presentation count does not impose a hidden per-section request floor."""
+        for count in (2, 40):
+            for stage in ("section", "planning"):
+                with self.subTest(count=count, stage=stage):
+                    batches = pack_request_items(
+                        self.items[:count], **(self.options | {"stage": stage})
+                    )
+                    self.assertEqual(len(batches), 1)
+                    self.assertEqual(len(batches[0].group_keys), count)
+                    self.assertEqual(
+                        set(batches[0].item_keys),
+                        {item.key for item in self.items[:count]},
+                    )
+                    if stage == "section":
+                        self.assertEqual(
+                            batches[0].item_keys,
+                            tuple(item.key for item in self.items[:count]),
+                        )
+
+    def test_output_bytes_and_time_give_different_adjacent_partitions(
+        self,
+    ) -> None:
+        """Practical byte and timeout limits bind even with a large context."""
+        cases = (
+            (ModelCapacity(100_000, 1000), self.limits, (3, 3, 1)),
+            (
+                self.capacity,
+                RequestPackingLimits(
+                    repair_output_tokens=0, response_byte_limit=4800
+                ),
+                (2, 2, 2, 1),
+            ),
+            (
+                self.capacity,
+                RequestPackingLimits(
+                    repair_output_tokens=0,
+                    output_tokens_per_second=100,
+                    fixed_latency_seconds=0,
+                    timeout_seconds=3,
+                ),
+                (1,) * 7,
+            ),
+        )
+        for capacity, limits, expected in cases:
+            with self.subTest(expected=expected):
+                batches = pack_request_items(
+                    self.items[:7],
+                    **(
+                        self.options | {"capacity": capacity, "limits": limits}
+                    ),
+                )
+                self.assertEqual(
+                    tuple(len(batch.item_keys) for batch in batches), expected
+                )
+                self.assertEqual(
+                    tuple(key for batch in batches for key in batch.item_keys),
+                    tuple(item.key for item in self.items[:7]),
+                )
+
+    def test_unordered_card_partitions_are_stable_without_text_slicing(
+        self,
+    ) -> None:
+        """Stable digest partitions are independent of arrival order."""
+        options = self.options | {
+            "stage": "planning",
+            "capacity": ModelCapacity(100_000, 1000),
+        }
+        first = pack_request_items(self.items, **options)
+        reverse = pack_request_items(tuple(reversed(self.items)), **options)
+        self.assertEqual(first, reverse)
+        self.assertEqual(
+            {key for batch in first for key in batch.item_keys},
+            {item.key for item in self.items},
+        )
+
+    def test_actual_repair_preparation_retains_prefix_schema_and_targets(
+        self,
+    ) -> None:
+        """The exact returned body, including repair fields, is the send authority."""
+        limits = RequestPackingLimits(
+            framing_bytes=13,
+            schema_reserve_bytes=17,
+            repair_reserve_bytes=19,
+            repair_output_tokens=23,
+            safety_tokens=29,
+        )
+
+        def repair(items: tuple, output: int) -> bytes:
+            return b"PROVIDER PREFIX\n" + canonical_bytes(
+                {
+                    "reason": "missing_item",
+                    "schema": {"items": "complete"},
+                    "items": items,
+                    "output": output,
+                }
+            )
+
+        prepared = prepare_request_items(
+            (self.items[3],),
+            **(self.options | {"serializer": repair, "limits": limits}),
+        )
+        self.assertTrue(prepared.body.startswith(b"PROVIDER PREFIX\n"))
+        payload = json.loads(prepared.body.split(b"\n", 1)[1])
+        self.assertEqual(
+            payload["items"], [self.items[3].model_dump(mode="json")]
+        )
+        self.assertEqual(payload["reason"], "missing_item")
+        self.assertEqual(prepared.batch.output_reservation, 323)
+        self.assertEqual(
+            prepared.batch.input_bound, len(prepared.body) + 1024 + 49
+        )
+        self.assertEqual(
+            prepared.batch.request_digest,
+            plan_module.content_digest(prepared.body),
+        )
+        self.assertNotIn("body", prepared.model_dump())
+        self.assertEqual(prepared.batch.item_keys, (self.items[3].key,))
+
+    def test_actual_child_growth_and_atomic_overflow_fail_before_send(
+        self,
+    ) -> None:
+        """Produced child prose can require another hierarchy level; no preview wins."""
+        capacity = ModelCapacity(8000, 1000)
+        options = self.options | {"stage": "planning", "capacity": capacity}
+        small = self.items[:2]
+        self.assertEqual(len(pack_request_items(small, **options)), 1)
+        large = ProseInputFixture(
+            key=small[0].key,
+            group_key=small[0].group_key,
+            statements=(
+                SupportedStatement(
+                    kind="editorial", text="complete child statement " * 1000
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(PackingError, "input_limit"):
+            pack_request_items((large, small[1]), **options)
+        self.assertEqual(len(large.statements[0].text), 25_000)
+
+    def test_public_preparer_keeps_codex_guard_and_rejects_invalid_atoms(
+        self,
+    ) -> None:
+        """Only an enforceable direct API cap can reserve less than full output."""
+        options = self.options | {"capacity": ModelCapacity(20_000, 18_000)}
+        with self.assertRaisesRegex(PackingError, "input_limit"):
+            prepare_request_items(self.items[:1], **options)
+        prepared = prepare_request_items(
+            self.items[:1], **(options | {"enforceable_output_cap": True})
+        )
+        self.assertEqual(prepared.batch.output_guard, 300)
+        for items in (
+            (),
+            (self.items[0], self.items[0]),
+            [self.items[0]],
+            ({"key": self.items[0].key},),
+        ):
+            with (
+                self.subTest(shape=type(items).__name__),
+                self.assertRaises(ValueError),
+            ):
+                prepare_request_items(items, **self.options)
+        for allowance in (0, -1, True, "300"):
+            with (
+                self.subTest(allowance=allowance),
+                self.assertRaises(ValueError),
+            ):
+                prepare_request_items(
+                    self.items[:1],
+                    **(
+                        self.options
+                        | {"allowance": lambda _items, value=allowance: value}
+                    ),
+                )
+
+    def test_actual_repacking_preserves_structural_plan_identity_and_closure(
+        self,
+    ) -> None:
+        """Replacing request bytes cannot drop deterministic members, claims, or terms."""
+        groups = graph_groups(3, claims=2)
+        plan = build_story_plan(
+            groups,
+            self.capacity,
+            self.limits,
+            body,
+            context_digest=semantic_digest("trusted-context"),
+        )
+
+        def produced(cards: tuple, output: int) -> bytes:
+            return canonical_bytes(
+                {
+                    "cards": cards,
+                    "output": output,
+                    "validated_child_prose": "All complete produced child statements are included here.",
+                }
+            )
+
+        requests = pack_request_items(
+            plan.cards,
+            stage="planning",
+            keys=lambda card: card.id,
+            groups=lambda card: tuple(
+                dict.fromkeys(atom.group_key for atom in card.atoms)
+            ),
+            serializer=produced,
+            allowance=lambda cards: 1000 * len(cards),
+            capacity=self.capacity,
+            limits=self.limits,
+        )
+        repacked = type(plan).model_validate(
+            plan.model_dump() | {"requests": requests}
+        )
+        validate_story_plan(repacked, groups)
+        self.assertEqual(repacked.id, plan.id)
+        self.assertNotEqual(repacked.requests, plan.requests)
+        self.assertEqual(repacked.groups, groups)
+        self.assertEqual(repacked.cards, plan.cards)
+        self.assertTrue(
+            all(
+                group.terminology and group.claims for group in repacked.groups
+            )
+        )
+
+    def test_bad_public_key_is_rejected_before_sizing_or_serialization(
+        self,
+    ) -> None:
+        """A caller's mistaken key callback must not echo source in a size error."""
+        serialize = mock.Mock(return_value=b"unused")
+        options = self.options | {
+            "keys": lambda _item: "PRIVATE_KEY_SENTINEL",
+            "serializer": serialize,
+            "allowance": lambda _items: 1_000_000,
+        }
+        for operation in (prepare_request_items, pack_request_items):
+            with self.assertRaisesRegex(ValueError, "^invalid_request_key$"):
+                operation(self.items[:1], **options)
+        serialize.assert_not_called()
 
 
 if __name__ == "__main__":

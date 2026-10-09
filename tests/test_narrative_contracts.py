@@ -8,12 +8,230 @@ from pydantic import ValidationError
 from diffstory.narrative_contracts import ArtifactDependency
 from diffstory.narrative_contracts import ArtifactRecord
 from diffstory.narrative_contracts import BatchResult
+from diffstory.narrative_contracts import ClaimRef
 from diffstory.narrative_contracts import DetailResult
+from diffstory.narrative_contracts import DocumentResult
 from diffstory.narrative_contracts import EvidenceUnit
 from diffstory.narrative_contracts import ItemFailure
+from diffstory.narrative_contracts import NarrativeResult
+from diffstory.narrative_contracts import PlanningCardResult
+from diffstory.narrative_contracts import ProseBinding
+from diffstory.narrative_contracts import ProseKind
+from diffstory.narrative_contracts import SectionResult
 from diffstory.narrative_contracts import SourceSpan
+from diffstory.narrative_contracts import SpanRef
+from diffstory.narrative_contracts import SupportedStatement
+from diffstory.narrative_contracts import SupportedTerminology
+from diffstory.narrative_contracts import result_key
+from diffstory.narrative_contracts import result_kind
+from diffstory.narrative_contracts import result_model
+from diffstory.narrative_contracts import result_stage
 from diffstory.narrative_contracts import structured_output_schema
 from diffstory.narrative_plan import content_digest
+from diffstory.narrative_plan import semantic_digest
+
+
+def prose_result(
+    kind: ProseKind,
+    subject: str,
+    *,
+    plan_key: str = "a" * 64,
+    context: str = "b" * 64,
+) -> NarrativeResult:
+    """Produce structural supported-prose fixtures, not a semantic quality oracle."""
+    binding = ProseBinding(
+        kind=kind,
+        subject_key=plan_key if kind == "document" else subject,
+        plan_key=plan_key,
+        context_digest=context,
+    )
+    statement = SupportedStatement(
+        kind="implementation_claim",
+        text="The new rstrip call retains leading whitespace while removing trailing whitespace.",
+        claims=(
+            ClaimRef(
+                unit_key=subject,
+                observation_id=semantic_digest("rstrip", subject),
+            ),
+        ),
+        effect="Indentation remains in normalized output.",
+        uncertainty=("No runtime test was executed.",),
+    )
+    editorial = SupportedStatement(
+        kind="editorial", text="Read normalization before its callers."
+    )
+    fields = {"item_key": binding.key, "binding": binding}
+    if kind == "planning_card":
+        return PlanningCardResult(**fields, abstraction=(statement,))
+    if kind == "section":
+        return SectionResult(
+            **fields,
+            title=editorial,
+            orientation=(editorial,),
+            synthesis=(statement,),
+            transition=(),
+        )
+    return DocumentResult(
+        **fields,
+        preamble=(statement,),
+        lead=(editorial,),
+        closing=(statement,),
+    )
+
+
+class ProseContractTests(unittest.TestCase):
+    """Exercise family, support, version, and content-identity boundaries."""
+
+    def test_version_extras_keys_and_family_are_strict(self) -> None:
+        """Wrong context keys or families cannot be relabelled as valid prose."""
+        for kind in ("planning_card", "section", "document"):
+            result = prose_result(kind, "c" * 64)
+            model = result_model(kind)
+            self.assertEqual(
+                model.model_validate_json(result.model_dump_json()), result
+            )
+            self.assertEqual(result_key(result), result.binding.key)
+            self.assertEqual(result_kind(result), kind)
+            for update in (
+                {"version": "v1"},
+                {"arbitrary": "field"},
+                {"item_key": "f" * 64},
+            ):
+                with (
+                    self.subTest(kind=kind, update=update),
+                    self.assertRaises(ValidationError),
+                ):
+                    model.model_validate(result.model_dump() | update)
+            with self.assertRaises(ValidationError):
+                result.binding.context_digest = "e" * 64
+            with self.assertRaises(ValidationError):
+                model.model_validate(
+                    result.model_copy(update={"item_key": "e" * 64})
+                )
+        card = prose_result("planning_card", "c" * 64)
+        section_binding = ProseBinding(
+            **(card.binding.model_dump() | {"kind": "section"})
+        )
+        with self.assertRaises(ValidationError):
+            PlanningCardResult.model_validate(
+                card.model_dump()
+                | {"binding": section_binding, "item_key": section_binding.key}
+            )
+        self.assertEqual(result_stage("document"), "document")
+        with self.assertRaises(KeyError):
+            result_model("unknown")
+
+    def test_claim_support_and_motivation_remain_distinct(self) -> None:
+        """Implementation needs ClaimRef or SpanRef; author statements need attribution."""
+        claim = ClaimRef(unit_key="c" * 64, observation_id="d" * 64)
+        span = SpanRef(
+            span_id="1" * 64,
+            unit_key="c" * 64,
+            group_key="e" * 64,
+            side="head",
+            path="normalize.py",
+            byte_start=0,
+            byte_end=9,
+            line_start=1,
+            line_end=1,
+            content_digest="2" * 64,
+        )
+        for support in ({"claims": (claim,)}, {"citations": (span,)}):
+            statement = SupportedStatement(
+                kind="implementation_claim",
+                text="Casefold replaces lower.",
+                **support,
+            )
+            self.assertEqual(statement.text, "Casefold replaces lower.")
+        for fields in (
+            {"kind": "implementation_claim"},
+            {"kind": "editorial", "effect": "Changes output"},
+            {"kind": "author_motivation"},
+            {"kind": "editorial", "author_context_digest": "a" * 64},
+            {"kind": "implementation_claim", "claims": (claim, claim)},
+            {"kind": "implementation_claim", "citations": (span, span)},
+        ):
+            with (
+                self.subTest(fields=tuple(fields)),
+                self.assertRaises(ValidationError),
+            ):
+                SupportedStatement(text="A statement", **fields)
+        author = SupportedStatement(
+            kind="author_motivation",
+            text="The author wants Unicode normalization.",
+            author_context_digest="3" * 64,
+        )
+        self.assertEqual(author.claims, ())
+        with self.assertRaises(ValidationError):
+            SupportedTerminology(term="normalization", definition=author)
+
+    def test_prose_retains_effect_uncertainty_terms_and_empty_transition(
+        self,
+    ) -> None:
+        """The content identity binds inputs and keeps full typed output unchanged."""
+        section = prose_result("section", "c" * 64)
+        term = SupportedTerminology(
+            term="trimming", definition=section.synthesis[0]
+        )
+        section = SectionResult.model_validate(
+            section.model_dump() | {"terminology": (term,)}
+        )
+        self.assertEqual(section.transition, ())
+        self.assertEqual(
+            section.terminology[0].definition.effect,
+            "Indentation remains in normalized output.",
+        )
+        self.assertEqual(
+            section.synthesis[0].uncertainty,
+            ("No runtime test was executed.",),
+        )
+        altered = SectionResult.model_validate(
+            section.model_dump()
+            | {
+                "title": SupportedStatement(
+                    kind="editorial", text="Normalization tour"
+                )
+            }
+        )
+        self.assertEqual(altered.item_key, section.item_key)
+        changed_context = prose_result("section", "c" * 64, context="d" * 64)
+        self.assertNotEqual(changed_context.item_key, section.item_key)
+        with self.assertRaises(ValidationError):
+            SectionResult.model_validate(
+                section.model_dump() | {"transition": ""}
+            )
+
+    def test_new_families_have_strict_schemas_and_typed_artifacts(
+        self,
+    ) -> None:
+        """No schema permits extra objects, and no prose becomes a detail result."""
+        for kind in ("planning_card", "section", "document"):
+            result = prose_result(kind, "c" * 64)
+            record = ArtifactRecord(
+                semantic_key="d" * 64,
+                dependencies=(),
+                original_request_digest="e" * 64,
+                validator_version="prose.v2",
+                result=result,
+            )
+            self.assertEqual(
+                ArtifactRecord.model_validate_json(record.model_dump_json()),
+                record,
+            )
+            with self.assertRaises(ValidationError):
+                BatchResult(batch_key="f" * 64, items=(result,), failures=())
+            pending = [structured_output_schema(type(result))]
+            while pending:
+                node = pending.pop()
+                if isinstance(node, dict):
+                    if node.get("type") == "object":
+                        self.assertFalse(node["additionalProperties"])
+                        self.assertEqual(
+                            set(node["required"]), set(node["properties"])
+                        )
+                    pending.extend(node.values())
+                elif isinstance(node, list):
+                    pending.extend(node)
 
 
 class ContractTests(unittest.TestCase):

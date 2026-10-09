@@ -36,13 +36,22 @@ from .narrative_contracts import ArtifactDependency
 from .narrative_contracts import ArtifactRecord
 from .narrative_contracts import BatchResult
 from .narrative_contracts import BatchSpec
+from .narrative_contracts import BatchStage
 from .narrative_contracts import Contract
 from .narrative_contracts import DetailResult
 from .narrative_contracts import Digest
 from .narrative_contracts import ItemFailure
+from .narrative_contracts import NarrativeResult
 from .narrative_contracts import Natural
 from .narrative_contracts import Positive
-from .narrative_contracts import StoryPlan
+from .narrative_contracts import ResultKind
+from .narrative_contracts import (
+    StoryPlan,  # noqa: F401 # Preserve the M2 module export.
+)
+from .narrative_contracts import result_key
+from .narrative_contracts import result_key_field
+from .narrative_contracts import result_model
+from .narrative_contracts import result_stage
 from .usage import RunUsage
 from .usage import estimate_input
 
@@ -50,6 +59,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
     from collections.abc import Mapping
+
+    from .narrative_plan import PreparedRequest
+    from .narrative_plan import RequestPackingLimits
+    from .usage import ModelCapacity
 
 try:
     import fcntl
@@ -1427,7 +1440,7 @@ class ArtifactLookup(Contract):
     """
 
     item_key: Digest
-    result_kind: Literal["detail", "story_plan"] = "detail"
+    result_kind: ResultKind = "detail"
     static_dependencies: tuple[ArtifactDependency, ...]
     validator_version: str
 
@@ -1485,6 +1498,12 @@ class ArtifactInvocation(Contract):
             tuple(item.item_key for item in self.lookups)
             == self.batch.item_keys
         )
+        _require_v2(
+            all(
+                result_stage(item.result_kind) == self.batch.stage
+                for item in self.lookups
+            )
+        )
         required = _STATIC_KINDS | _CONTEXT_KINDS | {"evidence", "peer"}
         _require_v2({d.kind for d in self.dependencies} == required)
         evidence = {
@@ -1525,6 +1544,16 @@ class ArtifactInvocation(Contract):
         return _canonical_digest(
             {"lookup": lookup.key, "invocation": self.semantic_key}
         )
+
+    def artifact_keys(self) -> dict[str, str]:
+        """Derive all item keys after hashing the shared invocation once."""
+        invocation = self.semantic_key
+        return {
+            lookup.item_key: _canonical_digest(
+                {"lookup": lookup.key, "invocation": invocation}
+            )
+            for lookup in self.lookups
+        }
 
 
 class PreparedMetadata(Contract):
@@ -1586,6 +1615,35 @@ class PreparedArtifactRequest(Contract):
     metadata: PreparedMetadata
 
 
+def bind_prepared_request(
+    request: PreparedRequest,
+    capacity: ModelCapacity,
+    limits: RequestPackingLimits,
+    *,
+    enforceable_output_cap: bool = False,
+) -> PreparedArtifactRequest:
+    """Bind actual public planner output to checked runtime send metadata.
+
+    Use the same capacity, limits, and cap enforcement as prepare_request_items.
+    Every initial, repair, split, or resumed node uses that public preparer and
+    this adapter; callers need not repeat private reservation arithmetic.
+    """
+    metadata = PreparedMetadata(
+        batch=request.batch,
+        context_tokens=capacity.context_tokens,
+        max_output_tokens=capacity.max_output_tokens,
+        enforceable_output_cap=enforceable_output_cap,
+        overhead_bytes=limits.framing_bytes
+        + limits.schema_reserve_bytes
+        + limits.repair_reserve_bytes,
+        safety_tokens=limits.safety_tokens,
+        response_byte_limit=limits.response_byte_limit,
+        timeout_seconds=limits.timeout_seconds,
+    )
+    metadata.check(request.body)
+    return PreparedArtifactRequest(body=request.body, metadata=metadata)
+
+
 class StoredArtifact(Contract):
     """Private typed payload with the full original batch and audit identity."""
 
@@ -1619,17 +1677,12 @@ class StoredArtifact(Contract):
 
 
 def _validate_result_key(
-    lookup: ArtifactLookup, result: DetailResult | StoryPlan
+    lookup: ArtifactLookup, result: NarrativeResult
 ) -> None:
-    if lookup.result_kind == "detail":
-        _require_v2(
-            isinstance(result, DetailResult)
-            and result.unit_key == lookup.item_key
-        )
-    else:
-        _require_v2(
-            isinstance(result, StoryPlan) and result.id == lookup.item_key
-        )
+    _require_v2(
+        type(result) is result_model(lookup.result_kind)
+        and result_key(result) == lookup.item_key
+    )
 
 
 def _atomic_record(path: Path, record: Contract) -> None:
@@ -1704,7 +1757,7 @@ class ArtifactStore:
         self,
         lookup: ArtifactLookup,
         registry: DependencyRegistry,
-        validate: Callable[[ArtifactLookup, DetailResult | StoryPlan], None],
+        validate: Callable[[ArtifactLookup, NarrativeResult], None],
     ) -> StoredArtifact | None:
         """Revalidate original dependencies and current result before reuse."""
         for path in sorted((self.directory / lookup.key).glob("*.json")):
@@ -1733,7 +1786,7 @@ class ArtifactStore:
         original_run: RunIdentity,
         invocation: ArtifactInvocation,
         registry: DependencyRegistry,
-        validate: Callable[[ArtifactLookup, DetailResult | StoryPlan], None],
+        validate: Callable[[ArtifactLookup, NarrativeResult], None],
     ) -> bool:
         """Import only already-v2 records; ordinary v1 prose is always a miss.
 
@@ -2312,7 +2365,7 @@ class SafeDiagnostic(Contract):
     category: Category
     reason: Reason
     task_digest: Digest
-    stage: Literal["detail", "planning", "section"]
+    stage: BatchStage
     stage_position: Natural | None = None
     attempt: Natural | None
     input_bound: Natural | None = None
@@ -2442,7 +2495,7 @@ class BatchCallbacks:
         [ArtifactInvocation, RecoveryNode, Purpose], PreparedArtifactRequest
     ]
     send: Callable[[PreparedArtifactRequest], ProviderReply]
-    validate: Callable[[ArtifactLookup, DetailResult | StoryPlan], None]
+    validate: Callable[[ArtifactLookup, NarrativeResult], None]
     envelope: Callable[[object, BatchSpec], WireEnvelope] = bind_wire_envelope
     split: Callable[[RecoveryNode], tuple[tuple[str, ...], ...]] | None = None
     check: Callable[[PreparedArtifactRequest], None] | None = None
@@ -2497,7 +2550,7 @@ class ArtifactBatchOutcome(Contract):
 class _ItemInspection(Contract):
     """Typed results and safe counts from one well-formed wire envelope."""
 
-    results: tuple[DetailResult | StoryPlan, ...]
+    results: tuple[NarrativeResult, ...]
     missing_keys: tuple[Digest, ...]
     invalid_keys: tuple[Digest, ...]
     unknown_count: Natural
@@ -2508,8 +2561,8 @@ def _inspect_items(  # noqa: C901, PLR0912 # Item parsing follows complete envel
     envelope: WireEnvelope,
     invocation: ArtifactInvocation,
     batch: BatchSpec,
-    validate: Callable[[ArtifactLookup, DetailResult | StoryPlan], None],
-    accept: Callable[[DetailResult | StoryPlan], None],
+    validate: Callable[[ArtifactLookup, NarrativeResult], None],
+    accept: Callable[[NarrativeResult], None],
 ) -> _ItemInspection:
     _require_v2(
         isinstance(envelope, WireEnvelope) and envelope.batch_key == batch.id,
@@ -2530,8 +2583,16 @@ def _inspect_items(  # noqa: C901, PLR0912 # Item parsing follows complete envel
     }
     grouped: dict[str, list[object]] = {key: [] for key in batch.item_keys}
     unknown = 0
+    fields = {
+        result_key_field(lookup.result_kind) for lookup in invocation.lookups
+    }
     for raw in envelope.items:
-        key = raw.get("unit_key", raw.get("id")) if type(raw) is dict else None
+        present = (
+            [raw[field] for field in fields if field in raw]
+            if type(raw) is dict
+            else []
+        )
+        key = present[0] if len(present) == 1 else None
         if type(key) is not str or key not in grouped:
             unknown += 1
         else:
@@ -2567,9 +2628,7 @@ def _inspect_items(  # noqa: C901, PLR0912 # Item parsing follows complete envel
             continue
         try:
             lookup = lookups[key]
-            model = (
-                DetailResult if lookup.result_kind == "detail" else StoryPlan
-            )
+            model = result_model(lookup.result_kind)
             result = model.model_validate_json(
                 json.dumps(items[0], allow_nan=False)
             )
@@ -2687,7 +2746,7 @@ class ArtifactRuntime(GenerationRuntime):
         self,
         lookups: tuple[ArtifactLookup, ...],
         registry: DependencyRegistry,
-        validate: Callable[[ArtifactLookup, DetailResult | StoryPlan], None],
+        validate: Callable[[ArtifactLookup, NarrativeResult], None],
     ) -> tuple[StoredArtifact, ...]:
         """Read reusable original artifacts before deciding new packing boundaries."""
         _require_v2(len({item.key for item in lookups}) == len(lookups))
@@ -2986,11 +3045,9 @@ class ArtifactRuntime(GenerationRuntime):
             )
             if succeeded:
                 return
-            if (
-                reason in _STOP_REASONS | {"storage"}
-                or not missing
-                or (inspection is not None and inspection.unknown_count)
-            ):
+            # Unknown extras remain failed diagnostics. Known gaps can use only
+            # the original node's remaining recovery allowance.
+            if reason in _STOP_REASONS | {"storage"} or not missing:
                 self._fail_node(state, node, reason)
 
     @staticmethod
@@ -3060,12 +3117,10 @@ class ArtifactRuntime(GenerationRuntime):
         self,
         state: LineageState,
         metadata: PreparedMetadata,
-        result: DetailResult | StoryPlan,
+        result: NarrativeResult,
         results: dict[str, StoredArtifact],
     ) -> None:
-        item_key = (
-            result.unit_key if isinstance(result, DetailResult) else result.id
-        )
+        item_key = result_key(result)
         lookup = next(
             item
             for item in state.invocation.lookups
