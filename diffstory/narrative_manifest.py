@@ -11,6 +11,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections import defaultdict
 from typing import TYPE_CHECKING
+from typing import Annotated
 from typing import Literal
 
 from pydantic import Field
@@ -24,15 +25,25 @@ from .narrative_contracts import DocumentResult
 from .narrative_contracts import NarrativeResult
 from .narrative_contracts import Natural
 from .narrative_contracts import PlanningCardResult
+from .narrative_contracts import Positive
 from .narrative_contracts import ResultKind
 from .narrative_contracts import SectionResult
 from .narrative_contracts import SourceSliceRef
+from .narrative_contracts import SpanRef
+from .narrative_contracts import StatementRef
 from .narrative_contracts import StoryPlan
+from .narrative_contracts import SupportedStatement
 from .narrative_contracts import result_key
 from .narrative_contracts import result_kind
 from .narrative_plan import canonical_bytes
 from .narrative_plan import content_digest
 from .narrative_plan import semantic_digest
+from .narrative_protocol import (
+    LedgerParameters,  # noqa: TC001 # Runtime Pydantic annotation and public re-export.
+)
+from .narrative_protocol import (
+    RequestConfiguration,  # noqa: TC001 # Runtime Pydantic annotation.
+)
 from .narrative_runtime import ArtifactInvocation
 from .narrative_runtime import PreparedMetadata
 from .narrative_runtime import RunIdentity
@@ -42,6 +53,7 @@ if TYPE_CHECKING:
 
     from .narrative_contracts import EvidenceLedger
     from .narrative_plan import LedgerIndex
+    from .narrative_protocol import V2Options
     from .narrative_runtime import StoredArtifact
     from .narrative_wire import ProseContext
     from .narrative_wire import WireAdapter
@@ -55,7 +67,7 @@ def _require(condition: bool, reason: str) -> None:  # noqa: FBT001 # Assertion 
 def compiler_fact_signature(report: dict) -> str:
     """Hash compiler facts after removing only declared generated presentation.
 
-    Exclude root document/generation and group narrative/title/number/next_id.
+    Exclude root document/generation/narrative_v2 and group presentation.
     Canonicalize group order by compiler ID. Retain every other field, including
     metadata, revisions, source, classification, prerequisites and test status.
     Never compare an annotated report's full hash to its pre-annotation hash.
@@ -79,7 +91,7 @@ def compiler_fact_signature(report: dict) -> str:
     projection = {
         key: value
         for key, value in report.items()
-        if key not in {"document", "generation", "groups"}
+        if key not in {"document", "generation", "groups", "narrative_v2"}
     }
     projection["groups"] = [
         {
@@ -90,13 +102,6 @@ def compiler_fact_signature(report: dict) -> str:
         for group in sorted(groups, key=lambda group: group["id"])
     ]
     return semantic_digest("diffstory.compiler-facts.v2", projection)
-
-
-class LedgerParameters(Contract):
-    """Declare the exact ledger partition parameters for trusted reconstruction."""
-
-    max_span_bytes: int = Field(ge=4)
-    max_unit_spans: int = Field(ge=2)
 
 
 class CurrentUsage(Contract):
@@ -234,7 +239,7 @@ class GenerationManifest(Contract):
     """Strict audit and coverage data; semantic authority stays with the report.
 
     unit_keys is the declared ledger coverage, including context-only units.
-    M4 compares it to a newly derived ledger; internal agreement cannot prove
+    Production validation compares a newly derived ledger; internal agreement cannot prove
     that the caller declared every unit. Source remains in report.source_evidence.
     Every detail and prose output has exactly one receipt. The deterministic
     plan is not a provider output and therefore has no receipt.
@@ -247,6 +252,7 @@ class GenerationManifest(Contract):
     current_usage: CurrentUsage
     ledger_digest: Digest
     ledger_parameters: LedgerParameters
+    request_configuration: RequestConfiguration
     unit_keys: tuple[Digest, ...]
     details: tuple[DetailResult, ...]
     plan: StoryPlan
@@ -552,7 +558,7 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
     """Assemble exact typed prose and all details using current compiler bindings.
 
     This helper does not apply annotations or render HTML. Public consumers must
-    first call validate_production with their trusted provider/options contract.
+    first call validate_generation to reconstruct the declared pure protocol.
     Optional ledger/index values reuse the production builder's current index.
     Without them, source is rebuilt from the report and declared parameters.
     """
@@ -585,6 +591,7 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
     provenance = {}
     prose = (*manifest.planning, *manifest.sections, manifest.document)
     producers = {r.item_key: r for r in prose}
+    receipts = {r.item_key: r for r in manifest.receipts}
     for detail in manifest.details:
         for value in (
             *detail.explanations,
@@ -609,6 +616,9 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
                         "reference": ref.model_dump(mode="json"),
                         "statement": statement.model_dump(mode="json"),
                         "consumption": "inherited_statement",
+                        "receipt": receipts[ref.producer_item_key].model_dump(
+                            mode="json"
+                        ),
                     }
     resolved = []
     for key, ref in sorted(references.items()):
@@ -620,7 +630,13 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
             {
                 "key": key,
                 "reference": ref.model_dump(mode="json"),
+                "consumption": "direct_source",
                 "fragment_key": binding.fragment_key,
+                "side": span.side,
+                "path": span.path,
+                "revision": report["meta"][
+                    "base_sha" if span.side == "base" else "head_sha"
+                ],
                 "byte_start": span.byte_start,
                 "byte_end": span.byte_end,
                 "line_start": span.line_start,
@@ -667,6 +683,11 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
                 "reference": ref.model_dump(mode="json"),
                 "consumption": "source_slice",
                 "fragment_key": binding.fragment_key,
+                "side": span.side,
+                "path": span.path,
+                "revision": report["meta"][
+                    "base_sha" if span.side == "base" else "head_sha"
+                ],
                 "byte_start": byte_start,
                 "byte_end": byte_end,
                 "line_start": line_start,
@@ -719,17 +740,205 @@ def validate_generation(
     report: dict,
     manifest: GenerationManifest,
     *,
-    provider: object,
-    options: object = None,
+    provider: object | None = None,
+    options: V2Options | None = None,
     candidate: dict | None = None,
-) -> None:
+) -> dict:
     """Rebuild trusted production support, hierarchy, requests and exact assembly."""
     from .narrative_v2 import validate_production
 
-    validate_production(
+    return validate_production(
         report,
         manifest,
         provider=provider,
         options=options,
         candidate=candidate,
     )
+
+
+LegacyIdentifier = Annotated[str, Field(pattern=r"^[a-f0-9]{16}$")]
+
+
+class ResolvedCitation(Contract):
+    """Bind direct source or an exact slice to current original fragment bytes."""
+
+    key: Digest
+    reference: SpanRef | SourceSliceRef
+    consumption: Literal["direct_source", "source_slice"]
+    fragment_key: str
+    side: Literal["base", "head"]
+    path: str
+    revision: str
+    byte_start: Natural
+    byte_end: Positive
+    line_start: Positive
+    line_end: Positive
+    url: str | None
+
+
+class InheritedProvenance(Contract):
+    """Identify the consumed statement and its actual successful request receipt."""
+
+    key: Digest
+    reference: StatementRef
+    statement: SupportedStatement
+    consumption: Literal["inherited_statement"]
+    receipt: ResultReceipt
+
+
+class PresentationSection(Contract):
+    """Retain complete section prose and all compiler-assigned detail results."""
+
+    group_id: LegacyIdentifier
+    group_key: Digest
+    number: Positive
+    next_id: LegacyIdentifier | None
+    prose: SectionResult
+    details: tuple[DetailResult, ...]
+
+
+class V2Presentation(Contract):
+    """Explicit reader subtree; structural parsing alone never authorizes it."""
+
+    version: Literal["diffstory.presentation.v2"]
+    provenance: Literal["model-generated · unverified"]
+    document: DocumentResult
+    sections: tuple[PresentationSection, ...]
+    context_details: tuple[DetailResult, ...]
+    citations: tuple[ResolvedCitation, ...]
+    support_provenance: tuple[InheritedProvenance, ...]
+
+
+def persisted_manifest(value: object) -> GenerationManifest:
+    """Parse JSON-shaped data without coercing a legacy declaration into v2."""
+    if (
+        type(value) is not dict
+        or value.get("version") != "diffstory.generation.v2"
+    ):
+        msg = "invalid_generation_schema"
+        raise ValueError(msg)
+    return GenerationManifest.model_validate_json(canonical_bytes(value))
+
+
+def presentation_from_candidate(candidate: dict) -> V2Presentation:
+    """Construct a typed reader view from an independently validated assembly."""
+    return V2Presentation.model_validate_json(
+        canonical_bytes(
+            {
+                "version": "diffstory.presentation.v2",
+                "provenance": "model-generated · unverified",
+                "document": candidate["document"],
+                "sections": candidate["steps"],
+                "context_details": candidate["context_details"],
+                "citations": candidate["citations"],
+                "support_provenance": candidate["support_provenance"],
+            }
+        )
+    )
+
+
+def _text(statements: tuple[SupportedStatement, ...]) -> str:
+    return "\n\n".join(statement.text for statement in statements)
+
+
+def _document_view(presentation: V2Presentation) -> dict:
+    return {
+        name: _text(getattr(presentation.document, name))
+        for name in ("preamble", "lead", "closing")
+    }
+
+
+def _group_view(section: PresentationSection, group: dict) -> dict:
+    return {
+        "title": section.prose.title.text,
+        "number": section.number,
+        "next_id": section.next_id,
+        "narrative": {
+            "provenance": "model-generated · unverified",
+            "evidence_change_ids": group["change_ids"],
+            "intent": _text(section.prose.orientation),
+            "why_now": "",
+            "takeaway": _text(section.prose.synthesis),
+            "transition": _text(section.prose.transition),
+            "invariants": [],
+            "questions": [
+                q.text for detail in section.details for q in detail.questions
+            ],
+        },
+    }
+
+
+def apply_v2_annotations(report: dict, annotations: dict) -> dict:
+    """Validate all offline proofs and attach deterministic typed presentation."""
+    from copy import deepcopy
+
+    manifest = persisted_manifest(annotations.get("generation"))
+    candidate = validate_generation(report, manifest, candidate=annotations)
+    presentation = presentation_from_candidate(candidate)
+    result = deepcopy(report)
+    groups = {g["id"]: g for g in result["groups"]}
+    result["groups"] = [groups[s.group_id] for s in presentation.sections]
+    for section, group in zip(
+        presentation.sections, result["groups"], strict=True
+    ):
+        group.update(_group_view(section, group))
+    result["document"] = _document_view(presentation)
+    result["narrative_v2"] = presentation.model_dump(mode="json")
+    result["generation"] = manifest.model_dump(mode="json")
+    _require(
+        compiler_fact_signature(result) == manifest.compiler_fact_signature,
+        "compiler_facts_changed",
+    )
+    return result
+
+
+def validate_v2_report(report: dict) -> None:
+    """Rebuild current authority and require exact equality of every applied field.
+
+    No cross-call mutable context or trusted persisted catalog is accepted. Each
+    standalone boundary builds one index and validates the shared support forest.
+    """
+    manifest = persisted_manifest(report.get("generation"))
+    candidate = validate_generation(report, manifest)
+    expected = presentation_from_candidate(candidate)
+    # JSON comparison preserves scalar types (True must not equal integer 1).
+    _require(
+        canonical_bytes(report.get("narrative_v2"))
+        == canonical_bytes(expected),
+        "presentation_changed",
+    )
+    _require(
+        canonical_bytes(report.get("document"))
+        == canonical_bytes(_document_view(expected)),
+        "document_changed",
+    )
+    _require(
+        [g["id"] for g in report["groups"]]
+        == [s.group_id for s in expected.sections],
+        "presentation_order_changed",
+    )
+    for section, group in zip(
+        expected.sections, report["groups"], strict=True
+    ):
+        actual = {
+            name: group.get(name)
+            for name in ("title", "number", "next_id", "narrative")
+        }
+        _require(
+            canonical_bytes(actual)
+            == canonical_bytes(_group_view(section, group)),
+            "section_presentation_changed",
+        )
+
+
+def validate_persisted_generation(report: dict, generation: dict) -> None:
+    """Validate JSON generation data and any presentation already applied to it."""
+    if "generation" in report or "narrative_v2" in report:
+        _require(
+            canonical_bytes(generation)
+            == canonical_bytes(report.get("generation")),
+            "applied_generation_mismatch",
+        )
+        validate_v2_report(report)
+    else:
+        validate_generation(report, persisted_manifest(generation))

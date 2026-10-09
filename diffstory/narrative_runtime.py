@@ -1758,6 +1758,8 @@ class ArtifactStore:
         lookup: ArtifactLookup,
         registry: DependencyRegistry,
         validate: Callable[[ArtifactLookup, NarrativeResult], None],
+        *,
+        audit_candidate: Callable[[StoredArtifact], bool] | None = None,
     ) -> StoredArtifact | None:
         """Revalidate original dependencies and current result before reuse."""
         for path in sorted((self.directory / lookup.key).glob("*.json")):
@@ -1776,6 +1778,11 @@ class ArtifactStore:
                 _require_v2(validate(lookup, candidate.record.result) is None)
             except Exception:  # noqa: BLE001, S112 # Cache failures are silent misses.
                 continue
+            if audit_candidate is not None:
+                accepted = audit_candidate(candidate)
+                _require_v2(type(accepted) is bool, "request_mismatch")
+                if not accepted:
+                    continue
             return candidate
         return None
 
@@ -2747,6 +2754,8 @@ class ArtifactRuntime(GenerationRuntime):
         lookups: tuple[ArtifactLookup, ...],
         registry: DependencyRegistry,
         validate: Callable[[ArtifactLookup, NarrativeResult], None],
+        *,
+        audit_candidate: Callable[[StoredArtifact], bool] | None = None,
     ) -> tuple[StoredArtifact, ...]:
         """Read reusable original artifacts before deciding new packing boundaries."""
         _require_v2(len({item.key for item in lookups}) == len(lookups))
@@ -2755,7 +2764,9 @@ class ArtifactRuntime(GenerationRuntime):
         found = []
         for lookup in lookups:
             self._check_identity(lookup)
-            artifact = self.artifacts.lookup(lookup, registry, validate)
+            artifact = self.artifacts.lookup(
+                lookup, registry, validate, audit_candidate=audit_candidate
+            )
             if artifact is not None:
                 found.append(artifact)
         with self._lock:
@@ -2794,7 +2805,7 @@ class ArtifactRuntime(GenerationRuntime):
             manifest,
         )
 
-    def execute_batch(
+    def execute_batch(  # noqa: PLR0913 # Additive audit preserves the existing runtime inputs.
         self,
         invocation: ArtifactInvocation,
         registry: DependencyRegistry,
@@ -2802,6 +2813,7 @@ class ArtifactRuntime(GenerationRuntime):
         *,
         policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         available: tuple[StoredArtifact, ...] = (),
+        audit_candidate: Callable[[StoredArtifact], bool] | None = None,
     ) -> ArtifactBatchOutcome:
         """Resume an original lineage or execute new work without resetting caps.
 
@@ -2829,7 +2841,11 @@ class ArtifactRuntime(GenerationRuntime):
             with self.recovery.lease(invocation.semantic_key):
                 state = self.recovery.ensure(invocation, policy, registry)
                 results = self._available(
-                    invocation, registry, callbacks, available
+                    invocation,
+                    registry,
+                    callbacks,
+                    available,
+                    audit_candidate=audit_candidate,
                 )
                 if len(results) == len(invocation.lookups):
                     return self._outcome(invocation, results)
@@ -2894,6 +2910,8 @@ class ArtifactRuntime(GenerationRuntime):
         registry: DependencyRegistry,
         callbacks: BatchCallbacks,
         available: tuple[StoredArtifact, ...],
+        *,
+        audit_candidate: Callable[[StoredArtifact], bool] | None = None,
     ) -> dict[str, StoredArtifact]:
         results = {}
         desired = {lookup.key: lookup for lookup in invocation.lookups}
@@ -2911,13 +2929,23 @@ class ArtifactRuntime(GenerationRuntime):
                     )
                 except Exception:  # noqa: BLE001, S112 # Invalid cached items are misses.
                     continue
+                if audit_candidate is not None:
+                    accepted = audit_candidate(artifact)
+                    _require_v2(type(accepted) is bool, "request_mismatch")
+                    if not accepted:
+                        continue
                 results[artifact.lookup.item_key] = artifact
         missing = tuple(
             lookup
             for lookup in invocation.lookups
             if lookup.item_key not in results
         )
-        for artifact in self.prefetch(missing, registry, callbacks.validate):
+        for artifact in self.prefetch(
+            missing,
+            registry,
+            callbacks.validate,
+            audit_candidate=audit_candidate,
+        ):
             results[artifact.lookup.item_key] = artifact
         return results
 

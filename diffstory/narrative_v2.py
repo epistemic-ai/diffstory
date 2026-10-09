@@ -11,12 +11,12 @@ import math
 import os
 import tempfile
 import time
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
-
-from pydantic import Field
+from typing import Literal
 
 from .narrative_contracts import ArtifactDependency
 from .narrative_contracts import AuthorContext
@@ -45,7 +45,7 @@ from .narrative_hierarchy import validate_production_requests
 from .narrative_hierarchy import validate_support_forest
 from .narrative_manifest import CurrentUsage
 from .narrative_manifest import GenerationManifest
-from .narrative_manifest import LedgerParameters
+from .narrative_manifest import ProducerDescriptor
 from .narrative_manifest import assemble_candidate
 from .narrative_manifest import build_receipts
 from .narrative_manifest import compiler_fact_signature
@@ -61,6 +61,12 @@ from .narrative_plan import pack_request_items
 from .narrative_plan import prepare_request_items
 from .narrative_plan import semantic_digest
 from .narrative_plan import validate_detail_result
+from .narrative_protocol import AdapterIdentity
+from .narrative_protocol import RequestConfiguration
+from .narrative_protocol import StageIdentity
+from .narrative_protocol import V2Options
+from .narrative_protocol import serialize_request
+from .narrative_runtime import DEFAULT_RETRY_POLICY
 from .narrative_runtime import ArtifactCallError
 from .narrative_runtime import ArtifactInvocation
 from .narrative_runtime import ArtifactLookup
@@ -68,6 +74,7 @@ from .narrative_runtime import ArtifactRuntime
 from .narrative_runtime import ArtifactRuntimeError
 from .narrative_runtime import BatchCallbacks
 from .narrative_runtime import DependencyRegistry
+from .narrative_runtime import LineageState
 from .narrative_runtime import Reason
 from .narrative_runtime import RunIdentity
 from .narrative_runtime import SemanticJob
@@ -99,6 +106,7 @@ if TYPE_CHECKING:
     from .narrative_runtime import ProgressEvent
     from .narrative_runtime import ProviderReply
     from .narrative_runtime import RecoveryNode
+    from .narrative_runtime import RetryPolicy
     from .narrative_runtime import StoredArtifact
 
 
@@ -170,19 +178,6 @@ def require(condition: bool, reason: str = "schema") -> None:  # noqa: FBT001
         raise ArtifactRuntimeError(reason)
 
 
-class V2Options(Contract):
-    """Explicit production limits; all fields enter configuration identity."""
-
-    ledger: LedgerParameters = LedgerParameters(
-        max_span_bytes=4096, max_unit_spans=16
-    )
-    packing: RequestPackingLimits = RequestPackingLimits()
-    card_wire_bytes: int = Field(default=4096, ge=512)
-    prose_wire_bytes: int = Field(default=8192, ge=512)
-    card_support_bytes: int = Field(default=16384, ge=512)
-    max_chapter_groups: int = Field(default=32, ge=1)
-
-
 class DispatchHandle(Contract):
     """Small immutable key; serializers dereference the shared trusted index."""
 
@@ -220,6 +215,54 @@ def statements(result: NarrativeResult) -> tuple[SupportedStatement, ...]:
     return tuple(values)
 
 
+def stage_identities() -> tuple[StageIdentity, ...]:
+    """Bind the current stage-specific contracts, including unchanged detail IDs."""
+    return tuple(
+        StageIdentity(
+            stage=stage,
+            prompt_digest=semantic_digest(PROMPTS[stage], COMMON_PROMPT),
+            schema_digest=semantic_digest(wire_schema(stage)),
+            validator=VALIDATOR_VERSION
+            if stage == "detail"
+            else PROSE_VALIDATOR_VERSION,
+        )
+        for stage in PROMPTS
+    )
+
+
+class OfflineTransport:
+    """Pure reconstruction settings; no provider or executable exists here."""
+
+    def __init__(self, descriptor: RequestConfiguration) -> None:
+        """Validate supported contracts and derive exact original packing limits."""
+        self.descriptor = RequestConfiguration.model_validate(descriptor)
+        require(
+            self.descriptor.stages == stage_identities(),
+            "dependencies_changed",
+        )
+        self.options = self.descriptor.options
+        self.prefix = self.descriptor.prefix
+        self.capacity = ModelCapacity(
+            descriptor.context_tokens, descriptor.max_output_tokens
+        )
+        self.enforceable = descriptor.enforceable_output_cap
+        limits = self.options.packing.model_dump()
+        limits["framing_bytes"] += descriptor.input_overhead_bytes
+        self.limits = RequestPackingLimits(**limits)
+        self.config_digest = descriptor.configuration_digest
+
+    def body(self, stage: str, data: dict, output: int) -> bytes:
+        """Serialize current stage input with the declared known byte codec."""
+        return serialize_request(
+            self.descriptor,
+            PROMPTS[stage] + COMMON_PROMPT,
+            data,
+            f"diffstory_{stage}_v2",
+            wire_schema(stage),
+            output,
+        )
+
+
 class Transport:
     """Bind provider configuration and enforce actual prepared send limits."""
 
@@ -251,18 +294,36 @@ class Transport:
         self.prepare_method = provider.prepare
         self.send_method = provider.complete_reply
         configuration = self.configuration()
+        self.descriptor = RequestConfiguration(
+            version="diffstory.request-configuration.v1",
+            protocol=(
+                "diffstory.codex-json.v1"
+                if self.is_codex
+                else "diffstory.responses-json.v1"
+                if self.is_api
+                else getattr(provider, "request_protocol", None)
+            ),
+            name=provider.name,
+            model=provider.model,
+            destination=provider.destination,
+            context_tokens=provider.context_tokens,
+            max_output_tokens=provider.max_output_tokens,
+            enforceable_output_cap=self.enforceable,
+            input_overhead_bytes=getattr(provider, "input_overhead_bytes", 0),
+            prefix_hex=self.prefix.hex(),
+            fixture_json_layers=getattr(provider, "request_json_layers", 0),
+            adapter=AdapterIdentity(
+                python_type=configuration["type"],
+                executable=configuration["executable"],
+                requested_model=configuration["requested_model"],
+            ),
+            options=self.options,
+            stages=stage_identities(),
+        )
         self.config = canonical_bytes(configuration)
         # Approval binds all stages. Separate prompt/schema dependencies keep
         # a prose-only contract edit from invalidating source-only artifacts.
-        self.config_digest = semantic_digest(
-            "diffstory.transport.v2",
-            {
-                key: value
-                for key, value in configuration.items()
-                if key
-                not in {"prompts", "common_prompt", "schemas", "validator"}
-            },
-        )
+        self.config_digest = self.descriptor.configuration_digest
 
     def configuration(self) -> dict:
         """Capture consumed settings without credentials or broad environment."""
@@ -285,6 +346,14 @@ class Transport:
                 and getattr(p, "enforceable_output_cap", False) is True
             ),
             "options": self.options.model_dump(mode="json"),
+            "protocol": (
+                "diffstory.codex-json.v1"
+                if self.is_codex
+                else "diffstory.responses-json.v1"
+                if self.is_api
+                else getattr(p, "request_protocol", None)
+            ),
+            "fixture_json_layers": getattr(p, "request_json_layers", 0),
             "prompts": PROMPTS,
             "common_prompt": COMMON_PROMPT,
             "schemas": {s: wire_schema(s) for s in PROMPTS},
@@ -308,7 +377,15 @@ class Transport:
         require(
             canonical_bytes(self.configuration()) == self.config
             and self.provider.prepare == self.prepare_method
-            and self.provider.complete_reply == self.send_method,
+            and self.provider.complete_reply == self.send_method
+            and getattr(self.provider, "request_json_layers", 0)
+            == self.descriptor.fixture_json_layers
+            and (
+                self.is_codex
+                or self.is_api
+                or getattr(self.provider, "request_protocol", None)
+                == self.descriptor.protocol
+            ),
             "dependencies_changed",
         )
 
@@ -323,7 +400,17 @@ class Transport:
             output,
         )
         require(type(inner) is bytes)
-        return self.prefix + inner
+        actual = self.prefix + inner
+        expected = serialize_request(
+            self.descriptor,
+            PROMPTS[stage] + COMMON_PROMPT,
+            data,
+            f"diffstory_{stage}_v2",
+            wire_schema(stage),
+            output,
+        )
+        require(actual == expected, "request_mismatch")
+        return actual
 
     def send(self, prepared: PreparedArtifactRequest) -> ProviderReply:
         """Send exactly once; provider transport enforces timeout and byte cap."""
@@ -371,7 +458,9 @@ class Transport:
 class ProductionInputs:
     """Reconstruct trusted source, support, fixed hierarchy and request bytes."""
 
-    def __init__(self, report: dict, transport: Transport) -> None:
+    def __init__(
+        self, report: dict, transport: Transport | OfflineTransport
+    ) -> None:
         """Freeze report bytes and build one indexed evidence ledger."""
         self.report_bytes = canonical_bytes(report)
         self.report = strict_json(self.report_bytes)
@@ -399,8 +488,8 @@ class ProductionInputs:
             base_revision=self.report["meta"]["base_sha"],
             head_revision=self.report["meta"]["head_sha"],
             report_signature=content_digest(self.report_bytes),
-            provider_destination=transport.provider.destination,
-            model=transport.provider.model,
+            provider_destination=transport.descriptor.destination,
+            model=transport.descriptor.model,
         )
         self.details: dict[str, DetailResult] = {}
         self.observations = {}
@@ -973,6 +1062,45 @@ class StageInputs:
             )
         )
 
+    def identity_view(
+        self, form: Literal["legacy", "codec"], layers: int
+    ) -> StageInputs:
+        """Share one logical stage while deriving a closed execution identity.
+
+        Alternate framing uses only the pure serializer. No descriptor, source
+        registry, producer or stored artifact is changed in place.
+        """
+        descriptor = RequestConfiguration.model_validate(
+            self.transport.descriptor.model_dump()
+            | {"fixture_json_layers": layers}
+        )
+        view = copy(self)
+        if layers != self.transport.descriptor.fixture_json_layers:
+            view.transport = OfflineTransport(descriptor)
+        view.static = tuple(
+            ArtifactDependency(
+                kind=d.kind,
+                key=d.key,
+                digest=descriptor.identity_digest(form)
+                if d.kind == "configuration"
+                else d.digest,
+            )
+            for d in self.static
+        )
+        view.lookups = {
+            key: ArtifactLookup(
+                **(lookup.model_dump() | {"static_dependencies": view.static})
+            )
+            for key, lookup in self.lookups.items()
+        }
+        view.registry = DependencyRegistry(
+            dependencies=(
+                *view.static,
+                *(d for ds in view.dynamic.values() for d in ds),
+            )
+        )
+        return view
+
     def kwargs(
         self,
         *,
@@ -1194,6 +1322,286 @@ class StageInputs:
         return structural.metadata.batch
 
 
+class CodecReplay:
+    """Audit original execution views without changing logical stage ownership.
+
+    The memo contains only exact immutable request/binding bytes. It is local to
+    this stage and cannot certify a different source, context, descriptor,
+    invocation, metadata or recovery state. Result and run checks still run for
+    each candidate. No full ledger is rebuilt for an artifact or citation.
+    """
+
+    def __init__(self, stage: StageInputs) -> None:
+        """Derive the finite views for one current, fully indexed stage."""
+        self.stage = stage
+        self.layers = stage.transport.descriptor.fixture_json_layers
+        self.fixture = (
+            stage.transport.descriptor.protocol == "diffstory.fixture-json.v1"
+        )
+        self.legacy = stage.identity_view("legacy", self.layers)
+        self.bound = stage.identity_view("codec", self.layers)
+        self.views = (
+            (self.bound, self.legacy)
+            if self.layers
+            else (self.legacy, self.bound)
+            if self.fixture
+            else (self.legacy,)
+        )
+        if self.fixture:
+            self.views += tuple(
+                stage.identity_view("codec", layers)
+                for layers in range(3)
+                if layers != self.layers
+            )
+        self.legacy_alternatives = (
+            tuple(
+                stage.identity_view("legacy", layers)
+                for layers in range(3)
+                if layers != self.layers
+            )
+            if self.fixture
+            else ()
+        )
+        self.collisions: set[str] = set()
+        self._requests: set[str] = set()
+
+    def audit(
+        self,
+        view: StageInputs,
+        invocation: ArtifactInvocation,
+        requests: tuple[PreparedMetadata, ...],
+    ) -> str:
+        """Memoize only exact validated bindings, initial bytes and metadata."""
+        require(
+            view.registry.contains(invocation.dependencies),
+            "dependencies_changed",
+        )
+        require(
+            invocation == view.invocation(invocation.batch),
+            "dependencies_changed",
+        )
+        binding = content_digest(
+            canonical_bytes(
+                {
+                    "descriptor": view.transport.descriptor,
+                    "capacity": (
+                        view.transport.capacity.context_tokens,
+                        view.transport.capacity.max_output_tokens,
+                    ),
+                    "limits": view.transport.limits,
+                    "enforceable": view.transport.enforceable,
+                    "prefix": view.transport.prefix.hex(),
+                    "static": view.static,
+                    "prompt": PROMPTS[view.stage] + COMMON_PROMPT,
+                    "schema": wire_schema(view.stage),
+                    "items": tuple(
+                        (
+                            i.key,
+                            i.subject,
+                            i.groups,
+                            content_digest(i.payload),
+                            i.output_tokens,
+                        )
+                        for key in invocation.batch.item_keys
+                        for i in (view.items[key],)
+                    ),
+                    "invocation": invocation,
+                }
+            )
+        )
+        if binding not in self._requests:
+            view.audit(invocation, ())
+            self._requests.add(binding)
+        for request in requests:
+            key = binding + content_digest(canonical_bytes(request))
+            if key not in self._requests:
+                view.reconstruct(request)
+                self._requests.add(key)
+        return binding
+
+    def select(
+        self,
+        invocation: ArtifactInvocation,
+        requests: tuple[PreparedMetadata, ...],
+        *,
+        history: LineageState | None = None,
+    ) -> StageInputs | None:
+        """Return the current codec view, or prove a different known framing.
+
+        A failed reconstruction is damaged history, never a cache miss. Only
+        the legacy form can ambiguously name another framing. Bound identities
+        must reconstruct under the codec they actually name.
+        """
+        invocation = ArtifactInvocation.model_validate(invocation)
+        if history is not None:
+            require(history.invocation == invocation, "state_corrupt")
+        views = [
+            v
+            for v in self.views
+            if v.registry.contains(invocation.dependencies)
+        ]
+        require(len(views) == 1, "dependencies_changed")
+        view = views[0]
+        candidates = [view]
+        if view is self.legacy and self.fixture:
+            candidates.extend(self.legacy_alternatives)
+        for candidate in candidates:
+            try:
+                self.audit(candidate, invocation, requests)
+                if history is not None:
+                    self.audit_history(candidate, history)
+            except (ArtifactRuntimeError, PackingError) as error:
+                if isinstance(
+                    error, ArtifactRuntimeError
+                ) and error.reason not in {
+                    "request_mismatch",
+                    "input_limit",
+                    "output_limit",
+                    "response_limit",
+                    "timeout_limit",
+                }:
+                    raise
+                continue
+            if candidate is view:
+                return (
+                    view
+                    if view.transport.descriptor.fixture_json_layers
+                    == self.layers
+                    else None
+                )
+            self.collisions.update(invocation.batch.item_keys)
+            return None
+        msg = "request_mismatch"
+        raise ArtifactRuntimeError(msg)
+
+    def audit_history(self, view: StageInputs, state: LineageState) -> None:
+        """Check original policy/tree/counters and every durable attempted byte."""
+        state = LineageState.model_validate(state)
+        require(
+            state.policy.total_attempts <= DEFAULT_RETRY_POLICY.total_attempts
+            and state.policy.max_split_depth
+            <= DEFAULT_RETRY_POLICY.max_split_depth,
+            "policy_conflict",
+        )
+        binding = self.audit(
+            view,
+            state.invocation,
+            tuple(a.prepared for n in state.nodes for a in n.attempts),
+        )
+        history_key = binding + semantic_digest("audited-history", state)
+        if history_key in self._requests:
+            return
+        for node in state.nodes:
+            if node.children:
+                middle = len(node.missing_keys) // 2
+                children = {n.key: n for n in state.nodes}
+                require(
+                    tuple(children[key].item_keys for key in node.children)
+                    == (
+                        node.missing_keys[:middle],
+                        node.missing_keys[middle:],
+                    ),
+                    "state_corrupt",
+                )
+            previous = None
+            for attempt in node.attempts:
+                require(
+                    attempt.prepared.batch.partition
+                    == state.invocation.batch.partition,
+                    "state_corrupt",
+                )
+                if attempt.purpose == "transient":
+                    require(previous is not None, "state_corrupt")
+                    require(
+                        attempt.prepared == previous.prepared, "state_corrupt"
+                    )
+                    require(
+                        previous.reason
+                        in {"transport", "timeout", "rate_limit", "cancelled"},
+                        "state_corrupt",
+                    )
+                else:
+                    require(
+                        (attempt.purpose == "initial") == (previous is None),
+                        "state_corrupt",
+                    )
+                    expected = view.prepare(
+                        attempt.item_keys,
+                        repair=attempt.purpose == "repair",
+                        partition=state.invocation.batch.partition,
+                        reason=previous.reason
+                        if previous is not None
+                        else None,
+                    )
+                    require(
+                        expected.metadata == attempt.prepared,
+                        "request_mismatch",
+                    )
+                previous = attempt
+        self._requests.add(history_key)
+
+    def required(
+        self,
+        invocation: ArtifactInvocation,
+        requests: tuple[PreparedMetadata, ...],
+    ) -> StageInputs:
+        """Persisted producers must all match the declared current codec."""
+        view = self.select(invocation, requests)
+        require(view is not None, "request_mismatch")
+        return view
+
+    def candidate(
+        self,
+        artifact: StoredArtifact,
+        run: RunIdentity,
+        history: LineageState | None,
+    ) -> bool:
+        """Audit producer and available history after the runtime checks results."""
+        ProducerDescriptor(
+            original_run=run,
+            invocation=artifact.invocation,
+            requests=(artifact.production_request,),
+        )
+        selected = self.select(
+            artifact.invocation, (artifact.production_request,)
+        )
+        if history is not None:
+            original = self.select(history.invocation, (), history=history)
+            if selected is not None:
+                require(
+                    history.invocation == artifact.invocation
+                    or original is None,
+                    "state_corrupt",
+                )
+        return selected is not None
+
+    def complete_collision(
+        self,
+        invocation: ArtifactInvocation,
+        history: LineageState,
+        artifacts: tuple[StoredArtifact, ...],
+    ) -> tuple[StoredArtifact, ...]:
+        """Reuse complete originals sharing L with a proved different codec.
+
+        Reuse exact results without ensure(), state replacement or attempts.
+        Incomplete originals cannot acquire a fresh allowance from the collision.
+        """
+        require(
+            self.select(history.invocation, (), history=history) is None,
+            "state_corrupt",
+        )
+        complete = {
+            a.lookup.item_key: a
+            for a in artifacts
+            if a.invocation == invocation
+        }
+        require(
+            set(complete) == set(invocation.batch.item_keys),
+            "results_unavailable",
+        )
+        return tuple(complete[k] for k in invocation.batch.item_keys)
+
+
 class BatchedNarrator:
     """One approved generation job; new instances resume original durable work."""
 
@@ -1279,6 +1687,16 @@ class BatchedNarrator:
         """Write one complete identity with atomic replacement and synced bytes."""
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         destination = directory / f"{self.inputs.run.digest}.json"
+        if destination.exists():
+            try:
+                existing = RunIdentity.model_validate_json(
+                    destination.read_bytes()
+                )
+                require(existing == self.inputs.run, "state_corrupt")
+            except (OSError, ValueError):
+                msg = "state_corrupt"
+                raise ArtifactRuntimeError(msg) from None
+            return
         descriptor, path = tempfile.mkstemp(dir=directory, prefix=".run-")
         try:
             with os.fdopen(descriptor, "wb") as stream:
@@ -1306,132 +1724,171 @@ class BatchedNarrator:
             raise ArtifactRuntimeError(msg) from None
         return run
 
-    def execute(self, stage: StageInputs) -> tuple[StoredArtifact, ...]:
-        """Prefetch and resume full original invocations before packing misses."""
+    def execute(self, stage: StageInputs) -> tuple[StoredArtifact, ...]:  # noqa: C901 # Preserve one logical ownership pass across original views.
+        """Discover and audit every compatible original before packing new work."""
         self.stages.append(stage)
-        callbacks = stage.callbacks()
-        send = callbacks.send
+        replay = CodecReplay(stage)
+        stage.replay = replay
+        states = {}
+        originals = {}
+        for view in replay.views:
+            for state in self.runtime.pending_lineages(view.registry):
+                states[state.key] = state
+                selected = replay.select(state.invocation, (), history=state)
+                if selected is not None:
+                    originals[state.key] = (
+                        state.invocation,
+                        state.policy,
+                        selected,
+                    )
 
-        def approved_send(prepared: PreparedArtifactRequest) -> ProviderReply:
-            self.check_approval(self.approved_report)
-            return send(prepared)
+        def audit_candidate(artifact: StoredArtifact) -> bool:
+            # The runtime already checked structure, dependencies and result.
+            # The producer/run and every available attempt are also mandatory,
+            # even when the record proves that an older codec occupied L.
+            key = artifact.invocation.semantic_key
+            return replay.candidate(
+                artifact,
+                self.original_run(artifact.original_run_digest),
+                self.runtime.recovery.load(key) if key in states else None,
+            )
 
-        callbacks = BatchCallbacks(
-            prepare=callbacks.prepare,
-            send=approved_send,
-            validate=callbacks.validate,
-            envelope=callbacks.envelope,
-            split=callbacks.split,
-            check=callbacks.check,
+        hits = tuple(
+            artifact
+            for view in replay.views
+            for artifact in self.runtime.prefetch(
+                tuple(view.lookups.values()),
+                view.registry,
+                view.validate,
+                audit_candidate=audit_candidate,
+            )
         )
-        hits = self.runtime.prefetch(
-            tuple(stage.lookups.values()), stage.registry, stage.validate
-        )
-        for artifact in hits:
-            stage.audit(artifact.invocation, (artifact.production_request,))
-            self.original_run(artifact.original_run_digest)
         self.reused.update(a.record.semantic_key for a in hits)
-        states = self.runtime.pending_lineages(stage.registry)
-        originals = {
-            s.invocation.semantic_key: (s.invocation, s.policy) for s in states
-        }
         for artifact in hits:
             originals.setdefault(
-                artifact.invocation.semantic_key, (artifact.invocation, None)
-            )
-        claimed: set[str] = set()
-        jobs = []
-        overlapping = False
-        for invocation, policy in originals.values():
-            stage.audit(invocation, ())
-            keys = set(invocation.batch.item_keys)
-            shared = bool(claimed.intersection(keys))
-            # Planning audits must form a bijection over structural cards.
-            # Detail receipts can retain different full original peer sets.
-            require(not shared or stage.stage == "detail", "pending_lineage")
-            overlapping = overlapping or shared
-            claimed.update(keys)
-            kwargs = {"policy": policy} if policy is not None else {}
-            jobs.append(
-                SemanticJob(
-                    invocation.semantic_key,
-                    lambda invocation=invocation,
-                    kwargs=kwargs: self.runtime.execute_batch(
-                        invocation,
-                        stage.registry,
-                        callbacks,
-                        available=hits,
-                        **kwargs,
+                artifact.invocation.semantic_key,
+                (
+                    artifact.invocation,
+                    None,
+                    replay.required(
+                        artifact.invocation, (artifact.production_request,)
                     ),
-                )
+                ),
             )
-        # Finish every required original lineage before calculating fresh batch
-        # boundaries. A failed old budget cannot be hidden by new work.
-        if overlapping:
-            outcomes = self.resume_overlapping(
-                stage, callbacks, originals, hits
-            )
-        else:
-            outcomes = (
-                self.runtime.run_stage(stage.stage, jobs) if jobs else []
-            )
-        jobs = []
-        for batch in stage.pack(
-            tuple(k for k in stage.items if k not in claimed)
-        ):
-            invocation = stage.invocation(batch)
-            jobs.append(
-                SemanticJob(
-                    invocation.semantic_key,
-                    lambda invocation=invocation: self.runtime.execute_batch(
-                        invocation, stage.registry, callbacks
-                    ),
-                )
-            )
-        if jobs:
-            outcomes.extend(self.runtime.run_stage(stage.stage, jobs))
-        artifacts = {
-            a.lookup.item_key: a
-            for outcome in outcomes
-            for a in outcome.artifacts
-        }
-        require(set(artifacts) == set(stage.items), "coverage")
-        return tuple(artifacts[k] for k in stage.items)
 
-    def resume_overlapping(
-        self,
-        stage: StageInputs,
-        callbacks: BatchCallbacks,
-        originals: dict,
-        hits: tuple[StoredArtifact, ...],
-    ) -> list:
-        """Resume overlapping detail lineages serially under their original caps.
-
-        A shared valid result retains its actual producer and all original peers.
-        Subsequent lineages receive it through the runtime's current validator.
-        A terminal failure stops before another lineage can spend a new slot.
-        """
-        available = {a.lookup.item_key: a for a in hits}
-        outcomes = []
-        for invocation, policy in originals.values():
-            kwargs = {"policy": policy} if policy is not None else {}
-            current = tuple(available.values())
-            job = SemanticJob(
-                invocation.semantic_key,
-                lambda invocation=invocation,
-                kwargs=kwargs,
-                current=current: self.runtime.execute_batch(
+        settled = []
+        for key, (invocation, _policy, _view) in tuple(originals.items()):
+            if key not in states or states[key].invocation == invocation:
+                continue
+            settled.extend(
+                replay.complete_collision(
                     invocation,
-                    stage.registry,
+                    self.runtime.recovery.load(key),
+                    hits,
+                )
+            )
+            del originals[key]
+
+        def job(
+            invocation: ArtifactInvocation,
+            policy: RetryPolicy | None,
+            view: StageInputs,
+            available: tuple[StoredArtifact, ...],
+        ) -> SemanticJob:
+            callbacks = view.callbacks()
+            send = callbacks.send
+
+            def approved_send(
+                prepared: PreparedArtifactRequest,
+            ) -> ProviderReply:
+                self.check_approval(self.approved_report)
+                return send(prepared)
+
+            callbacks = BatchCallbacks(
+                prepare=callbacks.prepare,
+                send=approved_send,
+                validate=callbacks.validate,
+                envelope=callbacks.envelope,
+                split=callbacks.split,
+                check=callbacks.check,
+            )
+            kwargs = {"policy": policy} if policy is not None else {}
+            return SemanticJob(
+                invocation.semantic_key,
+                lambda: self.runtime.execute_batch(
+                    invocation,
+                    view.registry,
                     callbacks,
-                    available=current,
+                    available=available,
+                    audit_candidate=audit_candidate,
                     **kwargs,
                 ),
             )
-            outcome = self.runtime.run_stage(stage.stage, [job])[0]
-            outcomes.append(outcome)
-            available.update((a.lookup.item_key, a) for a in outcome.artifacts)
-        return outcomes
+
+        claimed = {a.lookup.item_key for a in settled}
+        overlapping = False
+        for invocation, _policy, _view in originals.values():
+            keys = set(invocation.batch.item_keys)
+            shared = bool(claimed.intersection(keys))
+            require(not shared or stage.stage == "detail", "pending_lineage")
+            overlapping = overlapping or shared
+            claimed.update(keys)
+        # Preserve serial replay of overlapping detail producers, including
+        # their full peers and independent original configuration registries.
+        outcomes = []
+        if overlapping:
+            available = list(hits)
+            for invocation, policy, view in originals.values():
+                outcome = self.runtime.run_stage(
+                    stage.stage,
+                    [job(invocation, policy, view, tuple(available))],
+                )[0]
+                outcomes.append(outcome)
+                available.extend(outcome.artifacts)
+        elif originals:
+            outcomes = self.runtime.run_stage(
+                stage.stage,
+                [
+                    job(invocation, policy, view, hits)
+                    for invocation, policy, view in originals.values()
+                ],
+            )
+        jobs = []
+        fresh = tuple(k for k in stage.items if k not in claimed)
+        # Zero ordinarily retains L. Only keys with a proved historical L
+        # collision use C(0), so unrelated zero-layer work keeps its old keys.
+        for view, keys in (
+            (
+                replay.views[0],
+                tuple(
+                    k
+                    for k in fresh
+                    if replay.layers or k not in replay.collisions
+                ),
+            ),
+            (
+                replay.bound,
+                tuple(
+                    k
+                    for k in fresh
+                    if not replay.layers and k in replay.collisions
+                ),
+            ),
+        ):
+            jobs.extend(
+                job(view.invocation(batch), None, view, ())
+                for batch in view.pack(keys)
+            )
+        if jobs:
+            outcomes.extend(self.runtime.run_stage(stage.stage, jobs))
+        artifacts = {a.lookup.item_key: a for a in settled}
+        artifacts.update(
+            (a.lookup.item_key, a)
+            for outcome in outcomes
+            for a in outcome.artifacts
+        )
+        require(set(artifacts) == set(stage.items), "coverage")
+        return tuple(artifacts[k] for k in stage.items)
 
     def generate(self, report: dict) -> dict:
         """Generate and validate a v2 candidate without applying it to the reader."""
@@ -1475,7 +1932,7 @@ class BatchedNarrator:
                 a.invocation.semantic_key: a.invocation for a in result
             }
             audits.extend(
-                stage.subject_audit(invocation)
+                stage.replay.required(invocation, ()).subject_audit(invocation)
                 for invocation in invocations.values()
             )
             planning.update(
@@ -1507,6 +1964,7 @@ class BatchedNarrator:
             current_usage=CurrentUsage(**self.usage.report()),
             ledger_digest=self.inputs.ledger.id,
             ledger_parameters=self.options.ledger,
+            request_configuration=self.inputs.transport.descriptor,
             unit_keys=tuple(self.inputs.index.units),
             details=detail_results,
             plan=plan,
@@ -1541,7 +1999,7 @@ class BatchedNarrator:
             require(
                 all(stages[k] is stage for k in keys), "dependencies_changed"
             )
-            stage.audit(producer.invocation, producer.requests)
+            stage.replay.required(producer.invocation, producer.requests)
         for result in (
             *manifest.details,
             *manifest.planning,
@@ -1556,15 +2014,26 @@ def validate_production(
     report: dict,
     manifest: GenerationManifest,
     *,
-    provider: object,
+    provider: object | None = None,
     options: V2Options | None = None,
     candidate: dict | None = None,
-) -> None:
-    """Rebuild trusted inputs and exact request audits locally, with no provider send."""
+) -> dict:
+    """Rebuild all current proofs; default to the pure persisted codec.
+
+    Return the deterministic annotation candidate for this validated boundary.
+    A supplied provider remains a compatibility check, not an offline requirement.
+    """
     manifest = GenerationManifest.model_validate(manifest)
-    inputs = ProductionInputs(
-        report, Transport(provider, options or V2Options())
+    descriptor = manifest.request_configuration
+    transport = OfflineTransport(descriptor)
+    require(
+        options is None or options == descriptor.options,
+        "dependencies_changed",
     )
+    if provider is not None:
+        live = Transport(provider, descriptor.options)
+        require(live.descriptor == descriptor, "dependencies_changed")
+    inputs = ProductionInputs(report, transport)
     require(
         compiler_fact_signature(report) == manifest.compiler_fact_signature,
         "dependencies_changed",
@@ -1597,6 +2066,7 @@ def validate_production(
         require(
             {result_key(r) for r in results} == set(stage.items), "coverage"
         )
+        replay = CodecReplay(stage)
         for key in dict.fromkeys(
             receipts[result_key(r)].producer_key for r in results
         ):
@@ -1606,10 +2076,10 @@ def validate_production(
                 set(producer.invocation.batch.item_keys) <= set(stage.items),
                 "dependencies_changed",
             )
-            stage.audit(producer.invocation, producer.requests)
+            view = replay.required(producer.invocation, producer.requests)
             audited.add(key)
             if stage.stage == "planning":
-                audit = stage.subject_audit(producer.invocation)
+                audit = view.subject_audit(producer.invocation)
                 actual_audits[audit.id] = audit
         for result in results:
             key = result_key(result)
@@ -1649,8 +2119,11 @@ def validate_production(
     validate_support_forest(
         prose, inputs.sources, {r.item_key: r for r in prose}
     )
+    expected = assemble_candidate(
+        report, manifest, ledger=inputs.ledger, index=inputs.index
+    )
     if candidate is not None:
-        expected = assemble_candidate(
-            report, manifest, ledger=inputs.ledger, index=inputs.index
+        require(
+            canonical_bytes(candidate) == canonical_bytes(expected), "coverage"
         )
-        require(candidate == expected, "coverage")
+    return expected

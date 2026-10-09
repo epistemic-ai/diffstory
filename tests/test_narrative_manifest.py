@@ -103,7 +103,15 @@ def manifest_fixture() -> tuple[dict, GenerationManifest]:
                     disposition="sent",
                 )
             )
+    from test_narrative_v2 import FixtureProvider
+
+    from diffstory.narrative_v2 import Transport
+    from diffstory.narrative_v2 import V2Options
+
     manifest = GenerationManifest(
+        request_configuration=Transport(
+            FixtureProvider(), V2Options()
+        ).descriptor,
         run=run,
         compiler_fact_signature=compiler_fact_signature(report),
         current_usage=CurrentUsage(

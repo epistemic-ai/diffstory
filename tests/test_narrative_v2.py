@@ -80,6 +80,7 @@ def statement(text: str, support: dict | None = None) -> dict:
 class FixtureProvider:
     """Return authored normalization prose and retain only local fixture requests."""
 
+    request_protocol = "diffstory.fixture-json.v1"
     name = "fixture"
     model = "fixture-v2"
     destination = "fixture://local"
@@ -1854,6 +1855,7 @@ class ProductionRepairTests(unittest.TestCase):
         """Provider framing and an extra JSON string layer enter every size check."""
 
         class LayeredFixture(FixtureProvider):
+            request_json_layers = 1
             request_prefix = b"local fixture framing\n"
             input_overhead_bytes = 113
 
@@ -2070,3 +2072,830 @@ class ProductionRepairTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FramedFixture(FixtureProvider):
+    """Use the same adapter class with any declared closed fixture framing."""
+
+    def __init__(self, layers: int = 0, hook: object = None) -> None:
+        """Select framing before the transport captures its configuration."""
+        super().__init__(hook)
+        self.request_json_layers = layers
+
+    def prepare(self, *args: object) -> bytes:
+        """Wrap exact fixture bytes with the declared number of JSON layers."""
+        raw = super().prepare(*args)
+        for _ in range(self.request_json_layers):
+            raw = canonical_bytes({"payload": raw.decode()})
+        return raw
+
+    def complete_reply(
+        self, body: bytes, timeout: float, *, response_byte_limit: int
+    ) -> ProviderReply:
+        """Unwrap only the declared framing before returning fixture prose."""
+        for _ in range(self.request_json_layers):
+            body = json.loads(body)["payload"].encode()
+        return super().complete_reply(
+            body, timeout, response_byte_limit=response_byte_limit
+        )
+
+
+class CodecReplayTests(unittest.TestCase):
+    """Public narration must distinguish codecs without resetting legacy budgets."""
+
+    def setUp(self) -> None:
+        """Keep every issuance and replay isolated on local storage."""
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.options = V2Options(
+            packing=RequestPackingLimits(stable_partition_count=1)
+        )
+
+    def narrator(
+        self,
+        provider: FixtureProvider,
+        *,
+        state: str = "state",
+        cached: bool = True,
+    ) -> Narrator:
+        """Construct the actual public gated narrator."""
+        return Narrator(
+            provider,
+            architecture="v2",
+            concurrency=1,
+            recovery_dir=self.root / state,
+            checkpoint_dir=self.root / "cache" if cached else None,
+            v2_options=self.options,
+        )
+
+    def legacy(
+        self, provider: FixtureProvider, report: dict, *, cached: bool = True
+    ) -> tuple:
+        """Issue real requests under the f9a62a6 identity, before any record exists.
+
+        The old transport hashed this exact legacy payload for every framing.
+        Only this issuance fixture selects that old formula. Runtime preparation,
+        reservation, sends, artifact commits and producer runs remain actual.
+        No issued record, receipt, invocation or request is relabelled.
+        """
+        from diffstory.narrative_plan import semantic_digest
+        from diffstory.narrative_runtime import ArtifactRuntime
+        from diffstory.narrative_v2 import ProductionInputs
+        from diffstory.narrative_v2 import StageInputs
+        from diffstory.narrative_v2 import Transport
+
+        transport = Transport(provider, self.options)
+        transport.config_digest = semantic_digest(
+            "diffstory.transport.v2",
+            transport.descriptor.legacy_configuration(),
+        )
+        inputs = ProductionInputs(report, transport)
+        stage = StageInputs(inputs, "detail", inputs.detail_items())
+        runtime = ArtifactRuntime(
+            inputs.run,
+            recovery_dir=self.root / "state",
+            artifact_dir=self.root / "cache" if cached else None,
+        )
+        directory = self.root / "state" / "producer-runs-v2"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{inputs.run.digest}.json").write_text(
+            inputs.run.model_dump_json()
+        )
+        invocations = tuple(
+            stage.invocation(b) for b in stage.pack(tuple(stage.items))
+        )
+        return inputs, stage, runtime, invocations
+
+    def issue(
+        self, provider: FixtureProvider, report: dict, *, cached: bool = True
+    ) -> tuple:
+        """Commit actual successful legacy detail requests through the runtime."""
+        inputs, stage, runtime, invocations = self.legacy(
+            provider, report, cached=cached
+        )
+        artifacts = []
+        for invocation in invocations:
+            artifacts.extend(
+                runtime.execute_batch(
+                    invocation, stage.registry, stage.callbacks()
+                ).artifacts
+            )
+        return inputs, stage, runtime, tuple(artifacts)
+
+    def offline(self, report: dict, candidate: dict) -> GenerationManifest:
+        """Validate, apply, reload and render with provider operations disabled."""
+        from diffstory.analysis import apply_annotations
+        from diffstory.render import render
+
+        manifest = GenerationManifest.model_validate_json(
+            json.dumps(candidate["generation"])
+        )
+        with (
+            patch.object(
+                FramedFixture, "prepare", side_effect=AssertionError("prepare")
+            ),
+            patch.object(
+                FramedFixture,
+                "require_credentials",
+                side_effect=AssertionError("credentials"),
+            ),
+            patch.object(
+                FramedFixture,
+                "complete_reply",
+                side_effect=AssertionError("send"),
+            ),
+            patch(
+                "diffstory.narrative.OpenAIResponsesProvider.__init__",
+                side_effect=AssertionError("provider"),
+            ),
+            patch("shutil.which", side_effect=AssertionError("executable")),
+            patch("subprocess.Popen", side_effect=AssertionError("process")),
+            patch("socket.socket", side_effect=AssertionError("network")),
+        ):
+            validate_generation(report, manifest, candidate=candidate)
+            applied = apply_annotations(report, candidate)
+            loaded = json.loads(json.dumps(applied))
+            html = render(loaded)
+            self.assertIn("Normalization", html)
+        return manifest
+
+    def test_codec_changes_with_fresh_and_retained_recovery(self) -> None:
+        """New framing receives independent work under fresh and retained recovery."""
+        for before, after in ((0, 1), (1, 2)):
+            for retained in (False, True):
+                with self.subTest(
+                    before=before, after=after, retained=retained
+                ):
+                    # Independent directories for every public transition.
+                    self.root = (
+                        Path(self.temp.name) / f"{before}-{after}-{retained}"
+                    )
+                    report = golden_report(1)
+                    first = self.narrator(FramedFixture(before)).generate(
+                        report
+                    )
+                    provider = FramedFixture(after)
+                    second = self.narrator(
+                        provider, state="state" if retained else "new-state"
+                    ).generate(report)
+                    self.assertTrue(
+                        any(
+                            c["data"]["stage"] == "detail"
+                            for c in provider.calls
+                        )
+                    )
+                    left = GenerationManifest.model_validate_json(
+                        json.dumps(first["generation"])
+                    )
+                    right = self.offline(report, second)
+                    self.assertNotEqual(
+                        left.request_configuration.configuration_digest,
+                        right.request_configuration.configuration_digest,
+                    )
+                    self.assertEqual(left.details, right.details)
+                    self.assertTrue(
+                        {p.key for p in left.producers}.isdisjoint(
+                            p.key for p in right.producers
+                        )
+                    )
+                    warm = FramedFixture(after)
+                    self.narrator(warm, state="warm-state").generate(report)
+                    self.assertEqual(warm.calls, [])
+
+    def test_genuine_legacy_layer_one_reuses_exact_originals_and_mixed_manifest(
+        self,
+    ) -> None:
+        """Mixed original and new producers retain exact old receipts and requests."""
+        from diffstory.narrative_manifest import build_receipts
+
+        report = golden_report(1)
+        inputs, _stage, runtime, artifacts = self.issue(
+            FramedFixture(1), report
+        )
+        before = tuple(
+            runtime.recovery.load(a.invocation.semantic_key) for a in artifacts
+        )
+        producers, receipts = build_receipts(
+            artifacts,
+            lambda _digest: inputs.run,
+            frozenset(a.record.semantic_key for a in artifacts),
+        )
+        provider = FramedFixture(1)
+        candidate = self.narrator(provider).generate(golden_report(2))
+        manifest = self.offline(golden_report(2), candidate)
+        self.assertTrue(all(p in manifest.producers for p in producers))
+        self.assertTrue(all(r in manifest.receipts for r in receipts))
+        self.assertEqual(
+            tuple(
+                runtime.recovery.load(a.invocation.semantic_key)
+                for a in artifacts
+            ),
+            before,
+        )
+        old_keys = {a.lookup.item_key for a in artifacts}
+        self.assertTrue(old_keys < set(manifest.unit_keys))
+        # Only the new source unit receives a new detail send.
+        detail_calls = [
+            c for c in provider.calls if c["data"]["stage"] == "detail"
+        ]
+        self.assertEqual(len(detail_calls), 1)
+        self.assertEqual(
+            len(detail_calls[0]["data"]["items"]),
+            len(set(manifest.unit_keys) - old_keys),
+        )
+        warm = FramedFixture(1)
+        self.narrator(warm).generate(golden_report(2))
+        self.assertEqual(warm.calls, [])
+
+    def test_legacy_success_same_report_has_zero_detail_sends(self) -> None:
+        """An unchanged legacy framing reuses every detail without a send."""
+        report = golden_report(1)
+        _inputs, _stage, _runtime, artifacts = self.issue(
+            FramedFixture(1), report
+        )
+        provider = FramedFixture(1)
+        manifest = self.offline(
+            report, self.narrator(provider).generate(report)
+        )
+        self.assertFalse(
+            any(c["data"]["stage"] == "detail" for c in provider.calls)
+        )
+        self.assertEqual(
+            {
+                r.artifact_key
+                for r in manifest.receipts
+                if r.result_kind == "detail"
+            },
+            {a.record.semantic_key for a in artifacts},
+        )
+
+    def test_reverse_legacy_layer_one_collision_keeps_origin_and_uses_closed_zero(
+        self,
+    ) -> None:
+        """Proved historical collisions move only affected fresh work to C(0)."""
+        report = golden_report(1)
+        _inputs, stage, runtime, artifacts = self.issue(
+            FramedFixture(1), report
+        )
+        original = runtime.recovery.load(artifacts[0].invocation.semantic_key)
+        provider = FramedFixture(0)
+        manifest = self.offline(
+            report, self.narrator(provider).generate(report)
+        )
+        descriptor = manifest.request_configuration
+        configs = {
+            d.digest
+            for p in manifest.producers
+            if p.invocation.batch.stage == "detail"
+            for d in p.invocation.dependencies
+            if d.kind == "configuration"
+        }
+        self.assertEqual(configs, {descriptor.identity_digest("codec")})
+        self.assertEqual(runtime.recovery.load(original.key), original)
+        self.assertNotEqual(
+            stage.static,
+            next(
+                p.invocation.lookups[0].static_dependencies
+                for p in manifest.producers
+                if p.invocation.batch.stage == "detail"
+            ),
+        )
+        warm = FramedFixture(0)
+        self.narrator(warm).generate(report)
+        self.assertEqual(warm.calls, [])
+
+    def test_legacy_cacheless_exhaustion_and_missing_results_never_get_new_allowance(
+        self,
+    ) -> None:
+        """Completed or exhausted legacy work retains its original durable limit."""
+        for mode in ("exhausted", "missing"):
+            with self.subTest(mode=mode):
+                self.root = Path(self.temp.name) / mode
+                report = golden_report(1)
+                provider = FramedFixture(
+                    1,
+                    (lambda _p, _d, _r: b"{") if mode == "exhausted" else None,
+                )
+                _inputs, stage, runtime, invocations = self.legacy(
+                    provider, report, cached=False
+                )
+                if mode == "exhausted":
+                    with self.assertRaises(ArtifactRuntimeError):
+                        runtime.execute_batch(
+                            invocations[0], stage.registry, stage.callbacks()
+                        )
+                else:
+                    runtime.execute_batch(
+                        invocations[0], stage.registry, stage.callbacks()
+                    )
+                old = runtime.recovery.load(invocations[0].semantic_key)
+                fresh = FramedFixture(1)
+                with self.assertRaises(RuntimeStageError) as caught:
+                    self.narrator(fresh, cached=False).generate(report)
+                self.assertEqual(fresh.calls, [])
+                self.assertEqual(runtime.recovery.load(old.key), old)
+                if mode == "missing":
+                    self.assertEqual(
+                        caught.exception.diagnostic.reason,
+                        "results_unavailable",
+                    )
+
+    def test_legacy_partial_and_interrupted_transient_keep_original_remaining_limits(
+        self,
+    ) -> None:
+        """Replay consumes only the original remaining reservations."""
+        for mode in ("initial", "partial", "transient"):
+            with self.subTest(mode=mode):
+                self.root = Path(self.temp.name) / mode
+                report = golden_report(2)
+
+                def fault(
+                    provider: FixtureProvider,
+                    _data: dict,
+                    response: dict,
+                    mode: str = mode,
+                ) -> dict:
+                    if mode == "partial" and len(provider.calls) == 1:
+                        response["items"].pop()
+                        return response
+                    if mode == "transient" and len(provider.calls) == 1:
+                        msg = "transport"
+                        raise ArtifactCallError(msg)
+                    raise KeyboardInterrupt
+
+                provider = FramedFixture(1, fault)
+                _inputs, stage, runtime, invocations = self.legacy(
+                    provider, report
+                )
+                with self.assertRaises(KeyboardInterrupt):
+                    runtime.execute_batch(
+                        invocations[0], stage.registry, stage.callbacks()
+                    )
+                old = runtime.recovery.load(invocations[0].semantic_key)
+                resumed = FramedFixture(1)
+                if mode == "transient":
+                    with self.assertRaises(RuntimeStageError):
+                        self.narrator(resumed).generate(report)
+                    self.assertEqual(resumed.calls, [])
+                    self.assertEqual(
+                        runtime.recovery.load(old.key).consumed_attempts,
+                        old.consumed_attempts,
+                    )
+                    continue
+                manifest = self.offline(
+                    report, self.narrator(resumed).generate(report)
+                )
+                new = runtime.recovery.load(old.key)
+                self.assertEqual(new.invocation, old.invocation)
+                self.assertEqual(new.policy, old.policy)
+                self.assertEqual(
+                    new.consumed_attempts, old.consumed_attempts + 1
+                )
+                detail = [
+                    c for c in resumed.calls if c["data"]["stage"] == "detail"
+                ]
+                self.assertEqual(len(detail), 1)
+                if mode != "transient":
+                    self.assertEqual(detail[0], provider.calls[-1])
+                self.assertEqual(
+                    {
+                        r.item_key
+                        for r in manifest.receipts
+                        if r.result_kind == "detail"
+                    },
+                    set(manifest.unit_keys),
+                )
+
+    def test_both_legacy_candidate_orders_and_internal_recovery_are_audited(
+        self,
+    ) -> None:
+        """Another framing cannot hide a later compatible record in any cache path."""
+        from diffstory.narrative_runtime import ArtifactRuntime
+        from diffstory.narrative_v2 import CodecReplay
+        from diffstory.narrative_v2 import ProductionInputs
+        from diffstory.narrative_v2 import StageInputs
+        from diffstory.narrative_v2 import Transport
+
+        report = golden_report(1)
+        self.root = Path(self.temp.name) / "zero"
+        _i, _s, _r, other = self.issue(FramedFixture(0), report)
+        self.root = Path(self.temp.name) / "one"
+        inputs, stage, runtime, current = self.issue(FramedFixture(1), report)
+        for artifact in other:
+            runtime.artifacts.commit(artifact)
+        live = ProductionInputs(
+            report, Transport(FramedFixture(1), self.options)
+        )
+        replay = CodecReplay(StageInputs(live, "detail", live.detail_items()))
+        view = replay.legacy
+
+        def audit(artifact: object) -> bool:
+            return (
+                replay.select(
+                    artifact.invocation, (artifact.production_request,)
+                )
+                is not None
+            )
+
+        native_sorted = sorted
+        for reverse in (False, True):
+
+            def ordered(
+                values: object,
+                *args: object,
+                reverse: bool = reverse,
+                **kwargs: object,
+            ) -> list:
+                result = native_sorted(values, *args, **kwargs)
+                return (
+                    list(reversed(result))
+                    if reverse and result and isinstance(result[0], Path)
+                    else result
+                )
+
+            with patch(
+                "diffstory.narrative_runtime.sorted",
+                side_effect=ordered,
+                create=True,
+            ):
+                for artifact in current:
+                    found = runtime.artifacts.lookup(
+                        artifact.lookup,
+                        view.registry,
+                        view.validate,
+                        audit_candidate=audit,
+                    )
+                    self.assertEqual(found, artifact)
+                for supplied in ((), (*other, *current), (*current, *other)):
+                    state = (
+                        self.root
+                        / f"internal-{reverse}-{len(supplied)}-{bool(supplied and supplied[0] == current[0])}"
+                    )
+                    fresh = ArtifactRuntime(
+                        inputs.run,
+                        recovery_dir=state,
+                        artifact_dir=self.root / "cache",
+                    )
+                    outcome = fresh.execute_batch(
+                        current[0].invocation,
+                        stage.registry,
+                        stage.callbacks(),
+                        available=supplied,
+                        audit_candidate=audit,
+                    )
+                    self.assertEqual(outcome.artifacts, current)
+                    self.assertEqual(fresh.usage.report()["calls"], 0)
+                for recovery in (f"public-{reverse}", "state"):
+                    provider = FramedFixture(1)
+                    candidate = self.narrator(
+                        provider, state=recovery
+                    ).generate(report)
+                    self.offline(report, candidate)
+                    self.assertFalse(
+                        any(
+                            c["data"]["stage"] == "detail"
+                            for c in provider.calls
+                        )
+                    )
+
+    def test_damaged_legacy_requests_fail_closed_before_any_new_send(  # noqa: C901 # Independent corruption dimensions.
+        self,
+    ) -> None:
+        """Rehashed metadata and attempt corruption cannot prove another codec."""
+        from diffstory.narrative_plan import content_digest
+
+        for mutation in (
+            "request",
+            "bound",
+            "attempt",
+            "policy",
+            "peer",
+            "context",
+            "run",
+        ):
+            with self.subTest(mutation=mutation):
+                self.root = Path(self.temp.name) / mutation
+                report = golden_report(1)
+                _inputs, _stage, runtime, artifacts = self.issue(
+                    FramedFixture(1), report
+                )
+                original = artifacts[0]
+                path = (
+                    runtime.recovery.directory
+                    / f"{original.invocation.semantic_key}.json"
+                )
+                saved = json.loads(path.read_text())
+                if mutation == "request":
+                    saved["state"]["invocation"]["batch"]["request_digest"] = (
+                        "a" * 64
+                    )
+                elif mutation == "bound":
+                    saved["state"]["invocation"]["batch"]["input_bound"] += 1
+                elif mutation == "attempt":
+                    saved["state"]["nodes"][0]["attempts"][0]["prepared"][
+                        "overhead_bytes"
+                    ] += 1
+                elif mutation == "policy":
+                    saved["state"]["policy"]["total_attempts"] = 120
+                elif mutation == "peer":
+                    saved["state"]["invocation"]["batch"]["item_keys"] = []
+                elif mutation == "context":
+                    for dependency in saved["state"]["invocation"][
+                        "dependencies"
+                    ]:
+                        if dependency["kind"] == "context":
+                            dependency["digest"] = "a" * 64
+                else:
+                    run = (
+                        self.root
+                        / "state"
+                        / "producer-runs-v2"
+                        / f"{original.original_run_digest}.json"
+                    )
+                    value = json.loads(run.read_text())
+                    value["model"] = "wrong-model"
+                    run.write_text(json.dumps(value))
+                if mutation != "run":
+                    saved["digest"] = content_digest(
+                        canonical_bytes(saved["state"])
+                    )
+                    path.write_text(json.dumps(saved))
+                provider = FramedFixture(0)
+                with self.assertRaises(
+                    (ArtifactRuntimeError, RuntimeStageError)
+                ):
+                    self.narrator(provider).generate(report)
+                self.assertEqual(provider.calls, [])
+
+    def test_memoization_binds_complete_requests_and_current_payload(
+        self,
+    ) -> None:
+        """An exact audit can be reused; a rehashed bound or payload cannot."""
+        from dataclasses import replace
+        from types import MappingProxyType
+
+        from diffstory.narrative_runtime import PreparedMetadata
+        from diffstory.narrative_v2 import CodecReplay
+        from diffstory.narrative_v2 import ProductionInputs
+        from diffstory.narrative_v2 import StageInputs
+        from diffstory.narrative_v2 import Transport
+
+        report = golden_report(1)
+        _i, _s, _r, artifacts = self.issue(FramedFixture(1), report)
+        inputs = ProductionInputs(
+            report, Transport(FramedFixture(1), self.options)
+        )
+        replay = CodecReplay(
+            StageInputs(inputs, "detail", inputs.detail_items())
+        )
+        artifact = artifacts[0]
+        with (
+            patch.object(
+                replay.legacy, "reconstruct", wraps=replay.legacy.reconstruct
+            ) as reconstruct,
+            patch.object(
+                replay.stage,
+                "identity_view",
+                side_effect=AssertionError("registry rebuilt per candidate"),
+            ),
+        ):
+            for _ in range(3):
+                replay.required(
+                    artifact.invocation, (artifact.production_request,)
+                )
+            self.assertEqual(reconstruct.call_count, 1)
+            data = artifact.production_request.model_dump()
+            data["safety_tokens"] += 1
+            altered = PreparedMetadata.model_validate(data)
+            with self.assertRaisesRegex(
+                ArtifactRuntimeError, "request_mismatch"
+            ):
+                replay.required(artifact.invocation, (altered,))
+        original_limits = replay.legacy.transport.limits
+        replay.legacy.transport.limits = RequestPackingLimits(
+            **(
+                original_limits.model_dump()
+                | {"safety_tokens": original_limits.safety_tokens + 1}
+            )
+        )
+        with self.assertRaises(ArtifactRuntimeError):
+            replay.required(
+                artifact.invocation, (artifact.production_request,)
+            )
+        replay.legacy.transport.limits = original_limits
+        key = artifact.lookup.item_key
+        items = dict(replay.legacy.items)
+        items[key] = replace(
+            items[key],
+            payload=items[key].payload.replace(b"rstrip", b"lstrip"),
+        )
+        replay.legacy.items = MappingProxyType(items)
+        with self.assertRaises(ArtifactRuntimeError):
+            replay.required(
+                artifact.invocation, (artifact.production_request,)
+            )
+
+    def test_zero_protocol_or_layer_mutation_after_preview_stops_before_dispatch(
+        self,
+    ) -> None:
+        """Approval includes zero framing and the full known protocol tuple."""
+        report = golden_report(1)
+        for name, value in (
+            ("request_json_layers", 1),
+            ("request_protocol", "unknown"),
+        ):
+            provider = FramedFixture(0)
+            narrator = self.narrator(provider)
+            narrator.preview(report)
+            setattr(provider, name, value)
+            with self.assertRaisesRegex(
+                ArtifactRuntimeError, "dependencies_changed"
+            ):
+                narrator.generate(report)
+            self.assertEqual(provider.calls, [])
+
+    def test_reverse_collision_retains_compatible_zero_originals_in_one_stage(
+        self,
+    ) -> None:
+        """Mixed L histories retain compatible peers and assign C(0) only to misses."""
+        import shutil
+
+        from diffstory.narrative_manifest import build_receipts
+
+        self.root = Path(self.temp.name) / "zero"
+        inputs, _stage, zero_runtime, zeros = self.issue(
+            FramedFixture(0), golden_report(1)
+        )
+        zero_state = zero_runtime.recovery.load(
+            zeros[0].invocation.semantic_key
+        )
+        self.root = Path(self.temp.name) / "one"
+        _inputs, _stage, one_runtime, ones = self.issue(
+            FramedFixture(1), golden_report(2)
+        )
+        one_state = one_runtime.recovery.load(ones[0].invocation.semantic_key)
+        for artifact in zeros:
+            one_runtime.artifacts.commit(artifact)
+        for suffix in (".claim", ".json"):
+            shutil.copyfile(
+                zero_runtime.recovery.directory / f"{zero_state.key}{suffix}",
+                one_runtime.recovery.directory / f"{zero_state.key}{suffix}",
+            )
+        directory = self.root / "state" / "producer-runs-v2"
+        (directory / f"{inputs.run.digest}.json").write_text(
+            inputs.run.model_dump_json()
+        )
+        providers, receipts = build_receipts(
+            zeros,
+            lambda _digest: inputs.run,
+            frozenset(a.record.semantic_key for a in zeros),
+        )
+        provider = FramedFixture(0)
+        candidate = self.narrator(provider).generate(golden_report(2))
+        manifest = self.offline(golden_report(2), candidate)
+        self.assertTrue(all(p in manifest.producers for p in providers))
+        self.assertTrue(all(r in manifest.receipts for r in receipts))
+        self.assertEqual(one_runtime.recovery.load(zero_state.key), zero_state)
+        self.assertEqual(one_runtime.recovery.load(one_state.key), one_state)
+        calls = [c for c in provider.calls if c["data"]["stage"] == "detail"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]["data"]["items"]), 1)
+        warm = FramedFixture(0)
+        self.narrator(warm).generate(golden_report(2))
+        self.assertEqual(warm.calls, [])
+
+    def test_damaged_bound_codec_and_production_metadata_are_not_independence(
+        self,
+    ) -> None:
+        """Both closed identities and legacy cache-only metadata require byte proof."""
+        from diffstory.narrative_plan import content_digest
+        from diffstory.narrative_runtime import StoredArtifact
+
+        report = golden_report(1)
+        for source in ("bound-history", "legacy-artifact"):
+            with self.subTest(source=source):
+                self.root = Path(self.temp.name) / source
+                if source == "bound-history":
+                    self.narrator(FramedFixture(1)).generate(report)
+                    for path in (self.root / "state" / "recovery-v2").glob(
+                        "*.json"
+                    ):
+                        value = json.loads(path.read_text())
+                        if (
+                            value["state"]["invocation"]["batch"]["stage"]
+                            == "detail"
+                        ):
+                            value["state"]["nodes"][0]["attempts"][0][
+                                "prepared"
+                            ]["safety_tokens"] += 1
+                            value["digest"] = content_digest(
+                                canonical_bytes(value["state"])
+                            )
+                            path.write_text(json.dumps(value))
+                else:
+                    _i, _s, runtime, artifacts = self.issue(
+                        FramedFixture(1), report
+                    )
+                    for path in runtime.artifacts.directory.rglob("*.json"):
+                        path.unlink()
+                    for artifact in artifacts:
+                        data = artifact.model_dump()
+                        data["production_request"]["overhead_bytes"] += 1
+                        runtime.artifacts.commit(
+                            StoredArtifact.model_validate(data)
+                        )
+                provider = FramedFixture(2)
+                with self.assertRaises(
+                    (ArtifactRuntimeError, RuntimeStageError)
+                ):
+                    self.narrator(
+                        provider,
+                        state="fresh"
+                        if source == "legacy-artifact"
+                        else "state",
+                    ).generate(report)
+                self.assertEqual(provider.calls, [])
+
+    def test_legacy_completed_transient_audits_both_requests_without_detail_sends(
+        self,
+    ) -> None:
+        """Original transient bytes and spent reservations survive successful reuse."""
+        report = golden_report(1)
+
+        def fault(
+            provider: FixtureProvider, _data: dict, response: dict
+        ) -> dict:
+            if len(provider.calls) == 1:
+                msg = "rate_limit"
+                raise ArtifactCallError(msg)
+            return response
+
+        provider = FramedFixture(1, fault)
+        _i, _s, runtime, artifacts = self.issue(provider, report)
+        old = runtime.recovery.load(artifacts[0].invocation.semantic_key)
+        self.assertEqual(old.consumed_attempts, 2)
+        self.assertEqual(
+            old.nodes[0].attempts[0].prepared,
+            old.nodes[0].attempts[1].prepared,
+        )
+        fresh = FramedFixture(1)
+        candidate = self.narrator(fresh).generate(report)
+        self.offline(report, candidate)
+        self.assertFalse(
+            any(c["data"]["stage"] == "detail" for c in fresh.calls)
+        )
+        self.assertEqual(runtime.recovery.load(old.key), old)
+
+    def test_same_legacy_key_retains_complete_zero_results_without_touching_other_history(
+        self,
+    ) -> None:
+        """Exact complete zero originals survive a proved layer-one L state collision."""
+        from diffstory.narrative_manifest import build_receipts
+
+        report = golden_report(2)
+        self.root = Path(self.temp.name) / "zero"
+        inputs, _stage, _runtime, zeros = self.issue(FramedFixture(0), report)
+        self.root = Path(self.temp.name) / "one"
+        _inputs, _stage, runtime, ones = self.issue(FramedFixture(1), report)
+        old = runtime.recovery.load(ones[0].invocation.semantic_key)
+        self.assertEqual(old.key, zeros[0].invocation.semantic_key)
+        self.assertNotEqual(old.invocation, zeros[0].invocation)
+        for artifact in zeros:
+            runtime.artifacts.commit(artifact)
+        producers, receipts = build_receipts(
+            zeros,
+            lambda _digest: inputs.run,
+            frozenset(a.record.semantic_key for a in zeros),
+        )
+        provider = FramedFixture(0)
+        candidate = self.narrator(provider).generate(report)
+        manifest = self.offline(report, candidate)
+        self.assertTrue(all(p in manifest.producers for p in producers))
+        self.assertTrue(all(r in manifest.receipts for r in receipts))
+        self.assertFalse(
+            any(c["data"]["stage"] == "detail" for c in provider.calls)
+        )
+        self.assertEqual(runtime.recovery.load(old.key), old)
+        warm = FramedFixture(0)
+        self.narrator(warm).generate(report)
+        self.assertEqual(warm.calls, [])
+        # Losing one member of the complete original must not grant a new L
+        # or C(0) attempt while the other codec owns the durable key.
+        missing = zeros[-1]
+        for path in (runtime.artifacts.directory / missing.lookup.key).glob(
+            "*.json"
+        ):
+            value = json.loads(path.read_text())
+            if (
+                value["production_request"]["batch"]["request_digest"]
+                == missing.production_request.batch.request_digest
+            ):
+                path.unlink()
+        failed = FramedFixture(0)
+        with self.assertRaisesRegex(
+            ArtifactRuntimeError, "results_unavailable"
+        ):
+            self.narrator(failed).generate(report)
+        self.assertEqual(failed.calls, [])
+        self.assertEqual(runtime.recovery.load(old.key), old)

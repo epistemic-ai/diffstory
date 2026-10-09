@@ -3857,3 +3857,87 @@ class ProseArtifactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CandidateAuditTests(unittest.TestCase):
+    """The optional consumer audit controls selection without hiding failures."""
+
+    def test_candidate_audit_requires_bool_and_propagates_outside_cache_miss(
+        self,
+    ) -> None:
+        """Fetched, supplied and recovery-internal records share the same contract."""
+        invocation, registry, results = fixture_v2(1)
+        with tempfile.TemporaryDirectory() as directory:
+            sends = []
+            runtime = runtime_v2.ArtifactRuntime(
+                identity(), recovery_dir=directory, artifact_dir=directory
+            )
+            callbacks = ArtifactRuntimeTests().callbacks(results, sends)
+            outcome = runtime.execute_batch(invocation, registry, callbacks)
+            artifact = outcome.artifacts[0]
+            for value in (None, 1, "true", (), object()):
+
+                def invalid(
+                    _artifact: runtime_v2.StoredArtifact, value: object = value
+                ) -> object:
+                    return value
+
+                with self.subTest(value_type=type(value).__name__):
+                    with self.assertRaisesRegex(
+                        runtime_v2.ArtifactRuntimeError, "request_mismatch"
+                    ):
+                        runtime.artifacts.lookup(
+                            artifact.lookup,
+                            registry,
+                            validate_v2,
+                            audit_candidate=invalid,
+                        )
+                    for supplied in ((), (artifact,)):
+                        with self.assertRaisesRegex(
+                            runtime_v2.ArtifactRuntimeError, "request_mismatch"
+                        ):
+                            runtime.execute_batch(
+                                invocation,
+                                registry,
+                                callbacks,
+                                available=supplied,
+                                audit_candidate=invalid,
+                            )
+
+            def damaged(_artifact: runtime_v2.StoredArtifact) -> bool:
+                msg = "state_corrupt"
+                raise runtime_v2.ArtifactRuntimeError(msg)
+
+            with self.assertRaisesRegex(
+                runtime_v2.ArtifactRuntimeError, "state_corrupt"
+            ):
+                runtime.prefetch(
+                    invocation.lookups,
+                    registry,
+                    validate_v2,
+                    audit_candidate=damaged,
+                )
+            with self.assertRaisesRegex(
+                runtime_v2.ArtifactRuntimeError, "results_unavailable"
+            ):
+                runtime.execute_batch(
+                    invocation,
+                    registry,
+                    callbacks,
+                    available=(artifact,),
+                    audit_candidate=lambda _a: False,
+                )
+            self.assertEqual(sends, [invocation.batch.item_keys])
+            self.assertEqual(
+                runtime.execute_batch(
+                    invocation,
+                    registry,
+                    callbacks,
+                    available=(artifact,),
+                    audit_candidate=lambda _a: True,
+                ),
+                outcome,
+            )
+            self.assertEqual(
+                runtime.execute_batch(invocation, registry, callbacks), outcome
+            )

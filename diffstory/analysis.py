@@ -3083,6 +3083,14 @@ def validate_generation(report: dict, generation: dict) -> None:
             coverage, chunk coverage, or completion state is invalid.
 
     """
+    if (
+        isinstance(generation, dict)
+        and generation.get("version") == "diffstory.generation.v2"
+    ):
+        from .narrative_manifest import validate_persisted_generation
+
+        validate_persisted_generation(report, generation)
+        return
     required_fields = {
         "schema",
         "origin",
@@ -3188,6 +3196,14 @@ def validate_generated_report(report: dict) -> None:
 
     """
     generation = report.get("generation")
+    if (
+        isinstance(generation, dict)
+        and generation.get("version") == "diffstory.generation.v2"
+    ):
+        from .narrative_manifest import validate_v2_report
+
+        validate_v2_report(report)
+        return
     validate_generation(report, generation)
     validate_document(report.get("document"), generated=True)
     changes = {change["id"]: change for change in report["changes"]}
@@ -3529,6 +3545,16 @@ def apply_annotations(report: dict, annotations: dict) -> dict:
             or passage ranges do not match the report.
 
     """
+    if annotations.get("schema") == "diffstory.annotations.v2":
+        from .narrative_manifest import apply_v2_annotations
+
+        return apply_v2_annotations(report, annotations)
+    if "narrative_v2" in report or (
+        isinstance(annotations.get("generation"), dict)
+        and "version" in annotations["generation"]
+    ):
+        msg = "Mismatched annotation and generation schemas"
+        raise ValueError(msg)
     if annotations.get("schema") != "diffstory.annotations.v1":
         msg = "Expected diffstory.annotations.v1"
         raise ValueError(msg)

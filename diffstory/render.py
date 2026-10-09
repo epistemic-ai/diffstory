@@ -188,7 +188,27 @@ def validate_report(report: dict) -> None:
         msg = "Expected a diffstory report"
         raise ValueError(msg)
     _validate_report_collections(report)
-    _validate_nested_value(report)
+    generation = report.get("generation")
+    v2 = (
+        isinstance(generation, dict)
+        and generation.get("version") == "diffstory.generation.v2"
+    )
+    if v2:
+        # Only these exact root paths are exempt after complete proof and
+        # deterministic presentation validation. All compiler IDs stay 16-hex.
+        validate_generated_report(report)
+        _validate_nested_value(
+            {
+                key: value
+                for key, value in report.items()
+                if key not in {"generation", "narrative_v2"}
+            }
+        )
+    else:
+        if "narrative_v2" in report:
+            msg = "V2 presentation requires a validated v2 generation"
+            raise ValueError(msg)
+        _validate_nested_value(report)
     _validate_report_stats(report.get("stats"))
     groups = {g["id"] for g in report["groups"]}
     changes = {c["id"] for c in report["changes"]}
@@ -198,10 +218,10 @@ def validate_report(report: dict) -> None:
         msg = "Duplicate report identifiers"
         raise ValueError(msg)
     changes_by_id = {c["id"]: c for c in report["changes"]}
-    if "document" in report:
+    if "document" in report and not v2:
         validate_document(report["document"])
     _validate_group_links(report, groups, changes, changes_by_id)
-    if "generation" in report:
+    if "generation" in report and not v2:
         validate_generated_report(report)
 
 
