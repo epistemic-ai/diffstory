@@ -41,11 +41,14 @@ from diffstory.analysis import apply_annotations  # noqa: E402
 from diffstory.cli import main as cli_main  # noqa: E402
 from diffstory.narrative import CodexCLIProvider  # noqa: E402
 from diffstory.narrative import Narrator  # noqa: E402
+from diffstory.narrative_manifest import persisted_manifest  # noqa: E402
 from diffstory.narrative_plan import canonical_bytes  # noqa: E402
 from diffstory.narrative_runtime import ArtifactCallError  # noqa: E402
 from diffstory.narrative_runtime import ArtifactRuntimeError  # noqa: E402
 from diffstory.narrative_runtime import ProviderReply  # noqa: E402
 from diffstory.narrative_runtime import RuntimeStageError  # noqa: E402
+from diffstory.narrative_storage import encode_invocation  # noqa: E402
+from diffstory.narrative_storage import storage_digest  # noqa: E402
 from diffstory.narrative_v2 import StageInputs  # noqa: E402
 from diffstory.narrative_v2 import Transport  # noqa: E402
 from diffstory.narrative_v2 import V2Options  # noqa: E402
@@ -299,7 +302,10 @@ class StorageGuard:
         self.minimum_free = shutil.disk_usage(state).free
         self.record_bytes = 0
         self.record_writes = 0
+        self.shared_bytes = 0
+        self.shared_writes = 0
         self.atomic = narrative_runtime._atomic_record  # noqa: SLF001 # Observe the existing writer, not a replacement cache format.
+        self.immutable = narrative_runtime._immutable_cache_record  # noqa: SLF001 # Shared records and leaf temporaries use a distinct writer.
 
     def check(self, needed: int) -> None:
         """Refuse a write before it consumes the reserved filesystem space."""
@@ -314,6 +320,14 @@ class StorageGuard:
         self.atomic(path, record)
         self.record_bytes += size
         self.record_writes += 1
+
+    def shared_record(self, path: Path, record: object) -> None:
+        """Reserve exact shared/leaf temporary bytes even for an existing address."""
+        size = len(record.model_dump_json().encode("utf-8"))
+        self.check(size * 2)
+        self.immutable(path, record)
+        self.shared_bytes += size
+        self.shared_writes += 1
 
     def json(self, path: Path, value: dict) -> int:
         """Measure and stream complete JSON without a second serialized copy."""
@@ -361,6 +375,31 @@ def storage_metrics(state: Path) -> dict:
     return totals
 
 
+def cache_storage_metrics(state: Path) -> dict:
+    """Count every optional cache file, including shared records and leftovers."""
+    totals = {
+        name: {"files": 0, "bytes": 0}
+        for name in ("invocations", "requests", "items", "temporary", "other")
+    }
+    cache = state / "cache"
+    for path in cache.rglob("*"):
+        if not path.is_file():
+            continue
+        parts = path.relative_to(cache).parts
+        kind = (
+            "temporary"
+            if path.name.startswith(".v3-")
+            else parts[1]
+            if len(parts) >= 3  # noqa: PLR2004 # artifacts-v3/<kind>/<record>.
+            and parts[0] == "artifacts-v3"
+            and parts[1] in {"invocations", "requests", "items"}
+            else "other"
+        )
+        totals[kind]["files"] += 1
+        totals[kind]["bytes"] += path.stat().st_size
+    return totals
+
+
 def ledger_metrics(ledger: object) -> dict:
     """Derive exact current source and obligation counts, never historical counts."""
     return {
@@ -383,28 +422,48 @@ def ledger_metrics(ledger: object) -> dict:
 
 
 def detail_preflight(inputs: object) -> dict:
-    """Measure actual packed detail descriptors before full cache writes."""
+    """Measure compact initial metadata; results and later repair shapes are unknown."""
     stage = StageInputs(inputs, "detail", inputs.detail_items())
     batches = stage.pack(tuple(stage.items))
-    repeated = once = minimum = 0
+    repeated = compact = requests = leaves = 0
     for batch in batches:
         invocation = stage.invocation(batch)
         invocation_size = len(invocation.model_dump_json().encode("utf-8"))
-        dependencies_size = len(
-            canonical_bytes(
-                [d.model_dump(mode="json") for d in invocation.dependencies]
-            )
+        stored = encode_invocation(invocation)
+        request = narrative_runtime._StoredRequest(  # noqa: SLF001 # Measure the actual shared storage contract.
+            metadata=stage.prepare(
+                batch.item_keys, repair=False, partition=batch.partition
+            ).metadata
         )
-        once += invocation_size
+        compact += len(stored.model_dump_json().encode("utf-8"))
+        requests += len(request.model_dump_json().encode("utf-8"))
         repeated += invocation_size * len(batch.item_keys)
-        minimum += (invocation_size + dependencies_size) * len(batch.item_keys)
+        invocation_digest = storage_digest(stored)
+        request_digest = storage_digest(request)
+        for key, semantic_key in invocation.artifact_keys().items():
+            header = {
+                "version": narrative_runtime._StoredItem.model_fields[  # noqa: SLF001 # Measure the product leaf envelope.
+                    "version"
+                ].default,
+                "original_run_digest": inputs.run.digest,
+                "invocation_digest": invocation_digest,
+                "request_digest": request_digest,
+                "item_key": key,
+                "semantic_key": semantic_key,
+            }
+            # Exact leaf envelope size, excluding only the unknown result value.
+            leaves += len(canonical_bytes(header)) + len(',"result":')
     return {
         "initial_detail_batches": len(batches),
         "dynamic_later_batches": "unknown_until_validated_results",
-        "detail_descriptor_minimum_cache_bytes": minimum,
-        "invocation_bytes_once_per_batch": once,
-        "invocation_bytes_repeated_per_item": repeated,
-        "excludes": "results, metadata, recovery, later stages, reports and HTML",
+        "compact_invocation_bytes": compact,
+        "successful_request_metadata_bytes_if_initial_batches_succeed": requests,
+        "leaf_metadata_bytes_without_results": leaves,
+        "initial_metadata_bytes_if_batches_succeed": compact
+        + requests
+        + leaves,
+        "hypothetical_legacy_repeated_invocation_bytes": repeated,
+        "excludes": "results, repairs, recovery, later stages, reports and HTML",
         "conservative_input_bound_sum": sum(b.input_bound for b in batches),
         "reserved_output_bound_sum": sum(
             b.output_reservation for b in batches
@@ -419,7 +478,9 @@ def detail_preflight(inputs: object) -> dict:
 
 def coverage_metrics(candidate: dict, ledger: object) -> dict:
     """Check exact detail retention, every obligation, every group and receipts."""
-    manifest = candidate["generation"]
+    manifest = persisted_manifest(candidate["generation"]).model_dump(
+        mode="json"
+    )
     details = manifest["details"]
     displayed = [
         d for section in candidate["steps"] for d in section["details"]
@@ -457,6 +518,7 @@ def coverage_metrics(candidate: dict, ledger: object) -> dict:
         ),
         "plan_digest": digest_json(manifest["plan"]),
         "producer_count": len(manifest["producers"]),
+        "producer_history_digest": digest_json(manifest["producers"]),
         "historical_production_requests": sum(
             len(p["requests"]) for p in manifest["producers"]
         ),
@@ -560,6 +622,12 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
                     "diffstory.narrative_runtime._atomic_record", guard.record
                 )
             )
+            stack.enter_context(
+                patch(
+                    "diffstory.narrative_runtime._immutable_cache_record",
+                    guard.shared_record,
+                )
+            )
             metrics["stage"] = "load"
             report = json.loads(args.report.read_bytes())
             metrics["stage"] = "preflight"
@@ -571,7 +639,7 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
             if args.phase == "cold":
                 guard.check(
                     metrics["detail_preflight"][
-                        "detail_descriptor_minimum_cache_bytes"
+                        "initial_metadata_bytes_if_batches_succeed"
                     ]
                 )
             metrics["stage"] = "generate"
@@ -675,6 +743,7 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
                     "receipts",
                     "citations",
                     "support_provenance",
+                    "producer_history_digest",
                 ):
                     require(
                         metrics["coverage"][key] == cold["coverage"][key],
@@ -684,6 +753,17 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
                     metrics["pid"] != cold["pid"], "fresh_process_required"
                 )
                 metrics["fresh_process_warm"] = True
+                require(
+                    metrics["current_usage"]
+                    == {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                        "calls": 0,
+                        "unreported_calls": 0,
+                    },
+                    "warm_current_usage",
+                )
             require(
                 file_digest(args.report) == args.sha256,
                 "source_changed_during_run",
@@ -702,10 +782,13 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
             else metrics.get("counters", {})
         )
         metrics["storage"] = storage_metrics(args.state)
+        metrics["cache_storage"] = cache_storage_metrics(args.state)
         metrics["storage_guard"] = {
             "minimum_free_bytes": guard.minimum_free,
             "atomic_record_writes": guard.record_writes,
             "atomic_record_bytes_written": guard.record_bytes,
+            "immutable_record_writes": guard.shared_writes,
+            "immutable_record_bytes_written": guard.shared_bytes,
         }
 
 

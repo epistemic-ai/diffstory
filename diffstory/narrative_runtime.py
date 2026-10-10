@@ -54,6 +54,10 @@ from .narrative_contracts import result_key
 from .narrative_contracts import result_key_field
 from .narrative_contracts import result_model
 from .narrative_contracts import result_stage
+from .narrative_storage import StoredInvocation
+from .narrative_storage import decode_invocation
+from .narrative_storage import encode_invocation
+from .narrative_storage import storage_digest
 from .usage import RunUsage
 from .usage import estimate_input
 
@@ -1731,6 +1735,90 @@ class RunManifest(Contract):
         return _canonical_digest(self.model_dump(mode="json"))
 
 
+class _StoredRequest(Contract):
+    """One exact successful request, including all original capacity bounds."""
+
+    version: Literal["diffstory.request-storage.v1"] = (
+        "diffstory.request-storage.v1"
+    )
+    metadata: PreparedMetadata
+
+
+class _StoredItem(Contract):
+    """An item leaf bound to immutable, complete producer records."""
+
+    version: Literal["diffstory.artifact-storage.v3"] = (
+        "diffstory.artifact-storage.v3"
+    )
+    original_run_digest: Digest
+    invocation_digest: Digest
+    request_digest: Digest
+    item_key: Digest
+    semantic_key: Digest
+    result: NarrativeResult
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _cache_directory(path: Path) -> None:
+    """Durably create each private directory, including its parent's entry."""
+    missing = []
+    parent = path
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    # Another writer may have created this directory but not synced its entry.
+    # Every creator syncs its ancestors before creating a child.
+    _fsync_directory(parent)
+    _fsync_directory(parent.parent)
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        _fsync_directory(directory)
+        _fsync_directory(directory.parent)
+
+
+def _immutable_cache_record(path: Path, record: Contract) -> None:
+    """Publish once; concurrent writers must agree on all validated content.
+
+    A hard link publishes the complete fsynced file without overwriting another
+    writer. Recheck existing content on every commit, with no trusted memo.
+    Recovery records deliberately continue to use their separate writer.
+    """
+    temporary_path = None
+    try:
+        _cache_directory(path.parent)
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".v3-", dir=path.parent, delete=False
+        ) as stream:
+            temporary_path = Path(stream.name)
+            temporary_path.chmod(0o600)
+            stream.write(record.model_dump_json().encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            with path.open("rb") as stream:
+                existing = type(record).model_validate_json(stream.read())
+                _require_v2(existing == record, "storage")
+                _require_v2(storage_digest(existing) == path.stem, "storage")
+                os.fsync(stream.fileno())
+        _fsync_directory(path.parent)
+    except (OSError, ValueError, TypeError):
+        msg = "storage"
+        raise ArtifactRuntimeError(msg) from None
+    finally:
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink()
+
+
 class ArtifactStore:
     """Global typed artifact indices; malformed or stale candidates are misses.
 
@@ -1742,20 +1830,90 @@ class ArtifactStore:
 
     def __init__(self, directory: str | Path) -> None:
         """Select the optional private artifact cache."""
-        self.directory = Path(directory) / "artifacts-v2"
+        self.shared_directory = Path(directory) / "artifacts-v3"
+        self.directory = self.shared_directory / "items"
+        self.legacy_directory = Path(directory) / "artifacts-v2"
 
     def commit(self, artifact: StoredArtifact) -> None:
-        """Write a fully typed artifact under its lookup/content digests."""
+        """Durably commit shared dependencies before publishing the item leaf."""
         artifact = StoredArtifact.model_validate(artifact)
-        try:
-            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        except OSError:
-            reason = "storage"
-            raise ArtifactRuntimeError(reason) from None
-        digest = _canonical_digest(artifact.model_dump(mode="json"))
-        _atomic_record(
-            self.directory / artifact.lookup.key / f"{digest}.json", artifact
+        invocation = encode_invocation(artifact.invocation)
+        request = _StoredRequest(metadata=artifact.production_request)
+        item = _StoredItem(
+            original_run_digest=artifact.original_run_digest,
+            invocation_digest=storage_digest(invocation),
+            request_digest=storage_digest(request),
+            item_key=artifact.lookup.item_key,
+            semantic_key=artifact.record.semantic_key,
+            result=artifact.record.result,
         )
+        _immutable_cache_record(
+            self.shared_directory
+            / "invocations"
+            / f"{item.invocation_digest}.json",
+            invocation,
+        )
+        _immutable_cache_record(
+            self.shared_directory / "requests" / f"{item.request_digest}.json",
+            request,
+        )
+        _immutable_cache_record(
+            self.directory
+            / artifact.lookup.key
+            / f"{storage_digest(item)}.json",
+            item,
+        )
+
+    def _expand(self, item: _StoredItem) -> StoredArtifact:
+        encoded = StoredInvocation.model_validate_json(
+            (
+                self.shared_directory
+                / "invocations"
+                / f"{item.invocation_digest}.json"
+            ).read_bytes()
+        )
+        request = _StoredRequest.model_validate_json(
+            (
+                self.shared_directory
+                / "requests"
+                / f"{item.request_digest}.json"
+            ).read_bytes()
+        )
+        _require_v2(storage_digest(encoded) == item.invocation_digest)
+        _require_v2(storage_digest(request) == item.request_digest)
+        invocation = decode_invocation(encoded, ArtifactInvocation)
+        lookup = next(
+            lookup
+            for lookup in invocation.lookups
+            if lookup.item_key == item.item_key
+        )
+        return StoredArtifact(
+            original_run_digest=item.original_run_digest,
+            invocation=invocation,
+            lookup=lookup,
+            record=ArtifactRecord(
+                semantic_key=item.semantic_key,
+                dependencies=invocation.dependencies,
+                original_request_digest=invocation.batch.request_digest,
+                validator_version=lookup.validator_version,
+                result=item.result,
+            ),
+            production_request=request.metadata,
+        )
+
+    def read(self, serialized: bytes) -> StoredArtifact:
+        """Decode v2 exports or a v3 leaf with complete local reference closure.
+
+        This is structural validation only. Reuse and imports must also check
+        current dependencies, results and the applicable producer audit.
+        """
+        data = json.loads(serialized)
+        if (
+            isinstance(data, dict)
+            and data.get("format_version") == ARTIFACT_FORMAT_VERSION
+        ):
+            return StoredArtifact.model_validate_json(serialized)
+        return self._expand(_StoredItem.model_validate_json(serialized))
 
     def lookup(
         self,
@@ -1766,14 +1924,24 @@ class ArtifactStore:
         audit_candidate: Callable[[StoredArtifact], bool] | None = None,
     ) -> StoredArtifact | None:
         """Revalidate original dependencies and current result before reuse."""
-        for path in sorted((self.directory / lookup.key).glob("*.json")):
+        paths = (
+            *sorted((self.directory / lookup.key).glob("*.json")),
+            *sorted((self.legacy_directory / lookup.key).glob("*.json")),
+        )
+        for path in paths:
             try:
-                candidate = StoredArtifact.model_validate_json(
-                    path.read_bytes()
-                )
-                if path.stem != _canonical_digest(
-                    candidate.model_dump(mode="json")
-                ):
+                if path.parent.parent == self.legacy_directory:
+                    candidate = StoredArtifact.model_validate_json(
+                        path.read_bytes()
+                    )
+                    digest = _canonical_digest(
+                        candidate.model_dump(mode="json")
+                    )
+                else:
+                    item = _StoredItem.model_validate_json(path.read_bytes())
+                    digest = storage_digest(item)
+                    candidate = self._expand(item)
+                if path.stem != digest:
                     continue
                 if candidate.lookup != lookup or not registry.contains(
                     candidate.invocation.dependencies
@@ -1799,13 +1967,13 @@ class ArtifactStore:
         registry: DependencyRegistry,
         validate: Callable[[ArtifactLookup, NarrativeResult], None],
     ) -> bool:
-        """Import only already-v2 records; ordinary v1 prose is always a miss.
+        """Import expanded v2 or locally closed v3; v1 prose is always a miss.
 
         Both the exact original run and request descriptor must match. There is
-        no conversion, version relabeling, or copying prose into detail fields.
+        no prose conversion. Imports write v3; old cache files are never rewritten.
         """
         try:
-            candidate = StoredArtifact.model_validate_json(serialized)
+            candidate = self.read(serialized)
             if (
                 candidate.original_run_digest != original_run.digest
                 or candidate.invocation != invocation

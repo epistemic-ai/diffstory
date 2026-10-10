@@ -219,6 +219,53 @@ The legacy exact-run cache reader remains available. Old records are not
 relabeled as v2 proof. Compatibility reuse must meet the current obligations and
 retain the original producer, request, dependencies, and validation history.
 
+Saved generation storage has a separate version from the semantic manifest.
+New annotations and applied reports retain `generation.version` as
+`diffstory.generation.v2` and keep `request_configuration` in the same location.
+The marker `storage_version: "diffstory.generation-storage.v1"` declares compact
+producer invocations. Each `diffstory.invocation-storage.v1` invocation stores
+the six static dependencies once, ordered item lookups, all dynamic dependencies
+(including every original peer), and the exact original `BatchSpec`. Original
+run identities, successful request metadata, results, receipts, coverage, and
+citations remain complete. Each annotation, report, and HTML contains the proof
+data it needs; offline validation does not read the optional cache.
+
+Readers still accept expanded v2 generation data without a storage marker.
+They expand compact invocations before the existing manifest and production
+checks. Unknown versions, mixed shapes, missing dependencies, and unknown fields
+fail. Exact candidate comparison normalizes only this declared storage form;
+it preserves every application field, scalar type, and list order. Compact
+invocations must round trip to their exact stored form. A content digest alone
+does not authorize a producer, request, result, or current source reference.
+
+The optional typed cache writes `artifacts-v3/invocations`,
+`artifacts-v3/requests`, and `artifacts-v3/items`. Full-content storage digests
+address shared compact invocations and successful request metadata. Item leaves
+reference those records and retain their result and original identity bindings.
+Runtime semantic models, artifact keys, and provider request bytes remain
+expanded v2. Valid self-contained `artifacts-v2` records remain readable and
+importable after current proof checks; existing cache files are not rewritten.
+A v3 leaf needs its local reference closure. It is not a standalone export.
+
+Cache writes create a mode-0600 temporary file, sync it, then publish it with a
+create-only hard link and sync the directory. Shared dependencies publish before
+the leaf. An existing address must contain the same validated full content.
+Missing, malformed, wrong-kind, or digest-mismatched cache records are misses;
+coherent substitutions still face current producer and source audits. There is
+no trusted cross-call record memo. Interrupted writes can leave unreferenced
+records or temporary files; no garbage collection is added. Filesystem hard
+links and file/directory sync must be supported. Recovery storage, durable
+budgets, and resume rules are unchanged.
+
+The local benchmark reserves space before both recovery writes and each exact
+shared-cache or leaf temporary write. Its initial detail estimate measures
+compact invocation, successful-request, and leaf metadata bytes, excluding
+unknown results and later repairs. Repeated expanded invocation bytes are only
+a hypothetical legacy comparison. File totals include all shared files and
+leftovers. Marker bindings include the storage module; an old marker fails
+comparison and is never silently rewritten. These measurements do not establish
+whole-PR savings or change narration defaults.
+
 ### Recovery, optional payload storage, and deliberate fresh state
 
 Every CLI v2 run has durable recovery state, by default

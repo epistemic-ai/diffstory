@@ -29,7 +29,10 @@ from diffstory.narrative_hierarchy import PlanningSources
 from diffstory.narrative_manifest import GenerationManifest
 from diffstory.narrative_manifest import LedgerParameters
 from diffstory.narrative_manifest import compiler_fact_signature
+from diffstory.narrative_manifest import expanded_generation
+from diffstory.narrative_manifest import persisted_manifest
 from diffstory.narrative_manifest import result_digest
+from diffstory.narrative_manifest import stored_generation
 from diffstory.narrative_manifest import (
     validate_generation as validate_v2_generation,
 )
@@ -618,15 +621,95 @@ class PublicBoundaryTests(unittest.TestCase):
         cls.applied = apply_annotations(cls.original, cls.candidate)
 
     def assert_rejected(self, manifest: GenerationManifest) -> None:
-        """Exercise both persisted manifest and report production boundaries."""
+        """Exercise expanded and compact proofs at both public boundaries."""
+        for value in (
+            manifest.model_dump(mode="json"),
+            stored_generation(manifest),
+        ):
+            with self.subTest(compact="storage_version" in value):
+                with self.assertRaises((ValueError, ArtifactRuntimeError)):
+                    validate_generation(self.original, value)
+                applied = copy.deepcopy(self.applied)
+                applied["generation"] = value
+                with self.assertRaises((ValueError, ArtifactRuntimeError)):
+                    validate_report(applied)
+
+    def test_compact_and_legacy_standalone_boundaries_without_cache(
+        self,
+    ) -> None:
+        """Both saved forms retain all proof data with no optional cache or provider."""
+        legacy = copy.deepcopy(self.candidate)
+        legacy["generation"] = expanded_generation(legacy["generation"])
+        with ExitStack() as stack:
+            for target in (
+                "diffstory.narrative_runtime.ArtifactStore.__init__",
+                "test_narrative_v2.FixtureProvider.prepare",
+                "test_narrative_v2.FixtureProvider.complete_reply",
+                "socket.socket",
+                "subprocess.Popen",
+            ):
+                stack.enter_context(
+                    patch(target, side_effect=AssertionError(target))
+                )
+            for candidate in (legacy, self.candidate):
+                saved = json.loads(json.dumps(candidate))
+                applied = apply_annotations(self.original, saved)
+                self.assertEqual(applied, self.applied)
+                self.assertEqual(
+                    persisted_manifest(applied["generation"]),
+                    persisted_manifest(saved["generation"]),
+                )
+                for generation in (
+                    legacy["generation"],
+                    self.candidate["generation"],
+                ):
+                    report = copy.deepcopy(applied)
+                    report["generation"] = generation
+                    loaded = json.loads(json.dumps(report))
+                    validate_report(loaded)
+                    validate_generation(loaded, candidate["generation"])
+                    html = render(loaded)
+                    self.assertIn("diffstory.generation.v2", html)
+                    self.assertIn("diffstory.presentation.v2", html)
+
+    def test_both_storage_forms_require_exact_candidate_data(self) -> None:
+        """Do not hide extras, list order, defaults, numeric types or presentation edits."""
+        manifest = persisted_manifest(self.candidate["generation"])
+        mutations = (
+            lambda c: c.update(extra=None),
+            lambda c: c["steps"][0].update(number=True),
+            lambda c: c["steps"][0].update(number=1.0),
+            lambda c: c["steps"].reverse(),
+            lambda c: c["generation"].pop("provenance"),
+            lambda c: c["generation"]["unit_keys"].reverse(),
+            lambda c: c["generation"]["receipts"].reverse(),
+            lambda c: c["document"]["lead"][0].update(
+                text="Changed presentation"
+            ),
+        )
+        for compact in (False, True):
+            for position, mutate in enumerate(mutations):
+                candidate = copy.deepcopy(self.candidate)
+                if not compact:
+                    candidate["generation"] = expanded_generation(
+                        candidate["generation"]
+                    )
+                mutate(candidate)
+                with (
+                    self.subTest(compact=compact, position=position),
+                    self.assertRaises((ValueError, ArtifactRuntimeError)),
+                ):
+                    validate_v2_generation(
+                        self.original, manifest, candidate=candidate
+                    )
+
+        legacy = copy.deepcopy(self.candidate)
+        legacy["generation"] = expanded_generation(legacy["generation"])
+        legacy["generation"]["producers"][0]["invocation"][
+            "dependencies"
+        ].reverse()
         with self.assertRaises((ValueError, ArtifactRuntimeError)):
-            validate_generation(
-                self.original, manifest.model_dump(mode="json")
-            )
-        applied = copy.deepcopy(self.applied)
-        applied["generation"] = manifest.model_dump(mode="json")
-        with self.assertRaises((ValueError, ArtifactRuntimeError)):
-            validate_report(applied)
+            apply_annotations(self.original, legacy)
 
     def test_offline_public_golden_save_reload_and_render(self) -> None:
         """No public saved boundary needs credentials, serialization or transport."""

@@ -28,7 +28,10 @@ from diffstory.narrative_manifest import LedgerParameters
 from diffstory.narrative_manifest import ProducerDescriptor
 from diffstory.narrative_manifest import ResultReceipt
 from diffstory.narrative_manifest import compiler_fact_signature
+from diffstory.narrative_manifest import expanded_generation
+from diffstory.narrative_manifest import persisted_manifest
 from diffstory.narrative_manifest import result_digest
+from diffstory.narrative_manifest import stored_generation
 from diffstory.narrative_manifest import validate_generation
 from diffstory.narrative_plan import RequestPackingLimits
 from diffstory.narrative_plan import build_evidence_ledger
@@ -137,6 +140,45 @@ def manifest_fixture() -> tuple[dict, GenerationManifest]:
     return report, manifest
 
 
+def saved_generation_metrics(manifest: GenerationManifest) -> dict:
+    """Return source-free exact byte counts and typed roundtrip evidence."""
+    expanded = manifest.model_dump(mode="json")
+    compact = stored_generation(manifest)
+    restored = persisted_manifest(compact)
+    before = len(canonical_bytes(expanded))
+    after = len(canonical_bytes(compact))
+    return {
+        "expanded_manifest_bytes": before,
+        "compact_manifest_bytes": after,
+        "saved_bytes": before - after,
+        "expanded_invocation_bytes": sum(
+            len(canonical_bytes(p["invocation"]))
+            for p in expanded["producers"]
+        ),
+        "compact_invocation_bytes": sum(
+            len(canonical_bytes(p["invocation"])) for p in compact["producers"]
+        ),
+        "producer_count": len(manifest.producers),
+        "lookup_count": sum(
+            len(p.invocation.lookups) for p in manifest.producers
+        ),
+        "expanded_equality": restored == manifest,
+        "producer_keys_equal": tuple(p.key for p in restored.producers)
+        == tuple(p.key for p in manifest.producers),
+        "results_and_receipts_equal": all(
+            getattr(restored, field) == getattr(manifest, field)
+            for field in (
+                "details",
+                "planning",
+                "sections",
+                "document",
+                "receipts",
+            )
+        ),
+        "legacy_read_equal": persisted_manifest(expanded) == manifest,
+    }
+
+
 class ManifestTests(unittest.TestCase):
     """Reject incomplete audit relationships without claiming semantic authority."""
 
@@ -178,6 +220,111 @@ class ManifestTests(unittest.TestCase):
                 GenerationManifest.model_validate(
                     manifest.model_dump() | update
                 )
+
+    def test_compact_generation_is_lossless_and_measures_static_savings(
+        self,
+    ) -> None:
+        """All typed proofs survive; only repeated static dependency bytes shrink."""
+        manifest = self.manifest
+        expanded = manifest.model_dump(mode="json")
+        compact = stored_generation(manifest)
+        self.assertEqual(persisted_manifest(compact), manifest)
+        self.assertEqual(persisted_manifest(expanded), manifest)
+        self.assertEqual(expanded_generation(compact), expanded)
+        self.assertEqual(compact["version"], expanded["version"])
+        self.assertEqual(
+            compact["request_configuration"], expanded["request_configuration"]
+        )
+        self.assertLess(
+            len(canonical_bytes(compact)), len(canonical_bytes(expanded))
+        )
+        for before, after in zip(
+            manifest.producers,
+            persisted_manifest(compact).producers,
+            strict=True,
+        ):
+            self.assertEqual(before.key, after.key)
+            self.assertEqual(
+                before.invocation.artifact_keys(),
+                after.invocation.artifact_keys(),
+            )
+            self.assertEqual(before.original_run, after.original_run)
+            self.assertEqual(before.requests, after.requests)
+        self.assertEqual(
+            canonical_bytes(compact).count(b'"static_dependencies"'),
+            len(manifest.producers),
+        )
+        metrics = saved_generation_metrics(manifest)
+        self.assertGreater(metrics["saved_bytes"], 0)
+        self.assertTrue(metrics["expanded_equality"])
+        self.assertTrue(metrics["producer_keys_equal"])
+        self.assertTrue(metrics["results_and_receipts_equal"])
+
+    def test_compact_storage_dispatch_rejects_malformed_and_lossy_shapes(
+        self,
+    ) -> None:
+        """Versions, kinds, peer closure, order and exact scalar types stay strict."""
+        mutations = (
+            lambda v: v.update(storage_version="unknown"),
+            lambda v: v.update(storage_version=1),
+            lambda v: v.pop("storage_version"),
+            lambda v: v.update(extra="unknown"),
+            lambda v: v.update(producers={}),
+            lambda v: v["producers"][0].update(extra="unknown"),
+            lambda v: v["producers"][0]["invocation"].pop("version"),
+            lambda v: v["producers"][0]["invocation"].update(
+                version="diffstory.request-storage.v1"
+            ),
+            lambda v: v["producers"][0]["invocation"].update(extra=[]),
+            lambda v: v["producers"][0]["invocation"].pop(
+                "static_dependencies"
+            ),
+            lambda v: v["producers"][0]["invocation"][
+                "static_dependencies"
+            ].pop(),
+            lambda v: v["producers"][0]["invocation"][
+                "static_dependencies"
+            ].reverse(),
+            lambda v: v["producers"][0]["invocation"][
+                "dynamic_dependencies"
+            ].reverse(),
+            lambda v: v["producers"][0]["invocation"][
+                "dynamic_dependencies"
+            ].pop(),
+            lambda v: v["producers"][0]["invocation"].update(
+                dynamic_dependencies=[
+                    d
+                    for d in v["producers"][0]["invocation"][
+                        "dynamic_dependencies"
+                    ]
+                    if not (
+                        d["kind"] == "peer"
+                        and d["key"]
+                        == self.manifest.producers[
+                            0
+                        ].invocation.batch.item_keys[0]
+                    )
+                ]
+            ),
+            lambda v: v["producers"][0]["invocation"]["lookups"].reverse(),
+            lambda v: v["producers"][0]["invocation"]["lookups"][0].update(
+                result_kind="section"
+            ),
+            lambda v: v["producers"][0]["invocation"]["batch"].update(
+                partition=True
+            ),
+            lambda v: v["producers"][0]["requests"][0].update(
+                safety_tokens=True
+            ),
+        )
+        for position, mutate in enumerate(mutations):
+            value = stored_generation(self.manifest)
+            mutate(value)
+            with (
+                self.subTest(position=position),
+                self.assertRaises((ValueError, ArtifactRuntimeError)),
+            ):
+                persisted_manifest(value)
 
     def test_missing_duplicate_and_inconsistent_coverage_is_rejected(
         self,

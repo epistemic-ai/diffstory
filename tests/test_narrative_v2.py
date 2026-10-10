@@ -1092,19 +1092,23 @@ class BatchedNarratorTests(unittest.TestCase):
         self,
     ) -> None:
         """A valid checksum and typed result cannot authorize a stale source citation."""
-        from diffstory.narrative_plan import content_digest
+        from diffstory.narrative_runtime import ArtifactStore
+        from diffstory.narrative_runtime import _StoredItem
+        from diffstory.narrative_storage import storage_digest
 
         report = golden_report()
         self.narrator(FixtureProvider()).generate(report)
+        store = ArtifactStore(self.root / "cache")
         changed = False
-        for path in (self.root / "cache" / "artifacts-v2").glob("*/*.json"):
+        for path in store.directory.glob("*/*.json"):
             data = json.loads(path.read_bytes())
-            if data["lookup"]["result_kind"] == "detail":
-                data["record"]["result"]["explanations"][0]["citations"][0][
+            if store.read(path.read_bytes()).lookup.result_kind == "detail":
+                data["result"]["explanations"][0]["citations"][0][
                     "content_digest"
                 ] = "0" * 64
                 raw = canonical_bytes(data)
-                path.with_name(content_digest(raw) + ".json").write_bytes(raw)
+                key = storage_digest(_StoredItem.model_validate_json(raw))
+                path.with_name(key + ".json").write_bytes(raw)
                 path.unlink()
                 changed = True
                 break
@@ -1390,7 +1394,7 @@ class BatchedNarratorTests(unittest.TestCase):
             with self.assertRaises(RuntimeStageError):
                 self.narrator(provider).generate(golden_report())
             self.assertEqual(len(requests), prior_calls)
-        self.assertFalse((self.root / "cache" / "artifacts-v2").exists())
+        self.assertFalse((self.root / "cache" / "artifacts-v3").exists())
 
     def test_openai_actual_wire_output_cap_and_response_metadata(self) -> None:
         """Mock HTTPS and retain its real request cap, schema and measured output."""
@@ -2886,9 +2890,9 @@ class CodecReplayTests(unittest.TestCase):
         for path in (runtime.artifacts.directory / missing.lookup.key).glob(
             "*.json"
         ):
-            value = json.loads(path.read_text())
+            value = runtime.artifacts.read(path.read_bytes())
             if (
-                value["production_request"]["batch"]["request_digest"]
+                value.production_request.batch.request_digest
                 == missing.production_request.batch.request_digest
             ):
                 path.unlink()

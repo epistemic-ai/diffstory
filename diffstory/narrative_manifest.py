@@ -8,6 +8,7 @@ Legacy generation.v1 retains its existing guarantees.
 
 from __future__ import annotations
 
+import json
 from bisect import bisect_right
 from collections import defaultdict
 from typing import TYPE_CHECKING
@@ -47,6 +48,9 @@ from .narrative_protocol import (
 from .narrative_runtime import ArtifactInvocation
 from .narrative_runtime import PreparedMetadata
 from .narrative_runtime import RunIdentity
+from .narrative_storage import StoredInvocation
+from .narrative_storage import decode_invocation
+from .narrative_storage import encode_invocation
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -261,6 +265,20 @@ class GenerationManifest(Contract):
     document: DocumentResult
     producers: tuple[ProducerDescriptor, ...] = Field(min_length=1)
     receipts: tuple[ResultReceipt, ...] = Field(min_length=1)
+
+    @classmethod
+    def model_validate_json(
+        cls, json_data: str | bytes | bytearray, **kwargs: object
+    ) -> GenerationManifest:
+        """Dispatch saved storage while preserving strict JSON model validation.
+
+        Runtime Python models stay expanded. Dispatch before Pydantic consumes
+        JSON so arrays retain their strict JSON tuple semantics.
+        """
+        value = json.loads(json_data)
+        if type(value) is dict and "storage_version" in value:
+            json_data = canonical_bytes(expanded_generation(value))
+        return super().model_validate_json(json_data, **kwargs)
 
     @field_validator("run")
     @classmethod
@@ -742,7 +760,7 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
         ],
         "citations": resolved,
         "support_provenance": [provenance[key] for key in sorted(provenance)],
-        "generation": manifest.model_dump(mode="json"),
+        "generation": stored_generation(manifest),
     }
 
 
@@ -817,6 +835,74 @@ class V2Presentation(Contract):
     context_details: tuple[DetailResult, ...]
     citations: tuple[ResolvedCitation, ...]
     support_provenance: tuple[InheritedProvenance, ...]
+
+
+GENERATION_STORAGE_VERSION = "diffstory.generation-storage.v1"
+
+
+def stored_generation(manifest: GenerationManifest) -> dict:
+    """Embed a complete proof with one static dependency set per producer.
+
+    The semantic manifest and all its identities remain expanded v2. This
+    representation needs no cache files to reconstruct any producer or request.
+    """
+    value = manifest.model_dump(mode="json")
+    value["storage_version"] = GENERATION_STORAGE_VERSION
+    for producer, original in zip(
+        value["producers"], manifest.producers, strict=True
+    ):
+        producer["invocation"] = encode_invocation(
+            original.invocation
+        ).model_dump(mode="json")
+    return value
+
+
+def expanded_generation(value: object) -> dict:
+    """Normalize only the declared storage representation, losslessly.
+
+    Retain raw application fields for exact candidate comparison. Do not round
+    trip the whole manifest through models: defaults, normalized dependencies,
+    or numeric coercion must not hide candidate changes. Compact invocations
+    must be the exact encoding of their expanded form, including list order.
+    """
+    _require(
+        type(value) is dict
+        and value.get("version") == "diffstory.generation.v2",
+        "invalid_generation_schema",
+    )
+    if "storage_version" not in value:
+        return value
+    _require(
+        value["storage_version"] == GENERATION_STORAGE_VERSION,
+        "invalid_generation_storage_version",
+    )
+    _require(type(value.get("producers")) is list, "invalid_stored_producers")
+    producers = []
+    for producer in value["producers"]:
+        _require(type(producer) is dict, "invalid_stored_producer")
+        raw = producer.get("invocation")
+        stored = StoredInvocation.model_validate_json(canonical_bytes(raw))
+        expanded = decode_invocation(stored, ArtifactInvocation)
+        _require(
+            canonical_bytes(raw)
+            == canonical_bytes(encode_invocation(expanded)),
+            "noncanonical_stored_invocation",
+        )
+        producers.append(
+            {**producer, "invocation": expanded.model_dump(mode="json")}
+        )
+    return {
+        **{k: v for k, v in value.items() if k != "storage_version"},
+        "producers": producers,
+    }
+
+
+def candidate_storage_semantics(candidate: dict) -> dict:
+    """Keep every presentation field while expanding its declared proof storage."""
+    return {
+        **candidate,
+        "generation": expanded_generation(candidate.get("generation")),
+    }
 
 
 def persisted_manifest(value: object) -> GenerationManifest:
@@ -894,7 +980,7 @@ def apply_v2_annotations(report: dict, annotations: dict) -> dict:
         group.update(_group_view(section, group))
     result["document"] = _document_view(presentation)
     result["narrative_v2"] = presentation.model_dump(mode="json")
-    result["generation"] = manifest.model_dump(mode="json")
+    result["generation"] = stored_generation(manifest)
     _require(
         compiler_fact_signature(result) == manifest.compiler_fact_signature,
         "compiler_facts_changed",
@@ -945,8 +1031,8 @@ def validate_persisted_generation(report: dict, generation: dict) -> None:
     """Validate JSON generation data and any presentation already applied to it."""
     if "generation" in report or "narrative_v2" in report:
         _require(
-            canonical_bytes(generation)
-            == canonical_bytes(report.get("generation")),
+            canonical_bytes(expanded_generation(generation))
+            == canonical_bytes(expanded_generation(report.get("generation"))),
             "applied_generation_mismatch",
         )
         validate_v2_report(report)

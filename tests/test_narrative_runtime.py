@@ -1063,7 +1063,7 @@ class ArtifactRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 runtime.pending_lineages(registry)[0].consumed_attempts, 1
             )
-            self.assertFalse((Path(directory) / "artifacts-v2").exists())
+            self.assertFalse((Path(directory) / "artifacts-v3").exists())
         with self.assertRaisesRegex(ValueError, "explicit provider model"):
             GenerationRuntime(
                 identity(model="default"), checkpoint_dir="unused"
@@ -1110,7 +1110,8 @@ class ArtifactRuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.diagnostics[0].valid_items, 1)
             self.assertEqual(runtime.diagnostics[0].invalid_items, 1)
             self.assertEqual(
-                len(list(Path(directory).glob("artifacts-v2/*/*.json"))), 2
+                len(list(Path(directory).glob("artifacts-v3/items/*/*.json"))),
+                2,
             )
             self.assertEqual(
                 outcome.artifacts[1].production_request.batch.item_keys,
@@ -1400,11 +1401,13 @@ class ArtifactRuntimeTests(unittest.TestCase):
             artifact = runtime.execute_batch(
                 invocation, registry, self.callbacks(results, [])
             ).artifacts[0]
-            path = next(Path(directory).glob("artifacts-v2/*/*.json"))
+            path = next(Path(directory).glob("artifacts-v3/items/*/*.json"))
             original = path.read_bytes()
             for corrupted in (
                 b"{",
-                original.replace(b'"format_version":2', b'"format_version":1'),
+                original.replace(
+                    b"artifact-storage.v3", b"artifact-storage.v0"
+                ),
                 original.replace(
                     b'"explanations":[]', b'"explanations":["private"]'
                 ),
@@ -1443,6 +1446,7 @@ class ArtifactRuntimeTests(unittest.TestCase):
                     validate=validate_v2,
                 )
             )
+            path.unlink()
             self.assertTrue(
                 store.import_typed(
                     original,
@@ -2139,7 +2143,7 @@ except ArtifactRuntimeError as error:
             bad_artifact = changed_record(
                 hit, record=changed_record(hit.record, result=corrupted)
             )
-            for path in Path(directory).glob("artifacts-v2/*/*.json"):
+            for path in Path(directory).glob("artifacts-v3/items/*/*.json"):
                 path.unlink()
             second.artifacts.commit(bad_artifact)
             self.assertEqual(
@@ -2318,7 +2322,8 @@ except ArtifactRuntimeError as error:
             self.assertEqual(state.nodes[0].attempts[0].reason, "unknown_item")
             self.assertEqual(state.nodes[0].attempts[0].outcome, "failed")
             self.assertEqual(
-                len(list(Path(directory).glob("artifacts-v2/*/*.json"))), 2
+                len(list(Path(directory).glob("artifacts-v3/items/*/*.json"))),
+                2,
             )
             for artifact, request in zip(
                 outcome.artifacts, requests, strict=True
@@ -2401,7 +2406,12 @@ except ArtifactRuntimeError as error:
                     tuple(a.lookup.item_key for a in saved), (first,)
                 )
                 self.assertEqual(
-                    len(list(Path(directory).glob("artifacts-v2/*/*.json"))), 1
+                    len(
+                        list(
+                            Path(directory).glob("artifacts-v3/items/*/*.json")
+                        )
+                    ),
+                    1,
                 )
                 resumed = runtime_v2.ArtifactRuntime(
                     identity(report_signature="changed"),
@@ -2726,7 +2736,7 @@ except ArtifactRuntimeError as error:
     def test_atomic_artifact_failure_leaves_previous_committed_data(
         self,
     ) -> None:
-        """A failed replacement cannot damage the last complete typed artifact."""
+        """A failed publication cannot damage a previous immutable artifact."""
         invocation, registry, results = fixture_v2(1)
         with tempfile.TemporaryDirectory() as directory:
             runtime = runtime_v2.ArtifactRuntime(
@@ -2735,12 +2745,12 @@ except ArtifactRuntimeError as error:
             artifact = runtime.execute_batch(
                 invocation, registry, self.callbacks(results, [])
             ).artifacts[0]
-            path = next(Path(directory).glob("artifacts-v2/*/*.json"))
+            path = next(Path(directory).glob("artifacts-v3/items/*/*.json"))
             previous = path.read_bytes()
             with (
                 patch.object(
-                    Path,
-                    "replace",
+                    os,
+                    "link",
                     side_effect=OSError("private storage text"),
                 ),
                 self.assertRaisesRegex(

@@ -48,6 +48,7 @@ from .narrative_manifest import GenerationManifest
 from .narrative_manifest import ProducerDescriptor
 from .narrative_manifest import assemble_candidate
 from .narrative_manifest import build_receipts
+from .narrative_manifest import candidate_storage_semantics
 from .narrative_manifest import compiler_fact_signature
 from .narrative_manifest import validate_prose_support
 from .narrative_plan import PackingError
@@ -2124,6 +2125,8 @@ def validate_production(
     )
     if candidate is not None:
         require(
-            canonical_bytes(candidate) == canonical_bytes(expected), "coverage"
+            canonical_bytes(candidate_storage_semantics(candidate))
+            == canonical_bytes(candidate_storage_semantics(expected)),
+            "coverage",
         )
     return expected

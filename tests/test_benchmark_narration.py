@@ -15,6 +15,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from test_narrative_storage import artifacts_v2
 from test_narrative_v2 import CASE_AFTER
 from test_narrative_v2 import CASE_BEFORE
 from test_narrative_v2 import CASE_EFFECT
@@ -24,9 +25,12 @@ from test_narrative_v2 import STRIP_EFFECT
 from test_narrative_v2 import FixtureProvider
 from test_narrative_v2 import golden_report
 
+from diffstory import narrative_runtime
 from diffstory.analysis import apply_annotations
 from diffstory.narrative import CodexCLIProvider
 from diffstory.narrative import Narrator
+from diffstory.narrative_manifest import expanded_generation
+from diffstory.narrative_plan import canonical_bytes
 from diffstory.narrative_runtime import ArtifactCallError
 from diffstory.narrative_v2 import Transport
 from diffstory.narrative_v2 import V2Options
@@ -53,7 +57,7 @@ class BenchmarkTests(unittest.TestCase):
             report=self.report,
             sha256=benchmark.file_digest(self.report),
             state=self.state,
-            reserve_bytes=0,
+            reserve_bytes=benchmark.DEFAULT_RESERVE,
         )
 
     def command(self, phase: str) -> list[str]:
@@ -70,8 +74,6 @@ class BenchmarkTests(unittest.TestCase):
             benchmark.file_digest(self.report),
             "--state",
             str(self.state),
-            "--reserve-bytes",
-            "0",
         ]
 
     def test_codec_capacity_guard_and_distinct_identity(self) -> None:
@@ -128,6 +130,65 @@ class BenchmarkTests(unittest.TestCase):
             warm["coverage"]["exact_detail_digest"],
         )
         self.assertEqual(
+            cold["coverage"]["producer_history_digest"],
+            warm["coverage"]["producer_history_digest"],
+        )
+        self.assertGreater(cold["storage_guard"]["immutable_record_writes"], 0)
+        self.assertEqual(warm["storage_guard"]["immutable_record_writes"], 0)
+        cache_files = [
+            p for p in (self.state / "cache").rglob("*") if p.is_file()
+        ]
+        self.assertEqual(
+            sum(v["files"] for v in warm["cache_storage"].values()),
+            len(cache_files),
+        )
+        self.assertEqual(
+            sum(v["bytes"] for v in warm["cache_storage"].values()),
+            sum(p.stat().st_size for p in cache_files),
+        )
+        self.assertGreater(warm["cache_storage"]["invocations"]["files"], 0)
+        self.assertGreater(warm["cache_storage"]["requests"]["files"], 0)
+        self.assertEqual(
+            warm["cache_storage"]["items"]["files"],
+            cold["coverage"]["receipts"],
+        )
+        invocation_files = [
+            p
+            for p in cache_files
+            if p.parent.name == "invocations"
+            and json.loads(p.read_bytes())["batch"]["stage"] == "detail"
+        ]
+        request_files = [
+            p
+            for p in cache_files
+            if p.parent.name == "requests"
+            and json.loads(p.read_bytes())["metadata"]["batch"]["stage"]
+            == "detail"
+        ]
+        invocation_keys = {p.stem for p in invocation_files}
+        leaf_metadata = 0
+        for path in cache_files:
+            if path.parent.parent.name == "items":
+                leaf = json.loads(path.read_bytes())
+                if leaf["invocation_digest"] in invocation_keys:
+                    leaf_metadata += path.stat().st_size - len(
+                        canonical_bytes(leaf["result"])
+                    )
+        self.assertEqual(
+            cold["detail_preflight"]["compact_invocation_bytes"],
+            sum(p.stat().st_size for p in invocation_files),
+        )
+        self.assertEqual(
+            cold["detail_preflight"][
+                "successful_request_metadata_bytes_if_initial_batches_succeed"
+            ],
+            sum(p.stat().st_size for p in request_files),
+        )
+        self.assertEqual(
+            cold["detail_preflight"]["leaf_metadata_bytes_without_results"],
+            leaf_metadata,
+        )
+        self.assertEqual(
             cold["current_usage"]["calls"],
             cold["current_usage"]["unreported_calls"],
         )
@@ -164,6 +225,143 @@ class BenchmarkTests(unittest.TestCase):
             benchmark.initialize(args)
         self.assertEqual(marker.read_bytes(), original)
 
+    def test_storage_module_is_bound_and_old_marker_is_not_rewritten(
+        self,
+    ) -> None:
+        """Adding shared storage cannot silently renew an earlier benchmark lineage."""
+        args = self.args()
+        binding = benchmark.initialize(args)
+        self.assertIn(
+            "diffstory/narrative_storage.py", binding["candidate_hashes"]
+        )
+        marker = self.state / "LOCAL_FIXTURE_ONLY.json"
+        binding["candidate_hashes"].pop("diffstory/narrative_storage.py")
+        marker.write_text(json.dumps(binding))
+        original = marker.read_bytes()
+        args.phase = "resume"
+        with self.assertRaisesRegex(
+            benchmark.BenchmarkError, "state_binding_mismatch"
+        ):
+            benchmark.initialize(args)
+        self.assertEqual(marker.read_bytes(), original)
+
+    def test_floor_intercepts_each_shared_record_and_leaf_temporary(
+        self,
+    ) -> None:
+        """The actual store cannot publish any next dependency without its reserve."""
+        for fail_at in (1, 2, 3):
+            with self.subTest(fail_at=fail_at):
+                self.assert_shared_floor(fail_at)
+
+    def assert_shared_floor(self, fail_at: int) -> None:
+        """Refuse one exact writer stage without retaining a partially written leaf."""
+        artifact = artifacts_v2()[0][0]
+        state = self.root / f"floor-{fail_at}"
+        state.mkdir()
+        guard = benchmark.StorageGuard(state, benchmark.DEFAULT_RESERVE)
+        store = narrative_runtime.ArtifactStore(state / "cache")
+        writes = []
+        original = guard.immutable
+
+        def checked(path: Path, record: object) -> None:
+            writes.append((path, record))
+            original(path, record)
+
+        guard.immutable = checked
+        checks = []
+        original_check = guard.check
+
+        def check(needed: int) -> None:
+            checks.append(needed)
+            free = guard.reserve + needed - (len(checks) == fail_at)
+            usage = type("Usage", (), {"free": free})()
+            with patch.object(
+                benchmark.shutil, "disk_usage", return_value=usage
+            ):
+                original_check(needed)
+
+        guard.check = check
+        with (
+            patch.object(
+                narrative_runtime,
+                "_immutable_cache_record",
+                guard.shared_record,
+            ),
+            self.assertRaisesRegex(
+                benchmark.BenchmarkError, "insufficient_storage"
+            ),
+        ):
+            store.commit(artifact)
+        self.assertEqual(len(writes), fail_at - 1)
+        self.assertEqual(len(checks), fail_at)
+        for (_, record), needed in zip(writes, checks, strict=False):
+            self.assertEqual(
+                needed, 2 * len(record.model_dump_json().encode())
+            )
+        self.assertEqual(list(store.directory.glob("*/*.json")), [])
+        self.assertEqual(list(store.shared_directory.rglob(".v3-*")), [])
+
+    def test_existing_shared_address_and_recovery_still_need_temporary_space(
+        self,
+    ) -> None:
+        """Neither an existing address nor the separate recovery writer bypasses the floor."""
+        self.state.mkdir()
+        guard = benchmark.StorageGuard(self.state, benchmark.DEFAULT_RESERVE)
+        artifact = artifacts_v2()[0][0]
+        store = narrative_runtime.ArtifactStore(self.state / "cache")
+        store.commit(artifact)
+        path = next((store.shared_directory / "invocations").glob("*.json"))
+        before = path.read_bytes()
+        record = narrative_runtime.StoredInvocation.model_validate_json(before)
+        usage = type("Usage", (), {"free": guard.reserve})()
+        with patch.object(benchmark.shutil, "disk_usage", return_value=usage):
+            with self.assertRaisesRegex(
+                benchmark.BenchmarkError, "insufficient_storage"
+            ):
+                guard.shared_record(path, record)
+            with self.assertRaisesRegex(
+                benchmark.BenchmarkError, "insufficient_storage"
+            ):
+                guard.record(self.state / "recovery.json", record)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse((self.state / "recovery.json").exists())
+        self.assertEqual(list(store.shared_directory.rglob(".v3-*")), [])
+
+    def test_all_cache_files_and_both_manifest_shapes_are_measured(
+        self,
+    ) -> None:
+        """Include orphan temporaries and unrelated cache records in file totals."""
+        for relative in (
+            "artifacts-v3/invocations/a.json",
+            "artifacts-v3/requests/b.json",
+            "artifacts-v3/items/c/d.json",
+            "artifacts-v3/items/c/.v3-orphan",
+            "artifacts-v2/legacy.json",
+            "producer-runs-v2/run.json",
+        ):
+            path = self.state / "cache" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fixture")
+        counts = benchmark.cache_storage_metrics(self.state)
+        self.assertEqual(sum(v["files"] for v in counts.values()), 6)
+        self.assertEqual(sum(v["bytes"] for v in counts.values()), 42)
+        self.assertEqual(counts["temporary"], {"files": 1, "bytes": 7})
+        candidate = Narrator(
+            FixtureProvider(),
+            architecture="v2",
+            recovery_dir=self.root / "proof",
+            concurrency=1,
+        ).generate(golden_report())
+        from diffstory.narrative_plan import build_evidence_ledger
+
+        ledger = build_evidence_ledger(golden_report())
+        legacy = copy.deepcopy(candidate)
+        legacy["generation"] = expanded_generation(legacy["generation"])
+        self.assertEqual(
+            benchmark.coverage_metrics(candidate, ledger),
+            benchmark.coverage_metrics(legacy, ledger),
+        )
+
     def test_unmarked_state_and_bad_pin_are_refused(self) -> None:
         """Never use a real narration cache or an unpinned input as fixture state."""
         args = self.args("resume")
@@ -182,7 +380,7 @@ class BenchmarkTests(unittest.TestCase):
     ) -> None:
         """Use explicit resource failures without weakening coverage or output caps."""
         self.state.mkdir()
-        guard = benchmark.StorageGuard(self.state, 0)
+        guard = benchmark.StorageGuard(self.state, benchmark.DEFAULT_RESERVE)
         usage = type("Usage", (), {"free": 1})()
         with (
             patch.object(benchmark.shutil, "disk_usage", return_value=usage),
