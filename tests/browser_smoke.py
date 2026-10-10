@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from playwright.sync_api import Browser
+    from playwright.sync_api import Page
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -30,6 +31,85 @@ from diffstory.analysis import (  # noqa: E402, I001
     compile_snapshot,
 )
 from diffstory.render import render  # noqa: E402
+
+
+def check_story_sections(
+    page: Page, expected_ids: list[str], check: Callable, message: str
+) -> None:
+    """Check every section identity in report order, including both DOM attributes.
+
+    Args:
+        page: Reader page to inspect.
+        expected_ids: Unique group IDs in the trusted report's order.
+        check: Assertion callback that counts successful checks.
+        message: Description shown when the assertion fails.
+    """
+    actual = page.locator(".story-section").evaluate_all(
+        "nodes => nodes.map(node => [node.id, node.dataset.storySection])"
+    )
+    check(
+        actual == [[group_id, group_id] for group_id in expected_ids], message
+    )
+
+
+def check_section_completeness_guard(
+    browser: Browser, check: Callable
+) -> None:
+    """Prove the section check rejects incomplete or corrupt authored DOMs.
+
+    Args:
+        browser: Open Chromium instance.
+        check: Assertion callback that counts successful checks.
+    """
+    expected_ids = ["authored-alpha", "authored-beta", "authored-gamma"]
+    html = "".join(
+        f'<section class="story-section" id="{group_id}" '
+        f'data-story-section="{group_id}"></section>'
+        for group_id in expected_ids
+    )
+    proof_page = browser.new_page()
+    proof_page.set_content(html)
+    check_story_sections(
+        proof_page, expected_ids, check, "complete authored sections accepted"
+    )
+    cases = (
+        ("missing section", "nodes[1].remove()", len(expected_ids) - 1),
+        (
+            "missing section replaced by duplicate",
+            "nodes[1].replaceWith(nodes[0].cloneNode(true))",
+            len(expected_ids),
+        ),
+        (
+            "extra section",
+            "nodes[2].after(nodes[0].cloneNode(true))",
+            len(expected_ids) + 1,
+        ),
+        ("reordered sections", "nodes[0].before(nodes[2])", len(expected_ids)),
+        (
+            "mismatched section attribute",
+            "nodes[1].dataset.storySection = nodes[0].id",
+            len(expected_ids),
+        ),
+    )
+    try:
+        for name, mutation, expected_count in cases:
+            proof_page.set_content(html)
+            proof_page.locator(".story-section").evaluate_all(
+                f"nodes => {{ {mutation}; }}"
+            )
+            check(
+                proof_page.locator(".story-section").count() == expected_count,
+                f"authored {name} has expected cardinality",
+            )
+            message = f"reject authored {name}"
+            try:
+                check_story_sections(proof_page, expected_ids, check, message)
+            except AssertionError as error:
+                check(str(error) == message, message)
+            else:
+                check(value=False, message=message)
+    finally:
+        proof_page.close()
 
 
 def file_evidence_report() -> dict:
@@ -451,6 +531,9 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
     """
     html = (ROOT / "examples/demo.html").read_text(encoding="utf-8")
     report = json.loads((ROOT / "examples/demo.report.json").read_text())
+    # The legacy reader maps groups to sections in report order.
+    expected_section_ids = [group["id"] for group in report["groups"]]
+    section_count = len(expected_section_ids)
     screenshot_dir = Path(tempfile.gettempdir()) / "diffstory-browser-smoke"
     screenshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -492,6 +575,13 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
         assert value, message
         assertions += 1
 
+    check(
+        bool(expected_section_ids)
+        and all(expected_section_ids)
+        and len(set(expected_section_ids)) == section_count,
+        "trusted report has nonempty, unique section IDs",
+    )
+
     with sync_playwright() as p:
         options = {"headless": True}
         executable = os.environ.get("DIFFSTORY_CHROMIUM")
@@ -516,8 +606,10 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
             page.locator(".preamble").count() == 0,
             "manually authored narration can omit the optional preamble",
         )
-        check(
-            page.locator(".story-section").count() == 10,
+        check_story_sections(
+            page,
+            expected_section_ids,
+            check,
             "all sections present simultaneously",
         )
         check(
@@ -571,6 +663,7 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
             "brand palette",
         )
 
+        check_section_completeness_guard(browser, check)
         smoke_report = file_evidence_report()
         check_file_evidence(browser, check, smoke_report)
         check_authored_preamble(browser, check, smoke_report)
@@ -591,8 +684,10 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
         )
         page.locator("#search").fill("parse_tags")
         check(page.locator(".contents-item").count() == 1, "symbol search")
-        check(
-            page.locator(".story-section").count() == 10,
+        check_story_sections(
+            page,
+            expected_section_ids,
+            check,
             "search leaves whole document intact",
         )
         page.locator(".contents-item").click(no_wait_after=True)
@@ -606,7 +701,7 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
             "section deep link",
         )
         check(
-            f"{parsing_index + 1:02d} / 10"
+            f"{parsing_index + 1:02d} / {section_count}"
             in page.locator("#readingPosition").inner_text(),
             "reading position tracks scroll",
         )
@@ -633,8 +728,10 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
             "return tags" in code.inner_text(),
             "definition view shows the implementation",
         )
-        check(
-            page.locator(".story-section").count() == 10,
+        check_story_sections(
+            page,
+            expected_section_ids,
+            check,
             "changing code view does not navigate",
         )
         code.locator("[data-switch]").click(no_wait_after=True)
@@ -765,8 +862,10 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
             in page.locator("#evidence").inner_text(),
             "pinned head available",
         )
-        check(
-            page.locator(".story-section").count() == 10,
+        check_story_sections(
+            page,
+            expected_section_ids,
+            check,
             "appendices do not replace narrative",
         )
 
@@ -783,7 +882,7 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
             ),
             "mobile top no overflow",
         )
-        for index in (0, 1, 3, 8, 9):
+        for index in (0, 1, 3, section_count - 2, section_count - 1):
             page.locator(".story-section").nth(index).evaluate(
                 '(el)=>el.scrollIntoView({block:"start"})'
             )
