@@ -1,4 +1,4 @@
-"""Offline public CLI checks for explicit v2 narration and durable recovery."""
+"""Offline public CLI checks for default/selected v2 and durable recovery."""
 
 from __future__ import annotations
 
@@ -6,6 +6,9 @@ import copy
 import hashlib
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -58,6 +61,199 @@ def state_hashes(directory: Path) -> dict[str, str]:
     }
 
 
+def run_fixture_cli_process(mode: str, command: list[str]) -> None:
+    """Run a public command in a child process with authored source and blocked I/O."""
+    provider = FixtureProvider()
+    with ExitStack() as stack:
+        for target in (
+            "socket.socket",
+            "urllib.request.urlopen",
+            "subprocess.Popen",
+            "subprocess.run",
+        ):
+            stack.enter_context(
+                patch(
+                    target,
+                    side_effect=AssertionError("External I/O forbidden"),
+                )
+            )
+        if mode == "render":
+            for target in (
+                "diffstory.cli.from_github",
+                "diffstory.cli.from_git",
+                "diffstory.cli.OpenAIResponsesProvider",
+                "diffstory.cli.CodexCLIProvider",
+            ):
+                stack.enter_context(
+                    patch(
+                        target,
+                        side_effect=AssertionError("Offline render only"),
+                    )
+                )
+        else:
+            stack.enter_context(
+                patch(
+                    "diffstory.cli.from_github", return_value=source_snapshot()
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "diffstory.cli.OpenAIResponsesProvider",
+                    return_value=provider,
+                )
+            )
+            if mode == "warm":
+                stack.enter_context(
+                    patch.object(
+                        provider,
+                        "complete_reply",
+                        side_effect=AssertionError("Warm run must not send"),
+                    )
+                )
+        with redirect_stdout(io.StringIO()) as output:
+            code = main(command)
+    json.dump(
+        {
+            "pid": os.getpid(),
+            "calls": len(provider.calls),
+            "stdout": output.getvalue(),
+        },
+        sys.stdout,
+    )
+    raise SystemExit(code)
+
+
+class DefaultCliProcessTests(unittest.TestCase):
+    """Verify the activated public default across separate Python processes."""
+
+    def test_default_cold_warm_fresh_state_and_offline_render(self) -> None:
+        """Reconstruct cached proof and saved reports without a live provider."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            out = root / "walkthrough.html"
+            command = [
+                "github",
+                "owner/repo#1",
+                "--narrate",
+                "--yes",
+                "--concurrency",
+                "1",
+                "--out",
+                str(out),
+            ]
+            self.assertNotIn("--architecture", command)
+            project = Path(__file__).resolve().parents[1]
+
+            def run(mode: str, args: list[str]) -> dict:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        "import sys\nsys.path[:0] = sys.argv[1:3]\n"
+                        "from test_cli_narration_v2 import run_fixture_cli_process\n"
+                        "run_fixture_cli_process(sys.argv[3], sys.argv[4:])",
+                        str(project),
+                        str(project / "tests"),
+                        mode,
+                        *args,
+                    ],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
+                self.assertEqual(result.stderr, "")
+                return json.loads(result.stdout)
+
+            cold = run("cold", command)
+            self.assertGreater(cold["calls"], 0)
+            saved = read_json(str(out.with_suffix(".report.json")))
+            generation = saved["generation"]
+            self.assertEqual(generation["version"], "diffstory.generation.v2")
+            self.assertEqual(
+                generation["current_usage"]["calls"], cold["calls"]
+            )
+            self.assertEqual(
+                read_json(str(out.with_suffix(".annotations.json")))["schema"],
+                "diffstory.annotations.v2",
+            )
+            state = out.with_suffix(".narration-state")
+            cache = out.with_suffix(".narration-cache")
+            self.assertTrue(state_hashes(state))
+            cached = state_hashes(cache)
+            self.assertTrue(cached)
+
+            warm = run("warm", command)
+            self.assertEqual(warm["calls"], 0)
+            self.assertIn("actual attempts 0", warm["stdout"])
+            reused = read_json(str(out.with_suffix(".report.json")))
+            self.assertEqual(
+                reused["generation"]["current_usage"],
+                {
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0,
+                    "calls": 0,
+                    "unreported_calls": 0,
+                },
+            )
+            for field in (
+                "details",
+                "plan",
+                "planning",
+                "sections",
+                "document",
+                "producers",
+            ):
+                self.assertEqual(
+                    reused["generation"][field], generation[field], field
+                )
+            self.assertIn(
+                f"unique reused results: {len(reused['generation']['receipts'])}",
+                warm["stdout"],
+            )
+            self.assertEqual(state_hashes(cache), cached)
+            original_state = state_hashes(state)
+
+            fresh_state = root / "fresh-state"
+            fresh = run("warm", [*command, "--fresh-state", str(fresh_state)])
+            self.assertEqual(fresh["calls"], 0)
+            self.assertIn("Explicit fresh state", fresh["stdout"])
+            self.assertTrue(state_hashes(fresh_state))
+            self.assertEqual(state_hashes(state), original_state)
+            self.assertEqual(state_hashes(cache), cached)
+
+            saved_html = out.read_bytes()
+            final_saved = read_json(str(out.with_suffix(".report.json")))
+            reloaded = root / "reloaded.html"
+            offline = run(
+                "render",
+                [
+                    "render",
+                    str(out.with_suffix(".report.json")),
+                    "--out",
+                    str(reloaded),
+                ],
+            )
+            self.assertEqual(offline["calls"], 0)
+            self.assertEqual(reloaded.read_bytes(), saved_html)
+            self.assertEqual(
+                read_json(str(reloaded.with_suffix(".report.json"))),
+                final_saved,
+            )
+            self.assertEqual(
+                len(
+                    {result["pid"] for result in (cold, warm, fresh, offline)}
+                ),
+                4,
+            )
+
+
 class CliV2Tests(unittest.TestCase):
     """Exercise the actual narrator, validator, persistence and renderer locally."""
 
@@ -87,13 +283,15 @@ class CliV2Tests(unittest.TestCase):
 
     def command(self, *options: str) -> list[str]:
         """Build the supported GitHub command with explicit architecture."""
+        return self.default_command("--architecture", "v2", *options)
+
+    def default_command(self, *options: str) -> list[str]:
+        """Use the public default with all automatic state under the fixture root."""
         return [
             "github",
             "owner/repo#1",
             "--narrate",
             "--yes",
-            "--architecture",
-            "v2",
             "--concurrency",
             "1",
             "--out",
@@ -127,6 +325,68 @@ class CliV2Tests(unittest.TestCase):
             self.last_ingest = ingest.call_args
         self.assertNotIn(SENTINEL, output.getvalue() + errors.getvalue())
         return code, output.getvalue(), errors.getvalue()
+
+    def test_default_without_payload_cache_retains_selected_and_automatic_state(
+        self,
+    ) -> None:
+        """A new default CLI invocation cannot renew spent work when prose is absent."""
+        for selected in (False, True):
+            for unresolved in (False, True):
+                with self.subTest(
+                    selected_state=selected, unresolved_model=unresolved
+                ):
+                    root = self.root / f"{selected}-{unresolved}"
+                    out = root / "walkthrough.html"
+                    state = (
+                        root / "selected-state"
+                        if selected
+                        else out.with_suffix(".narration-state")
+                    )
+                    options = (
+                        ["--provider", "codex"]
+                        if unresolved
+                        else ["--no-cache"]
+                    )
+                    if selected:
+                        options += ["--state-dir", str(state)]
+                    command = self.default_command("--out", str(out), *options)
+                    self.assertNotIn("--architecture", command)
+                    provider = FixtureProvider()
+                    if unresolved:
+                        provider.model = "Codex CLI default"
+                    code, output, errors = self.run_cli(command, provider)
+                    self.assertEqual(code, 0, errors)
+                    self.assertGreater(len(provider.calls), 0)
+                    self.assertIn(f"Durable recovery: {state}", output)
+                    self.assertIn(
+                        "Payload cache disabled. Attempt budgets persist",
+                        output,
+                    )
+                    self.assertTrue(list(state.glob("recovery-v2/*.json")))
+                    before = state_hashes(state)
+                    self.assertFalse(
+                        out.with_suffix(".narration-cache").exists()
+                    )
+                    self.assertEqual(
+                        read_json(str(out.with_suffix(".report.json")))[
+                            "generation"
+                        ]["version"],
+                        "diffstory.generation.v2",
+                    )
+                    restarted = FixtureProvider()
+                    if unresolved:
+                        restarted.model = "Codex CLI default"
+                    with patch.object(
+                        restarted,
+                        "complete_reply",
+                        side_effect=AssertionError("Restart must not send"),
+                    ):
+                        code, output, errors = self.run_cli(command, restarted)
+                    self.assertEqual(code, 2)
+                    self.assertIn("results_unavailable", errors)
+                    self.assertIn("actual attempts 0", output)
+                    self.assertEqual(restarted.calls, [])
+                    self.assertEqual(state_hashes(state), before)
 
     def test_nondefault_options_and_paths_survive_offline_reload(self) -> None:
         """Honor CLI overrides and decode persisted nondefault ledger parameters."""
@@ -652,7 +912,7 @@ class CliV2Tests(unittest.TestCase):
     def test_confirmation_url_and_source_limit_are_preserved(self) -> None:
         """Only the existing source-transfer confirmation authorizes sends."""
         for pr in ("owner/repo#1", "https://github.com/owner/repo/pull/1"):
-            command = self.command("--max-source-bytes", "10000")
+            command = self.default_command("--max-source-bytes", "10000")
             command[1] = pr
             command.remove("--yes")
             provider = FixtureProvider()
@@ -668,7 +928,7 @@ class CliV2Tests(unittest.TestCase):
             _build_parser()
             .parse_args(["github", "a/b#1", "--out", "x.html"])
             .architecture,
-            "legacy",
+            "v2",
         )
         self.assertEqual(MAX_SNAPSHOT_SOURCE_BYTES, 64_000_000)
 

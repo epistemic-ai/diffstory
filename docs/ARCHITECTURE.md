@@ -113,7 +113,9 @@ Python AST support is implemented with the standard library, so parse support fo
 
 ### Legacy narration and shared source limits
 
-The following narration description covers the legacy CLI default. The explicit v2 mode is described below.
+The following narration description covers explicit `--architecture legacy` and
+the compatible `Narrator` library default. The CLI defaults to v2 when narration
+is requested, as described below.
 
 The default narrative uses deterministic templates. The demo adds authored domain-specific annotations. The opt-in `--narrate` path supports the OpenAI Responses API and the user's signed-in Codex CLI. Both providers return structured output and assemble validated source-bound passages with hierarchical summaries. OpenAI requests use its selected model capacity; known Codex overrides use published model capacity, while the CLI default is packed against a conservative 400,000-token context bound. A planning call chooses a story order from group summaries; dependency constraints and cycle groups are enforced before section prose is written. Long source lines are split into bounded slices without dropping text. If a leaf response omits change citations, Diffstory may make one bounded repair request for that chunk. The Codex adapter runs `codex exec` from a temporary directory, in a read-only sandbox, with local shell, browser, app, and plugin tools disabled. Each provider call has a 900-second timeout. Both adapters use the standard library for transport. Shared data validation uses Pydantic. Successful calls contribute provider-reported input, cached input, and output token counts to a run summary; no run-wide token, call-count, or elapsed-time budget is imposed.
 
@@ -137,13 +139,14 @@ First add full-repository symbol indexing with explicit resolution confidence an
 - GitHub pull-request file pagination: https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files
 - GitHub contents API: https://docs.github.com/en/rest/repos/contents
 
-## Explicit narration architecture v2
+## Default narration architecture v2
 
-`--narrate --architecture v2` selects the new pipeline. The CLI and the
-`Narrator` library still default to legacy narration. Default activation is gated
-on the remaining integration, benchmark, and independent acceptance checks.
-`--architecture legacy` remains an explicit compatibility option. An ordinary
-command without `--narrate` still produces the deterministic baseline narrative.
+`--narrate` uses the v2 pipeline by default. `--architecture v2` also selects it
+explicitly. `--architecture legacy` selects the supported legacy pipeline.
+The `Narrator` library keeps its legacy default for callers that do not supply
+durable v2 state. Library callers select v2 with `architecture="v2"` and a stable
+`recovery_dir`. An ordinary command without `--narrate` still produces the
+deterministic baseline narrative.
 
 ```text
 Compiled report → evidence ledger → packed detail requests → detailed results
@@ -268,7 +271,8 @@ whole-PR savings or change narration defaults.
 
 ### Recovery, optional payload storage, and deliberate fresh state
 
-Every CLI v2 run has durable recovery state, by default
+Every CLI v2 run, including default `--narrate` commands, has durable recovery
+state. Its default path is
 `Path(out).with_suffix('.narration-state')`. `--state-dir PATH` selects a stable
 alternative. Keep that path across restarts. Changing the output path changes
 the default state path, so use `--state-dir` when renaming outputs for the same
@@ -353,13 +357,19 @@ success, or live-model quality result is claimed here.
 ### Supported UV commands
 
 The existing source-limit and source-transfer confirmation behavior is retained.
-Both repository/PR-number and URL forms are supported. These commands select v2
-explicitly while the default remains gated:
+Both repository/PR-number and URL forms are supported. These commands use the
+v2 default:
 
 ```sh
-uv run --locked diffstory github 'owner/repo#123' --narrate --architecture v2 --provider codex --model gpt-6.1-sol --out walkthrough.html
-uv run --locked diffstory github https://github.com/owner/repo/pull/123 --narrate --architecture v2 --provider codex --model gpt-6.1-sol --out walkthrough.html
-uv run --locked diffstory git --repo . --base BASE --head HEAD --narrate --architecture v2 --provider codex --model gpt-6.1-sol --out walkthrough.html
+uv run --locked diffstory github 'owner/repo#123' --narrate --provider codex --model gpt-6.1-sol --out walkthrough.html
+uv run --locked diffstory github https://github.com/owner/repo/pull/123 --narrate --provider codex --model gpt-6.1-sol --out walkthrough.html
+uv run --locked diffstory git --repo . --base BASE --head HEAD --narrate --provider codex --model gpt-6.1-sol --out walkthrough.html
+```
+
+To select the supported legacy pipeline explicitly:
+
+```sh
+uv run --locked diffstory github 'owner/repo#123' --narrate --architecture legacy --provider codex --model gpt-6.1-sol --out legacy.html
 ```
 
 Approve the displayed source transfer interactively, or supply the existing
@@ -367,8 +377,8 @@ Approve the displayed source transfer interactively, or supply the existing
 can lower the source limit. `--concurrency N` controls active narration jobs.
 
 ```sh
-uv run --locked diffstory github 'owner/repo#123' --narrate --architecture v2 --provider codex --model gpt-6.1-sol --state-dir walkthrough.narration-state --no-cache --out walkthrough.html
-uv run --locked diffstory github 'owner/repo#123' --narrate --architecture v2 --provider codex --model gpt-6.1-sol --fresh-state retry.narration-state --out walkthrough.html
+uv run --locked diffstory github 'owner/repo#123' --narrate --provider codex --model gpt-6.1-sol --state-dir walkthrough.narration-state --no-cache --out walkthrough.html
+uv run --locked diffstory github 'owner/repo#123' --narrate --provider codex --model gpt-6.1-sol --fresh-state retry.narration-state --out walkthrough.html
 uv run --locked diffstory render walkthrough.report.json --out reloaded.html
 uv run --locked diffstory render compiler.report.json --annotations walkthrough.annotations.json --out annotated.html
 uv run --locked diffstory render large.report.json --max-report-bytes 512000000 --out reloaded.html

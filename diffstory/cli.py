@@ -188,8 +188,8 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--architecture",
         choices=["legacy", "v2"],
-        default="legacy",
-        help="Narration architecture (default: legacy; v2 activation is gated)",
+        default="v2",
+        help="Narration architecture (default: v2; legacy remains supported)",
     )
     state_group = parser.add_mutually_exclusive_group()
     state_group.add_argument(

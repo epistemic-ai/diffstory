@@ -1159,7 +1159,15 @@ class NarrativeTests(unittest.TestCase):
                 patch("diffstory.cli.sys.stdin.isatty", return_value=False),
             ):
                 result = main(
-                    ["github", "owner/repo#1", "--narrate", "--out", str(out)]
+                    [
+                        "github",
+                        "owner/repo#1",
+                        "--narrate",
+                        "--architecture",
+                        "legacy",
+                        "--out",
+                        str(out),
+                    ]
                 )
             self.assertEqual(result, 2)
             self.assertEqual(provider.calls, [])
@@ -1182,6 +1190,8 @@ class NarrativeTests(unittest.TestCase):
                         "github",
                         "owner/repo#1",
                         "--narrate",
+                        "--architecture",
+                        "legacy",
                         "--yes",
                         "--out",
                         str(out),
@@ -1242,6 +1252,8 @@ class NarrativeTests(unittest.TestCase):
                         "github",
                         "owner/repo#1",
                         "--narrate",
+                        "--architecture",
+                        "legacy",
                         "--yes",
                         "--out",
                         str(out),
