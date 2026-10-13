@@ -964,12 +964,16 @@ def _group_view(section: PresentationSection, group: dict) -> dict:
     }
 
 
-def apply_v2_annotations(report: dict, annotations: dict) -> dict:
-    """Validate all offline proofs and attach deterministic typed presentation."""
+def _apply_v2_candidate(
+    report: dict, manifest: GenerationManifest, candidate: dict
+) -> dict:
+    """Apply already validated deterministic v2 data to an owned report copy.
+
+    This helper performs data assembly only. Callers at public dictionary
+    boundaries must validate the complete proof before using it.
+    """
     from copy import deepcopy
 
-    manifest = persisted_manifest(annotations.get("generation"))
-    candidate = validate_generation(report, manifest, candidate=annotations)
     presentation = presentation_from_candidate(candidate)
     result = deepcopy(report)
     groups = {g["id"]: g for g in result["groups"]}
@@ -986,6 +990,13 @@ def apply_v2_annotations(report: dict, annotations: dict) -> dict:
         "compiler_facts_changed",
     )
     return result
+
+
+def apply_v2_annotations(report: dict, annotations: dict) -> dict:
+    """Validate all offline proofs and attach deterministic typed presentation."""
+    manifest = persisted_manifest(annotations.get("generation"))
+    candidate = validate_generation(report, manifest, candidate=annotations)
+    return _apply_v2_candidate(report, manifest, candidate)
 
 
 def validate_v2_report(report: dict) -> None:

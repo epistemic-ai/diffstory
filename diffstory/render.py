@@ -168,6 +168,41 @@ def _validate_group_links(
             raise ValueError(msg)
 
 
+def _validate_report_schema(report: dict) -> None:
+    """Require the renderer's report schema before inspecting its fields."""
+    if report.get("schema") != SCHEMA:
+        msg = "Expected a diffstory report"
+        raise ValueError(msg)
+
+
+def _validate_v2_report_surface(report: dict) -> None:
+    """Check v2 renderer fields after a separate complete proof check.
+
+    This verifies renderer safety only. It does not validate narration proof or
+    issue a capability. The public report boundary calls it after
+    ``validate_generated_report``; a completed ReportSession import may call it
+    after its own complete generation validation and deterministic application.
+    The schema and collection checks must already have passed.
+    """
+    _validate_nested_value(
+        {
+            key: value
+            for key, value in report.items()
+            if key not in {"generation", "narrative_v2"}
+        }
+    )
+    _validate_report_stats(report.get("stats"))
+    groups = {g["id"] for g in report["groups"]}
+    changes = {c["id"] for c in report["changes"]}
+    if len(groups) != len(report["groups"]) or len(changes) != len(
+        report["changes"],
+    ):
+        msg = "Duplicate report identifiers"
+        raise ValueError(msg)
+    changes_by_id = {c["id"]: c for c in report["changes"]}
+    _validate_group_links(report, groups, changes, changes_by_id)
+
+
 def validate_report(report: dict) -> None:
     """
     Validate report structure and values that affect safe rendering.
@@ -184,9 +219,7 @@ def validate_report(report: dict) -> None:
         TypeError: If a value has an unsupported container or scalar type.
 
     """
-    if report.get("schema") != SCHEMA:
-        msg = "Expected a diffstory report"
-        raise ValueError(msg)
+    _validate_report_schema(report)
     _validate_report_collections(report)
     generation = report.get("generation")
     v2 = (
@@ -197,18 +230,12 @@ def validate_report(report: dict) -> None:
         # Only these exact root paths are exempt after complete proof and
         # deterministic presentation validation. All compiler IDs stay 16-hex.
         validate_generated_report(report)
-        _validate_nested_value(
-            {
-                key: value
-                for key, value in report.items()
-                if key not in {"generation", "narrative_v2"}
-            }
-        )
-    else:
-        if "narrative_v2" in report:
-            msg = "V2 presentation requires a validated v2 generation"
-            raise ValueError(msg)
-        _validate_nested_value(report)
+        _validate_v2_report_surface(report)
+        return
+    if "narrative_v2" in report:
+        msg = "V2 presentation requires a validated v2 generation"
+        raise ValueError(msg)
+    _validate_nested_value(report)
     _validate_report_stats(report.get("stats"))
     groups = {g["id"] for g in report["groups"]}
     changes = {c["id"] for c in report["changes"]}
@@ -218,10 +245,10 @@ def validate_report(report: dict) -> None:
         msg = "Duplicate report identifiers"
         raise ValueError(msg)
     changes_by_id = {c["id"]: c for c in report["changes"]}
-    if "document" in report and not v2:
+    if "document" in report:
         validate_document(report["document"])
     _validate_group_links(report, groups, changes, changes_by_id)
-    if "generation" in report and not v2:
+    if "generation" in report:
         validate_generated_report(report)
 
 
