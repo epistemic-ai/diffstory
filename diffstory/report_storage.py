@@ -39,6 +39,7 @@ from .narrative_contracts import StatementRef
 from .narrative_contracts import StoryPlan
 from .narrative_contracts import SupportedStatement
 from .narrative_contracts import result_key
+from .narrative_contracts import result_key_field
 from .narrative_contracts import result_kind
 from .narrative_manifest import CurrentUsage
 from .narrative_manifest import GenerationManifest
@@ -141,11 +142,13 @@ def _strict_json_value(value: object, *, depth: int = 0) -> None:  # noqa: C901 
 
 
 def _freeze(value: object) -> object:
+    if isinstance(value, BaseModel):
+        return _freeze(value.model_dump(mode="json"))
     if type(value) is dict:
         return MappingProxyType(
             {key: _freeze(item) for key, item in value.items()}
         )
-    if type(value) is list:
+    if type(value) in {list, tuple}:
         return tuple(_freeze(item) for item in value)
     return value
 
@@ -156,6 +159,50 @@ def _thaw(value: object) -> object:
     if type(value) in {list, tuple}:
         return [_thaw(item) for item in value]
     return value
+
+
+def _model_snapshot(value: BaseModel) -> dict:
+    """Return a detached JSON snapshot that keeps explicitly absent defaults absent."""
+    snapshot = value.model_dump(mode="json", exclude_unset=True)
+    if type(snapshot) is not dict:
+        _fail("invalid_typed_storage_record")
+    _strict_json_value(snapshot)
+    return snapshot
+
+
+def _raw_json_snapshot(value: object) -> object:
+    """Copy typed values without allowing serializers to coerce their scalars."""
+    if isinstance(value, BaseModel):
+        return _raw_model_snapshot(value)
+    if type(value) in {list, tuple}:
+        return [_raw_json_snapshot(item) for item in value]
+    if isinstance(value, Mapping):
+        result = {key: _raw_json_snapshot(item) for key, item in value.items()}
+        _strict_json_value(result)
+        return result
+    if value is None or type(value) in {str, bool, int, float}:
+        _strict_json_value(value)
+        return value
+    _fail("invalid_typed_storage_record")
+
+
+def _raw_model_snapshot(value: BaseModel) -> dict:
+    """Capture every declared field, including defaults, from raw attributes."""
+    if not isinstance(value, BaseModel):
+        _fail("invalid_typed_storage_record")
+    fields = type(value).model_fields
+    if set(vars(value)) - set(fields):
+        _fail("invalid_typed_storage_record")
+    snapshot = {
+        name: _raw_json_snapshot(getattr(value, name)) for name in fields
+    }
+    _strict_json_value(snapshot)
+    return snapshot
+
+
+def _json_snapshot(value: object) -> object:
+    """Copy one typed field to JSON primitives without making a report tree."""
+    return _raw_json_snapshot(value)
 
 
 def _ref(storage_id: str, kind: str) -> dict[str, str]:
@@ -196,19 +243,164 @@ def storage_address(kind: str, record: dict) -> str:
     ).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class RecordRef:
+    """An integrity address into one table; it carries no proof authority."""
+
+    table: str
+    kind: str
+    storage_id: str
+
+    def __post_init__(self) -> None:
+        """Reject an address whose table, kind, or digest is out of contract."""
+        if (
+            self.table not in _TABLES
+            or self.kind not in _TABLE_RECORD_KINDS[self.table]
+            or type(self.storage_id) is not str
+            or not _ID_PATTERN.fullmatch(self.storage_id)
+        ):
+            _fail("invalid_storage_record_reference")
+
+
+@dataclass(frozen=True, slots=True)
+class ResultRef(RecordRef):
+    """Typed address of one complete shared generation result."""
+
+    item_key: str
+
+    def __post_init__(self) -> None:
+        """Require the address and semantic item key to identify a result."""
+        super(ResultRef, self).__post_init__()
+        if (
+            self.table != "results"
+            or type(self.item_key) is not str
+            or not _ID_PATTERN.fullmatch(self.item_key)
+        ):
+            _fail("invalid_storage_result_reference")
+
+
+@dataclass(frozen=True, slots=True)
+class ReaderSectionRef:
+    """Ordered reader membership with result addresses, without result copies."""
+
+    group_id: str
+    group_key: str
+    number: int
+    next_id: str | None
+    prose: ResultRef
+    details: tuple[ResultRef, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedReaderProjection:
+    """Read-only ordered reader references backed by a report record graph."""
+
+    shape: str
+    document: ResultRef
+    sections: tuple[ReaderSectionRef, ...]
+    context_details: tuple[ResultRef, ...]
+    citations: tuple[RecordRef, ...]
+    support_provenance: tuple[RecordRef, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReportReaderProjection:
+    """Borrowed typed reader inputs consumed while constructing a graph.
+
+    The input models are not retained. ``ReportRecordGraph.from_typed`` copies
+    each complete record into immutable JSON primitives before it returns.
+    """
+
+    shape: str
+    document: DocumentResult
+    sections: tuple[PresentationSection, ...]
+    context_details: tuple[DetailResult, ...]
+    citations: tuple[ResolvedCitation, ...]
+    support_provenance: tuple[InheritedProvenance, ...]
+    version: str | None = None
+    provenance: str | None = None
+
+    @classmethod
+    def from_presentation(
+        cls, presentation: V2Presentation
+    ) -> ReportReaderProjection:
+        """Create typed input from a complete v2 presentation model."""
+        if not isinstance(presentation, V2Presentation):
+            _fail("reader_projection_requires_typed_presentation")
+        return cls(
+            shape="presentation",
+            document=presentation.document,
+            sections=presentation.sections,
+            context_details=presentation.context_details,
+            citations=presentation.citations,
+            support_provenance=presentation.support_provenance,
+            version=presentation.version,
+            provenance=presentation.provenance,
+        )
+
+    @classmethod
+    def from_annotations(
+        cls,
+        *,
+        document: DocumentResult,
+        steps: tuple[PresentationSection, ...],
+        context_details: tuple[DetailResult, ...],
+        citations: tuple[ResolvedCitation, ...],
+        support_provenance: tuple[InheritedProvenance, ...],
+    ) -> ReportReaderProjection:
+        """Create typed reader input for an annotations.v2 artifact."""
+        return cls(
+            shape="annotations",
+            document=document,
+            sections=steps,
+            context_details=context_details,
+            citations=citations,
+            support_provenance=support_provenance,
+        )
+
+
 class _Builder:
     """Build typed records bottom-up and share exact canonical content."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, defer_validation: bool = False) -> None:
+        self.defer_validation = defer_validation
         self.records: dict[str, dict[str, dict[str, object]]] = {
             name: {} for name in _TABLES
         }
         self.address_contents: dict[str, dict[str, bytes]] = {
             name: {} for name in _TABLES
         }
+        self.logical_records: dict[str, dict] = {}
         self.record_count = 0
         self.result_ids: dict[tuple[str, str], str] = {}
+        self.typed_results: dict[str, BaseModel] = {}
         self.receipt_ids: dict[str, str] = {}
+
+    def _capture_record(
+        self, model: type[BaseModel], value: dict | BaseModel
+    ) -> tuple[dict, BaseModel | None]:
+        if isinstance(value, model):
+            record = _raw_model_snapshot(value)
+        elif type(value) is dict:
+            record = copy.deepcopy(value)
+            _strict_json_value(record)
+        else:
+            _fail("invalid_typed_storage_record")
+        typed = None if self.defer_validation else _model(model, record)
+        return record, typed
+
+    @staticmethod
+    def _array(record: dict, field: str) -> list | tuple:
+        value = record.get(field, [])
+        if type(value) not in {list, tuple}:
+            _fail("invalid_typed_storage_record")
+        return value
+
+    @staticmethod
+    def _model_array(value: object) -> tuple | list:
+        if type(value) not in {tuple, list}:
+            _fail("invalid_typed_storage_record")
+        return value
 
     def put(
         self,
@@ -217,20 +409,44 @@ class _Builder:
         record: dict,
         *,
         address_record: dict | None = None,
+        stream_address: bool = False,
     ) -> str:
         if table not in self.records or kind not in _TABLE_RECORD_KINDS[table]:
             _fail("invalid_storage_record_kind")
         _strict_json_value(record)
-        complete = record if address_record is None else address_record
-        _strict_json_value(complete)
-        identifier = storage_address(kind, complete)
-        encoded_complete = canonical_bytes(complete)
+        if stream_address:
+            if table != "readers":
+                _fail("invalid_streamed_storage_record")
+            identifier = _logical_storage_address(
+                table,
+                "",
+                {"kind": kind, "record": record},
+                self.records,
+                self.logical_records,
+            )
+            encoded_complete = None
+        else:
+            complete = record if address_record is None else address_record
+            _strict_json_value(complete)
+            identifier = storage_address(kind, complete)
+            encoded_complete = canonical_bytes(complete)
         encoded_stored = canonical_bytes(record)
         prior = self.records[table].get(identifier)
         if prior is not None:
+            same_logical_content = (
+                _logical_reader_streams_equal(
+                    prior["record"],
+                    record,
+                    self.records,
+                    self.logical_records,
+                )
+                if stream_address
+                else self.address_contents[table][identifier]
+                == encoded_complete
+            )
             if (
                 prior["kind"] != kind
-                or self.address_contents[table][identifier] != encoded_complete
+                or not same_logical_content
                 or canonical_bytes(prior["record"]) != encoded_stored
             ):
                 _fail("storage_address_collision")
@@ -242,67 +458,91 @@ class _Builder:
             "kind": kind,
             "record": record,
         }
-        self.address_contents[table][identifier] = encoded_complete
+        if not stream_address:
+            self.address_contents[table][identifier] = encoded_complete
+            self.logical_records[f"{table}:{identifier}"] = complete
         self.record_count += 1
         return identifier
 
-    def add_span(self, value: dict) -> dict[str, str]:
-        _model(SpanRef, value)
+    def add_span(self, value: dict | SpanRef) -> dict[str, str]:
+        value, _ = self._capture_record(SpanRef, value)
         return _ref(
             self.put("evidence_refs", "span_ref", copy.deepcopy(value)),
             "span_ref",
         )
 
-    def add_evidence(self, value: dict, kind: str) -> dict[str, str]:
+    def add_evidence(
+        self, value: dict | SpanRef | SourceSliceRef | StatementRef, kind: str
+    ) -> dict[str, str]:
         if kind == "span_ref":
             return self.add_span(value)
         if kind == "source_slice_ref":
-            _model(SourceSliceRef, value)
+            value, _ = self._capture_record(SourceSliceRef, value)
+            source = value.get("source")
+            if type(source) is not dict:
+                _fail("invalid_typed_storage_record")
             record = copy.deepcopy(value)
-            record["source"] = self.add_span(record["source"])
+            record["source"] = self.add_span(source)
             return _ref(
                 self.put("evidence_refs", kind, record, address_record=value),
                 kind,
             )
         if kind == "statement_ref":
-            _model(StatementRef, value)
+            value, _ = self._capture_record(StatementRef, value)
             return _ref(
                 self.put("evidence_refs", kind, copy.deepcopy(value)), kind
             )
         _fail("invalid_evidence_reference_kind")
 
-    def add_statement(self, value: dict) -> dict[str, str]:
-        _model(SupportedStatement, value)
+    def add_statement(
+        self, value: dict | SupportedStatement
+    ) -> dict[str, str]:
+        value, _ = self._capture_record(SupportedStatement, value)
         record = copy.deepcopy(value)
         if "citations" in record:
             record["citations"] = [
                 self.add_evidence(citation, "span_ref")
-                for citation in record["citations"]
+                for citation in self._array(record, "citations")
             ]
         if "basis" in record:
             record["basis"] = [
                 self.add_evidence(
                     basis,
                     "source_slice_ref"
-                    if basis.get("kind") == "source_slice"
+                    if type(basis) is dict
+                    and basis.get("kind") == "source_slice"
                     else "statement_ref",
                 )
-                for basis in record["basis"]
+                for basis in self._array(record, "basis")
             ]
         return record  # The containing result receives the table address.
 
-    def add_result(self, kind: str, value: dict) -> dict[str, str]:
+    def add_result(  # noqa: C901, PLR0912 # Build one typed result table record bottom-up.
+        self, kind: str, value: dict | BaseModel
+    ) -> dict[str, str]:
         model = _RESULT_MODELS.get(kind)
         if model is None:
             _fail("invalid_result_kind")
-        _model(model, value)
+        value, typed = self._capture_record(model, value)
+        logical_id = storage_address(kind, value)
+        key_field = result_key_field(kind)
+        if key_field not in value or type(value[key_field]) is not str:
+            _fail("invalid_typed_storage_record")
+        pair = (kind, value[key_field])
+        prior = self.result_ids.get(pair)
+        if prior is not None:
+            if prior != logical_id:
+                _fail("duplicate_result_identity")
+            return _ref(prior, kind)
         record = copy.deepcopy(value)
         if kind == "detail":
             for family in ("explanations", "observations", "questions"):
-                for item in record.get(family, []):
+                for item in self._array(record, family):
+                    if type(item) is not dict:
+                        _fail("invalid_typed_storage_record")
                     item["citations"] = [
                         self.add_evidence(citation, "span_ref")
-                        for citation in item.get("citations", [])
+                        for citation in self._array(item, "citations")
                     ]
         else:
             statement_fields = {
@@ -314,25 +554,27 @@ class _Builder:
                 record["title"] = self.add_statement(record["title"])
             for field in statement_fields:
                 record[field] = [
-                    self.add_statement(item) for item in record.get(field, [])
+                    self.add_statement(item)
+                    for item in self._array(record, field)
                 ]
-            for terminology in record.get("terminology", []):
+            for terminology in self._array(record, "terminology"):
+                if type(terminology) is not dict:
+                    _fail("invalid_typed_storage_record")
                 terminology["definition"] = self.add_statement(
                     terminology["definition"]
                 )
         identifier = self.put("results", kind, record, address_record=value)
-        logical_key = result_key(_model(model, value))
-        pair = (kind, logical_key)
-        old = self.result_ids.get(pair)
-        if old is not None and old != identifier:
-            _fail("duplicate_result_identity")
         self.result_ids[pair] = identifier
+        if typed is not None:
+            self.typed_results[identifier] = typed
         return _ref(identifier, kind)
 
-    def add_citation(self, value: dict) -> dict[str, str]:
-        citation = _model(ResolvedCitation, value)
+    def add_citation(self, value: dict | ResolvedCitation) -> dict[str, str]:
+        value, citation = self._capture_record(ResolvedCitation, value)
         record = copy.deepcopy(value)
         reference = record["reference"]
+        if type(reference) is not dict:
+            _fail("invalid_typed_storage_record")
         ref_kind = (
             "source_slice_ref"
             if reference.get("kind") == "source_slice"
@@ -349,7 +591,8 @@ class _Builder:
         )
         url = record.pop("url")
         record["url"] = _ref(self.put("urls", "url", {"value": url}), "url")
-        _validate_citation_binding(citation, value)
+        if isinstance(citation, ResolvedCitation):
+            _validate_citation_binding(citation, value)
         return _ref(
             self.put(
                 "resolved_citations",
@@ -360,43 +603,99 @@ class _Builder:
             "resolved_citation",
         )
 
-    def add_run(self, value: dict) -> dict[str, str]:
-        _model(RunIdentity, value)
+    def add_run(self, value: dict | RunIdentity) -> dict[str, str]:
+        value, _ = self._capture_record(RunIdentity, value)
         return _ref(self.put("runs", "run", copy.deepcopy(value)), "run")
 
-    def add_receipt(self, value: dict) -> dict[str, str]:
-        receipt = _model(ResultReceipt, value)
+    def add_receipt(self, value: dict | ResultReceipt) -> dict[str, str]:
+        value, _ = self._capture_record(ResultReceipt, value)
         identifier = self.put("receipts", "receipt", copy.deepcopy(value))
-        prior = self.receipt_ids.get(receipt.item_key)
+        item_key = value.get("item_key")
+        if type(item_key) is not str:
+            _fail("invalid_typed_storage_record")
+        prior = self.receipt_ids.get(item_key)
         if prior is not None and prior != identifier:
             _fail("duplicate_receipt_identity")
-        self.receipt_ids[receipt.item_key] = identifier
+        self.receipt_ids[item_key] = identifier
         return _ref(identifier, "receipt")
 
-    def add_producer(self, value: dict) -> dict[str, str]:
-        _model(ProducerDescriptor, value)
+    def add_producer(self, value: dict | ProducerDescriptor) -> dict[str, str]:
+        value, _ = self._capture_record(ProducerDescriptor, value)
         record = copy.deepcopy(value)
-        record["original_run"] = self.add_run(record["original_run"])
+        original_run = value.get("original_run")
+        invocation = value.get("invocation")
+        requests = value.get("requests")
+        if (
+            type(original_run) is not dict
+            or type(invocation) is not dict
+            or type(requests) not in {list, tuple}
+        ):
+            _fail("invalid_typed_storage_record")
+        record["original_run"] = self.add_run(original_run)
         record["invocation"] = _ref(
-            self.put(
-                "invocations", "invocation", copy.deepcopy(value["invocation"])
-            ),
+            self.put("invocations", "invocation", copy.deepcopy(invocation)),
             "invocation",
         )
         record["requests"] = [
             _ref(
-                self.put("requests", "request", copy.deepcopy(request)),
+                self.put(
+                    "requests",
+                    "request",
+                    copy.deepcopy(request),
+                ),
                 "request",
             )
-            for request in value["requests"]
+            for request in requests
         ]
         return _ref(
             self.put("producers", "producer", record, address_record=value),
             "producer",
         )
 
-    def add_generation(self, value: dict) -> dict:
-        """Create a generation skeleton without dumping models or defaults."""
+    def add_generation(self, value: dict) -> dict:  # noqa: C901 # Convert typed manifest fields to references.
+        """Create a generation skeleton while preserving typed defaults."""
+        if isinstance(value, GenerationManifest):
+            manifest = value
+            generation: dict = {}
+            for name in GenerationManifest.model_fields:
+                item = getattr(manifest, name)
+                if name == "run":
+                    generation[name] = self.add_run(item)
+                elif name == "details":
+                    generation[name] = [
+                        self.add_result("detail", result)
+                        for result in self._model_array(item)
+                    ]
+                elif name == "plan":
+                    generation[name] = _ref(
+                        self.put(
+                            "plans",
+                            "story_plan",
+                            _raw_model_snapshot(item),
+                        ),
+                        "story_plan",
+                    )
+                elif name in {"planning", "sections"}:
+                    kind = "planning_card" if name == "planning" else "section"
+                    generation[name] = [
+                        self.add_result(kind, result)
+                        for result in self._model_array(item)
+                    ]
+                elif name == "document":
+                    generation[name] = self.add_result("document", item)
+                elif name == "producers":
+                    generation[name] = [
+                        self.add_producer(producer)
+                        for producer in self._model_array(item)
+                    ]
+                elif name == "receipts":
+                    generation[name] = [
+                        self.add_receipt(receipt)
+                        for receipt in self._model_array(item)
+                    ]
+                else:
+                    generation[name] = _json_snapshot(item)
+            return generation
         generation = copy.deepcopy(value)
         generation["run"] = self.add_run(generation["run"])
         generation["details"] = [
@@ -429,17 +728,31 @@ class _Builder:
             _fail("missing_provenance_result")
         return _ref(identifier, kind)
 
-    def add_inherited(self, value: dict) -> dict[str, str]:
-        inherited = _model(InheritedProvenance, value)
-        reference = inherited.reference.model_dump(mode="json")
-        result_id = self.result_ids.get(
-            ("planning_card", inherited.reference.producer_item_key)
-        )
+    def add_inherited(  # noqa: C901 # Check inherited statement and receipt bindings.
+        self, value: dict | InheritedProvenance
+    ) -> dict[str, str]:
+        value, inherited = self._capture_record(InheritedProvenance, value)
+        reference = value.get("reference")
+        receipt = value.get("receipt")
+        if type(reference) is not dict or type(receipt) is not dict:
+            _fail("invalid_typed_storage_record")
+        producer_item_key = reference.get("producer_item_key")
+        receipt_item_key = receipt.get("item_key")
+        if (
+            type(producer_item_key) is not str
+            or type(receipt_item_key) is not str
+        ):
+            _fail("invalid_typed_storage_record")
+        if isinstance(inherited, InheritedProvenance) and (
+            inherited.reference.producer_item_key != inherited.receipt.item_key
+        ):
+            _fail("reader_provenance_mismatch")
+        result_id = self.result_ids.get(("planning_card", producer_item_key))
         result_kind_value = "planning_card"
         if result_id is None:
             for candidate_kind in ("section", "document"):
                 result_id = self.result_ids.get(
-                    (candidate_kind, inherited.reference.producer_item_key)
+                    (candidate_kind, producer_item_key)
                 )
                 if result_id is not None:
                     result_kind_value = candidate_kind
@@ -447,28 +760,40 @@ class _Builder:
         if result_id is None:
             _fail("missing_provenance_result")
         result_pointer = _ref(result_id, result_kind_value)
-        receipt_id = self.receipt_ids.get(inherited.receipt.item_key)
+        receipt_id = self.receipt_ids.get(receipt_item_key)
         if receipt_id is None:
             _fail("missing_provenance_receipt")
-        logical_result = self.records["results"][result_id]["record"]
-        # Stored result references are already address-bound; resolve only its
-        # declared evidence fields to compare the inherited statement exactly.
-        logical_result = _builder_logical_result(
-            self, result_kind_value, logical_result
+        if not self.defer_validation:
+            typed_result = self.typed_results.get(result_id)
+            if typed_result is None:
+                _fail("missing_provenance_result")
+            statement = _statement_from_path(
+                {"version": typed_result.version},
+                reference,
+                typed_result=typed_result,
+                typed_reference=(
+                    inherited.reference
+                    if isinstance(inherited, InheritedProvenance)
+                    else None
+                ),
+            )
+            if canonical_bytes(statement) != canonical_bytes(
+                value["statement"]
+            ):
+                _fail("inherited_statement_mismatch")
+            stored_receipt = self.records["receipts"][receipt_id]["record"]
+            if canonical_bytes(stored_receipt) != canonical_bytes(
+                value["receipt"]
+            ):
+                _fail("inherited_receipt_mismatch")
+        evidence_value = (
+            inherited.reference
+            if isinstance(inherited, InheritedProvenance)
+            else reference
         )
-        statement = _statement_from_path(logical_result, reference)
-        if canonical_bytes(statement) != canonical_bytes(
-            inherited.statement.model_dump(mode="json")
-        ):
-            _fail("inherited_statement_mismatch")
-        stored_receipt = self.records["receipts"][receipt_id]["record"]
-        if canonical_bytes(stored_receipt) != canonical_bytes(
-            inherited.receipt.model_dump(mode="json")
-        ):
-            _fail("inherited_receipt_mismatch")
-        ref_pointer = self.add_evidence(reference, "statement_ref")
+        ref_pointer = self.add_evidence(evidence_value, "statement_ref")
         record = {
-            "key": inherited.key,
+            "key": value.get("key"),
             "reference": ref_pointer,
             "result": result_pointer,
             "consumption": "inherited_statement",
@@ -482,6 +807,104 @@ class _Builder:
                 address_record=value,
             ),
             "inherited_provenance",
+        )
+
+    def add_reader_projection(
+        self, projection: ReportReaderProjection
+    ) -> dict[str, str]:
+        """Build a reader table record directly from typed ordered inputs."""
+        if projection.shape not in {"presentation", "annotations"}:
+            _fail("invalid_reader_shape")
+        arrays = (
+            projection.sections,
+            projection.context_details,
+            projection.citations,
+            projection.support_provenance,
+        )
+        if any(type(value) not in {tuple, list} for value in arrays):
+            _fail("reader_projection_requires_typed_records")
+        if (
+            not isinstance(projection.document, DocumentResult)
+            or any(
+                not isinstance(section, PresentationSection)
+                for section in projection.sections
+            )
+            or any(
+                not isinstance(detail, DetailResult)
+                for detail in projection.context_details
+            )
+            or any(
+                not isinstance(citation, ResolvedCitation)
+                for citation in projection.citations
+            )
+            or any(
+                not isinstance(item, InheritedProvenance)
+                for item in projection.support_provenance
+            )
+        ):
+            _fail("reader_projection_requires_typed_records")
+        section_field = (
+            "sections" if projection.shape == "presentation" else "steps"
+        )
+        if projection.shape == "presentation":
+            record = {
+                "shape": "presentation",
+                "version": projection.version,
+                "provenance": projection.provenance,
+                "document": self.add_result("document", projection.document),
+                "sections": [],
+                "context_details": [
+                    self.add_result("detail", detail)
+                    for detail in self._model_array(projection.context_details)
+                ],
+                "citations": [
+                    self.add_citation(citation)
+                    for citation in self._model_array(projection.citations)
+                ],
+                "support_provenance": [
+                    self.add_inherited(item)
+                    for item in self._model_array(
+                        projection.support_provenance
+                    )
+                ],
+            }
+        else:
+            record = {
+                "shape": "annotations",
+                "document": self.add_result("document", projection.document),
+                "steps": [],
+                "context_details": [
+                    self.add_result("detail", detail)
+                    for detail in self._model_array(projection.context_details)
+                ],
+                "citations": [
+                    self.add_citation(citation)
+                    for citation in self._model_array(projection.citations)
+                ],
+                "support_provenance": [
+                    self.add_inherited(item)
+                    for item in self._model_array(
+                        projection.support_provenance
+                    )
+                ],
+            }
+        for section in self._model_array(projection.sections):
+            record[section_field].append(
+                {
+                    "group_id": section.group_id,
+                    "group_key": section.group_key,
+                    "number": section.number,
+                    "next_id": section.next_id,
+                    "prose": self.add_result("section", section.prose),
+                    "details": [
+                        self.add_result("detail", detail)
+                        for detail in self._model_array(section.details)
+                    ],
+                }
+            )
+        return _ref(
+            self.put("readers", "reader", record, stream_address=True),
+            "reader",
         )
 
     def add_reader(self, value: dict, *, shape: str) -> dict[str, str]:
@@ -589,34 +1012,6 @@ def _validate_citation_binding(citation: ResolvedCitation, raw: dict) -> None:
         _fail("citation_key_mismatch")
     if type(raw.get("url")) not in {str, type(None)}:
         _fail("invalid_citation_url")
-
-
-def _builder_logical_result(
-    builder: _Builder, kind: str, record: dict
-) -> dict:
-    """Resolve one builder result's evidence pointers for provenance checks."""
-    value = copy.deepcopy(record)
-    for path, table, _target_kind in _record_ref_locations(
-        "results", kind, record
-    ):
-        pointer = _at(value, path)
-        identifier, _pointer_kind = _check_reference_shape(pointer)
-        evidence_entry = builder.records[table].get(identifier)
-        if evidence_entry is None:
-            _fail("missing_storage_record")
-        evidence = copy.deepcopy(evidence_entry["record"])
-        if evidence_entry["kind"] == "source_slice_ref":
-            source_pointer = evidence["source"]
-            source_id, _ = _check_reference_shape(source_pointer)
-            source_record = builder.records["evidence_refs"][source_id][
-                "record"
-            ]
-            evidence["source"] = copy.deepcopy(source_record)
-        parent = value
-        for item in path[:-1]:
-            parent = parent[item]
-        parent[path[-1]] = evidence
-    return value
 
 
 def _expand_generation_input(value: object) -> dict:
@@ -1044,12 +1439,19 @@ def _validate_envelope_shape(  # noqa: C901 # Validate envelope and all closed t
 
 @dataclass(frozen=True, slots=True)
 class ReportStorageView:
-    """Immutable owned envelope with detached indexed record access."""
+    """Immutable structural data view with detached indexed record access.
 
-    _raw: bytes
+    It verifies storage structure and integrity only. It is not a reusable
+    proof, validation result, or report-use capability.
+    """
+
+    _raw: bytes | None
     _artifact_kind: str
     _root: Mapping[str, object]
     _tables: Mapping[str, Mapping[str, Mapping[str, object]]]
+    _result_by_key: Mapping[tuple[str, str], ResultRef]
+    _result_by_id: Mapping[str, ResultRef]
+    _typed_validation_counts: Mapping[str, int]
 
     @property
     def artifact_kind(self) -> str:
@@ -1058,13 +1460,128 @@ class ReportStorageView:
 
     @property
     def byte_length(self) -> int:
-        """Return the owned canonical envelope byte count."""
-        return len(self._raw)
+        """Return input bytes, or explicit stored-envelope size for a live graph."""
+        if self._raw is not None:
+            return len(self._raw)
+        return len(self.to_bytes())
+
+    def to_bytes(self) -> bytes:
+        """Return canonical storage bytes, serializing live graphs on request."""
+        if self._raw is not None:
+            return self._raw
+        envelope = {
+            "storage_version": STORAGE_VERSION,
+            "artifact_kind": self._artifact_kind,
+            "root": _thaw(self._root),
+            "tables": {
+                table: [
+                    _thaw(self._tables[table][identifier])
+                    for identifier in sorted(self._tables[table])
+                ]
+                for table in _TABLES
+            },
+        }
+        return canonical_bytes(envelope)
 
     @property
     def storage_counts(self) -> dict[str, int]:
         """Return detached record counts for each typed table."""
         return {name: len(self._tables[name]) for name in _TABLES}
+
+    @property
+    def typed_validation_counts(self) -> dict[str, int]:
+        """Return unique table/kind counts from typed input or one parse pass."""
+        return dict(self._typed_validation_counts)
+
+    def lookup_result(self, kind: str, item_key: str) -> ResultRef:
+        """Look up one result by its semantic kind and item key."""
+        reference = self._result_by_key.get((kind, item_key))
+        if reference is None:
+            _fail("missing_storage_result")
+        return reference
+
+    def result_reference(self, storage_id: str) -> ResultRef:
+        """Return a typed address for one indexed result."""
+        reference = self._result_by_id.get(storage_id)
+        if reference is None:
+            _fail("missing_storage_result")
+        return reference
+
+    @property
+    def generation_result_refs(self) -> Mapping[str, tuple[ResultRef, ...]]:
+        """Return ordered generation result membership as typed addresses."""
+        generation = self._root["generation"]
+        output: dict[str, tuple[ResultRef, ...]] = {}
+        for name in ("details", "planning", "sections"):
+            output[name] = tuple(
+                self._result_ref(item) for item in generation.get(name, [])
+            )
+        output["document"] = (self._result_ref(generation["document"]),)
+        return MappingProxyType(output)
+
+    @property
+    def generation_record_refs(self) -> Mapping[str, object]:
+        """Return run, plan, producer, receipt, and result addresses in order."""
+        generation = self._root["generation"]
+        output: dict[str, object] = {
+            "results": self.generation_result_refs,
+            "run": self._record_ref("runs", generation["run"]),
+            "plan": self._record_ref("plans", generation["plan"]),
+            "producers": tuple(
+                self._record_ref("producers", item)
+                for item in generation["producers"]
+            ),
+            "receipts": tuple(
+                self._record_ref("receipts", item)
+                for item in generation["receipts"]
+            ),
+        }
+        return MappingProxyType(output)
+
+    @property
+    def reader_projection(self) -> IndexedReaderProjection:
+        """Return ordered reader membership without materializing result data."""
+        reader = self._reader_record()
+        section_field = (
+            "sections" if reader["shape"] == "presentation" else "steps"
+        )
+        sections = tuple(
+            ReaderSectionRef(
+                group_id=section["group_id"],
+                group_key=section["group_key"],
+                number=section["number"],
+                next_id=section["next_id"],
+                prose=self._result_ref(section["prose"]),
+                details=tuple(
+                    self._result_ref(item) for item in section["details"]
+                ),
+            )
+            for section in reader[section_field]
+        )
+        return IndexedReaderProjection(
+            shape=reader["shape"],
+            document=self._result_ref(reader["document"]),
+            sections=sections,
+            context_details=tuple(
+                self._result_ref(item) for item in reader["context_details"]
+            ),
+            citations=tuple(
+                self._record_ref("resolved_citations", item)
+                for item in reader["citations"]
+            ),
+            support_provenance=tuple(
+                self._record_ref("inherited_provenance", item)
+                for item in reader["support_provenance"]
+            ),
+        )
+
+    def reader_section(self, group_id: str) -> ReaderSectionRef:
+        """Return one ordered section's typed references without resolving peers."""
+        for section in self.reader_projection.sections:
+            if section.group_id == group_id:
+                return section
+        _fail("missing_reader_section")
+        return None
 
     def record(self, table: str, storage_id: str) -> dict:
         """Return a detached normalized table record by table and address."""
@@ -1081,6 +1598,12 @@ class ReportStorageView:
         if entry is None or (kind is not None and entry["kind"] != kind):
             _fail("missing_storage_result")
         return self._materialize("results", storage_id, {})
+
+    def result_record(self, reference: ResultRef) -> dict:
+        """Return one detached logical result for a typed result address."""
+        if not isinstance(reference, ResultRef):
+            _fail("invalid_storage_result_reference")
+        return self.result(reference.storage_id, kind=reference.kind)
 
     def iter_sections(self) -> Iterator[dict]:
         """Yield ordered reader sections with detached prose and detail records."""
@@ -1172,6 +1695,22 @@ class ReportStorageView:
     def _reader_id(self) -> str:
         return self._root["reader"]["$ref"]
 
+    def _record_ref(
+        self, table: str, pointer: Mapping[str, object]
+    ) -> RecordRef:
+        identifier, kind = _check_reference_shape(pointer)
+        entry = self._tables[table].get(identifier)
+        if entry is None or entry["kind"] != kind:
+            _fail("wrong_kind_storage_reference")
+        return RecordRef(table, kind, identifier)
+
+    def _result_ref(self, pointer: Mapping[str, object]) -> ResultRef:
+        identifier, kind = _check_reference_shape(pointer)
+        reference = self._result_by_id.get(identifier)
+        if reference is None or reference.kind != kind:
+            _fail("wrong_kind_storage_reference")
+        return reference
+
     def _reader_record(self) -> Mapping[str, object]:
         return self._tables["readers"][self._reader_id()]["record"]
 
@@ -1249,9 +1788,184 @@ class ReportStorageView:
         memo[cache_key] = copy.deepcopy(result)
         return result
 
+    def _validated_record(self, table: str, storage_id: str) -> dict:
+        """Return one detached logical record already checked at the storage boundary.
+
+        This narrow adapter supports indexed detail, support, and manifest
+        validators. The returned mapping is data only; it carries no proof.
+        """
+        if table not in {
+            "results",
+            "plans",
+            "evidence_refs",
+            "resolved_citations",
+            "runs",
+            "invocations",
+            "requests",
+            "producers",
+            "receipts",
+            "inherited_provenance",
+        }:
+            _fail("unsupported_validated_record_access")
+        return self._materialize(table, storage_id, {})
+
     def _url_value(self, identifier: str) -> str | None:
         record = self._tables["urls"][identifier]["record"]
         return record["value"]
+
+
+def _validate_builder_reader_relationships(
+    generation: dict,
+    reader_pointer: dict,
+    tables: dict[str, dict[str, dict]],
+) -> None:
+    """Check reader membership against builder indexes without resolving records."""
+    reader_entry = tables["readers"].get(reader_pointer["$ref"])
+    if reader_entry is None:
+        _fail("missing_storage_record")
+    reader = reader_entry["record"]
+    generation_result_ids: set[str] = set()
+    for field in ("details", "planning", "sections"):
+        generation_result_ids.update(
+            item["$ref"] for item in generation[field]
+        )
+    generation_result_ids.add(generation["document"]["$ref"])
+    if reader["document"]["$ref"] != generation["document"]["$ref"]:
+        _fail("reader_document_mismatch")
+    generation_section_ids = {item["$ref"] for item in generation["sections"]}
+    section_field = (
+        "sections" if reader["shape"] == "presentation" else "steps"
+    )
+    for section in reader[section_field]:
+        if section["prose"]["$ref"] not in generation_section_ids:
+            _fail("reader_section_mismatch")
+        if any(
+            item["$ref"] not in generation_result_ids
+            for item in section["details"]
+        ):
+            _fail("reader_detail_mismatch")
+    if any(
+        item["$ref"] not in generation_result_ids
+        for item in reader["context_details"]
+    ):
+        _fail("reader_context_mismatch")
+
+    generation_receipt_ids = {item["$ref"] for item in generation["receipts"]}
+    for pointer in reader["support_provenance"]:
+        provenance = tables["inherited_provenance"][pointer["$ref"]]["record"]
+        reference = tables["evidence_refs"][provenance["reference"]["$ref"]][
+            "record"
+        ]
+        receipt_pointer = provenance["receipt"]
+        receipt = tables["receipts"][receipt_pointer["$ref"]]["record"]
+        if (
+            reference["producer_item_key"] != receipt["item_key"]
+            or receipt_pointer["$ref"] not in generation_receipt_ids
+        ):
+            _fail("reader_provenance_receipt_mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class ReportRecordGraph(ReportStorageView):
+    """Run-owned immutable graph built from typed records without report JSON.
+
+    The graph shares the structural indexed accessors used by parsed views. It
+    is data only: record addresses, structural checks, and attached reader
+    references do not establish report or generation authority.
+    """
+
+    @classmethod
+    def from_typed(
+        cls,
+        generation: GenerationManifest,
+        reader: ReportReaderProjection,
+        *,
+        artifact_kind: str,
+        base_report: dict | None = None,
+        metadata: dict | None = None,
+    ) -> ReportRecordGraph:
+        """Build a shared graph from typed unique results and ordered reader input.
+
+        ``base_report`` is an opaque pass-through compiler report mapping for a
+        report graph. ``metadata`` contains the annotations.v2 root identity.
+        The generation and reader models are snapshotted record by record; no
+        expanded artifact is encoded, parsed, or retained.
+        """
+        if (
+            type(artifact_kind) is not str
+            or artifact_kind not in {"report", "annotations"}
+            or not isinstance(generation, GenerationManifest)
+            or not isinstance(reader, ReportReaderProjection)
+        ):
+            _fail("invalid_typed_graph_input")
+        if (artifact_kind == "report") != (reader.shape == "presentation"):
+            _fail("artifact_reader_kind_mismatch")
+        builder = _Builder(defer_validation=True)
+        generation_skeleton = builder.add_generation(generation)
+        reader_pointer = builder.add_reader_projection(reader)
+        if artifact_kind == "report":
+            if (
+                metadata is not None
+                or type(base_report) is not dict
+                or {"generation", "narrative_v2"} & set(base_report)
+            ):
+                _fail("invalid_report_graph_root")
+            _strict_json_value(base_report)
+            root = {
+                "shape": "report",
+                "base_report": copy.deepcopy(base_report),
+                "generation": generation_skeleton,
+                "reader": reader_pointer,
+            }
+        else:
+            if base_report is not None or type(metadata) is not dict:
+                _fail("invalid_annotations_graph_root")
+            if set(metadata) != {"schema", "base_sha", "head_sha"}:
+                _fail("invalid_annotations_metadata")
+            if (
+                metadata.get("schema") != "diffstory.annotations.v2"
+                or type(metadata.get("base_sha")) is not str
+                or type(metadata.get("head_sha")) is not str
+            ):
+                _fail("invalid_annotations_metadata")
+            _strict_json_value(metadata)
+            root = {
+                "shape": "annotations",
+                "metadata": copy.deepcopy(metadata),
+                "generation": generation_skeleton,
+                "reader": reader_pointer,
+            }
+        _read_root_generation_shape(root)
+        _check_graph_and_addresses(root, builder.records)
+        memo, _typed_records, validation_counts = _validate_table_records(
+            root, builder.records
+        )
+        _verify_storage_addresses(builder.records, memo)
+
+        by_key: dict[tuple[str, str], ResultRef] = {}
+        by_id: dict[str, ResultRef] = {}
+        for (kind, item_key), identifier in builder.result_ids.items():
+            reference = ResultRef("results", kind, identifier, item_key)
+            by_key[(kind, item_key)] = reference
+            by_id[identifier] = reference
+        frozen_tables = {
+            table: MappingProxyType(
+                {
+                    identifier: _freeze(entry)
+                    for identifier, entry in records.items()
+                }
+            )
+            for table, records in builder.records.items()
+        }
+        return cls(
+            _raw=None,
+            _artifact_kind=artifact_kind,
+            _root=_freeze(root),
+            _tables=MappingProxyType(frozen_tables),
+            _result_by_key=MappingProxyType(by_key),
+            _result_by_id=MappingProxyType(by_id),
+            _typed_validation_counts=MappingProxyType(validation_counts),
+        )
 
 
 def _replace_paths(
@@ -1271,9 +1985,15 @@ def _replace_paths(
     return result
 
 
-def _statement_from_path(result: dict, reference: dict) -> dict:
+def _statement_from_path(
+    result: dict,
+    reference: dict,
+    *,
+    typed_result: BaseModel | None = None,
+    typed_reference: StatementRef | None = None,
+) -> dict:
     """Resolve an allowlisted statement path without copied prose storage."""
-    ref = StatementRef.model_validate(reference)
+    ref = typed_reference or StatementRef.model_validate(reference)
     kind_by_version = {
         "diffstory.planning-card-result.v2": "planning_card",
         "diffstory.section-result.v2": "section",
@@ -1282,11 +2002,13 @@ def _statement_from_path(result: dict, reference: dict) -> dict:
     result_kind_value = kind_by_version.get(result.get("version"))
     if result_kind_value is None:
         _fail("invalid_statement_path")
-    typed_result = _model(_RESULT_MODELS[result_kind_value], result)
+    model = _RESULT_MODELS[result_kind_value]
+    if not isinstance(typed_result, model):
+        typed_result = _model(model, result)
     from .narrative_hierarchy import statement_at
 
     statement = statement_at(typed_result, ref.statement_path).model_dump(
-        mode="json"
+        mode="json", exclude_unset=True
     )
     if (
         typed_result.item_key != ref.producer_item_key
@@ -1303,13 +2025,16 @@ def _validate_logical_record(
     table: str,
     identifier: str,
     memo: dict[str, dict],
+    typed_records: dict[str, BaseModel] | None = None,
 ) -> dict:
     entry = view_tables[table][identifier]
     record = entry["record"]
     kind = entry["kind"]
 
     def resolve(target_table: str, target_id: str) -> dict:
-        return _logical_record(view_tables, target_table, target_id, memo)
+        return _logical_record(
+            view_tables, target_table, target_id, memo, typed_records
+        )
 
     locations = _record_ref_locations(table, kind, record)
     if table == "resolved_citations":
@@ -1347,10 +2072,33 @@ def _validate_logical_record(
         ]
     elif table == "inherited_provenance":
         source_result = logical.pop("result")
-        logical["statement"] = _statement_from_path(
-            source_result, logical["reference"]
+        result_pointer = record["result"]
+        reference_pointer = record["reference"]
+        typed_result = (
+            None
+            if typed_records is None
+            else typed_records.get(f"results:{result_pointer['$ref']}")
         )
-    _validate_typed_table_record(table, kind, logical)
+        typed_reference = (
+            None
+            if typed_records is None
+            else typed_records.get(
+                f"evidence_refs:{reference_pointer['$ref']}"
+            )
+        )
+        logical["statement"] = _statement_from_path(
+            source_result,
+            logical["reference"],
+            typed_result=typed_result,
+            typed_reference=(
+                typed_reference
+                if isinstance(typed_reference, StatementRef)
+                else None
+            ),
+        )
+    typed = _validate_typed_table_record(table, kind, logical)
+    if typed is not None and typed_records is not None:
+        typed_records[f"{table}:{identifier}"] = typed
     memo[f"{table}:{identifier}"] = copy.deepcopy(logical)
     return logical
 
@@ -1360,18 +2108,21 @@ def _logical_record(
     table: str,
     identifier: str,
     memo: dict[str, dict],
+    typed_records: dict[str, BaseModel] | None = None,
 ) -> dict:
     key = f"{table}:{identifier}"
     if key in memo:
         return copy.deepcopy(memo[key])
     if table == "urls":
         record = view_tables[table][identifier]["record"]
-        _expect_keys(record, {"value"}, "invalid_url_record")
-        if type(record["value"]) not in {str, type(None)}:
-            _fail("invalid_url_record")
+        _validate_typed_table_record(
+            table, view_tables[table][identifier]["kind"], record
+        )
         memo[key] = {"value": record["value"]}
         return copy.deepcopy(memo[key])
-    return _validate_logical_record(view_tables, table, identifier, memo)
+    return _validate_logical_record(
+        view_tables, table, identifier, memo, typed_records
+    )
 
 
 def _logical_reader_section(
@@ -1394,13 +2145,16 @@ def _logical_reader_section(
     return output
 
 
-def _validate_typed_table_record(table: str, kind: str, logical: dict) -> None:  # noqa: C901, PLR0912 # Dispatch to each closed record model.
+def _validate_typed_table_record(  # noqa: C901, PLR0911, PLR0912 # Dispatch each table/kind to its closed schema.
+    table: str, kind: str, logical: dict
+) -> BaseModel | None:
+    """Structurally validate one complete logical record and return its model."""
     if table == "results":
-        _model(_RESULT_MODELS[kind], logical)
-    elif table == "plans":
-        _model(StoryPlan, logical)
-    elif table == "evidence_refs":
-        _model(
+        return _model(_RESULT_MODELS[kind], logical)
+    if table == "plans":
+        return _model(StoryPlan, logical)
+    if table == "evidence_refs":
+        return _model(
             {
                 "span_ref": SpanRef,
                 "source_slice_ref": SourceSliceRef,
@@ -1408,7 +2162,7 @@ def _validate_typed_table_record(table: str, kind: str, logical: dict) -> None: 
             }[kind],
             logical,
         )
-    elif table == "source_targets":
+    if table == "source_targets":
         _expect_keys(
             logical,
             {"fragment_key", "side", "path", "revision"},
@@ -1418,21 +2172,27 @@ def _validate_typed_table_record(table: str, kind: str, logical: dict) -> None: 
             _fail("invalid_source_target")
         if logical["side"] not in {"base", "head"}:
             _fail("invalid_source_target")
-    elif table == "resolved_citations":
+    if table == "resolved_citations":
         citation = _model(ResolvedCitation, logical)
         _validate_citation_binding(citation, logical)
-    elif table == "runs":
-        _model(RunIdentity, logical)
-    elif table == "invocations":
-        _model(ArtifactInvocation, logical)
-    elif table == "requests":
-        _model(PreparedMetadata, logical)
-    elif table == "producers":
-        _model(ProducerDescriptor, logical)
-    elif table == "receipts":
-        _model(ResultReceipt, logical)
-    elif table == "inherited_provenance":
-        _model(InheritedProvenance, logical)
+        return citation
+    if table == "runs":
+        return _model(RunIdentity, logical)
+    if table == "invocations":
+        return _model(ArtifactInvocation, logical)
+    if table == "requests":
+        return _model(PreparedMetadata, logical)
+    if table == "producers":
+        return _model(ProducerDescriptor, logical)
+    if table == "receipts":
+        return _model(ResultReceipt, logical)
+    if table == "inherited_provenance":
+        return _model(InheritedProvenance, logical)
+    if table == "urls":
+        _expect_keys(logical, {"value"}, "invalid_url_record")
+        if type(logical["value"]) not in {str, type(None)}:
+            _fail("invalid_url_record")
+    return None
 
 
 def _validate_annotation_reader(reader: dict) -> None:
@@ -1536,66 +2296,113 @@ def _validate_reader_record(reader: dict) -> None:  # noqa: C901 # Validate type
             _check_reference_shape(reference)
 
 
-def _validate_generation_relationships(  # noqa: C901, PLR0912 # Check the cross-table generation proof bindings.
-    root: dict, tables: dict[str, dict[str, dict]], memo: dict[str, dict]
-) -> None:
-    generation = root["generation"]
-
-    def get(table: str, pointer: dict) -> dict:
-        return _logical_record(tables, table, pointer["$ref"], memo)
-
-    details = [get("results", item) for item in generation["details"]]
-    planning = [get("results", item) for item in generation["planning"]]
-    sections = [get("results", item) for item in generation["sections"]]
-    document = get("results", generation["document"])
-    plan = get("plans", generation["plan"])
-    producers = [get("producers", item) for item in generation["producers"]]
-    receipts = [
-        _model(ResultReceipt, get("receipts", item))
-        for item in generation["receipts"]
-    ]
-    all_results = [*details, *planning, *sections, document]
-    logical_keys = [
-        result_key(_model(_RESULT_MODELS[kind], record))
-        for kind, records in (
-            ("detail", details),
-            ("planning_card", planning),
-            ("section", sections),
-            ("document", [document]),
-        )
-        for record in records
-    ]
-    if len(set(logical_keys)) != len(logical_keys):
-        _fail("duplicate_result_identity")
-    if {
-        item.unit_key
-        for item in (_model(DetailResult, detail) for detail in details)
-    } != set(generation["unit_keys"]) or len(details) != len(
-        generation["unit_keys"]
+def _validate_generation_coverage(  # noqa: C901, PLR0913 # Check complete manifest coverage.
+    generation: dict,
+    details: list[BaseModel],
+    planning: list[BaseModel],
+    sections: list[BaseModel],
+    document: BaseModel,
+    plan: StoryPlan,
+) -> dict[str, BaseModel]:
+    unit_keys = generation["unit_keys"]
+    units = set(unit_keys)
+    if len(units) != len(unit_keys):
+        _fail("duplicate_ledger_unit")
+    if (
+        len(details) != len(unit_keys)
+        or {item.unit_key for item in details} != units
     ):
         _fail("detail_coverage")
-    receipt_by_item = {item.item_key: item for item in receipts}
-    if len(receipt_by_item) != len(receipts) or set(receipt_by_item) != set(
-        logical_keys
+    group_keys = [group.group.key for group in plan.groups]
+    if len(set(group_keys)) != len(group_keys):
+        _fail("duplicate_plan_group")
+    if len(plan.ordered_group_keys) != len(plan.groups) or set(
+        plan.ordered_group_keys
+    ) != set(group_keys):
+        _fail("plan_group_order")
+    if any(not set(group.group.unit_keys) <= units for group in plan.groups):
+        _fail("plan_unit_coverage")
+    if tuple(section.binding.subject_key for section in sections) != tuple(
+        plan.ordered_group_keys
     ):
-        _fail("receipt_coverage")
-    producer_models = [_model(ProducerDescriptor, item) for item in producers]
-    producer_by_key = {item.key: item for item in producer_models}
-    if len(producer_by_key) != len(producer_models):
+        _fail("section_coverage")
+    subjects = [*plan.cards]
+    if len({card.id for card in subjects}) != len(subjects):
+        _fail("duplicate_plan_card")
+    if plan.production is not None:
+        subjects.extend(plan.production.auxiliary_cards)
+    subject_ids = [card.id for card in subjects]
+    if len(set(subject_ids)) != len(subject_ids):
+        _fail("duplicate_plan_card")
+    if len(planning) != len(subjects) or {
+        card.binding.subject_key for card in planning
+    } != set(subject_ids):
+        _fail("planning_coverage")
+    prose = [*planning, *sections, document]
+    if any(result.binding.plan_key != plan.id for result in prose):
+        _fail("prose_plan_mismatch")
+    ordered_results = [*details, *planning, *sections, document]
+    logical_keys = [result_key(record) for record in ordered_results]
+    if len(set(logical_keys)) != len(logical_keys):
+        _fail("duplicate_result_identity")
+    return dict(zip(logical_keys, ordered_results, strict=True))
+
+
+def _validate_generation_producer_coverage(
+    receipts: list[ResultReceipt], producers: list[ProducerDescriptor]
+) -> dict[str, ProducerDescriptor]:
+    producer_by_key = {item.key: item for item in producers}
+    if len(producer_by_key) != len(producers):
         _fail("duplicate_producer")
+    producer_identities = [
+        (
+            item.original_run.digest,
+            item.invocation.semantic_key,
+            item.invocation.batch.id,
+        )
+        for item in producers
+    ]
+    if len(set(producer_identities)) != len(producer_identities):
+        _fail("duplicate_original_producer")
     if {receipt.producer_key for receipt in receipts} != set(producer_by_key):
         _fail("producer_coverage")
-    result_by_key = {
-        result_key(_model(model, record)): _model(model, record)
-        for model, record in ((DetailResult, item) for item in details)
+    return producer_by_key
+
+
+def _validate_generation_receipts(  # noqa: C901, PLR0912, PLR0913 # Check producer and receipt bindings.
+    generation: dict,
+    receipts: list[ResultReceipt],
+    result_by_key: dict[str, BaseModel],
+    producers: list[ProducerDescriptor],
+    producer_by_key: dict[str, ProducerDescriptor],
+    run: RunIdentity | None,
+) -> None:
+    requests = {
+        key: {request.batch.id: request for request in producer.requests}
+        for key, producer in producer_by_key.items()
     }
-    for record, model in [
-        *((item, PlanningCardResult) for item in planning),
-        *((item, SectionResult) for item in sections),
-        (document, DocumentResult),
-    ]:
-        typed = _model(model, record)
-        result_by_key[result_key(typed)] = typed
+    lookups = {
+        key: {
+            lookup.item_key: lookup for lookup in producer.invocation.lookups
+        }
+        for key, producer in producer_by_key.items()
+    }
+    artifact_keys = {
+        key: producer.invocation.artifact_keys()
+        for key, producer in producer_by_key.items()
+    }
+    request_items = {
+        (key, request.batch.id): set(request.batch.item_keys)
+        for key, producer in producer_by_key.items()
+        for request in producer.requests
+    }
+    receipt_by_item = {item.item_key: item for item in receipts}
+    if len(receipt_by_item) != len(receipts) or set(receipt_by_item) != set(
+        result_by_key
+    ):
+        _fail("receipt_coverage")
+    used_requests: set[tuple[str, str]] = set()
+    sent_requests: set[tuple[str, str]] = set()
     for receipt in receipts:
         item = result_by_key.get(receipt.item_key)
         producer = producer_by_key.get(receipt.producer_key)
@@ -1607,46 +2414,96 @@ def _validate_generation_relationships(  # noqa: C901, PLR0912 # Check the cross
             _fail("receipt_binding_mismatch")
         if receipt.result_digest != result_digest(item):
             _fail("receipt_result_mismatch")
-        request = next(
-            (
-                item
-                for item in producer.requests
-                if item.batch.id == receipt.request_key
-            ),
-            None,
-        )
-        lookup = next(
-            (
-                item
-                for item in producer.invocation.lookups
-                if item.item_key == receipt.item_key
-            ),
-            None,
-        )
+        request_identity = (receipt.producer_key, receipt.request_key)
+        request = requests[receipt.producer_key].get(receipt.request_key)
+        lookup = lookups[receipt.producer_key].get(receipt.item_key)
         if (
             request is None
             or lookup is None
             or lookup.result_kind != receipt.result_kind
-            or receipt.item_key not in request.batch.item_keys
+            or receipt.item_key
+            not in request_items.get(request_identity, set())
         ):
             _fail("receipt_binding_mismatch")
-        if receipt.artifact_key != producer.invocation.artifact_keys().get(
+        if receipt.artifact_key != artifact_keys[receipt.producer_key].get(
             receipt.item_key
         ):
             _fail("receipt_artifact_mismatch")
-    if generation["run"] is not None:
-        run = _model(RunIdentity, get("runs", generation["run"]))
-        for producer in producer_models:
+        used_requests.add(request_identity)
+        if receipt.disposition == "sent":
+            sent_requests.add(request_identity)
+    if used_requests != {
+        (key, request_id)
+        for key, request_map in requests.items()
+        for request_id in request_map
+    }:
+        _fail("unused_production_request")
+    if run is not None:
+        for producer in producers:
             if (
                 producer.original_run.provider_destination
                 != run.provider_destination
                 or producer.original_run.model != run.model
             ):
                 _fail("producer_identity_mismatch")
-    _ = plan, all_results
+        for receipt in receipts:
+            if (
+                receipt.disposition == "sent"
+                and producer_by_key[receipt.producer_key].original_run != run
+            ):
+                _fail("sent_run_mismatch")
+    current_usage = generation.get("current_usage")
+    if (
+        type(current_usage) is not dict
+        or type(current_usage.get("calls")) is not int
+        or len(sent_requests) > current_usage["calls"]
+    ):
+        _fail("sent_usage_mismatch")
 
 
-def _validate_reader_relationships(
+def _validate_generation_relationships(
+    root: dict,
+    typed_records: dict[str, BaseModel],
+) -> None:
+    generation = root["generation"]
+
+    def get(table: str, pointer: dict) -> BaseModel:
+        identifier, kind = _check_reference_shape(pointer)
+        record = typed_records.get(f"{table}:{identifier}")
+        if record is None:
+            _fail(f"missing_validated_storage_model:{table}:{kind}")
+        return record
+
+    details = [get("results", item) for item in generation["details"]]
+    planning = [get("results", item) for item in generation["planning"]]
+    sections = [get("results", item) for item in generation["sections"]]
+    document = get("results", generation["document"])
+    plan = get("plans", generation["plan"])
+    producers = [get("producers", item) for item in generation["producers"]]
+    receipts = [get("receipts", item) for item in generation["receipts"]]
+    if not isinstance(plan, StoryPlan):
+        _fail("missing_validated_storage_model:plans:story_plan")
+    if any(not isinstance(item, ProducerDescriptor) for item in producers):
+        _fail("missing_validated_storage_model:producers:producer")
+    if any(not isinstance(item, ResultReceipt) for item in receipts):
+        _fail("missing_validated_storage_model:receipts:receipt")
+    result_by_key = _validate_generation_coverage(
+        generation, details, planning, sections, document, plan
+    )
+    producer_by_key = _validate_generation_producer_coverage(
+        receipts, producers
+    )
+    run = None
+    if generation["run"] is not None:
+        run = get("runs", generation["run"])
+        if not isinstance(run, RunIdentity):
+            _fail("missing_validated_storage_model:runs:run")
+    _validate_generation_receipts(
+        generation, receipts, result_by_key, producers, producer_by_key, run
+    )
+
+
+def _validate_reader_relationships(  # noqa: C901, PLR0912 # Check ordered reader ownership and provenance.
     root: dict, tables: dict[str, dict[str, dict]], memo: dict[str, dict]
 ) -> None:
     reader = tables["readers"][root["reader"]["$ref"]]["record"]
@@ -1660,9 +2517,69 @@ def _validate_reader_relationships(
     section_field = (
         "sections" if reader["shape"] == "presentation" else "steps"
     )
-    for section in reader[section_field]:
+    reader_sections = reader[section_field]
+    generation_sections = generation["sections"]
+    if len(reader_sections) != len(generation_sections):
+        _fail("reader_section_mismatch")
+    plan = _logical_record(tables, "plans", generation["plan"]["$ref"], memo)
+    groups = {item["group"]["key"]: item["group"] for item in plan["groups"]}
+    ordered_group_keys = plan["ordered_group_keys"]
+    if len(reader_sections) != len(ordered_group_keys):
+        _fail("reader_section_mismatch")
+    details_by_unit = {
+        _logical_record(tables, "results", item["$ref"], memo)[
+            "unit_key"
+        ]: item
+        for item in generation["details"]
+    }
+    assigned_units = {
+        unit_key
+        for group in groups.values()
+        for unit_key in group["unit_keys"]
+    }
+    for position, (section, generation_pointer, group_key) in enumerate(
+        zip(
+            reader_sections,
+            generation_sections,
+            ordered_group_keys,
+            strict=True,
+        )
+    ):
+        prose = _logical_record(
+            tables, "results", generation_pointer["$ref"], memo
+        )
+        expected_next = (
+            reader_sections[position + 1]["group_id"]
+            if position + 1 < len(reader_sections)
+            else None
+        )
+        expected_details = [
+            details_by_unit[unit_key]["$ref"]
+            for unit_key in groups[group_key]["unit_keys"]
+        ]
+        if (
+            section["prose"]["$ref"] != generation_pointer["$ref"]
+            or section["group_key"] != group_key
+            or section["group_key"] != prose["binding"]["subject_key"]
+            or section["number"] != position + 1
+            or section["next_id"] != expected_next
+        ):
+            _fail("reader_section_mismatch")
+        if [item["$ref"] for item in section["details"]] != expected_details:
+            _fail("reader_detail_mismatch")
+    expected_context = [
+        item["$ref"]
+        for item in generation["details"]
+        if _logical_record(tables, "results", item["$ref"], memo)["unit_key"]
+        not in assigned_units
+    ]
+    if [
+        item["$ref"] for item in reader["context_details"]
+    ] != expected_context:
+        _fail("reader_context_mismatch")
+    for section in reader_sections:
         if section["prose"]["$ref"] not in {
-            item["$ref"] for item in generation["sections"]
+            item["$ref"] for item in generation_sections
         }:
             _fail("reader_section_mismatch")
         if any(
@@ -1705,15 +2622,21 @@ def _validate_reader_relationships(
 
 def _validate_table_records(
     root: dict, indexes: dict[str, dict[str, dict]]
-) -> dict[str, dict]:
+) -> tuple[dict[str, dict], dict[str, BaseModel], dict[str, int]]:
     memo: dict[str, dict] = {}
+    typed_records: dict[str, BaseModel] = {}
+    validation_counts: dict[str, int] = {}
     tables = indexes
     for table in _TABLES:
-        for identifier in tables[table]:
-            _logical_record(tables, table, identifier, memo)
-    _validate_generation_relationships(root, tables, memo)
+        for identifier, entry in tables[table].items():
+            _logical_record(tables, table, identifier, memo, typed_records)
+            count_key = f"{table}:{entry['kind']}"
+            validation_counts[count_key] = (
+                validation_counts.get(count_key, 0) + 1
+            )
+    _validate_generation_relationships(root, typed_records)
     _validate_reader_relationships(root, tables, memo)
-    return memo
+    return memo, typed_records, validation_counts
 
 
 def _check_graph_and_addresses(  # noqa: C901, PLR0912 # Check every typed edge, cycle, and closure.
@@ -1868,35 +2791,94 @@ def _logical_storage_address(
             _fail("missing_storage_record")
         return storage_address(kind, logical_record)
 
-    # Reader records have a small pointer skeleton but may refer to large result
-    # trees at many locations. Stream their complete logical record through the
-    # schema-declared references so parse does not allocate a second reader tree.
     record = entry["record"]
-    _validate_reader_record(record)
+    digest = hashlib.sha256()
+    digest.update(b'{"kind":')
+    digest.update(canonical_bytes(kind))
+    digest.update(b',"record":')
+    for chunk in _logical_reader_chunks(record, indexes, memo):
+        digest.update(chunk)
+    digest.update(b',"storage_version":')
+    digest.update(canonical_bytes(STORAGE_VERSION))
+    digest.update(b"}")
+    return digest.hexdigest()
+
+
+def _logical_reader_chunks(
+    record: dict,
+    indexes: dict[str, dict[str, dict]],
+    memo: dict[str, dict],
+) -> Iterator[bytes]:
+    """Stream a reader's complete logical content through declared references."""
     logical_reader = {
         key: value for key, value in record.items() if key != "shape"
     }
     references = {
         path: (target_table, target_kind)
         for path, target_table, target_kind in _record_ref_locations(
-            "readers", kind, record
+            "readers", "reader", record
         )
     }
-    digest = hashlib.sha256()
-    digest.update(b'{"kind":')
-    digest.update(canonical_bytes(kind))
-    digest.update(b',"record":')
-    for chunk in _iter_logical_record_json(
+    yield from _iter_logical_record_json(
         logical_reader,
         references=references,
         indexes=indexes,
         memo=memo,
-    ):
-        digest.update(chunk)
-    digest.update(b',"storage_version":')
-    digest.update(canonical_bytes(STORAGE_VERSION))
-    digest.update(b"}")
-    return digest.hexdigest()
+    )
+
+
+def _logical_reader_streams_equal(  # noqa: C901 # Compare arbitrarily chunked logical reader streams.
+    left_record: dict,
+    right_record: dict,
+    indexes: dict[str, dict[str, dict]],
+    memo: dict[str, dict],
+) -> bool:
+    """Compare logical reader bytes in bounded chunks without joining them."""
+    left = iter(_logical_reader_chunks(left_record, indexes, memo))
+    right = iter(_logical_reader_chunks(right_record, indexes, memo))
+    left_chunk: bytes | None = None
+    right_chunk: bytes | None = None
+    left_offset = 0
+    right_offset = 0
+    left_done = False
+    right_done = False
+    while True:
+        if left_chunk is None and not left_done:
+            try:
+                left_chunk = next(left)
+                left_offset = 0
+            except StopIteration:
+                left_done = True
+        if right_chunk is None and not right_done:
+            try:
+                right_chunk = next(right)
+                right_offset = 0
+            except StopIteration:
+                right_done = True
+        if left_done or right_done:
+            return left_done and right_done
+        if left_chunk is None or right_chunk is None:
+            _fail("invalid_streamed_storage_record")
+        left_remaining = len(left_chunk) - left_offset
+        right_remaining = len(right_chunk) - right_offset
+        if left_remaining == 0:
+            left_chunk = None
+            continue
+        if right_remaining == 0:
+            right_chunk = None
+            continue
+        length = min(left_remaining, right_remaining)
+        if (
+            left_chunk[left_offset : left_offset + length]
+            != right_chunk[right_offset : right_offset + length]
+        ):
+            return False
+        left_offset += length
+        right_offset += length
+        if left_offset == len(left_chunk):
+            left_chunk = None
+        if right_offset == len(right_chunk):
+            right_chunk = None
 
 
 def _verify_storage_addresses(
@@ -1918,7 +2900,9 @@ def parse_report_storage(raw_bytes: bytes | str) -> ReportStorageView:
     envelope, raw = _strict_json_load(raw_bytes)
     artifact_kind, root, indexes = _validate_envelope_shape(envelope)
     _check_graph_and_addresses(root, indexes)
-    memo = _validate_table_records(root, indexes)
+    memo, typed_records, validation_counts = _validate_table_records(
+        root, indexes
+    )
     _verify_storage_addresses(indexes, memo)
     if raw != canonical_bytes(envelope):
         _fail("noncanonical_storage_json")
@@ -1928,11 +2912,24 @@ def parse_report_storage(raw_bytes: bytes | str) -> ReportStorageView:
         )
         for table, index in indexes.items()
     }
+    result_by_key: dict[tuple[str, str], ResultRef] = {}
+    result_by_id: dict[str, ResultRef] = {}
+    for identifier, entry in indexes["results"].items():
+        typed = typed_records.get(f"results:{identifier}")
+        if typed is None:
+            _fail("missing_validated_storage_model:results")
+        item_key = result_key(typed)
+        reference = ResultRef("results", entry["kind"], identifier, item_key)
+        result_by_key[(entry["kind"], item_key)] = reference
+        result_by_id[identifier] = reference
     return ReportStorageView(
         _raw=raw,
         _artifact_kind=artifact_kind,
         _root=_freeze(root),
         _tables=MappingProxyType(frozen_tables),
+        _result_by_key=MappingProxyType(result_by_key),
+        _result_by_id=MappingProxyType(result_by_id),
+        _typed_validation_counts=MappingProxyType(validation_counts),
     )
 
 

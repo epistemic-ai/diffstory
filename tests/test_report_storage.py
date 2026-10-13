@@ -6,16 +6,28 @@ import copy
 import json
 import tempfile
 import unittest
+from collections import Counter
+from typing import TYPE_CHECKING
 from unittest.mock import patch
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 from test_narrative_runtime import changed_record
 from test_narrative_v2 import FixtureProvider
 from test_narrative_v2 import golden_report
 
+from diffstory import report_storage
 from diffstory.analysis import apply_annotations
 from diffstory.narrative import Narrator
 from diffstory.narrative_contracts import ClaimRef
+from diffstory.narrative_contracts import DetailResult
+from diffstory.narrative_contracts import DocumentResult
 from diffstory.narrative_manifest import GenerationManifest
+from diffstory.narrative_manifest import InheritedProvenance
+from diffstory.narrative_manifest import PresentationSection
+from diffstory.narrative_manifest import ResolvedCitation
+from diffstory.narrative_manifest import V2Presentation
 from diffstory.narrative_manifest import expanded_generation
 from diffstory.narrative_manifest import result_digest
 from diffstory.narrative_manifest import validate_generation
@@ -24,6 +36,8 @@ from diffstory.narrative_runtime import ArtifactRuntimeError
 from diffstory.render import render
 from diffstory.render import validate_report
 from diffstory.report_storage import STORAGE_VERSION
+from diffstory.report_storage import ReportReaderProjection
+from diffstory.report_storage import ReportRecordGraph
 from diffstory.report_storage import ReportStorageView
 from diffstory.report_storage import encode_report_storage
 from diffstory.report_storage import expand_report_storage
@@ -86,6 +100,53 @@ class ReportStorageTests(unittest.TestCase):
             **cls.applied,
             "generation": expanded_generation(cls.applied["generation"]),
         }
+
+    @staticmethod
+    def _typed_model(model: type, value: dict) -> BaseModel:
+        return model.model_validate_json(canonical_bytes(value))
+
+    def _typed_annotation_reader(self, value: dict) -> ReportReaderProjection:
+        return ReportReaderProjection.from_annotations(
+            document=self._typed_model(DocumentResult, value["document"]),
+            steps=tuple(
+                self._typed_model(PresentationSection, item)
+                for item in value["steps"]
+            ),
+            context_details=tuple(
+                self._typed_model(DetailResult, item)
+                for item in value["context_details"]
+            ),
+            citations=tuple(
+                self._typed_model(ResolvedCitation, item)
+                for item in value["citations"]
+            ),
+            support_provenance=tuple(
+                self._typed_model(InheritedProvenance, item)
+                for item in value["support_provenance"]
+            ),
+        )
+
+    def _typed_report_graph(
+        self, generation_data: dict | None = None
+    ) -> ReportRecordGraph:
+        manifest = self._typed_model(
+            GenerationManifest,
+            generation_data or self.expanded_report["generation"],
+        )
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        base_report = {
+            key: value
+            for key, value in self.applied.items()
+            if key not in {"generation", "narrative_v2"}
+        }
+        return ReportRecordGraph.from_typed(
+            manifest,
+            ReportReaderProjection.from_presentation(presentation),
+            artifact_kind="report",
+            base_report=base_report,
+        )
 
     def assert_round_trip(
         self, value: dict, kind: str, *, expected: dict | None = None
@@ -407,6 +468,664 @@ class ReportStorageTests(unittest.TestCase):
         self.assertEqual(
             actual,
             self.applied["narrative_v2"]["sections"][target_index]["details"],
+        )
+
+    def test_typed_graph_builds_without_expanded_codec_roundtrip(self) -> None:
+        """Build report and annotation graphs directly from typed records."""
+        original_canonical = report_storage.canonical_bytes
+
+        def guarded_canonical(value: object) -> bytes:
+            if (
+                type(value) is dict
+                and {"sections", "document", "support_provenance"}
+                <= value.keys()
+                and type(value["document"]) is dict
+                and value["document"].get("version")
+                == "diffstory.document-result.v2"
+            ):
+                message = "graph serialized a complete reader"
+                raise AssertionError(message)
+            return original_canonical(value)
+
+        report_generation = self._typed_model(
+            GenerationManifest, self.expanded_report["generation"]
+        )
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        base_report = {
+            key: value
+            for key, value in self.applied.items()
+            if key not in {"generation", "narrative_v2"}
+        }
+        base_report["custom_compiler_metadata"] = {
+            "literal": {
+                "$ref": "not-a-storage-address",
+                "kind": "detail",
+            }
+        }
+        report_input = {
+            **self.applied,
+            "custom_compiler_metadata": base_report[
+                "custom_compiler_metadata"
+            ],
+        }
+        expected_report = {
+            **self.expanded_report,
+            "custom_compiler_metadata": base_report[
+                "custom_compiler_metadata"
+            ],
+        }
+        with (
+            patch(
+                "diffstory.report_storage.encode_report_storage",
+                side_effect=AssertionError("graph used the expanded encoder"),
+            ),
+            patch(
+                "diffstory.report_storage.parse_report_storage",
+                side_effect=AssertionError("graph reparsed storage bytes"),
+            ),
+            patch(
+                "diffstory.report_storage.expand_report_storage",
+                side_effect=AssertionError("graph expanded the report"),
+            ),
+            patch(
+                "diffstory.report_storage.canonical_bytes",
+                side_effect=guarded_canonical,
+            ),
+            patch.object(
+                PresentationSection,
+                "model_dump",
+                side_effect=AssertionError(
+                    "graph dumped a full reader section"
+                ),
+            ),
+            patch(
+                "diffstory.report_storage._model_snapshot",
+                side_effect=AssertionError("graph used model serialization"),
+            ),
+        ):
+            report_graph = ReportRecordGraph.from_typed(
+                report_generation,
+                ReportReaderProjection.from_presentation(presentation),
+                artifact_kind="report",
+                base_report=base_report,
+            )
+
+        self.assertEqual(
+            report_graph.to_bytes(),
+            encode_report_storage(report_input, "report"),
+        )
+        self.assertEqual(
+            canonical_bytes(
+                expand_report_storage(
+                    report_graph, max_output_bytes=128 * 1024 * 1024
+                )
+            ),
+            canonical_bytes(expected_report),
+        )
+
+        annotation_reader = self._typed_annotation_reader(self.annotations)
+        metadata = {
+            key: self.annotations[key]
+            for key in ("schema", "base_sha", "head_sha")
+        }
+        compact_manifest = self._typed_model(
+            GenerationManifest, self.annotations["generation"]
+        )
+        with (
+            patch(
+                "diffstory.report_storage.encode_report_storage",
+                side_effect=AssertionError("graph used the expanded encoder"),
+            ),
+            patch(
+                "diffstory.report_storage.parse_report_storage",
+                side_effect=AssertionError("graph reparsed storage bytes"),
+            ),
+            patch(
+                "diffstory.report_storage.expand_report_storage",
+                side_effect=AssertionError("graph expanded annotations"),
+            ),
+            patch(
+                "diffstory.report_storage.canonical_bytes",
+                side_effect=guarded_canonical,
+            ),
+            patch.object(
+                PresentationSection,
+                "model_dump",
+                side_effect=AssertionError("graph dumped an annotation step"),
+            ),
+            patch(
+                "diffstory.report_storage._model_snapshot",
+                side_effect=AssertionError("graph used model serialization"),
+            ),
+        ):
+            compact_graph = ReportRecordGraph.from_typed(
+                compact_manifest,
+                annotation_reader,
+                artifact_kind="annotations",
+                metadata=metadata,
+            )
+
+        expanded_annotations_graph = ReportRecordGraph.from_typed(
+            self._typed_model(
+                GenerationManifest,
+                self.expanded_annotations["generation"],
+            ),
+            annotation_reader,
+            artifact_kind="annotations",
+            metadata=metadata,
+        )
+        self.assertEqual(
+            compact_graph.to_bytes(), expanded_annotations_graph.to_bytes()
+        )
+        self.assertEqual(
+            compact_graph.to_bytes(),
+            encode_report_storage(self.annotations, "annotations"),
+        )
+        self.assertEqual(
+            canonical_bytes(
+                expand_report_storage(
+                    compact_graph, max_output_bytes=128 * 1024 * 1024
+                )
+            ),
+            canonical_bytes(self.expanded_annotations),
+        )
+
+    def test_graph_references_share_records_and_select_one_section(
+        self,
+    ) -> None:
+        """Use typed references for shared results and resolve only selected details."""
+        graph = self._typed_report_graph()
+        generation_details = graph.generation_result_refs["details"]
+        reader_projection = graph.reader_projection
+        reader_details = tuple(
+            reference
+            for section in reader_projection.sections
+            for reference in section.details
+        )
+        shared = next(
+            reference
+            for reference in reader_details
+            if reference in generation_details
+        )
+        matching_generation_ref = next(
+            reference
+            for reference in generation_details
+            if reference == shared
+        )
+        self.assertIs(shared, matching_generation_ref)
+        self.assertEqual(shared.storage_id, matching_generation_ref.storage_id)
+        self.assertEqual(
+            graph.result_record(shared),
+            graph.result_record(matching_generation_ref),
+        )
+
+        selected = reader_projection.sections[1]
+        requested_ids = {item.storage_id for item in selected.details}
+        resolved: list[tuple[str, str]] = []
+        original = ReportStorageView._materialize  # noqa: SLF001 # Track one-section indexed resolution.
+
+        def tracked(
+            view: ReportStorageView, table: str, identifier: str, memo: dict
+        ) -> dict:
+            resolved.append((table, identifier))
+            return original(view, table, identifier, memo)
+
+        with patch.object(ReportStorageView, "_materialize", new=tracked):
+            selected_by_id = graph.reader_section(selected.group_id)
+            details = graph.section_details(selected.group_id)
+        self.assertEqual(selected_by_id, selected)
+        resolved_result_ids = {
+            identifier for table, identifier in resolved if table == "results"
+        }
+        self.assertEqual(resolved_result_ids, requested_ids)
+        self.assertEqual(
+            details,
+            self.applied["narrative_v2"]["sections"][1]["details"],
+        )
+
+    def test_graph_owns_detached_primitive_records(self) -> None:
+        """Caller models and detached accessor mutations cannot change the graph."""
+        generation = self._typed_model(
+            GenerationManifest, self.expanded_report["generation"]
+        )
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        base_report = {
+            key: copy.deepcopy(value)
+            for key, value in self.applied.items()
+            if key not in {"generation", "narrative_v2"}
+        }
+        graph = ReportRecordGraph.from_typed(
+            generation,
+            ReportReaderProjection.from_presentation(presentation),
+            artifact_kind="report",
+            base_report=base_report,
+        )
+        before_bytes = graph.to_bytes()
+        original_detail = generation.details[0]
+        object.__setattr__(original_detail, "unit_key", "0" * 64)
+        base_report["meta"]["title"] = "mutated caller dictionary"
+        detached_base = graph.record(
+            "readers",
+            graph._reader_id(),  # noqa: SLF001 # Confirm owned address data.
+        )
+        self.assertNotIn(
+            "mutated caller dictionary",
+            canonical_bytes(detached_base).decode(),
+        )
+        self.assertEqual(graph.to_bytes(), before_bytes)
+
+        reference = graph.generation_result_refs["details"][0]
+        detached = graph.result_record(reference)
+        detached["explanations"][0]["before"] = "mutated accessor"
+        self.assertNotEqual(
+            graph.result_record(reference)["explanations"][0]["before"],
+            "mutated accessor",
+        )
+        stored = graph.record("results", reference.storage_id)
+        stored["unit_key"] = "0" * 64
+        self.assertNotEqual(
+            graph.record("results", reference.storage_id)["unit_key"],
+            "0" * 64,
+        )
+        self.assertEqual(graph.to_bytes(), before_bytes)
+
+    def test_unique_record_validation_is_not_repeated_by_relationship_checks(
+        self,
+    ) -> None:
+        """Validate every unique table record once and reuse typed models later."""
+        encoded = encode_report_storage(self.applied, "report")
+        envelope = _envelope(encoded)
+        expected_record_calls = Counter(
+            f"{table}:{entry['kind']}"
+            for table, entries in envelope["tables"].items()
+            for entry in entries
+        )
+        validation_calls: Counter[str] = Counter()
+        model_calls: Counter[str] = Counter()
+        original_record_validation = (
+            report_storage._validate_typed_table_record  # noqa: SLF001
+        )
+        original_model = report_storage._model  # noqa: SLF001
+
+        def tracked_record_validation(
+            table: str, kind: str, logical: dict
+        ) -> BaseModel | None:
+            validation_calls[f"{table}:{kind}"] += 1
+            return original_record_validation(table, kind, logical)
+
+        def tracked_model(
+            model: type[BaseModel], logical: object
+        ) -> BaseModel:
+            model_calls[model.__name__] += 1
+            return original_model(model, logical)
+
+        with (
+            patch(
+                "diffstory.report_storage._validate_typed_table_record",
+                side_effect=tracked_record_validation,
+            ),
+            patch(
+                "diffstory.report_storage._model", side_effect=tracked_model
+            ),
+        ):
+            view = parse_report_storage(encoded)
+
+        self.assertEqual(validation_calls, expected_record_calls)
+        self.assertEqual(
+            view.typed_validation_counts, dict(expected_record_calls)
+        )
+        model_by_table_kind = {
+            "results": report_storage._RESULT_MODELS,  # noqa: SLF001
+            "plans": {"story_plan": report_storage.StoryPlan},
+            "evidence_refs": {
+                "span_ref": report_storage.SpanRef,
+                "source_slice_ref": report_storage.SourceSliceRef,
+                "statement_ref": report_storage.StatementRef,
+            },
+            "resolved_citations": {
+                "resolved_citation": report_storage.ResolvedCitation
+            },
+            "runs": {"run": report_storage.RunIdentity},
+            "invocations": {"invocation": report_storage.ArtifactInvocation},
+            "requests": {"request": report_storage.PreparedMetadata},
+            "producers": {"producer": report_storage.ProducerDescriptor},
+            "receipts": {"receipt": report_storage.ResultReceipt},
+            "inherited_provenance": {
+                "inherited_provenance": report_storage.InheritedProvenance
+            },
+        }
+        expected_model_calls: Counter[str] = Counter()
+        for table, kinds in model_by_table_kind.items():
+            for kind, model in kinds.items():
+                expected_model_calls[model.__name__] += expected_record_calls[
+                    f"{table}:{kind}"
+                ]
+        self.assertEqual(
+            Counter(
+                {name: model_calls[name] for name in expected_model_calls}
+            ),
+            expected_model_calls,
+        )
+
+    def test_live_graph_runs_unique_table_validators_once(self) -> None:
+        """Count executed typed validators for direct construction as well."""
+        encoded = encode_report_storage(self.applied, "report")
+        envelope = _envelope(encoded)
+        expected_record_calls = Counter(
+            f"{table}:{entry['kind']}"
+            for table, entries in envelope["tables"].items()
+            for entry in entries
+        )
+        validation_calls: Counter[str] = Counter()
+        model_calls: Counter[str] = Counter()
+        original_record_validation = (
+            report_storage._validate_typed_table_record  # noqa: SLF001
+        )
+        original_model = report_storage._model  # noqa: SLF001
+
+        def tracked_record_validation(
+            table: str, kind: str, logical: dict
+        ) -> BaseModel | None:
+            validation_calls[f"{table}:{kind}"] += 1
+            return original_record_validation(table, kind, logical)
+
+        def tracked_model(
+            model: type[BaseModel], logical: object
+        ) -> BaseModel:
+            model_calls[model.__name__] += 1
+            return original_model(model, logical)
+
+        with (
+            patch(
+                "diffstory.report_storage._validate_typed_table_record",
+                side_effect=tracked_record_validation,
+            ),
+            patch(
+                "diffstory.report_storage._model", side_effect=tracked_model
+            ),
+        ):
+            graph = self._typed_report_graph()
+
+        self.assertEqual(validation_calls, expected_record_calls)
+        self.assertEqual(
+            graph.typed_validation_counts, dict(expected_record_calls)
+        )
+        model_by_table_kind = {
+            "results": report_storage._RESULT_MODELS,  # noqa: SLF001
+            "plans": {"story_plan": report_storage.StoryPlan},
+            "evidence_refs": {
+                "span_ref": report_storage.SpanRef,
+                "source_slice_ref": report_storage.SourceSliceRef,
+                "statement_ref": report_storage.StatementRef,
+            },
+            "resolved_citations": {
+                "resolved_citation": report_storage.ResolvedCitation
+            },
+            "runs": {"run": report_storage.RunIdentity},
+            "invocations": {"invocation": report_storage.ArtifactInvocation},
+            "requests": {"request": report_storage.PreparedMetadata},
+            "producers": {"producer": report_storage.ProducerDescriptor},
+            "receipts": {"receipt": report_storage.ResultReceipt},
+            "inherited_provenance": {
+                "inherited_provenance": report_storage.InheritedProvenance
+            },
+        }
+        expected_model_calls: Counter[str] = Counter()
+        for table, kinds in model_by_table_kind.items():
+            for kind, model in kinds.items():
+                expected_model_calls[model.__name__] += expected_record_calls[
+                    f"{table}:{kind}"
+                ]
+        actual_table_model_calls = Counter(
+            {name: model_calls[name] for name in expected_model_calls}
+        )
+        self.assertEqual(actual_table_model_calls, expected_model_calls)
+        self.assertEqual(
+            model_calls["SpanRef"],
+            expected_record_calls["evidence_refs:span_ref"],
+        )
+        self.assertEqual(
+            model_calls["StatementRef"],
+            expected_record_calls["evidence_refs:statement_ref"],
+        )
+
+    def test_live_typed_capture_rejects_bypassed_scalar_and_relation_changes(
+        self,
+    ) -> None:
+        """Read raw nested attributes before any serializer can coerce them."""
+
+        def graph_for(
+            manifest: GenerationManifest, presentation: V2Presentation
+        ) -> ReportRecordGraph:
+            base_report = {
+                key: value
+                for key, value in self.applied.items()
+                if key not in {"generation", "narrative_v2"}
+            }
+            return ReportRecordGraph.from_typed(
+                manifest,
+                ReportReaderProjection.from_presentation(presentation),
+                artifact_kind="report",
+                base_report=base_report,
+            )
+
+        manifest = self._typed_model(
+            GenerationManifest, self.expanded_report["generation"]
+        )
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        object.__setattr__(presentation.citations[0], "byte_start", True)
+        with self.assertRaisesRegex(ValueError, "byte_start"):
+            graph_for(manifest, presentation)
+
+        manifest = self._typed_model(
+            GenerationManifest, self.expanded_report["generation"]
+        )
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        object.__setattr__(presentation.citations[0], "unexpected", "value")
+        with self.assertRaisesRegex(
+            ValueError, "invalid_typed_storage_record"
+        ):
+            graph_for(manifest, presentation)
+
+        manifest = self._typed_model(
+            GenerationManifest, self.expanded_report["generation"]
+        )
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        object.__setattr__(manifest.receipts[0], "result_digest", "0" * 64)
+        with self.assertRaisesRegex(ValueError, "receipt_result_mismatch"):
+            graph_for(manifest, presentation)
+
+        manifest = self._typed_model(
+            GenerationManifest, self.expanded_report["generation"]
+        )
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        sent_receipt = next(
+            receipt
+            for receipt in manifest.receipts
+            if receipt.disposition == "sent"
+        )
+        producer = next(
+            item
+            for item in manifest.producers
+            if item.key == sent_receipt.producer_key
+        )
+        prior_key = producer.key
+        object.__setattr__(
+            producer.original_run,
+            "report_signature",
+            "changed-report-signature",
+        )
+        changed_key = producer.key
+        for receipt in manifest.receipts:
+            if receipt.producer_key == prior_key:
+                object.__setattr__(receipt, "producer_key", changed_key)
+        with self.assertRaisesRegex(ValueError, "sent_run_mismatch"):
+            graph_for(manifest, presentation)
+
+        manifest = self._typed_model(
+            GenerationManifest, self.expanded_report["generation"]
+        )
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        sent_requests = {
+            (receipt.producer_key, receipt.request_key)
+            for receipt in manifest.receipts
+            if receipt.disposition == "sent"
+        }
+        self.assertGreater(len(sent_requests), 0)
+        object.__setattr__(
+            manifest.current_usage, "calls", len(sent_requests) - 1
+        )
+        with self.assertRaisesRegex(ValueError, "sent_usage_mismatch"):
+            graph_for(manifest, presentation)
+
+    def test_live_typed_capture_checks_reader_metadata_and_order(self) -> None:
+        """Keep the indexed reader skeleton bound to its ordered generation."""
+
+        def graph_for(presentation: V2Presentation) -> ReportRecordGraph:
+            manifest = self._typed_model(
+                GenerationManifest, self.expanded_report["generation"]
+            )
+            base_report = {
+                key: value
+                for key, value in self.applied.items()
+                if key not in {"generation", "narrative_v2"}
+            }
+            return ReportRecordGraph.from_typed(
+                manifest,
+                ReportReaderProjection.from_presentation(presentation),
+                artifact_kind="report",
+                base_report=base_report,
+            )
+
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        object.__setattr__(presentation, "provenance", "verified")
+        with self.assertRaisesRegex(ValueError, "invalid_reader_metadata"):
+            graph_for(presentation)
+
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        self.assertGreaterEqual(len(presentation.sections), 2)
+        object.__setattr__(
+            presentation, "sections", tuple(reversed(presentation.sections))
+        )
+        with self.assertRaisesRegex(ValueError, "reader_section_mismatch"):
+            graph_for(presentation)
+
+    def test_typed_constructor_defaults_match_canonical_models(self) -> None:
+        """Include default schema versions omitted by fresh model constructors."""
+        manifest = self._typed_model(
+            GenerationManifest, self.expanded_report["generation"]
+        )
+        source_detail = manifest.details[0]
+        fresh_detail = DetailResult(
+            **{
+                name: getattr(source_detail, name)
+                for name in type(source_detail).model_fields
+                if name != "version"
+            }
+        )
+        source_section = manifest.sections[0]
+        fresh_section = type(source_section)(
+            **{
+                name: getattr(source_section, name)
+                for name in type(source_section).model_fields
+                if name != "version"
+            }
+        )
+        manifest_fields = {
+            name: getattr(manifest, name)
+            for name in GenerationManifest.model_fields
+            if name not in {"version", "provenance"}
+        }
+        manifest_fields["details"] = (fresh_detail, *manifest.details[1:])
+        manifest_fields["sections"] = (fresh_section, *manifest.sections[1:])
+        fresh_manifest = GenerationManifest(**manifest_fields)
+        self.assertNotIn("version", fresh_manifest.model_fields_set)
+        self.assertNotIn("provenance", fresh_manifest.model_fields_set)
+        self.assertNotIn("version", fresh_detail.model_fields_set)
+        self.assertNotIn("version", fresh_section.model_fields_set)
+
+        presentation = self._typed_model(
+            V2Presentation, self.applied["narrative_v2"]
+        )
+        source_reader_section = presentation.sections[0]
+        fresh_reader_section = type(source_reader_section)(
+            group_id=source_reader_section.group_id,
+            group_key=source_reader_section.group_key,
+            number=source_reader_section.number,
+            next_id=source_reader_section.next_id,
+            prose=fresh_section,
+            details=source_reader_section.details,
+        )
+        fresh_presentation = V2Presentation(
+            version=presentation.version,
+            provenance=presentation.provenance,
+            document=presentation.document,
+            sections=(fresh_reader_section, *presentation.sections[1:]),
+            context_details=presentation.context_details,
+            citations=presentation.citations,
+            support_provenance=presentation.support_provenance,
+        )
+        base_report = {
+            key: value
+            for key, value in self.applied.items()
+            if key not in {"generation", "narrative_v2"}
+        }
+        graph = ReportRecordGraph.from_typed(
+            fresh_manifest,
+            ReportReaderProjection.from_presentation(fresh_presentation),
+            artifact_kind="report",
+            base_report=base_report,
+        )
+        expanded = expand_report_storage(
+            parse_report_storage(graph.to_bytes()),
+            max_output_bytes=128 * 1024 * 1024,
+        )
+        self.assertEqual(
+            canonical_bytes(expanded["generation"]),
+            canonical_bytes(fresh_manifest),
+        )
+        self.assertEqual(
+            canonical_bytes(expanded), canonical_bytes(self.expanded_report)
+        )
+
+        missing_defaults = copy.deepcopy(self.expanded_report["generation"])
+        missing_defaults.pop("version")
+        missing_defaults.pop("provenance")
+        parsed_manifest = GenerationManifest.model_validate_json(
+            canonical_bytes(missing_defaults)
+        )
+        self.assertNotIn("version", parsed_manifest.model_fields_set)
+        parsed_graph = ReportRecordGraph.from_typed(
+            parsed_manifest,
+            ReportReaderProjection.from_presentation(presentation),
+            artifact_kind="report",
+            base_report=base_report,
+        )
+        parsed_expanded = expand_report_storage(
+            parse_report_storage(parsed_graph.to_bytes()),
+            max_output_bytes=128 * 1024 * 1024,
+        )
+        self.assertEqual(
+            canonical_bytes(parsed_expanded["generation"]),
+            canonical_bytes(parsed_manifest),
         )
 
     def test_transformed_citations_validate_closed_logical_records(
