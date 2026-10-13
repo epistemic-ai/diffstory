@@ -27,16 +27,27 @@ import sys
 import time
 from collections import Counter
 from contextlib import ExitStack
+from contextlib import contextmanager
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
+from functools import wraps
 from pathlib import Path
+from threading import Lock
+from threading import local
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from diffstory import analysis as analysis_module  # noqa: E402
+from diffstory import cli as cli_module  # noqa: E402
+from diffstory import narrative_hierarchy  # noqa: E402
+from diffstory import narrative_manifest  # noqa: E402
+from diffstory import narrative_plan  # noqa: E402
 from diffstory import narrative_runtime  # noqa: E402
+from diffstory import narrative_v2  # noqa: E402
+from diffstory import render as render_module  # noqa: E402
 from diffstory.analysis import apply_annotations  # noqa: E402
 from diffstory.cli import main as cli_main  # noqa: E402
 from diffstory.narrative import CodexCLIProvider  # noqa: E402
@@ -55,6 +66,8 @@ from diffstory.narrative_v2 import V2Options  # noqa: E402
 from diffstory.usage import estimate_input  # noqa: E402
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from diffstory.narrative_runtime import ProgressEvent
@@ -65,10 +78,614 @@ STAGES = ("detail", "planning", "section", "document")
 DEFAULT_RESERVE = 2_000_000_000
 SHA256_LENGTH = 64
 PROGRESS_INTERVAL = 15
+PHASE_LABELS = (
+    "input.initial_read",
+    "input.initial_json_parse",
+    "input.canonical_json_parse",
+    "canonicalization",
+    "ledger.build",
+    "ledger.index_build",
+    "manifest.persisted_boundary",
+    "manifest.structural_parse",
+    "manifest.inline_validation",
+    "result.stage_validation",
+    "cache.lookup",
+    "cache.read_parse",
+    "cache.expand",
+    "cache.record_parse",
+    "proof.production",
+    "proof.generated_manifest_audit",
+    "proof.producer_request_audit",
+    "proof.request_plan_audit",
+    "proof.support.prose",
+    "proof.support.consumed",
+    "proof.support.forest",
+    "source.resolve",
+    "source.resolve_lookup",
+    "apply.public",
+    "persistence.serialize",
+    "cli.reload.read_decode_validate",
+    "cli.reload.json_parse",
+    "render.safety_validation",
+    "render.json_serialize",
+    "render.html_assembly",
+)
+MEASUREMENT_QUALIFICATIONS = {
+    "cli_reload": (
+        "read_json includes file checks, bounded read, UTF-8 decode, object check, "
+        "and JSON parse; the nested parse has its own timer."
+    ),
+    "cli_parser_input": (
+        "The CLI JSON parser receives decoded text, so its byte-equivalent input "
+        "is not re-encoded; the parser records characters."
+    ),
+    "manifest_results": (
+        "Nested Pydantic result validators run inside GenerationManifest parsing; "
+        "M1 measures that full parser and separate stage-result checks."
+    ),
+    "renderer": (
+        "Renderer safety time includes generic checks and its nested full proof; "
+        "same-thread child time is subtracted from exclusive time."
+    ),
+    "thread_cpu": (
+        "Nested phase CPU uses per-thread CPU time; process_cpu_seconds is a "
+        "separate run-wide total."
+    ),
+    "exclusive_time": (
+        "Exclusive time subtracts nested instrumented phases on the same thread. "
+        "Do not sum inclusive phase times."
+    ),
+    "peak_memory": (
+        "peak_rss_bytes is a process-wide high-water mark, not a per-phase peak."
+    ),
+    "browser": (
+        "Browser parsing and rendering are deferred to M6; Python HTML assembly "
+        "does not measure browser work."
+    ),
+}
 
 
 class BenchmarkError(Exception):
     """Carry only a fixed benchmark reason, never input or exception text."""
+
+
+class PhaseMeasurements:
+    """Collect fixed-label nested timings and source-free numeric counters."""
+
+    def __init__(
+        self,
+        *,
+        wall_clock: Callable[[], float] | None = None,
+        thread_cpu_clock: Callable[[], float] | None = None,
+    ) -> None:
+        """Use monotonic wall and thread CPU clocks unless a test injects clocks."""
+        self._wall_clock = wall_clock or time.perf_counter
+        self._thread_cpu_clock = thread_cpu_clock or time.thread_time
+        self._local = local()
+        self._lock = Lock()
+        self._values = {
+            name: {
+                "calls": 0,
+                "failures": 0,
+                "records": 0,
+                "bytes": 0,
+                "characters": 0,
+                "wall_inclusive_seconds": 0.0,
+                "wall_exclusive_seconds": 0.0,
+                "thread_cpu_inclusive_seconds": 0.0,
+                "thread_cpu_exclusive_seconds": 0.0,
+            }
+            for name in PHASE_LABELS
+        }
+
+    def _add(self, name: str, **counts: float) -> None:
+        """Add numeric observations under a fixed phase label."""
+        with self._lock:
+            values = self._values[name]
+            for key, value in counts.items():
+                values[key] += value
+
+    def observe(
+        self,
+        name: str,
+        *,
+        records: int = 0,
+        byte_count: int = 0,
+        characters: int = 0,
+    ) -> None:
+        """Record numeric counts without retaining or serializing source data."""
+        self._add(
+            name,
+            records=records,
+            bytes=byte_count,
+            characters=characters,
+        )
+
+    @contextmanager
+    def measure(self, name: str) -> Iterator[None]:
+        """Measure one nested operation and preserve its result or exception."""
+        if name not in self._values:
+            msg = "unknown_measurement_phase"
+            raise ValueError(msg)
+        stack = getattr(self._local, "stack", None)
+        if stack is None:
+            stack = []
+            self._local.stack = stack
+        with self._lock:
+            self._values[name]["calls"] += 1
+        frame = {
+            "wall_child": 0.0,
+            "cpu_child": 0.0,
+        }
+        wall_start = self._wall_clock()
+        cpu_start = self._thread_cpu_clock()
+        stack.append(frame)
+        failed = False
+        try:
+            yield
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            cpu_elapsed = max(0.0, self._thread_cpu_clock() - cpu_start)
+            wall_elapsed = max(0.0, self._wall_clock() - wall_start)
+            stack.pop()
+            if stack:
+                stack[-1]["wall_child"] += wall_elapsed
+                stack[-1]["cpu_child"] += cpu_elapsed
+            self._add(
+                name,
+                failures=int(failed),
+                wall_inclusive_seconds=wall_elapsed,
+                wall_exclusive_seconds=max(
+                    0.0, wall_elapsed - frame["wall_child"]
+                ),
+                thread_cpu_inclusive_seconds=cpu_elapsed,
+                thread_cpu_exclusive_seconds=max(
+                    0.0, cpu_elapsed - frame["cpu_child"]
+                ),
+            )
+
+    def wrap(  # noqa: PLR0913 # Timed hook counters stay explicit.
+        self,
+        name: str,
+        function: Callable[..., object],
+        *,
+        records: Callable[..., int] | None = None,
+        input_bytes: Callable[..., int] | None = None,
+        input_characters: Callable[..., int] | None = None,
+        output_records: Callable[[object], int] | None = None,
+        output_bytes: Callable[[object], int] | None = None,
+        output_characters: Callable[[object], int] | None = None,
+    ) -> Callable[..., object]:
+        """Wrap a hook while forwarding arguments, result, and exception intact."""
+
+        @wraps(function)
+        def wrapped(*args: object, **kwargs: object) -> object:
+            with self.measure(name):
+                if records is not None:
+                    self.observe(name, records=records(*args, **kwargs))
+                if input_bytes is not None:
+                    self.observe(name, byte_count=input_bytes(*args, **kwargs))
+                if input_characters is not None:
+                    self.observe(
+                        name,
+                        characters=input_characters(*args, **kwargs),
+                    )
+                result = function(*args, **kwargs)
+                if output_records is not None:
+                    self.observe(name, records=output_records(result))
+                if output_bytes is not None:
+                    self.observe(name, byte_count=output_bytes(result))
+                if output_characters is not None:
+                    self.observe(name, characters=output_characters(result))
+                return result
+
+        return wrapped
+
+    def snapshot(self) -> dict:
+        """Return fixed-label counters and timings with no caller-owned objects."""
+        with self._lock:
+            return {name: dict(self._values[name]) for name in PHASE_LABELS}
+
+
+class _ObservedJson:
+    """Delegate JSON operations while replacing only the selected local hook."""
+
+    def __init__(
+        self, module: object, **overrides: Callable[..., object]
+    ) -> None:
+        """Keep the original JSON module and a small set of measured callables."""
+        self._module = module
+        self._overrides = overrides
+
+    def __getattr__(self, name: str) -> object:
+        """Forward every unmeasured JSON attribute unchanged."""
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._module, name)
+
+
+def _bytes_length(*args: object, **_kwargs: object) -> int:
+    """Return the length of one byte-buffer argument without copying it."""
+    value = args[0] if args else None
+    return (
+        len(value) if isinstance(value, (bytes, bytearray, memoryview)) else 0
+    )
+
+
+def _manifest_record_count(value: object) -> int:
+    """Count typed proof records using existing collections only."""
+    names = ("details", "planning", "sections", "producers", "receipts")
+    return 1 + sum(len(getattr(value, name, ())) for name in names)
+
+
+def _ledger_record_count(value: object) -> int:
+    """Count ledger records without building a serialized representation."""
+    names = ("buffers", "spans", "units", "groups", "changes")
+    return sum(len(getattr(value, name, ())) for name in names)
+
+
+def _instrument_method(
+    stack: ExitStack,
+    owner: object,
+    attribute: str,
+    measurements: PhaseMeasurements,
+    phase: str,
+    **options: object,
+) -> None:
+    """Patch one module or class hook for this benchmark run only."""
+    original = getattr(owner, attribute)
+    stack.enter_context(
+        patch.object(
+            owner,
+            attribute,
+            measurements.wrap(phase, original, **options),
+        )
+    )
+
+
+def _instrument_classmethod(
+    stack: ExitStack,
+    owner: type,
+    attribute: str,
+    measurements: PhaseMeasurements,
+    phase: str,
+    **options: object,
+) -> None:
+    """Patch a bound class validator while restoring its original descriptor."""
+    original = getattr(owner, attribute)
+    wrapped = measurements.wrap(phase, original, **options)
+
+    def dispatch(_class: type, *args: object, **kwargs: object) -> object:
+        return wrapped(*args, **kwargs)
+
+    stack.enter_context(patch.object(owner, attribute, classmethod(dispatch)))
+
+
+def install_measurement_hooks(
+    stack: ExitStack, measurements: PhaseMeasurements
+) -> None:
+    """Install benchmark-local observers at the mapped narration boundaries."""
+    for owner in (narrative_plan, narrative_v2, narrative_manifest):
+        if hasattr(owner, "canonical_bytes"):
+            _instrument_method(
+                stack,
+                owner,
+                "canonical_bytes",
+                measurements,
+                "canonicalization",
+                output_bytes=lambda value: len(value),
+            )
+    _instrument_method(
+        stack,
+        sys.modules[__name__],
+        "canonical_bytes",
+        measurements,
+        "canonicalization",
+        output_bytes=lambda value: len(value),
+    )
+    for owner in (narrative_plan, narrative_v2):
+        if hasattr(owner, "build_evidence_ledger"):
+            _instrument_method(
+                stack,
+                owner,
+                "build_evidence_ledger",
+                measurements,
+                "ledger.build",
+                output_records=_ledger_record_count,
+            )
+        if hasattr(owner, "build_ledger_index"):
+            _instrument_method(
+                stack,
+                owner,
+                "build_ledger_index",
+                measurements,
+                "ledger.index_build",
+                records=lambda ledger, **_kwargs: len(ledger.units)
+                + len(ledger.spans),
+            )
+    _instrument_method(
+        stack,
+        narrative_v2,
+        "strict_json",
+        measurements,
+        "input.canonical_json_parse",
+        records=lambda *_args, **_kwargs: 1,
+        input_bytes=_bytes_length,
+    )
+    _instrument_method(
+        stack,
+        narrative_manifest,
+        "persisted_manifest",
+        measurements,
+        "manifest.persisted_boundary",
+        records=lambda _value, **_kwargs: 1,
+    )
+    _instrument_method(
+        stack,
+        sys.modules[__name__],
+        "persisted_manifest",
+        measurements,
+        "manifest.persisted_boundary",
+        records=lambda _value, **_kwargs: 1,
+    )
+    _instrument_classmethod(
+        stack,
+        narrative_manifest.GenerationManifest,
+        "model_validate_json",
+        measurements,
+        "manifest.structural_parse",
+        records=lambda *_args, **_kwargs: 1,
+        input_bytes=_bytes_length,
+    )
+    _instrument_classmethod(
+        stack,
+        narrative_manifest.GenerationManifest,
+        "model_validate",
+        measurements,
+        "manifest.inline_validation",
+        records=lambda value, **_kwargs: _manifest_record_count(value),
+    )
+    _instrument_method(
+        stack,
+        narrative_v2.StageInputs,
+        "validate",
+        measurements,
+        "result.stage_validation",
+        records=lambda *_args, **_kwargs: 1,
+    )
+
+    _instrument_method(
+        stack,
+        narrative_runtime.ArtifactStore,
+        "lookup",
+        measurements,
+        "cache.lookup",
+        records=lambda *_args, **_kwargs: 1,
+    )
+    _instrument_method(
+        stack,
+        narrative_runtime.ArtifactStore,
+        "read",
+        measurements,
+        "cache.read_parse",
+        records=lambda *_args, **_kwargs: 1,
+        input_bytes=lambda _self, serialized, **_kwargs: len(serialized),
+    )
+    _instrument_method(
+        stack,
+        narrative_runtime.ArtifactStore,
+        "_expand",
+        measurements,
+        "cache.expand",
+        records=lambda *_args, **_kwargs: 1,
+    )
+    for model in (
+        narrative_runtime._StoredItem,  # noqa: SLF001 # Instrument the actual v3 leaf parser.
+        narrative_runtime._StoredRequest,  # noqa: SLF001 # Instrument shared request records.
+        narrative_runtime.StoredInvocation,
+        narrative_runtime.StoredArtifact,
+    ):
+        _instrument_classmethod(
+            stack,
+            model,
+            "model_validate_json",
+            measurements,
+            "cache.record_parse",
+            records=lambda *_args, **_kwargs: 1,
+            input_bytes=_bytes_length,
+        )
+
+    _instrument_method(
+        stack,
+        narrative_v2,
+        "validate_production",
+        measurements,
+        "proof.production",
+        records=lambda _report, manifest, **_kwargs: _manifest_record_count(
+            manifest
+        ),
+    )
+    _instrument_method(
+        stack,
+        narrative_v2.BatchedNarrator,
+        "validate_manifest",
+        measurements,
+        "proof.generated_manifest_audit",
+        records=lambda _self, manifest, **_kwargs: _manifest_record_count(
+            manifest
+        ),
+    )
+    _instrument_method(
+        stack,
+        narrative_v2.CodecReplay,
+        "required",
+        measurements,
+        "proof.producer_request_audit",
+        records=lambda _self, _invocation, requests, **_kwargs: len(requests),
+    )
+    _instrument_method(
+        stack,
+        narrative_v2,
+        "validate_production_requests",
+        measurements,
+        "proof.request_plan_audit",
+        records=lambda plan, **_kwargs: len(plan.requests),
+    )
+    _instrument_method(
+        stack,
+        narrative_v2,
+        "validate_prose_support",
+        measurements,
+        "proof.support.prose",
+        records=lambda *_args, **_kwargs: 1,
+    )
+    _instrument_method(
+        stack,
+        narrative_v2,
+        "validate_support_forest",
+        measurements,
+        "proof.support.forest",
+        records=lambda prose, *_args, **_kwargs: len(prose),
+    )
+    _instrument_method(
+        stack,
+        narrative_hierarchy,
+        "validate_consumed_support",
+        measurements,
+        "proof.support.consumed",
+        records=lambda *_args, **_kwargs: 1,
+    )
+    _instrument_method(
+        stack,
+        narrative_hierarchy,
+        "validate_support_forest",
+        measurements,
+        "proof.support.forest",
+        records=lambda prose, *_args, **_kwargs: len(prose),
+    )
+    _instrument_method(
+        stack,
+        narrative_plan,
+        "resolve_span_ref",
+        measurements,
+        "source.resolve",
+        records=lambda *_args, **_kwargs: 1,
+    )
+    _instrument_method(
+        stack,
+        narrative_plan,
+        "_resolve_span_ref",
+        measurements,
+        "source.resolve_lookup",
+        records=lambda *_args, **_kwargs: 1,
+    )
+
+    _instrument_method(
+        stack,
+        analysis_module,
+        "apply_annotations",
+        measurements,
+        "apply.public",
+        records=lambda *_args, **_kwargs: 1,
+    )
+    _instrument_method(
+        stack,
+        sys.modules[__name__],
+        "apply_annotations",
+        measurements,
+        "apply.public",
+        records=lambda *_args, **_kwargs: 1,
+    )
+    _instrument_method(
+        stack,
+        StorageGuard,
+        "json",
+        measurements,
+        "persistence.serialize",
+        records=lambda *_args, **_kwargs: 1,
+        output_bytes=lambda value: value,
+    )
+
+    cli_json = cli_module.json
+    stack.enter_context(
+        patch.object(
+            cli_module,
+            "json",
+            _ObservedJson(
+                cli_json,
+                loads=measurements.wrap(
+                    "cli.reload.json_parse",
+                    cli_json.loads,
+                    records=lambda *_args, **_kwargs: 1,
+                    input_characters=lambda value, **_kwargs: len(value)
+                    if isinstance(value, str)
+                    else 0,
+                ),
+            ),
+        )
+    )
+    _instrument_method(
+        stack,
+        cli_module,
+        "read_json",
+        measurements,
+        "cli.reload.read_decode_validate",
+        records=lambda *_args, **_kwargs: 1,
+    )
+    _instrument_method(
+        stack,
+        render_module,
+        "validate_report",
+        measurements,
+        "render.safety_validation",
+        records=lambda *_args, **_kwargs: 1,
+    )
+    render_json = render_module.json
+    stack.enter_context(
+        patch.object(
+            render_module,
+            "json",
+            _ObservedJson(
+                render_json,
+                dumps=measurements.wrap(
+                    "render.json_serialize",
+                    render_json.dumps,
+                    records=lambda *_args, **_kwargs: 1,
+                    output_characters=lambda value: len(value),
+                ),
+            ),
+        )
+    )
+    _instrument_method(
+        stack,
+        render_module,
+        "render",
+        measurements,
+        "render.html_assembly",
+        records=lambda *_args, **_kwargs: 1,
+        output_characters=lambda value: len(value),
+    )
+    _instrument_method(
+        stack,
+        cli_module,
+        "render",
+        measurements,
+        "render.html_assembly",
+        records=lambda *_args, **_kwargs: 1,
+        output_characters=lambda value: len(value),
+    )
+
+
+def binding_summary(binding: dict) -> dict:
+    """Export only fixed-key aggregates and a digest of the private binding."""
+    return {
+        "version": binding["version"],
+        "binding_sha256": digest_json(binding),
+        "candidate_file_count": len(binding["candidate_hashes"]),
+        "source_bytes": binding["source_bytes"],
+    }
 
 
 def require(condition: bool, reason: str) -> None:  # noqa: FBT001
@@ -579,7 +1196,12 @@ def initialize(args: argparse.Namespace) -> dict:
     return binding
 
 
-def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 # Keep the sequential public boundary audit explicit.
+def execute(  # noqa: PLR0915 # Keep the sequential public boundary audit explicit.
+    args: argparse.Namespace,
+    metrics: dict,
+    binding: dict,
+    measurements: PhaseMeasurements,
+) -> None:
     """Run actual generation, offline apply, persistence and supported CLI reload."""
     provider = LocalCodexFixture()
     guard = StorageGuard(args.state, args.reserve_bytes)
@@ -604,6 +1226,7 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
             "attempts": event.provider_calls,
         }
         metrics["fixture"] = provider.metrics()
+        metrics["phase_measurements"] = measurements.snapshot()
         write_metrics(args.state / "progress.json", metrics)
 
     narrator = Narrator(
@@ -616,6 +1239,7 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
     )
     try:
         with ExitStack() as stack:
+            install_measurement_hooks(stack, measurements)
             offline_guard(stack)
             stack.enter_context(
                 patch(
@@ -629,12 +1253,27 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
                 )
             )
             metrics["stage"] = "load"
-            report = json.loads(args.report.read_bytes())
+            with measurements.measure("input.initial_read"):
+                report_bytes = args.report.read_bytes()
+                measurements.observe(
+                    "input.initial_read",
+                    records=1,
+                    byte_count=len(report_bytes),
+                )
+            with measurements.measure("input.initial_json_parse"):
+                measurements.observe(
+                    "input.initial_json_parse",
+                    records=1,
+                    byte_count=len(report_bytes),
+                )
+                report = json.loads(report_bytes)
+            del report_bytes
             metrics["stage"] = "preflight"
             metrics["preview"] = narrator.preview(report)
             inputs = narrator._v2.inputs  # noqa: SLF001 # Inspect actual frozen public-preview inputs for measurement only.
             metrics["ledger"] = ledger_metrics(inputs.ledger)
             metrics["detail_preflight"] = detail_preflight(inputs)
+            metrics["phase_measurements"] = measurements.snapshot()
             write_metrics(args.state / "progress.json", metrics)
             if args.phase == "cold":
                 guard.check(
@@ -723,6 +1362,9 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
                 "cli_report_retention",
             )
             metrics["html_bytes"] = html_path.stat().st_size
+            measurements.observe(
+                "render.html_assembly", byte_count=metrics["html_bytes"]
+            )
             metrics["html_sha256"] = file_digest(html_path)
             metrics["public_cli"]["report_bytes_preserved"] = True
             metrics["public_cli"]["strong_offline_validation"] = True
@@ -769,7 +1411,7 @@ def execute(args: argparse.Namespace, metrics: dict) -> None:  # noqa: PLR0915 #
                 "source_changed_during_run",
             )
             require(
-                candidate_hashes() == metrics["binding"]["candidate_hashes"],
+                candidate_hashes() == binding["candidate_hashes"],
                 "candidate_changed_during_run",
             )
             metrics["status"] = "PASS"
@@ -812,6 +1454,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--reserve-bytes", type=int, default=DEFAULT_RESERVE)
     started = time.monotonic()
+    process_cpu_started = time.process_time()
+    measurements = PhaseMeasurements()
     metrics = {
         "version": VERSION,
         "status": "BLOCKED",
@@ -824,12 +1468,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "observed_llm_tokens": None,
     }
     ready = False
+    binding = None
     try:
         args = parser.parse_args(argv)
-        metrics["binding"] = initialize(args)
+        binding = initialize(args)
+        metrics["binding"] = binding_summary(binding)
         ready = True
         metrics["phase"] = args.phase
-        execute(args, metrics)
+        execute(args, metrics, binding, measurements)
     except BenchmarkError as error:
         metrics["reason"] = str(error)
     except (ArtifactRuntimeError, RuntimeStageError) as error:
@@ -852,8 +1498,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             type(error).__name__.encode()
         ).hexdigest()
     metrics["elapsed_seconds"] = time.monotonic() - started
+    metrics["process_cpu_seconds"] = time.process_time() - process_cpu_started
+    metrics["phase_measurements"] = measurements.snapshot()
+    metrics["measurement_qualifications"] = dict(MEASUREMENT_QUALIFICATIONS)
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     metrics["peak_rss_bytes"] = rss if sys.platform == "darwin" else rss * 1024
+    metrics["peak_rss_scope"] = "process_run_high_water_mark"
     if ready:
         try:
             write_metrics(args.state / f"{args.phase}-metrics.json", metrics)
@@ -868,6 +1518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "status",
                     "stage",
                     "elapsed_seconds",
+                    "process_cpu_seconds",
                     "peak_rss_bytes",
                     "reason",
                 )
