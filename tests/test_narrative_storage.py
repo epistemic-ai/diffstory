@@ -337,9 +337,186 @@ class ArtifactStorageTests(unittest.TestCase):
         request.write_text(json.dumps(value))
         self.assertIsNone(self.lookup())
 
+    def test_exact_byte_memo_reuses_shared_parses_and_current_audits(
+        self,
+    ) -> None:
+        """Sibling hits read every record but share only structural parse work."""
+        for artifact in self.artifacts:
+            self.store.commit(artifact)
+        validate = Mock(wraps=validate_v2)
+        audit = Mock(return_value=True)
+        first = self.store.lookup(
+            self.artifacts[0].lookup,
+            self.registry,
+            validate,
+            audit_candidate=audit,
+        )
+        second = self.store.lookup(
+            self.artifacts[1].lookup,
+            self.registry,
+            validate,
+            audit_candidate=audit,
+        )
+        repeated = self.store.lookup(
+            self.artifacts[0].lookup,
+            self.registry,
+            validate,
+            audit_candidate=audit,
+        )
+
+        self.assertEqual(first, self.artifacts[0])
+        self.assertEqual(second, self.artifacts[1])
+        self.assertEqual(repeated, self.artifacts[0])
+        self.assertEqual(validate.call_count, 3)
+        self.assertEqual(audit.call_count, 3)
+        counters = self.store.memo_counters
+        self.assertEqual(counters["leaf_reads"], 3)
+        self.assertEqual(counters["invocation_reads"], 3)
+        self.assertEqual(counters["request_reads"], 3)
+        self.assertEqual(counters["reads"], 9)
+        self.assertEqual(counters["leaf_parses"], 2)
+        self.assertEqual(counters["invocation_parses"], 1)
+        self.assertEqual(counters["request_parses"], 1)
+        self.assertEqual(counters["expansions"], 1)
+
+    def test_failed_parse_is_not_retained(self) -> None:
+        """Malformed exact bytes are parsed again until valid bytes return."""
+        _leaf, invocation, _request = self.commit()
+        self.assertEqual(self.lookup(), self.artifact)
+        original = invocation.read_bytes()
+        before = self.store.memo_counters
+        invocation.write_bytes(b"{")
+        self.assertIsNone(self.lookup())
+        failed_once = self.store.memo_counters
+        self.assertIsNone(self.lookup())
+        failed_twice = self.store.memo_counters
+        self.assertEqual(
+            failed_twice["invocation_parses"],
+            failed_once["invocation_parses"] + 1,
+        )
+        self.assertEqual(failed_twice["entries"], before["entries"])
+        self.assertEqual(
+            failed_twice["retained_bytes"], before["retained_bytes"]
+        )
+        invocation.write_bytes(original)
+        self.assertEqual(self.lookup(), self.artifact)
+        restored = self.store.memo_counters
+        self.assertEqual(restored["invocation_parses"], 3)
+        self.assertEqual(restored["expansions"], 1)
+
+    def test_returned_models_and_audit_mutation_do_not_alias_memo(
+        self,
+    ) -> None:
+        """Frozen-model bypasses stay detached from later reads of memo entries."""
+        self.commit()
+
+        def mutate(candidate: runtime.StoredArtifact) -> bool:
+            object.__setattr__(candidate.invocation.batch, "input_bound", 0)
+            object.__setattr__(
+                candidate.invocation.lookups[0], "validator_version", "changed"
+            )
+            object.__setattr__(
+                candidate.production_request, "safety_tokens", 0
+            )
+            object.__setattr__(
+                candidate.record.result, "unit_key", digest("changed")
+            )
+            return True
+
+        returned = self.lookup(audit_candidate=mutate)
+        self.assertIsNotNone(returned)
+        before = self.store.memo_counters
+        assert returned is not None
+        object.__setattr__(returned, "lookup", "changed")
+        object.__setattr__(returned.record, "result", "changed")
+
+        later = self.lookup(audit_candidate=lambda _candidate: True)
+        after = self.store.memo_counters
+        self.assertEqual(later, self.artifact)
+        self.assertEqual(after["leaf_parses"], before["leaf_parses"])
+        self.assertEqual(
+            after["invocation_parses"], before["invocation_parses"]
+        )
+        self.assertEqual(after["request_parses"], before["request_parses"])
+        self.assertEqual(after["expansions"], before["expansions"])
+        self.assertEqual(after["reads"], before["reads"] + 3)
+
+    def test_store_memo_is_bounded_and_independent(self) -> None:
+        """Eviction and oversized records only add work; stores share no authority."""
+        self.commit()
+        sizing = runtime.ArtifactStore(self.root)
+        sized_hit = sizing.lookup(
+            self.artifact.lookup, self.registry, validate_v2
+        )
+        self.assertEqual(sized_hit, self.artifact)
+        weights = [entry.retained_bytes for entry in sizing._memo.values()]  # noqa: SLF001
+        self.assertEqual(len(weights), 3)
+        self.assertGreater(sum(weights), max(weights))
+
+        capacity = sum(weights) - min(weights)
+        bounded = runtime.ArtifactStore(self.root, _memo_max_bytes=capacity)
+        first = bounded.lookup(
+            self.artifact.lookup, self.registry, validate_v2
+        )
+        second = bounded.lookup(
+            self.artifacts[1].lookup, self.registry, validate_v2
+        )
+        repeated = bounded.lookup(
+            self.artifact.lookup, self.registry, validate_v2
+        )
+        self.assertEqual(first, self.artifact)
+        self.assertEqual(second, self.artifacts[1])
+        self.assertEqual(repeated, self.artifact)
+        bounded_counts = bounded.memo_counters
+        self.assertGreater(bounded_counts["evictions"], 0)
+        self.assertGreater(bounded_counts["parses"], 3)
+        self.assertLessEqual(
+            bounded_counts["retained_bytes"], bounded_counts["capacity_bytes"]
+        )
+
+        oversized = runtime.ArtifactStore(self.root, _memo_max_bytes=1)
+        oversized_first = oversized.lookup(
+            self.artifact.lookup, self.registry, validate_v2
+        )
+        oversized_second = oversized.lookup(
+            self.artifact.lookup, self.registry, validate_v2
+        )
+        self.assertEqual(oversized_first, self.artifact)
+        self.assertEqual(oversized_second, self.artifact)
+        oversized_counts = oversized.memo_counters
+        self.assertEqual(oversized_counts["entries"], 0)
+        self.assertEqual(oversized_counts["retained_bytes"], 0)
+        self.assertEqual(oversized_counts["oversized_records"], 6)
+        self.assertEqual(oversized_counts["expansions"], 2)
+
+        independent = runtime.ArtifactStore(self.root)
+        audit = Mock(return_value=True)
+        local_hit = independent.lookup(
+            self.artifact.lookup,
+            self.registry,
+            validate_v2,
+            audit_candidate=audit,
+        )
+        other_hit = sizing.lookup(
+            self.artifact.lookup,
+            self.registry,
+            validate_v2,
+            audit_candidate=audit,
+        )
+        self.assertEqual(local_hit, self.artifact)
+        self.assertEqual(other_hit, self.artifact)
+        self.assertIsNot(local_hit, other_hit)
+        self.assertIsNot(local_hit.invocation, other_hit.invocation)
+        self.assertEqual(audit.call_count, 2)
+        self.assertEqual(independent.memo_counters["leaf_parses"], 1)
+        self.assertEqual(independent.memo_counters["invocation_parses"], 1)
+        self.assertEqual(independent.memo_counters["request_parses"], 1)
+        self.assertEqual(independent.memo_counters["expansions"], 1)
+
     def test_rehashed_missing_peer_and_leaf_binding_forgery_miss(self) -> None:
         """A valid storage checksum cannot remove an original peer or change item identity."""
         leaf, invocation, _request = self.commit()
+        self.assertEqual(self.lookup(), self.artifact)
         original_leaf = leaf.read_bytes()
         encoded = json.loads(invocation.read_bytes())
         encoded["dynamic_dependencies"] = [
@@ -378,6 +555,7 @@ class ArtifactStorageTests(unittest.TestCase):
     def test_rehashed_exact_request_forgery_reaches_audit(self) -> None:
         """Producer auditing rejects coherent rehashed request changes outside miss handling."""
         leaf, invocation, request = self.commit()
+        self.assertEqual(self.lookup(), self.artifact)
         changed = changed_record(
             self.artifact.invocation,
             batch=changed_record(self.artifact.invocation.batch, partition=1),

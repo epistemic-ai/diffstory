@@ -7,10 +7,12 @@ import json
 import os
 import queue
 import re
+import sys
 import tempfile
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Sequence
 from concurrent.futures import FIRST_COMPLETED
 from concurrent.futures import Future
@@ -21,6 +23,7 @@ from contextlib import suppress
 from dataclasses import InitVar
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -83,6 +86,7 @@ DEFAULT_CONCURRENCY = 4
 _ASCII_CONTROL_CHARACTER_MAX = 31
 _ASCII_DELETE_CHARACTER = 127
 _MAX_REQUEST_DIGEST_CHARS = 256
+_DEFAULT_ARTIFACT_MEMO_BYTES = 8 * 1024 * 1024
 _PAIR_LENGTH = 2
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _HEX_DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -1758,6 +1762,45 @@ class _StoredItem(Contract):
     result: NarrativeResult
 
 
+@dataclass(frozen=True)
+class _ArtifactMemoEntry:
+    """One exact-byte record validated for a particular storage record type."""
+
+    parsed: object
+    digest: str
+    expanded: ArtifactInvocation | None = None
+    retained_bytes: int = 0
+
+
+def _object_graph_size(value: object, seen: set[int] | None = None) -> int:
+    """Estimate a retained Python object graph without following class globals."""
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    size = sys.getsizeof(value)
+    if isinstance(value, Contract):
+        return size + sum(
+            _object_graph_size(member, seen)
+            for member in (
+                value.__dict__,
+                value.__pydantic_fields_set__,
+                value.__pydantic_extra__,
+                value.__pydantic_private__,
+            )
+        )
+    if isinstance(value, dict):
+        return size + sum(
+            _object_graph_size(key, seen) + _object_graph_size(item, seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return size + sum(_object_graph_size(item, seen) for item in value)
+    return size
+
+
 def _fsync_directory(path: Path) -> None:
     directory_fd = os.open(path, os.O_RDONLY)
     try:
@@ -1820,7 +1863,7 @@ def _immutable_cache_record(path: Path, record: Contract) -> None:
 
 
 class ArtifactStore:
-    """Global typed artifact indices; malformed or stale candidates are misses.
+    """A per-store memo over typed artifact indices; stale candidates are misses.
 
     Each index is a directory of immutable content-digest records. There is no
     shared mutable index whose updates can lose another process's artifacts.
@@ -1828,11 +1871,122 @@ class ArtifactStore:
     must use the current ledger/index for coverage and citation checks.
     """
 
-    def __init__(self, directory: str | Path) -> None:
+    def __init__(
+        self,
+        directory: str | Path,
+        *,
+        _memo_max_bytes: int = _DEFAULT_ARTIFACT_MEMO_BYTES,
+    ) -> None:
         """Select the optional private artifact cache."""
+        if type(_memo_max_bytes) is not int or _memo_max_bytes < 0:
+            msg = "Artifact memo limit must be a non-negative integer"
+            raise ValueError(msg)
         self.shared_directory = Path(directory) / "artifacts-v3"
         self.directory = self.shared_directory / "items"
         self.legacy_directory = Path(directory) / "artifacts-v2"
+        self._memo_max_bytes = _memo_max_bytes
+        self._memo: OrderedDict[
+            tuple[type[Contract], bytes], _ArtifactMemoEntry
+        ] = OrderedDict()
+        self._memo_retained_bytes = 0
+        self._memo_lock = threading.RLock()
+        self._memo_metrics = {
+            "leaf_reads": 0,
+            "invocation_reads": 0,
+            "request_reads": 0,
+            "leaf_parses": 0,
+            "invocation_parses": 0,
+            "request_parses": 0,
+            "expansions": 0,
+            "memo_hits": 0,
+            "evictions": 0,
+            "oversized_records": 0,
+        }
+
+    @property
+    def memo_counters(self) -> dict[str, int]:
+        """Return source-free numeric read, parse, expansion and memory counts."""
+        with self._memo_lock:
+            return {
+                **self._memo_metrics,
+                "reads": sum(
+                    self._memo_metrics[key]
+                    for key in (
+                        "leaf_reads",
+                        "invocation_reads",
+                        "request_reads",
+                    )
+                ),
+                "parses": sum(
+                    self._memo_metrics[key]
+                    for key in (
+                        "leaf_parses",
+                        "invocation_parses",
+                        "request_parses",
+                    )
+                ),
+                "entries": len(self._memo),
+                "retained_bytes": self._memo_retained_bytes,
+                "capacity_bytes": self._memo_max_bytes,
+            }
+
+    def _note(self, counter: str) -> None:
+        with self._memo_lock:
+            self._memo_metrics[counter] += 1
+
+    def _memoized(
+        self,
+        record_type: type[Contract],
+        raw: bytes,
+        parse_counter: str,
+        load: Callable[[], _ArtifactMemoEntry],
+    ) -> _ArtifactMemoEntry:
+        """Reuse a fully checked parse only for the same type and exact bytes."""
+        key = (record_type, raw)
+        with self._memo_lock:
+            entry = self._memo.get(key)
+            if entry is not None:
+                self._memo.move_to_end(key)
+                self._memo_metrics["memo_hits"] += 1
+                return entry
+
+            self._memo_metrics[parse_counter] += 1
+            entry = load()
+            # Count exact raw/key storage directly. Inflate the recursive model
+            # graph estimate to cover Pydantic and allocator overhead that
+            # sys.getsizeof cannot see through model internals.
+            retained_bytes = (
+                sys.getsizeof(raw)
+                + sys.getsizeof(key)
+                + 256
+                + 4
+                * _object_graph_size(
+                    (entry.parsed, entry.digest, entry.expanded)
+                )
+            )
+            entry = replace(entry, retained_bytes=retained_bytes)
+            if retained_bytes > self._memo_max_bytes:
+                self._memo_metrics["oversized_records"] += 1
+                return entry
+
+            while (
+                self._memo
+                and self._memo_retained_bytes + retained_bytes
+                > self._memo_max_bytes
+            ):
+                _old_key, old_entry = self._memo.popitem(last=False)
+                self._memo_retained_bytes -= old_entry.retained_bytes
+                self._memo_metrics["evictions"] += 1
+            self._memo[key] = entry
+            self._memo_retained_bytes += retained_bytes
+            return entry
+
+    @staticmethod
+    def _detach_artifact(artifact: StoredArtifact) -> StoredArtifact:
+        """Revalidate a primitive dump so no memo-owned model can escape."""
+        return StoredArtifact.model_validate(
+            artifact.model_dump(mode="python")
+        )
 
     def commit(self, artifact: StoredArtifact) -> None:
         """Durably commit shared dependencies before publishing the item leaf."""
@@ -1865,28 +2019,60 @@ class ArtifactStore:
         )
 
     def _expand(self, item: _StoredItem) -> StoredArtifact:
-        encoded = StoredInvocation.model_validate_json(
-            (
-                self.shared_directory
-                / "invocations"
-                / f"{item.invocation_digest}.json"
-            ).read_bytes()
+        invocation_path = (
+            self.shared_directory
+            / "invocations"
+            / f"{item.invocation_digest}.json"
         )
-        request = _StoredRequest.model_validate_json(
-            (
-                self.shared_directory
-                / "requests"
-                / f"{item.request_digest}.json"
-            ).read_bytes()
+        request_path = (
+            self.shared_directory / "requests" / f"{item.request_digest}.json"
         )
-        _require_v2(storage_digest(encoded) == item.invocation_digest)
-        _require_v2(storage_digest(request) == item.request_digest)
-        invocation = decode_invocation(encoded, ArtifactInvocation)
+        self._note("invocation_reads")
+        invocation_bytes = invocation_path.read_bytes()
+        self._note("request_reads")
+        request_bytes = request_path.read_bytes()
+
+        def parse_invocation() -> _ArtifactMemoEntry:
+            encoded = StoredInvocation.model_validate_json(invocation_bytes)
+            digest = storage_digest(encoded)
+            _require_v2(digest == item.invocation_digest)
+            expanded = decode_invocation(encoded, ArtifactInvocation)
+            self._note("expansions")
+            return _ArtifactMemoEntry(
+                parsed=encoded, digest=digest, expanded=expanded
+            )
+
+        invocation_entry = self._memoized(
+            StoredInvocation,
+            invocation_bytes,
+            "invocation_parses",
+            parse_invocation,
+        )
+        _require_v2(invocation_entry.digest == item.invocation_digest)
+
+        def parse_request() -> _ArtifactMemoEntry:
+            request = _StoredRequest.model_validate_json(request_bytes)
+            digest = storage_digest(request)
+            _require_v2(digest == item.request_digest)
+            return _ArtifactMemoEntry(parsed=request, digest=digest)
+
+        request_entry = self._memoized(
+            _StoredRequest, request_bytes, "request_parses", parse_request
+        )
+        _require_v2(request_entry.digest == item.request_digest)
+
+        invocation = invocation_entry.expanded
+        _require_v2(invocation is not None)
+        # Clone the retained graph, then let the candidate contracts revalidate
+        # every nested instance before any model leaves this store.
+        invocation = invocation.model_copy(deep=True)
         lookup = next(
             lookup
             for lookup in invocation.lookups
             if lookup.item_key == item.item_key
         )
+        result = item.result.model_copy(deep=True)
+        request = request_entry.parsed
         return StoredArtifact(
             original_run_digest=item.original_run_digest,
             invocation=invocation,
@@ -1896,9 +2082,9 @@ class ArtifactStore:
                 dependencies=invocation.dependencies,
                 original_request_digest=invocation.batch.request_digest,
                 validator_version=lookup.validator_version,
-                result=item.result,
+                result=result,
             ),
-            production_request=request.metadata,
+            production_request=request.metadata.model_copy(deep=True),
         )
 
     def read(self, serialized: bytes) -> StoredArtifact:
@@ -1912,8 +2098,25 @@ class ArtifactStore:
             isinstance(data, dict)
             and data.get("format_version") == ARTIFACT_FORMAT_VERSION
         ):
-            return StoredArtifact.model_validate_json(serialized)
-        return self._expand(_StoredItem.model_validate_json(serialized))
+
+            def parse_legacy() -> _ArtifactMemoEntry:
+                artifact = StoredArtifact.model_validate_json(serialized)
+                digest = _canonical_digest(artifact.model_dump(mode="json"))
+                return _ArtifactMemoEntry(parsed=artifact, digest=digest)
+
+            entry = self._memoized(
+                StoredArtifact, serialized, "leaf_parses", parse_legacy
+            )
+            return self._detach_artifact(entry.parsed)
+
+        def parse_item() -> _ArtifactMemoEntry:
+            item = _StoredItem.model_validate_json(serialized)
+            return _ArtifactMemoEntry(parsed=item, digest=storage_digest(item))
+
+        entry = self._memoized(
+            _StoredItem, serialized, "leaf_parses", parse_item
+        )
+        return self._expand(entry.parsed)
 
     def lookup(
         self,
@@ -1930,16 +2133,46 @@ class ArtifactStore:
         )
         for path in paths:
             try:
+                self._note("leaf_reads")
+                serialized = path.read_bytes()
                 if path.parent.parent == self.legacy_directory:
-                    candidate = StoredArtifact.model_validate_json(
-                        path.read_bytes()
+
+                    def parse_legacy(
+                        serialized: bytes = serialized,
+                    ) -> _ArtifactMemoEntry:
+                        artifact = StoredArtifact.model_validate_json(
+                            serialized
+                        )
+                        digest = _canonical_digest(
+                            artifact.model_dump(mode="json")
+                        )
+                        return _ArtifactMemoEntry(
+                            parsed=artifact, digest=digest
+                        )
+
+                    entry = self._memoized(
+                        StoredArtifact,
+                        serialized,
+                        "leaf_parses",
+                        parse_legacy,
                     )
-                    digest = _canonical_digest(
-                        candidate.model_dump(mode="json")
-                    )
+                    digest = entry.digest
+                    candidate = self._detach_artifact(entry.parsed)
                 else:
-                    item = _StoredItem.model_validate_json(path.read_bytes())
-                    digest = storage_digest(item)
+
+                    def parse_item(
+                        serialized: bytes = serialized,
+                    ) -> _ArtifactMemoEntry:
+                        item = _StoredItem.model_validate_json(serialized)
+                        return _ArtifactMemoEntry(
+                            parsed=item, digest=storage_digest(item)
+                        )
+
+                    entry = self._memoized(
+                        _StoredItem, serialized, "leaf_parses", parse_item
+                    )
+                    item = entry.parsed
+                    digest = entry.digest
                     candidate = self._expand(item)
                 if path.stem != digest:
                     continue
