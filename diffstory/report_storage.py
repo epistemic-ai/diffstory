@@ -2947,6 +2947,41 @@ class _ArenaRecordReader:
             _fail("foreign_storage_result_reference")
         return entry["record"]
 
+    def result_binding_facts(
+        self, reference: ResultRef
+    ) -> tuple[str, str, str]:
+        """Select the kind, subject, and plan from one owned prose row.
+
+        Preconditions:
+            ``reference`` names an owned planning-card, section, or document
+            result captured with its strict prose binding.
+        Postconditions:
+            Returns ``(kind, subject_key, plan_key)`` from the immutable row.
+        Essential behavior:
+            Selects the context-bound identity fields without expanding a full
+            result model or mistaking its item key for its subject key.
+        """
+        if type(reference) is not ResultRef or reference.kind not in {
+            "planning_card",
+            "section",
+            "document",
+        }:
+            _fail("invalid_prose_binding")
+        stored = self._stored_result(reference)
+        binding = stored.get("binding")
+        if not isinstance(binding, Mapping):
+            _fail("invalid_prose_binding")
+        kind = binding.get("kind")
+        subject_key = binding.get("subject_key")
+        plan_key = binding.get("plan_key")
+        if (
+            type(kind) is not str
+            or type(subject_key) is not str
+            or type(plan_key) is not str
+        ):
+            _fail("invalid_prose_binding")
+        return kind, subject_key, plan_key
+
     def _result_view(self, reference: ResultRef) -> Mapping[str, object]:
         """Expose one immutable normalized result row to private adapters.
 
@@ -3884,6 +3919,270 @@ class _RecordArena:
             that projection after the caller releases it.
         """
         return self._snapshot_reader().result_view(reference)
+
+    def result_digests(self, reference: ResultRef) -> tuple[str, str]:
+        """Return the captured receipt and content digests for one result.
+
+        Preconditions:
+            ``reference`` is an exact result family, address, and item binding
+            already owned by this arena.
+        Postconditions:
+            Returns the semantic receipt digest followed by the canonical
+            logical-content digest captured during strict insertion.
+        Essential behavior:
+            Reads two scalar witnesses without selecting or parsing the result.
+        """
+        self._owned_result_reference(reference, kind=reference.kind)
+        receipt_digest = self._result_digests.get(reference.storage_id)
+        content_digest_value = self._result_content_digests.get(
+            reference.storage_id
+        )
+        if receipt_digest is None or content_digest_value is None:
+            _fail("foreign_storage_result_reference")
+        return receipt_digest, content_digest_value
+
+    def plan_assembly_facts(
+        self, reference: RecordRef
+    ) -> Mapping[str, object]:
+        """Return validated plan order and group membership selectors.
+
+        Preconditions:
+            ``reference`` is an owned ``story_plan`` record.
+        Postconditions:
+            Returns immutable plan ID, ordered group keys, ordered group unit
+            membership, and planning-card subject IDs from strict capture.
+        Essential behavior:
+            Selects compact arena facts without reconstructing a ``StoryPlan``.
+        """
+        pointer = self._owned_record_reference(
+            reference, table="plans", kind="story_plan"
+        )
+        facts = self._plan_facts.get(pointer["$ref"])
+        if not isinstance(facts, Mapping):
+            _fail("missing_validated_storage_model:plans:story_plan")
+        return facts
+
+    def producer_keys(
+        self, references: Sequence[RecordRef]
+    ) -> tuple[str, ...]:
+        """Select producer identities for an ordered owned reference set.
+
+        Preconditions:
+            ``references`` is a list or tuple of owned producer references.
+        Postconditions:
+            Returns unique producer keys in the supplied order.
+        Essential behavior:
+            Builds one temporary address index over captured producer facts and
+            performs constant-time membership selection for each reference.
+        """
+        if type(references) not in {tuple, list}:
+            _fail("invalid_producer_reference_set")
+        by_record_id = {
+            facts["record_id"]: key
+            for key, facts in self._producer_facts.items()
+        }
+        keys = []
+        for reference in references:
+            pointer = self._owned_record_reference(
+                reference, table="producers", kind="producer"
+            )
+            key = by_record_id.get(pointer["$ref"])
+            if type(key) is not str:
+                _fail("producer_coverage")
+            keys.append(key)
+        if len(set(keys)) != len(keys):
+            _fail("duplicate_producer")
+        return tuple(keys)
+
+    def receipt_reference_for_item(self, item_key: str) -> RecordRef:
+        """Select one captured receipt by its semantic result key.
+
+        Preconditions:
+            ``item_key`` is a string naming a receipt captured by this arena.
+        Postconditions:
+            Returns the exact owned receipt address or rejects missing content.
+        Essential behavior:
+            Uses the arena's existing item index for constant-time selection.
+        """
+        if type(item_key) is not str:
+            _fail("missing_provenance_receipt")
+        identifier = self._builder.receipt_ids.get(item_key)
+        if identifier is None:
+            _fail("missing_provenance_receipt")
+        return RecordRef("receipts", "receipt", identifier)
+
+    def receipt_view(self, reference: RecordRef) -> Mapping[str, object]:
+        """Return one immutable selected receipt row without model parsing.
+
+        Preconditions:
+            ``reference`` is an exact receipt record owned by this arena.
+        Postconditions:
+            Returns the frozen primitive receipt fields for that address.
+        Essential behavior:
+            Resolves one row and does not scan the generation receipt set.
+        """
+        pointer = self._owned_record_reference(
+            reference, table="receipts", kind="receipt"
+        )
+        return self._builder.records["receipts"][pointer["$ref"]]["record"]
+
+    def put_indexed_inherited_provenance(  # noqa: C901 # Check one exact reference closure before insertion.
+        self,
+        reference: RecordRef,
+        producer: ResultRef,
+        receipt: RecordRef,
+    ) -> RecordRef:
+        """Insert provenance as references to an owned result and receipt.
+
+        Preconditions:
+            ``reference`` selects a strictly captured statement reference;
+            ``producer`` selects its strictly captured planning, section, or
+            document result; and ``receipt`` selects an owned receipt.
+        Postconditions:
+            One frozen provenance row points to the original result, exact path
+            and digests, and matching receipt. No statement or receipt copy is
+            retained beside its source rows.
+        Essential behavior:
+            Reuses selected-path resolution and streamed canonical addressing;
+            it does not construct an ``InheritedProvenance`` model.
+        """
+        builder = self._ensure_writable()
+        reference_pointer = self._owned_record_reference(
+            reference, table="evidence_refs", kind="statement_ref"
+        )
+        if type(producer) is not ResultRef or producer.kind not in {
+            "planning_card",
+            "section",
+            "document",
+        }:
+            _fail("invalid_statement_producer")
+        result_pointer = self._owned_result_reference(
+            producer, kind=producer.kind
+        )
+        receipt_pointer = self._owned_record_reference(
+            receipt, table="receipts", kind="receipt"
+        )
+        raw_reference = _thaw(
+            builder.records["evidence_refs"][reference_pointer["$ref"]][
+                "record"
+            ]
+        )
+        if (
+            type(raw_reference) is not dict
+            or raw_reference.get("producer_item_key") != producer.item_key
+        ):
+            _fail("reader_provenance_mismatch")
+        result_content_digest = self._result_content_digests.get(
+            producer.storage_id
+        )
+        if (
+            result_content_digest is None
+            or raw_reference.get("result_digest") != result_content_digest
+        ):
+            _fail("inherited_statement_mismatch")
+        statement = _statement_value_from_normalized_result(
+            builder.records, producer.storage_id, raw_reference
+        )
+        if statement.get("kind") != "implementation_claim":
+            _fail("inherited_statement_mismatch")
+        statement_locations = _statement_reference_locations(statement)
+        statement_chunks = _iter_logical_record_json(
+            statement,
+            references=statement_locations,
+            indexes=builder.records,
+            logical_lookup=lambda table, identifier: _record_logical_chunks(
+                table, identifier, builder.records
+            ),
+        )
+        statement_digest = hashlib.sha256()
+        for chunk in statement_chunks:
+            statement_digest.update(chunk)
+        if statement_digest.hexdigest() != raw_reference.get(
+            "statement_digest"
+        ):
+            _fail("inherited_statement_mismatch")
+        receipt_record = builder.records["receipts"][receipt_pointer["$ref"]][
+            "record"
+        ]
+        if receipt_record.get("item_key") != producer.item_key:
+            _fail("reader_provenance_mismatch")
+
+        key = semantic_digest(raw_reference)
+        logical_record = {
+            "key": key,
+            "reference": reference_pointer,
+            "statement": statement,
+            "consumption": "inherited_statement",
+            "receipt": receipt_pointer,
+        }
+        logical_locations = {
+            ("reference",): ("evidence_refs", "statement_ref"),
+            ("receipt",): ("receipts", "receipt"),
+        }
+        logical_locations.update(
+            {
+                ("statement", *path): location
+                for path, location in statement_locations.items()
+            }
+        )
+        logical_chunks = _iter_logical_record_json(
+            logical_record,
+            references=logical_locations,
+            indexes=builder.records,
+            logical_lookup=lambda table, identifier: _record_logical_chunks(
+                table, identifier, builder.records
+            ),
+        )
+        identifier = _streamed_storage_address(
+            "inherited_provenance", logical_chunks
+        )
+        record = {
+            "key": key,
+            "reference": reference_pointer,
+            "result": result_pointer,
+            "consumption": "inherited_statement",
+            "receipt": receipt_pointer,
+        }
+        prior = builder.records["inherited_provenance"].get(identifier)
+        if prior is not None:
+            same_record = (
+                prior["kind"] == "inherited_provenance"
+                and canonical_bytes(_thaw(prior["record"]))
+                == canonical_bytes(record)
+                and _canonical_streams_equal(
+                    _record_logical_chunks(
+                        "inherited_provenance", identifier, builder.records
+                    ),
+                    _iter_logical_record_json(
+                        logical_record,
+                        references=logical_locations,
+                        indexes=builder.records,
+                        logical_lookup=lambda table,
+                        target_id: _record_logical_chunks(
+                            table, target_id, builder.records
+                        ),
+                    ),
+                )
+            )
+            if not same_record:
+                _fail("storage_address_collision")
+            return RecordRef(
+                "inherited_provenance", "inherited_provenance", identifier
+            )
+        if builder.record_count >= _MAX_RECORDS:
+            _fail("too_many_storage_records")
+        builder.records["inherited_provenance"][identifier] = MappingProxyType(
+            {
+                "id": identifier,
+                "kind": "inherited_provenance",
+                "record": _freeze(record),
+            }
+        )
+        builder.record_count += 1
+        self._add_validation("inherited_provenance", "inherited_provenance")
+        return RecordRef(
+            "inherited_provenance", "inherited_provenance", identifier
+        )
 
     def statement_view(
         self, reference: ResultRef, path: StatementPath | Mapping[str, object]

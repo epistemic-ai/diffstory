@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 import tempfile
 import unittest
+from collections import Counter
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Mapping
+    from types import FrameType
+
 from test_narrative import two_group_report
 from test_narrative_contracts import prose_result
 from test_narrative_plan import authored_result
@@ -18,23 +27,44 @@ from test_narrative_runtime import identity
 from test_narrative_runtime import invocation_for_results
 from test_narrative_runtime import prepared_family
 
+from diffstory.narrative_contracts import AuthorContext
 from diffstory.narrative_contracts import ClaimRef
+from diffstory.narrative_contracts import EvidenceUnit
+from diffstory.narrative_contracts import ProseBinding
+from diffstory.narrative_contracts import SourceSliceRef
+from diffstory.narrative_contracts import SpanRef
+from diffstory.narrative_contracts import StatementPath
 from diffstory.narrative_contracts import SupportedStatement
+from diffstory.narrative_contracts import SupportedTerminology
 from diffstory.narrative_contracts import result_key
 from diffstory.narrative_contracts import result_kind
+from diffstory.narrative_hierarchy import derive_planning_sources_indexed
+from diffstory.narrative_hierarchy import span_reference
+from diffstory.narrative_hierarchy import statement_reference
 from diffstory.narrative_manifest import CurrentUsage
 from diffstory.narrative_manifest import GenerationManifest
 from diffstory.narrative_manifest import LedgerParameters
 from diffstory.narrative_manifest import ProducerDescriptor
 from diffstory.narrative_manifest import ResultReceipt
+from diffstory.narrative_manifest import _document_view
+from diffstory.narrative_manifest import _group_view
+from diffstory.narrative_manifest import assemble_candidate
+from diffstory.narrative_manifest import assemble_indexed_candidate
+from diffstory.narrative_manifest import assemble_indexed_reader
+from diffstory.narrative_manifest import candidate_storage_semantics
 from diffstory.narrative_manifest import compiler_fact_signature
 from diffstory.narrative_manifest import expanded_generation
+from diffstory.narrative_manifest import indexed_applied_fields
 from diffstory.narrative_manifest import persisted_manifest
+from diffstory.narrative_manifest import presentation_from_candidate
 from diffstory.narrative_manifest import result_digest
 from diffstory.narrative_manifest import stored_generation
 from diffstory.narrative_manifest import validate_generation
 from diffstory.narrative_plan import RequestPackingLimits
+from diffstory.narrative_plan import SourceSpan
+from diffstory.narrative_plan import _capture_indexed_arena_detail_results
 from diffstory.narrative_plan import build_evidence_ledger
+from diffstory.narrative_plan import build_ledger_index
 from diffstory.narrative_plan import build_story_plan
 from diffstory.narrative_plan import canonical_bytes
 from diffstory.narrative_plan import content_digest
@@ -42,7 +72,37 @@ from diffstory.narrative_plan import planning_groups_from_details
 from diffstory.narrative_plan import semantic_digest
 from diffstory.narrative_runtime import ArtifactInvocation
 from diffstory.narrative_runtime import ArtifactRuntimeError
+from diffstory.report_storage import GenerationRecordSet
+from diffstory.report_storage import RecordRef
+from diffstory.report_storage import ResultRef
+from diffstory.report_storage import _RecordArena
+from diffstory.report_storage import expand_report_storage
 from diffstory.usage import ModelCapacity
+
+
+def _span_validator_profiler(
+    counts: Counter[str],
+) -> Callable[[FrameType, str, object], None]:
+    """Count real nested span model validators during one scoped operation.
+
+    Preconditions:
+        ``counts`` is the mutable counter for one measured call.
+    Postconditions:
+        Returns a profiler that records each executed ``SpanRef.ranges`` call.
+    Essential behavior:
+        Measures nested Pydantic validator execution separately from storage
+        table rows and mocked top-level model dispatch.
+    """
+
+    def profile(frame: FrameType, event: str, _arg: object) -> None:
+        if (
+            event == "call"
+            and frame.f_code.co_name == "ranges"
+            and isinstance(frame.f_locals.get("self"), SpanRef)
+        ):
+            counts["span_ref_ranges"] += 1
+
+    return profile
 
 
 def manifest_fixture() -> tuple[dict, GenerationManifest]:
@@ -177,6 +237,241 @@ def saved_generation_metrics(manifest: GenerationManifest) -> dict:
         ),
         "legacy_read_equal": persisted_manifest(expanded) == manifest,
     }
+
+
+def indexed_assembly_inputs(
+    report: dict,
+    manifest: GenerationManifest,
+    *,
+    author: AuthorContext | None = None,
+) -> tuple[object, object, _RecordArena, GenerationRecordSet, object, object]:
+    """Capture authored generation rows and bind indexed detail/source views.
+
+    Preconditions:
+        ``report`` and ``manifest`` form one deterministic local fixture.
+    Postconditions:
+        Every result and audit row is in ``arena`` before assembly begins;
+        the returned detail and source selectors share that arena and ledger
+        and carry the report's exact ``(base_sha, head_sha)`` binding.
+    Essential behavior:
+        Exercises strict initial ownership once, then leaves normal assembly to
+        read only selected records and captured scalar facts.
+    """
+    from diffstory.narrative_plan import build_evidence_ledger
+
+    ledger = build_evidence_ledger(
+        report, **manifest.ledger_parameters.model_dump()
+    )
+    index = build_ledger_index(ledger)
+    revision_binding = (
+        report["meta"]["base_sha"],
+        report["meta"]["head_sha"],
+    )
+    arena = _RecordArena()
+    detail_refs = tuple(arena.put_result(item) for item in manifest.details)
+    details = _capture_indexed_arena_detail_results(
+        detail_refs,
+        arena,
+        ledger,
+        index=index,
+        revision_binding=revision_binding,
+    )
+    plan_ref = arena.put_record("story_plan", manifest.plan)
+    planning_refs = tuple(arena.put_result(item) for item in manifest.planning)
+    section_refs = tuple(arena.put_result(item) for item in manifest.sections)
+    document_ref = arena.put_result(manifest.document)
+    run_ref = arena.put_record("run", manifest.run)
+    producer_refs = tuple(
+        arena.put_record("producer", item) for item in manifest.producers
+    )
+    receipt_refs = tuple(
+        arena.put_record("receipt", item) for item in manifest.receipts
+    )
+    generation_data = manifest.model_dump(mode="json")
+    header_fields = (
+        "version",
+        "provenance",
+        "compiler_fact_signature",
+        "current_usage",
+        "ledger_digest",
+        "ledger_parameters",
+        "request_configuration",
+        "unit_keys",
+    )
+    generation = GenerationRecordSet(
+        {key: generation_data[key] for key in header_fields},
+        run_ref=run_ref,
+        details=detail_refs,
+        plan_ref=plan_ref,
+        planning=planning_refs,
+        sections=section_refs,
+        document=document_ref,
+        producers=producer_refs,
+        receipts=receipt_refs,
+    )
+    sources = derive_planning_sources_indexed(
+        index,
+        details,
+        author_context=author if author is not None else AuthorContext(),
+        revision_binding=revision_binding,
+    )
+    return ledger, index, arena, generation, details, sources
+
+
+def indexed_generation_with(
+    generation: GenerationRecordSet, **changes: object
+) -> GenerationRecordSet:
+    """Rebuild one typed indexed set with selected relationship changes.
+
+    Preconditions:
+        ``generation`` is a captured set and ``changes`` names constructor
+        fields whose replacement values have the declared reference types.
+    Postconditions:
+        Returns a fresh data-only set with unchanged fields preserved.
+    Essential behavior:
+        Builds realistic adversarial relationship inputs through the same
+        strict constructor used by valid indexed assemblies.
+    """
+    values: dict[str, object] = {
+        "header": generation.header,
+        "run_ref": generation.run_ref,
+        "details": generation.details,
+        "plan_ref": generation.plan_ref,
+        "planning": generation.planning,
+        "sections": generation.sections,
+        "document": generation.document,
+        "producers": generation.producers,
+        "receipts": generation.receipts,
+    }
+    values.update(changes)
+    return GenerationRecordSet(**values)
+
+
+def indexed_support_manifest(
+    report: dict,
+    manifest: GenerationManifest,
+    *,
+    slice_error: str | None = None,
+    statement_digest_error: bool = False,
+    inherited_endpoint_error: bool = False,
+) -> tuple[GenerationManifest, AuthorContext]:
+    """Add an authored slice and two immediate inherited statement links.
+
+    Preconditions:
+        ``manifest`` has the local two-group source fixture and stable result
+        item keys needed for reference construction.
+    Postconditions:
+        Returns a strict manifest whose receipts match the changed result rows;
+        optional digest, endpoint, and slice errors remain structurally valid
+        but fail current assembly.
+    Essential behavior:
+        Covers source slices, exact paths/digests, authorship, uncertainty,
+        terminology, and a two-edge inherited statement chain.
+    """
+    ledger = build_evidence_ledger(
+        report, **manifest.ledger_parameters.model_dump()
+    )
+    unit = ledger.units[0]
+    span = unit.spans[0]
+    source = span_reference(span, unit)
+    source_bytes = span.text.encode("utf-8")
+    slice_end = len(source_bytes) + (1 if slice_error == "coordinate" else 0)
+    slice_digest = (
+        "f" * 64 if slice_error == "digest" else content_digest(source_bytes)
+    )
+    source_slice = SourceSliceRef(
+        source=source,
+        byte_start=0,
+        byte_end=slice_end,
+        content_digest=slice_digest,
+    )
+    plan_results = list(manifest.planning)
+    first_plan = plan_results[0]
+    terminology = SupportedTerminology(
+        term="casefold",
+        definition=SupportedStatement(
+            kind="implementation_claim",
+            text="The selected term keeps Unicode case folding explicit.",
+            effect="The terminology retains the generated definition.",
+            basis=(source_slice,),
+        ),
+    )
+    plan_results[0] = changed_record(first_plan, terminology=(terminology,))
+    plan_reference = statement_reference(
+        plan_results[0], StatementPath(field="abstraction", index=0)
+    )
+    if statement_digest_error:
+        plan_reference = changed_record(
+            plan_reference, statement_digest="f" * 64
+        )
+    elif inherited_endpoint_error:
+        plan_reference = changed_record(
+            plan_reference, producer_item_key="0" * 64
+        )
+    section_results = list(manifest.sections)
+    first_section = section_results[0]
+    inherited_claim = SupportedStatement(
+        kind="implementation_claim",
+        text="The section uses the selected source and planning statement.",
+        effect="The inherited source remains linked to its original producer.",
+        uncertainty=("Caller behavior remains unverified.",),
+        basis=(source_slice, plan_reference),
+    )
+    section_results[0] = changed_record(
+        first_section, synthesis=(inherited_claim,)
+    )
+    section_reference = statement_reference(
+        section_results[0], StatementPath(field="synthesis", index=0)
+    )
+    author = AuthorContext(
+        title="Fixture author",
+        repository="example/project",
+        author_reported_motivation="Keep the behavior visible.",
+    )
+    author_digest = semantic_digest("diffstory.author-context.v2", author)
+    document_claim = SupportedStatement(
+        kind="implementation_claim",
+        text="The document preserves the inherited section reference.",
+        effect="The second provenance edge remains explicit.",
+        basis=(section_reference,),
+    )
+    motivation = SupportedStatement(
+        kind="author_motivation",
+        text="The author wants the behavior to remain visible.",
+        author_context_digest=author_digest,
+    )
+    uncertainty = SupportedStatement(
+        kind="uncertainty",
+        text="The fixture has no executed runtime tests.",
+        uncertainty=("Runtime behavior was not measured.",),
+    )
+    document = changed_record(
+        manifest.document,
+        preamble=(document_claim,),
+        lead=(motivation,),
+        closing=(uncertainty,),
+    )
+    changed_results = {
+        item.item_key: item
+        for item in (*plan_results, *section_results, document)
+    }
+    receipts = tuple(
+        changed_record(
+            receipt,
+            result_digest=result_digest(changed_results[receipt.item_key]),
+        )
+        if receipt.item_key in changed_results
+        else receipt
+        for receipt in manifest.receipts
+    )
+    updated = changed_record(
+        manifest,
+        planning=tuple(plan_results),
+        sections=tuple(section_results),
+        document=document,
+        receipts=receipts,
+    )
+    return updated, author
 
 
 class ManifestTests(unittest.TestCase):
@@ -533,6 +828,847 @@ class ManifestTests(unittest.TestCase):
         with patch.object(ArtifactInvocation, "artifact_keys", tracked):
             GenerationManifest.model_validate(self.manifest)
         self.assertEqual(len(calls), len(self.manifest.producers))
+
+
+class IndexedAssemblyTests(unittest.TestCase):
+    """Keep indexed reader and application fields equal to expanded oracles."""
+
+    def setUp(self) -> None:
+        """Prepare one multi-group report with direct and inherited support."""
+        self.report, base_manifest = manifest_fixture()
+        self.manifest, self.author = indexed_support_manifest(
+            self.report, base_manifest
+        )
+
+    def test_indexed_candidate_matches_expanded_reader_and_application(
+        self,
+    ) -> None:
+        """The indexed path retains exact output without full record expansion.
+
+        Input/expected case matrix:
+            annotation reader: expected is ``assemble_candidate`` over the
+            captured current ledger and strict detail oracle.
+            document overlay: expected is ``_document_view`` over the explicit
+            ``V2Presentation`` oracle.
+            group overlays: expected is ``_group_view`` for each presentation
+            section and current compiler group, in section order.
+        """
+        from diffstory.narrative_manifest import PresentationSection
+        from diffstory.narrative_manifest import V2Presentation
+        from diffstory.report_storage import ReportRecordGraph
+        from diffstory.report_storage import _ArenaRecordReader
+
+        ledger, index, arena, generation, details, sources = (
+            indexed_assembly_inputs(
+                self.report, self.manifest, author=self.author
+            )
+        )
+        expected_candidate = assemble_candidate(
+            self.report, self.manifest, ledger=ledger, index=index
+        )
+        expected_presentation = presentation_from_candidate(expected_candidate)
+        groups_by_id = {group["id"]: group for group in self.report["groups"]}
+        expected_group_overlays = tuple(
+            {
+                "group_id": section.group_id,
+                **_group_view(section, groups_by_id[section.group_id]),
+            }
+            for section in expected_presentation.sections
+        )
+        previous_resolution_count = details.citation_scope.resolution_count
+        with (
+            patch(
+                "diffstory.narrative_manifest.assemble_candidate",
+                side_effect=AssertionError("indexed path rebuilt candidate"),
+            ),
+            patch(
+                "diffstory.narrative_manifest.presentation_from_candidate",
+                side_effect=AssertionError("indexed path built presentation"),
+            ),
+            patch(
+                "diffstory.narrative_manifest.stored_generation",
+                side_effect=AssertionError("indexed path expanded generation"),
+            ),
+            patch(
+                "diffstory.narrative_manifest.expanded_generation",
+                side_effect=AssertionError("indexed path expanded generation"),
+            ),
+            patch(
+                "diffstory.report_storage.expand_report_storage",
+                side_effect=AssertionError("indexed path expanded report"),
+            ),
+            patch.object(
+                GenerationManifest,
+                "model_validate",
+                side_effect=AssertionError("indexed path parsed manifest"),
+            ),
+            patch.object(
+                GenerationManifest,
+                "model_validate_json",
+                side_effect=AssertionError("indexed path parsed manifest"),
+            ),
+            patch.object(
+                GenerationManifest,
+                "__init__",
+                side_effect=AssertionError("indexed path built manifest"),
+            ),
+            patch.object(
+                V2Presentation,
+                "model_validate",
+                side_effect=AssertionError("indexed path parsed presentation"),
+            ),
+            patch.object(
+                V2Presentation,
+                "model_validate_json",
+                side_effect=AssertionError("indexed path parsed presentation"),
+            ),
+            patch.object(
+                V2Presentation,
+                "__init__",
+                side_effect=AssertionError("indexed path built presentation"),
+            ),
+            patch.object(
+                PresentationSection,
+                "model_validate",
+                side_effect=AssertionError("indexed path parsed sections"),
+            ),
+            patch.object(
+                PresentationSection,
+                "model_validate_json",
+                side_effect=AssertionError("indexed path parsed sections"),
+            ),
+            patch.object(
+                PresentationSection,
+                "__init__",
+                side_effect=AssertionError("indexed path built sections"),
+            ),
+            patch.object(
+                SupportedStatement,
+                "model_validate",
+                side_effect=AssertionError("indexed path reparsed statements"),
+            ),
+            patch.object(
+                _RecordArena,
+                "result_view",
+                side_effect=AssertionError("indexed path expanded a result"),
+            ),
+            patch.object(
+                _ArenaRecordReader,
+                "result_view",
+                side_effect=AssertionError("indexed path expanded a result"),
+            ),
+            patch.object(
+                _ArenaRecordReader,
+                "result_record",
+                side_effect=AssertionError("indexed path expanded a result"),
+            ),
+        ):
+            graph = assemble_indexed_candidate(
+                self.report,
+                generation,
+                arena=arena,
+                details=details,
+                sources=sources,
+            )
+            overlay = indexed_applied_fields(
+                graph.reader_projection,
+                arena=arena,
+                details=details,
+                sources=sources,
+                groups=groups_by_id,
+            )
+
+        self.assertIsInstance(graph, ReportRecordGraph)
+        self.assertEqual(
+            details.citation_scope.resolution_count,
+            previous_resolution_count,
+        )
+        expanded = expand_report_storage(
+            graph, max_output_bytes=128 * 1024 * 1024
+        )
+        cases = (
+            ("annotation reader", expected_candidate, expanded),
+            (
+                "document overlay",
+                _document_view(expected_presentation),
+                overlay["document"],
+            ),
+            (
+                "ordered group overlays",
+                expected_group_overlays,
+                overlay["groups"],
+            ),
+        )
+        for label, expected, actual in cases:
+            expected_value = (
+                candidate_storage_semantics(expected)
+                if label == "annotation reader"
+                else expected
+            )
+            with self.subTest(case=label):
+                self.assertEqual(
+                    canonical_bytes(actual), canonical_bytes(expected_value)
+                )
+
+        self.assertEqual(len(expanded["support_provenance"]), 2)
+        self.assertGreaterEqual(len(expanded["citations"]), 2)
+        self.assertEqual(
+            arena.retained_record_counts["inherited_provenance"], 2
+        )
+        for entry in arena._builder.records["inherited_provenance"].values():  # noqa: SLF001 # Confirm provenance stores addresses, not copied content.
+            self.assertEqual(
+                set(entry["record"]),
+                {"key", "reference", "result", "consumption", "receipt"},
+            )
+
+    def test_indexed_assembly_counts_current_lookups_and_nested_validation(  # noqa: PLR0915 # Keep independently measured counters explicit.
+        self,
+    ) -> None:
+        """Indexed work uses unique current bindings and reports real counters.
+
+        Input/expected case matrix:
+            ordered generation results: one selected receipt row read and
+            result digest read per result.
+            inherited endpoints: one additional direct receipt-index lookup per
+            retained provenance reference, with no receipt scan.
+            repeated source references: one checked selection per distinct
+            reference/unit pair and one resolver call per new current binding.
+            nested source spans: actual ``SpanRef.ranges`` calls are counted
+            separately from arena row validation counters.
+            owned results and plans: indexed work adds no result or plan rows;
+            inherited provenance adds two reference-only rows.
+        """
+        import diffstory.narrative_plan as plan_module
+        from diffstory.narrative_plan import CitationResolutionScope
+
+        _ledger, _index, arena, generation, details, sources = (
+            indexed_assembly_inputs(
+                self.report, self.manifest, author=self.author
+            )
+        )
+        scope = details.citation_scope
+        prior_resolution_count = scope.resolution_count
+        prior_memo_count = scope.memoized_reference_count
+        prior_validation_counts = arena.typed_validation_counts
+        prior_retained_counts = arena.retained_record_counts
+        result_refs = (
+            *generation.details,
+            *generation.planning,
+            *generation.sections,
+            generation.document,
+        )
+        receipt_lookups: list[str] = []
+        receipt_reads: list[str] = []
+        result_digest_reads: list[str] = []
+        resolution_requests: list[tuple[str, str]] = []
+        span_validator_calls: Counter[str] = Counter()
+
+        original_receipt_lookup = _RecordArena.receipt_reference_for_item
+        original_receipt_view = _RecordArena.receipt_view
+        original_result_digests = _RecordArena.result_digests
+        original_resolution = (
+            CitationResolutionScope._resolve_validated  # noqa: SLF001 # Count actual selected resolver calls.
+        )
+
+        def tracked_receipt_lookup(
+            owner: _RecordArena, item_key: str
+        ) -> RecordRef:
+            receipt_lookups.append(item_key)
+            return original_receipt_lookup(owner, item_key)
+
+        def tracked_receipt_view(
+            owner: _RecordArena, reference: RecordRef
+        ) -> Mapping[str, object]:
+            receipt_reads.append(reference.storage_id)
+            return original_receipt_view(owner, reference)
+
+        def tracked_result_digests(
+            owner: _RecordArena, reference: ResultRef
+        ) -> tuple[str, str]:
+            result_digest_reads.append(reference.item_key)
+            return original_result_digests(owner, reference)
+
+        def tracked_resolution(
+            scope_value: CitationResolutionScope,
+            reference: SpanRef,
+            unit: EvidenceUnit,
+        ) -> SourceSpan:
+            resolution_requests.append((semantic_digest(reference), unit.id))
+            return original_resolution(scope_value, reference, unit)
+
+        prior_profiler = sys.getprofile()
+        sys.setprofile(_span_validator_profiler(span_validator_calls))
+        try:
+            with (
+                patch.object(
+                    _RecordArena,
+                    "receipt_reference_for_item",
+                    new=tracked_receipt_lookup,
+                ),
+                patch.object(
+                    _RecordArena, "receipt_view", new=tracked_receipt_view
+                ),
+                patch.object(
+                    _RecordArena, "result_digests", new=tracked_result_digests
+                ),
+                patch.object(
+                    CitationResolutionScope,
+                    "_resolve_validated",
+                    new=tracked_resolution,
+                ),
+                patch.object(
+                    plan_module,
+                    "_resolve_span_ref",
+                    wraps=plan_module._resolve_span_ref,  # noqa: SLF001 # Count calls at the existing current resolver.
+                ) as actual_source_resolutions,
+            ):
+                projection = assemble_indexed_reader(
+                    self.report,
+                    generation,
+                    arena=arena,
+                    details=details,
+                    sources=sources,
+                )
+        finally:
+            sys.setprofile(prior_profiler)
+
+        expected_result_keys = [
+            reference.item_key for reference in result_refs
+        ]
+        self.assertEqual(
+            receipt_lookups[: len(expected_result_keys)], expected_result_keys
+        )
+        self.assertEqual(
+            len(receipt_lookups),
+            len(expected_result_keys) + len(projection.support_provenance),
+        )
+        self.assertEqual(len(receipt_reads), len(result_refs))
+        self.assertEqual(result_digest_reads, expected_result_keys)
+        self.assertEqual(
+            len(resolution_requests), len(set(resolution_requests))
+        )
+        new_resolutions = scope.resolution_count - prior_resolution_count
+        new_memo_entries = scope.memoized_reference_count - prior_memo_count
+        self.assertEqual(actual_source_resolutions.call_count, new_resolutions)
+        self.assertEqual(new_resolutions, new_memo_entries)
+        self.assertGreater(span_validator_calls["span_ref_ranges"], 0)
+        self.assertEqual(
+            len(projection.support_provenance),
+            arena.retained_record_counts["inherited_provenance"]
+            - prior_retained_counts["inherited_provenance"],
+        )
+        self.assertEqual(
+            arena.retained_record_counts["inherited_provenance"]
+            - prior_retained_counts["inherited_provenance"],
+            2,
+        )
+        current_validation_counts = arena.typed_validation_counts
+        for counter_name in set(prior_validation_counts) | set(
+            current_validation_counts
+        ):
+            if counter_name.startswith(
+                ("results:", "plans:", "producers:", "receipts:")
+            ):
+                self.assertEqual(
+                    current_validation_counts.get(counter_name, 0),
+                    prior_validation_counts.get(counter_name, 0),
+                )
+        current_retained_counts = arena.retained_record_counts
+        for table in ("results", "plans", "producers", "receipts"):
+            self.assertEqual(
+                current_retained_counts[table], prior_retained_counts[table]
+            )
+
+    def test_indexed_reader_entry_matches_wrapper_and_keeps_receipt_order(
+        self,
+    ) -> None:
+        """The unsealed projection preserves caller receipt order and seals once.
+
+        Input/expected case matrix:
+            original receipt order: expanded output keeps that order.
+            reversed receipt order: reader membership is unchanged, while the
+            generation array retains the supplied reversed order.
+        """
+        from diffstory.report_storage import GenerationRecordSet
+        from diffstory.report_storage import ReportRecordGraph
+
+        expected_ledger = build_evidence_ledger(
+            self.report,
+            **self.manifest.ledger_parameters.model_dump(),
+        )
+        expected_index = build_ledger_index(expected_ledger)
+        expected_candidate = assemble_candidate(
+            self.report,
+            self.manifest,
+            ledger=expected_ledger,
+            index=expected_index,
+        )
+        outputs = []
+        for label, reverse_receipts in (
+            ("original", False),
+            ("reversed", True),
+        ):
+            _ledger, _index, arena, generation, details, sources = (
+                indexed_assembly_inputs(
+                    self.report, self.manifest, author=self.author
+                )
+            )
+            if reverse_receipts:
+                generation = GenerationRecordSet(
+                    generation.header,
+                    run_ref=generation.run_ref,
+                    details=generation.details,
+                    plan_ref=generation.plan_ref,
+                    planning=generation.planning,
+                    sections=generation.sections,
+                    document=generation.document,
+                    producers=generation.producers,
+                    receipts=tuple(reversed(generation.receipts)),
+                )
+            projection = assemble_indexed_reader(
+                self.report,
+                generation,
+                arena=arena,
+                details=details,
+                sources=sources,
+            )
+            graph = arena.seal(
+                generation,
+                projection,
+                {
+                    "shape": "annotations",
+                    "metadata": {
+                        "schema": "diffstory.annotations.v2",
+                        "base_sha": self.report["meta"]["base_sha"],
+                        "head_sha": self.report["meta"]["head_sha"],
+                    },
+                },
+            )
+            self.assertIsInstance(graph, ReportRecordGraph)
+            expanded = expand_report_storage(
+                graph, max_output_bytes=128 * 1024 * 1024
+            )
+            expected = candidate_storage_semantics(
+                copy.deepcopy(expected_candidate)
+            )
+            if reverse_receipts:
+                expected["generation"]["receipts"].reverse()
+            outputs.append((label, expected, expanded))
+
+        for label, expected, output in outputs:
+            with self.subTest(case=label):
+                self.assertEqual(
+                    canonical_bytes(output),
+                    canonical_bytes(expected),
+                )
+
+    def test_section_and_document_coverage_uses_binding_subjects(self) -> None:
+        """Context-bound item keys do not stand in for covered plan subjects.
+
+        Input/expected case matrix:
+            each section result: item key differs from its subject key, while
+            projected group key equals that subject key.
+            document result: item key differs from the plan subject, while the
+            selected binding exposes the exact plan subject and plan key.
+        """
+        _ledger, _index, arena, generation, details, sources = (
+            indexed_assembly_inputs(
+                self.report, self.manifest, author=self.author
+            )
+        )
+        reader = arena._snapshot_reader()  # noqa: SLF001 # Select immutable binding facts without full result expansion.
+        section_cases = tuple(
+            (
+                reference.item_key,
+                reader.result_binding_facts(reference)[1],
+            )
+            for reference in generation.sections
+        )
+        document_kind, document_subject, document_plan = (
+            reader.result_binding_facts(generation.document)
+        )
+        identity_cases = (
+            *(
+                ("section", item_key, subject)
+                for item_key, subject in section_cases
+            ),
+            ("document", generation.document.item_key, document_subject),
+        )
+        for label, item_key, subject in identity_cases:
+            with self.subTest(case=label, subject=subject):
+                self.assertNotEqual(item_key, subject)
+        self.assertEqual(document_kind, "document")
+        self.assertEqual(document_subject, document_plan)
+
+        projection = assemble_indexed_reader(
+            self.report,
+            generation,
+            arena=arena,
+            details=details,
+            sources=sources,
+        )
+        self.assertEqual(
+            tuple(section.group_key for section in projection.sections),
+            tuple(subject for _item_key, subject in section_cases),
+        )
+
+    def test_indexed_assembly_rejects_wrong_prose_subjects_and_plans(
+        self,
+    ) -> None:
+        """Context-bound prose cannot claim another plan subject or plan.
+
+        Input/expected case matrix:
+            section bound to an unknown subject: ``section_coverage``.
+            document bound to another plan: ``document_plan_mismatch``.
+            planning card bound to another plan: ``prose_plan_mismatch``.
+        """
+        cases = ("section_subject", "document_plan", "planning_plan")
+        for case in cases:
+            with self.subTest(case=case):
+                _ledger, _index, arena, generation, details, sources = (
+                    indexed_assembly_inputs(
+                        self.report, self.manifest, author=self.author
+                    )
+                )
+                reason = "section_coverage"
+                if case == "section_subject":
+                    original = self.manifest.sections[0]
+                    subject_key = semantic_digest("foreign indexed group")
+                    binding = ProseBinding(
+                        kind="section",
+                        subject_key=subject_key,
+                        plan_key=original.binding.plan_key,
+                        context_digest=original.binding.context_digest,
+                    )
+                    wrong_result = original.model_copy(
+                        update={"binding": binding, "item_key": binding.key}
+                    )
+                    wrong_reference = arena.put_result(wrong_result)
+                    generation = indexed_generation_with(
+                        generation,
+                        sections=(wrong_reference, *generation.sections[1:]),
+                    )
+                elif case == "document_plan":
+                    original = self.manifest.document
+                    plan_key = semantic_digest("foreign indexed plan")
+                    binding = ProseBinding(
+                        kind="document",
+                        subject_key=plan_key,
+                        plan_key=plan_key,
+                        context_digest=original.binding.context_digest,
+                    )
+                    wrong_result = original.model_copy(
+                        update={"binding": binding, "item_key": binding.key}
+                    )
+                    wrong_reference = arena.put_result(wrong_result)
+                    generation = indexed_generation_with(
+                        generation, document=wrong_reference
+                    )
+                    reason = "document_plan_mismatch"
+                else:
+                    original = self.manifest.planning[0]
+                    binding = ProseBinding(
+                        kind="planning_card",
+                        subject_key=original.binding.subject_key,
+                        plan_key=semantic_digest("foreign indexed plan"),
+                        context_digest=original.binding.context_digest,
+                    )
+                    wrong_result = original.model_copy(
+                        update={"binding": binding, "item_key": binding.key}
+                    )
+                    wrong_reference = arena.put_result(wrong_result)
+                    generation = indexed_generation_with(
+                        generation,
+                        planning=(wrong_reference, *generation.planning[1:]),
+                    )
+                    reason = "prose_plan_mismatch"
+
+                with self.assertRaisesRegex(ValueError, reason):
+                    assemble_indexed_reader(
+                        self.report,
+                        generation,
+                        arena=arena,
+                        details=details,
+                        sources=sources,
+                    )
+
+    def test_indexed_assembly_checks_group_membership_against_current_index(
+        self,
+    ) -> None:
+        """A stored plan cannot reassign current ledger units between groups.
+
+        Input/expected case matrix:
+            the original plan keeps each current group assignment and is
+            accepted; a re-bound plan swaps actual unit memberships and fails
+            with ``plan_unit_coverage``.
+        """
+        _ledger, _index, arena, generation, details, sources = (
+            indexed_assembly_inputs(
+                self.report, self.manifest, author=self.author
+            )
+        )
+        original_groups = self.manifest.plan.groups
+        self.assertGreaterEqual(len(original_groups), 2)
+        first, second = original_groups[:2]
+        changed_first = first.model_copy(
+            update={
+                "group": first.group.model_copy(
+                    update={"unit_keys": second.group.unit_keys}
+                )
+            }
+        )
+        changed_second = second.model_copy(
+            update={
+                "group": second.group.model_copy(
+                    update={"unit_keys": first.group.unit_keys}
+                )
+            }
+        )
+        changed_plan = self.manifest.plan.model_copy(
+            update={
+                "groups": (changed_first, changed_second, *original_groups[2:])
+            }
+        )
+        plan_ref = arena.put_record("story_plan", changed_plan)
+        generation = indexed_generation_with(generation, plan_ref=plan_ref)
+
+        with self.assertRaisesRegex(ValueError, "plan_unit_coverage"):
+            assemble_indexed_reader(
+                self.report,
+                generation,
+                arena=arena,
+                details=details,
+                sources=sources,
+            )
+
+    def test_indexed_assembly_checks_receipt_membership_and_binding(
+        self,
+    ) -> None:
+        """Receipt selectors must be a complete set with current result bindings.
+
+        Input/expected case matrix:
+            duplicate receipt membership fails with ``receipt_coverage``.
+            an owned receipt naming a foreign producer fails with
+            ``receipt_binding_mismatch``.
+        """
+        cases = ("receipt_membership", "receipt_producer")
+        for case in cases:
+            with self.subTest(case=case):
+                manifest = self.manifest
+                if case == "receipt_producer":
+                    first = manifest.receipts[0].model_copy(
+                        update={
+                            "producer_key": semantic_digest(
+                                "foreign indexed producer"
+                            )
+                        }
+                    )
+                    manifest = manifest.model_copy(
+                        update={"receipts": (first, *manifest.receipts[1:])}
+                    )
+                _ledger, _index, arena, generation, details, sources = (
+                    indexed_assembly_inputs(
+                        self.report, manifest, author=self.author
+                    )
+                )
+                reason = "receipt_binding_mismatch"
+                if case == "receipt_membership":
+                    receipts = generation.receipts
+                    generation = indexed_generation_with(
+                        generation,
+                        receipts=(receipts[0], *receipts[:-1]),
+                    )
+                    reason = "receipt_coverage"
+                with self.assertRaisesRegex(ValueError, reason):
+                    assemble_indexed_reader(
+                        self.report,
+                        generation,
+                        arena=arena,
+                        details=details,
+                        sources=sources,
+                    )
+
+    def test_indexed_applied_fields_reject_wrong_prose_identity(self) -> None:
+        """Application cannot read a selector with another prose identity.
+
+        Input/expected case matrix:
+            planning result selected as section prose: rejected by kind.
+            section selector rebound to another subject: rejected by subject.
+            valid section row bound to another plan: rejected by plan.
+            Each invalid selector fails with ``reader_section_mismatch``.
+        """
+        from diffstory.report_storage import IndexedReaderProjection
+        from diffstory.report_storage import ReaderSectionRef
+
+        _ledger, _index, arena, generation, details, sources = (
+            indexed_assembly_inputs(
+                self.report, self.manifest, author=self.author
+            )
+        )
+        projection = assemble_indexed_reader(
+            self.report,
+            generation,
+            arena=arena,
+            details=details,
+            sources=sources,
+        )
+        original = projection.sections[0]
+        original_result = self.manifest.sections[0]
+        other_plan = semantic_digest("foreign applied-fields plan")
+        wrong_plan_binding = ProseBinding(
+            kind="section",
+            subject_key=original.group_key,
+            plan_key=other_plan,
+            context_digest=original_result.binding.context_digest,
+        )
+        wrong_plan_result = original_result.model_copy(
+            update={
+                "binding": wrong_plan_binding,
+                "item_key": wrong_plan_binding.key,
+            }
+        )
+        wrong_plan_reference = arena.put_result(wrong_plan_result)
+
+        invalid_sections = (
+            (
+                "kind",
+                ReaderSectionRef(
+                    group_id=original.group_id,
+                    group_key=original.group_key,
+                    number=original.number,
+                    next_id=original.next_id,
+                    prose=generation.planning[0],
+                    details=original.details,
+                ),
+            ),
+            (
+                "subject",
+                ReaderSectionRef(
+                    group_id=original.group_id,
+                    group_key=semantic_digest("foreign applied-fields group"),
+                    number=original.number,
+                    next_id=original.next_id,
+                    prose=original.prose,
+                    details=original.details,
+                ),
+            ),
+            (
+                "plan",
+                ReaderSectionRef(
+                    group_id=original.group_id,
+                    group_key=original.group_key,
+                    number=original.number,
+                    next_id=original.next_id,
+                    prose=wrong_plan_reference,
+                    details=original.details,
+                ),
+            ),
+        )
+        groups = {group["id"]: group for group in self.report["groups"]}
+        for label, section in invalid_sections:
+            with self.subTest(case=label):
+                invalid_projection = IndexedReaderProjection(
+                    shape=projection.shape,
+                    document=projection.document,
+                    sections=(section, *projection.sections[1:]),
+                    context_details=projection.context_details,
+                    citations=projection.citations,
+                    support_provenance=projection.support_provenance,
+                    version=projection.version,
+                    provenance=projection.provenance,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "reader_section_mismatch"
+                ):
+                    indexed_applied_fields(
+                        invalid_projection,
+                        arena=arena,
+                        details=details,
+                        sources=sources,
+                        groups=groups,
+                    )
+
+    def test_indexed_assembly_rejects_current_binding_and_reference_errors(
+        self,
+    ) -> None:
+        """Selected rows fail when their order, source, or provenance is unsupported.
+
+        Input/expected case matrix:
+            changed report revision: ``source_revision_changed``.
+            reordered section references: ``section_coverage``.
+            unsupported inherited producer endpoint:
+                ``unconsumed_statement_producer``.
+            wrong source-slice digest: ``source_slice_digest``.
+            out-of-span slice coordinates: ``invalid_source_slice``.
+            rehashed inherited statement reference: ``inherited_statement_mismatch``.
+        """
+        cases = (
+            "revision",
+            "sections",
+            "slice_digest",
+            "slice_coordinate",
+            "statement_digest",
+            "inherited_endpoint",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                report = self.report
+                manifest = self.manifest
+                if case in {
+                    "slice_digest",
+                    "slice_coordinate",
+                    "statement_digest",
+                    "inherited_endpoint",
+                }:
+                    error = {
+                        "slice_digest": "digest",
+                        "slice_coordinate": "coordinate",
+                    }.get(case)
+                    manifest, author = indexed_support_manifest(
+                        self.report,
+                        manifest_fixture()[1],
+                        slice_error=error,
+                        statement_digest_error=case == "statement_digest",
+                        inherited_endpoint_error=case == "inherited_endpoint",
+                    )
+                else:
+                    author = self.author
+                _ledger, _index, arena, generation, details, sources = (
+                    indexed_assembly_inputs(report, manifest, author=author)
+                )
+                if case == "revision":
+                    report = copy.deepcopy(report)
+                    report["meta"]["base_sha"] = "0" * 40
+                    reason = "source_revision_changed"
+                elif case == "sections":
+                    generation = GenerationRecordSet(
+                        generation.header,
+                        run_ref=generation.run_ref,
+                        details=generation.details,
+                        plan_ref=generation.plan_ref,
+                        planning=generation.planning,
+                        sections=tuple(reversed(generation.sections)),
+                        document=generation.document,
+                        producers=generation.producers,
+                        receipts=generation.receipts,
+                    )
+                    reason = "section_coverage"
+                elif case == "slice_digest":
+                    reason = "source_slice_digest"
+                elif case == "slice_coordinate":
+                    reason = "invalid_source_slice"
+                elif case == "statement_digest":
+                    reason = "inherited_statement_mismatch"
+                else:
+                    reason = "unconsumed_statement_producer"
+                with self.assertRaisesRegex(ValueError, reason):
+                    assemble_indexed_reader(
+                        report,
+                        generation,
+                        arena=arena,
+                        details=details,
+                        sources=sources,
+                    )
 
 
 class CompilerFactSignatureTests(unittest.TestCase):
