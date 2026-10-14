@@ -172,6 +172,137 @@ class CompactWireTests(unittest.TestCase):
             for span in value["spans"]:
                 self.assertEqual(set(span), {"handle", "side", "path", "text"})
 
+    def test_indexed_prose_context_serializes_selected_section_bytes(
+        self,
+    ) -> None:
+        """Wire serialization could retain or rebuild complete consumed prose.
+
+        Input/expected case matrix:
+            expanded section: title, all arrays, one term, and aliases.
+            indexed section: selected arena paths and the same alias order.
+            request body: exact canonical bytes match between both routes.
+
+        Preconditions:
+            Details and prose rows share one owned arena and current indexed
+            planning sources. The fixture has no external provider dispatch.
+        Postconditions:
+            ``ProseContext`` retains the indexed selector, while wire output and
+            request bytes match the strict expanded compatibility adapter.
+        """
+        from diffstory.narrative_contracts import AuthorContext
+        from diffstory.narrative_contracts import DetailResult
+        from diffstory.narrative_contracts import ProseBinding
+        from diffstory.narrative_contracts import SectionResult
+        from diffstory.narrative_contracts import SupportedStatement
+        from diffstory.narrative_contracts import SupportedTerminology
+        from diffstory.narrative_contracts import SupportSet
+        from diffstory.narrative_hierarchy import (
+            capture_indexed_consumed_prose,
+        )
+        from diffstory.narrative_hierarchy import (
+            derive_planning_sources_indexed,
+        )
+        from diffstory.narrative_manifest import validate_prose_support
+        from diffstory.narrative_plan import (
+            _capture_indexed_arena_detail_results,
+        )
+        from diffstory.narrative_plan import canonical_bytes
+        from diffstory.narrative_plan import semantic_digest
+        from diffstory.narrative_wire import ProseContext
+        from diffstory.narrative_wire import WireAdapter
+        from diffstory.report_storage import _RecordArena
+
+        raw = FixtureProvider.respond(self.data)
+        envelope = self.inputs.wire.envelope(raw, self.batch, {})
+        self.assertFalse(envelope.failures)
+        details = tuple(
+            DetailResult.model_validate_json(canonical_bytes(item))
+            for item in envelope.items
+        )
+        arena = _RecordArena()
+        detail_refs = tuple(arena.put_result(item) for item in details)
+        detail_context = _capture_indexed_arena_detail_results(
+            detail_refs,
+            arena,
+            self.inputs.ledger,
+            index=self.inputs.index,
+        )
+        sources = derive_planning_sources_indexed(
+            self.inputs.index,
+            detail_context,
+            author_context=AuthorContext(),
+        )
+        claim = next(iter(sources._source_state.claim_records))  # noqa: SLF001 # Use one current accepted detail observation.
+        statement = SupportedStatement(
+            kind="implementation_claim",
+            text="The selected claim remains in the request.",
+            claims=(claim,),
+        )
+        subject = semantic_digest("wire section subject")
+        plan_key = semantic_digest("wire section plan")
+        binding = ProseBinding(
+            kind="section",
+            subject_key=subject,
+            plan_key=plan_key,
+            context_digest=semantic_digest("wire section context"),
+        )
+        expanded = SectionResult(
+            item_key=binding.key,
+            binding=binding,
+            title=statement,
+            orientation=(statement,),
+            synthesis=(statement,),
+            transition=(),
+            terminology=(
+                SupportedTerminology(term="wire term", definition=statement),
+            ),
+        )
+        reference = arena.put_result(expanded)
+        selector = capture_indexed_consumed_prose(
+            arena._snapshot_reader(),  # noqa: SLF001 # Select the exact owned section result.
+            (reference,),
+            sources,
+        )
+        context = ProseContext(
+            binding=binding,
+            claims=(claim,),
+            citations=(),
+            author_digest=sources.author_digest,
+            support=SupportSet(claims=(claim,)),
+            consumed=selector,
+            sources=sources,
+        )
+        self.assertIs(context.consumed, selector)
+
+        validate_prose_support(
+            expanded, context, WireAdapter(self.inputs.index)
+        )
+        expanded_input = WireAdapter(self.inputs.index).prose_input(expanded)
+        indexed_input = WireAdapter(self.inputs.index).prose_input(
+            selector.select(expanded.item_key)
+        )
+        self.assertEqual(
+            canonical_bytes(indexed_input), canonical_bytes(expanded_input)
+        )
+        self.assertEqual(
+            canonical_bytes(
+                {"version": "diffstory.wire.v2", "data": indexed_input}
+            ),
+            canonical_bytes(
+                {"version": "diffstory.wire.v2", "data": expanded_input}
+            ),
+        )
+        other_index = build_ledger_index(
+            build_evidence_ledger(golden_report())
+        )
+        with self.assertRaisesRegex(
+            ValueError, "citation_scope_binding_mismatch"
+        ):
+            WireAdapter(other_index).prose_input(
+                selector.select(expanded.item_key)
+            )
+        detail_context.citation_scope.close()
+
     def test_typed_basis_handles_reject_unconsumed_and_stale_proof(  # noqa: PLR0915 # Exercise both actual consumed support families.
         self,
     ) -> None:

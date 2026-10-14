@@ -965,6 +965,113 @@ class ReportStorageTests(unittest.TestCase):
         )
         self.assertEqual(arena.retained_record_counts["results"], 1)
 
+    def test_arena_selects_every_prose_kind_and_allowlisted_path(self) -> None:
+        """An indexed selector could omit kinds or reorder statement paths.
+
+        Input/expected case matrix:
+            planning card: abstraction statements, then term definitions.
+            section: title, prose arrays, then term definitions.
+            document: prose arrays, then term definitions.
+            each family: implementation, author, editorial, and uncertainty.
+
+        Preconditions:
+            The fixture has proof-valid planning, section, and document results.
+        Postconditions:
+            Selected paths and statement bytes equal the expanded statement
+            oracle in exact field order, and nested return values are immutable.
+        """
+        from diffstory.narrative_contracts import ClaimRef
+        from diffstory.narrative_contracts import DocumentResult
+        from diffstory.narrative_contracts import PlanningCardResult
+        from diffstory.narrative_contracts import SectionResult
+        from diffstory.narrative_contracts import StatementPath
+        from diffstory.narrative_contracts import SupportedStatement
+        from diffstory.narrative_contracts import SupportedTerminology
+        from diffstory.narrative_hierarchy import statement_entries
+        from diffstory.report_storage import _RecordArena
+        from diffstory.report_storage import _thaw
+
+        claim = ClaimRef(unit_key="a" * 64, observation_id="b" * 64)
+        variants = (
+            SupportedStatement(
+                kind="implementation_claim",
+                text="Selected source-backed implementation statement.",
+                claims=(claim,),
+            ),
+            SupportedStatement(
+                kind="author_motivation",
+                text="Selected author statement.",
+                author_context_digest="c" * 64,
+            ),
+            SupportedStatement(kind="editorial", text="Selected editorial."),
+            SupportedStatement(
+                kind="uncertainty", text="Selected uncertainty."
+            ),
+        )
+        term = SupportedTerminology(
+            term="fixture term", definition=variants[0]
+        )
+        families = (
+            (
+                "planning_card",
+                PlanningCardResult,
+                self.expanded_report["generation"]["planning"][0],
+                {"abstraction": tuple(variants)},
+            ),
+            (
+                "section",
+                SectionResult,
+                self.expanded_report["generation"]["sections"][0],
+                {
+                    "title": variants[0],
+                    "orientation": tuple(variants),
+                    "synthesis": tuple(variants),
+                    "transition": tuple(variants),
+                },
+            ),
+            (
+                "document",
+                DocumentResult,
+                self.expanded_report["generation"]["document"],
+                {
+                    "preamble": tuple(variants),
+                    "lead": tuple(variants),
+                    "closing": tuple(variants),
+                },
+            ),
+        )
+        arena = _RecordArena()
+        for family, model, original, changed_fields in families:
+            with self.subTest(family=family):
+                raw = copy.deepcopy(original)
+                raw["terminology"] = [term.model_dump(mode="json")]
+                for name, value in changed_fields.items():
+                    raw[name] = (
+                        value.model_dump(mode="json")
+                        if isinstance(value, SupportedStatement)
+                        else [item.model_dump(mode="json") for item in value]
+                    )
+                result = model.model_validate_json(canonical_bytes(raw))
+                reference = arena.put_result(result)
+                expected = statement_entries(result)
+                self.assertEqual(
+                    arena.statement_paths(reference),
+                    tuple(path for path, _statement in expected),
+                )
+                self.assertIn(
+                    StatementPath(field="terminology", index=0),
+                    arena.statement_paths(reference),
+                )
+                for path, statement in expected:
+                    selected = arena.statement_view(reference, path)
+                    self.assertEqual(
+                        canonical_bytes(_thaw(selected)),
+                        canonical_bytes(statement),
+                    )
+                    with self.assertRaises(TypeError):
+                        selected["text"] = "changed selected statement"
+                self.assertEqual(reference.kind, family)
+
     def test_arena_rolls_back_nested_rows_when_parent_validation_fails(
         self,
     ) -> None:

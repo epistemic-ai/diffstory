@@ -3014,13 +3014,15 @@ class _ArenaRecordReader:
     def statement_view(
         self, reference: ResultRef, path: StatementPath | Mapping[str, object]
     ) -> Mapping[str, object]:
-        """Return one immutable logical supported statement by exact path.
+        """Return one immutable supported statement by exact path.
 
         Preconditions:
             ``reference`` is an owned planning, section, or document result;
             ``path`` is a strict allowlisted ``StatementPath`` value.
         Postconditions:
             Only that statement and its typed evidence references are projected.
+            All declared statement kinds are retained, including editorial,
+            author-motivation, and uncertainty statements.
         Essential behavior:
             Does not reconstruct the full result model or retain the projection.
         """
@@ -3053,14 +3055,87 @@ class _ArenaRecordReader:
         except json.JSONDecodeError as error:
             msg = "invalid_statement_path"
             raise ValueError(msg) from error
-        if (
-            type(logical) is not dict
-            or logical.get("kind") != "implementation_claim"
-        ):
-            _fail("unsupported_statement_kind")
+        if type(logical) is not dict or logical.get("kind") not in {
+            "implementation_claim",
+            "author_motivation",
+            "editorial",
+            "uncertainty",
+        }:
+            _fail("invalid_statement_path")
         if stored.get("item_key") != reference.item_key:
             _fail("foreign_storage_result_reference")
         return _freeze(logical)
+
+    def statement_paths(
+        self, reference: ResultRef
+    ) -> tuple[StatementPath, ...]:
+        """Enumerate exact prose statement locations without expanding a result.
+
+        Preconditions:
+            ``reference`` is an owned planning, section, or document result.
+        Postconditions:
+            Returns fresh paths in the expanded adapter's field order, followed
+            by each ``terminology.definition`` location in input order.
+        Essential behavior:
+            Reads only the selected row's field lengths and does not project
+            any statement or reconstruct its producer model.
+        """
+        stored = self._stored_result(reference)
+        fields = {
+            "planning_card": ("abstraction",),
+            "section": ("title", "orientation", "synthesis", "transition"),
+            "document": ("preamble", "lead", "closing"),
+        }
+        names = fields.get(reference.kind)
+        if names is None:
+            _fail("invalid_statement_producer")
+        paths: list[StatementPath] = []
+        for name in names:
+            if name == "title":
+                if "title" not in stored:
+                    _fail("invalid_statement_path")
+                paths.append(StatementPath(field="title"))
+                continue
+            values = stored.get(name, ())
+            if type(values) not in {tuple, list}:
+                _fail("invalid_statement_path")
+            paths.extend(
+                StatementPath(field=name, index=ordinal)
+                for ordinal in range(len(values))
+            )
+        terminology = stored.get("terminology", ())
+        if type(terminology) not in {tuple, list}:
+            _fail("invalid_statement_path")
+        paths.extend(
+            StatementPath(field="terminology", index=ordinal)
+            for ordinal in range(len(terminology))
+        )
+        return tuple(paths)
+
+    def terminology_term(self, reference: ResultRef, index: int) -> str:
+        """Return one term label while keeping its definition selected.
+
+        Preconditions:
+            ``reference`` is an owned prose result and ``index`` selects one
+            of its declared terminology entries.
+        Postconditions:
+            Returns the exact immutable term string without materializing the
+            result or its other terminology definitions.
+        Essential behavior:
+            Shares the existing result-address and path resolver checks.
+        """
+        stored = self._stored_result(reference)
+        if reference.kind not in {"planning_card", "section", "document"}:
+            _fail("invalid_statement_producer")
+        if type(index) is not int or index < 0:
+            _fail("invalid_statement_path")
+        terms = stored.get("terminology", ())
+        if type(terms) not in {tuple, list} or index >= len(terms):
+            _fail("invalid_statement_path")
+        term = terms[index]
+        if not isinstance(term, Mapping) or type(term.get("term")) is not str:
+            _fail("invalid_statement_path")
+        return term["term"]
 
     def logical_chunks(self, reference: ResultRef) -> Iterator[bytes]:
         """Stream exact canonical logical bytes for one owned result.
@@ -3813,7 +3888,7 @@ class _RecordArena:
     def statement_view(
         self, reference: ResultRef, path: StatementPath | Mapping[str, object]
     ) -> Mapping[str, object]:
-        """Return one immutable supported-statement projection by exact path.
+        """Return one immutable statement projection by exact path.
 
         Preconditions:
             ``reference`` is an owned planning, section, or document result;
@@ -3824,6 +3899,33 @@ class _RecordArena:
             Resolves only the selected statement and its evidence records.
         """
         return self._snapshot_reader().statement_view(reference, path)
+
+    def statement_paths(
+        self, reference: ResultRef
+    ) -> tuple[StatementPath, ...]:
+        """List exact statement locations without projecting the result.
+
+        Preconditions:
+            ``reference`` is an owned planning, section, or document result.
+        Postconditions:
+            Paths preserve prose-field and terminology input order.
+        Essential behavior:
+            Reads only stored array lengths from a shallow reader snapshot.
+        """
+        return self._snapshot_reader().statement_paths(reference)
+
+    def terminology_term(self, reference: ResultRef, index: int) -> str:
+        """Return one selected term label from an owned prose result.
+
+        Preconditions:
+            ``reference`` is an owned prose result and ``index`` selects an
+            existing terminology entry.
+        Postconditions:
+            Returns the exact term string; no other result fields are exposed.
+        Essential behavior:
+            Uses the same checked arena result resolver as statement selection.
+        """
+        return self._snapshot_reader().terminology_term(reference, index)
 
     def logical_chunks(self, reference: ResultRef) -> Iterator[bytes]:
         """Stream canonical expanded bytes for one owned result address.

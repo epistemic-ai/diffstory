@@ -31,6 +31,10 @@ from .narrative_contracts import SupportSet
 from .narrative_contracts import Text
 from .narrative_contracts import result_model
 from .narrative_contracts import structured_output_schema
+from .narrative_hierarchy import IndexedConsumedProse
+from .narrative_hierarchy import IndexedProseResult
+from .narrative_hierarchy import PlanningSource
+from .narrative_hierarchy import ProseResult
 from .narrative_plan import canonical_bytes
 from .narrative_plan import semantic_digest
 from .narrative_plan import span_reference
@@ -44,8 +48,6 @@ if TYPE_CHECKING:
     from .narrative_contracts import EvidenceUnit
     from .narrative_contracts import ProseBinding
     from .narrative_contracts import SpanRef
-    from .narrative_hierarchy import PlanningSources
-    from .narrative_hierarchy import ProseResult
     from .narrative_plan import LedgerIndex
 
 WIRE_VERSION = "diffstory.wire.v2"
@@ -242,7 +244,27 @@ def wire_schema(stage: str) -> dict:
 
 @dataclass(frozen=True)
 class ProseContext:
-    """Trusted allowed support from exactly the supplied item context."""
+    """Trusted allowed support from exactly the supplied item context.
+
+    ``consumed`` may retain the compatibility mapping of expanded producer
+    models or an ``IndexedConsumedProse`` selector. The latter owns only arena
+    references and small digests, and remains usable only while its exact
+    indexed source and citation scope stay live. Neither form is complete
+    production proof by itself.
+
+    Attributes:
+        binding: Expected item kind, subject, plan, and consumed-context digest.
+        claims: Whole observation claims granted to this request.
+        citations: Whole source references granted to this request.
+        author_digest: Current author-context digest, or ``None``.
+        final: Whether the item is the final item in its ordered family.
+        max_wire_bytes: Maximum encoded prose-result bytes; default 4,096.
+        support: Exact immediate claims, citations, slices, statements, and
+            author context supplied to the item.
+        consumed: Expanded producer mapping or one immutable arena selector.
+        sources: Current legacy or indexed planning source context, if present.
+        max_support_bytes: Maximum serialized support bytes; default 16,384.
+    """
 
     binding: ProseBinding
     claims: tuple[ClaimRef, ...]
@@ -251,10 +273,10 @@ class ProseContext:
     final: bool = False
     max_wire_bytes: int = 4096
     support: SupportSet = field(default_factory=SupportSet)
-    consumed: Mapping[str, ProseResult] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
-    sources: PlanningSources | None = None
+    consumed: (
+        Mapping[str, ProseResult | IndexedProseResult] | IndexedConsumedProse
+    ) = field(default_factory=lambda: MappingProxyType({}))
+    sources: PlanningSource | None = None
     max_support_bytes: int = 16384
 
 
@@ -373,8 +395,21 @@ class WireAdapter:
             "uncertainty": list(statement.uncertainty),
         }
 
-    def prose_input(self, result: Contract) -> dict:
-        """Serialize all prose and proposed terms without changing the result."""
+    def prose_input(self, result: Contract | IndexedProseResult) -> dict:
+        """Serialize all prose with the expanded or selected indexed adapter.
+
+        Preconditions:
+            ``result`` is a strict prose contract or a live indexed result
+            selector bound to the current source context.
+        Postconditions:
+            Output fields, statement order, terminology, aliases, and defaults
+            match the expanded wire adapter exactly.
+        Essential behavior:
+            Indexed inputs resolve only selected statements and never rebuild
+            a complete producer model.
+        """
+        if type(result) is IndexedProseResult:
+            return self.prose_input_indexed(result)
         values = {
             "target": self.aliases.add("i", result.item_key),
             "terminology": [
@@ -402,6 +437,62 @@ class WireAdapter:
                     if name == "title"
                     else [self.statement_input(s) for s in field]
                 )
+        return values
+
+    def prose_input_indexed(self, result: IndexedProseResult) -> dict:
+        """Serialize a producer from ordered arena statement selectors.
+
+        Preconditions:
+            ``result`` selects one planning, section, or document record from
+            a live ``IndexedConsumedProse`` owned by the current arena.
+        Postconditions:
+            The returned dictionary matches ``prose_input`` field-for-field,
+            including title placement, term order, defaults, and aliases.
+        Essential behavior:
+            Materializes a transient tuple of selected statements for this
+            producer before serialization. It retains no producer model or
+            complete-result presentation tree.
+        """
+        item_key, result_kind, entries, terms = result.prose_projection(
+            index=self.index
+        )
+        by_field: dict[str, list[tuple[int, SupportedStatement]]] = {}
+        for path, statement in entries:
+            by_field.setdefault(path.field, []).append((path.index, statement))
+        values = {
+            "target": self.aliases.add("i", item_key),
+            "terminology": [
+                {
+                    "term": term,
+                    "definition": self.statement_input(statement),
+                }
+                for term, (_ordinal, statement) in zip(
+                    terms,
+                    by_field.get("terminology", ()),
+                    strict=True,
+                )
+            ],
+        }
+        fields = {
+            "planning_card": ("abstraction",),
+            "section": ("title", "orientation", "synthesis", "transition"),
+            "document": ("preamble", "lead", "closing"),
+        }.get(result_kind)
+        if fields is None:
+            msg = "invalid_prose_family"
+            raise ValueError(msg)
+        for name in fields:
+            selected = sorted(by_field.get(name, ()), key=lambda item: item[0])
+            if name == "title":
+                if len(selected) != 1 or selected[0][0] != 0:
+                    msg = "invalid_statement_path"
+                    raise ValueError(msg)
+                values[name] = self.statement_input(selected[0][1])
+            else:
+                values[name] = [
+                    self.statement_input(statement)
+                    for _ordinal, statement in selected
+                ]
         return values
 
     def detail_input(self, result: DetailResult) -> dict:

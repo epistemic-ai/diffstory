@@ -7,12 +7,16 @@ output budgets, and audit actual requests after execution. Details stay intact.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
 from collections import OrderedDict
+from collections.abc import Iterator
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING
+from typing import NoReturn
 from weakref import WeakKeyDictionary
 
 from diffstory.narrative_contracts import AtomProjection
@@ -73,10 +77,12 @@ from diffstory.narrative_plan import span_reference
 from diffstory.narrative_plan import story_card
 from diffstory.narrative_plan import story_chapters
 from diffstory.narrative_plan import validate_primary_structure
+from diffstory.report_storage import ResultRef
+from diffstory.report_storage import _ArenaRecordReader
+from diffstory.report_storage import _thaw
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Mapping
 
 ProseResult = PlanningCardResult | SectionResult | DocumentResult
 UTF8_CONTINUATION = 0x80
@@ -89,6 +95,11 @@ REVISION_BINDING_WIDTH = 2
 def _require(condition: bool, reason: str) -> None:  # noqa: FBT001
     if not condition:
         raise ValueError(reason)
+
+
+def _reject(reason: str) -> NoReturn:
+    """Raise one bounded contract error from an unreachable selector branch."""
+    raise ValueError(reason)
 
 
 def record_key(owner: RecordOwner) -> str:
@@ -268,10 +279,10 @@ class _IndexedSourceState:
             id(self.claim_records),
             id(self.heading_records),
             id(self.group_bytes),
-            self.revision_binding,
-            self.author_bytes,
-            self.author_digest,
-            self.metadata_fingerprint,
+            id(self.revision_binding),
+            id(self.author_bytes),
+            id(self.author_digest),
+            id(self.metadata_fingerprint),
         )
 
     def current_metadata_fingerprint(self) -> str:
@@ -422,6 +433,572 @@ class IndexedPlanningSources:
 
 
 PlanningSource = PlanningSources | IndexedPlanningSources
+
+
+_INDEXED_CONSUMED_PROSE_TOKEN = object()
+
+
+def _result_reference_value(reference: ResultRef) -> tuple[str, str, str, str]:
+    """Copy one result address to immutable scalar selectors.
+
+    Preconditions:
+        ``reference`` is the exact result-reference type used by the arena.
+    Postconditions:
+        Returns table, kind, storage address, and semantic item key as strings.
+    Essential behavior:
+        Does not retain a caller-owned model or mutable mapping.
+    """
+    _require(type(reference) is ResultRef, "invalid_indexed_prose_reference")
+    return (
+        reference.table,
+        reference.kind,
+        reference.storage_id,
+        reference.item_key,
+    )
+
+
+def _result_reference_from_value(
+    value: tuple[str, str, str, str],
+) -> ResultRef:
+    """Create a fresh strict result address from captured scalar selectors.
+
+    Preconditions:
+        ``value`` is a captured four-string result address.
+    Postconditions:
+        Returns a detached ``ResultRef`` that rechecks each scalar.
+    """
+    return ResultRef(*value)
+
+
+class IndexedConsumedProse:
+    """Select ordered consumed prose records from one live owned arena.
+
+    The selector retains one immutable arena reader, ordered primitive result
+    addresses, streamed complete-result digests, and one live indexed source
+    adapter. It retains no complete producer model or expanded result bytes.
+    Its records are data only. The source adapter and its citation scope must
+    remain live whenever an accessor or support validator uses this selector.
+
+    Attributes:
+        item_keys: Consumed producer keys in the supplied reference order.
+        sources: The exact ``IndexedPlanningSources`` instance accepted at
+            capture; a copied, rebound, or closed source scope cannot be used.
+        _reader: One immutable reader whose rows belong to the source context's
+            ``_RecordArena``; it is never exposed as a public property.
+        _sources: Exact ``IndexedPlanningSources`` instance accepted at
+            capture.
+        _reference_values: Unique ``(table, kind, storage_id, item_key)`` string
+            tuples. Table is ``results``; kind is planning card, section, or
+            document; both digest strings are lowercase SHA256 values.
+        _result_digests: One lowercase SHA256 logical result digest per address,
+            in the same order as ``_reference_values``.
+        _source_state: Exact registered indexed source owner at capture.
+        _binding: Identity and selector witness checked before each use.
+        ``select``: Return a small selector for one consumed producer.
+    """
+
+    __slots__ = (
+        "_binding",
+        "_reader",
+        "_reference_values",
+        "_result_digests",
+        "_source_state",
+        "_sources",
+    )
+
+    def __init__(
+        self,
+        reader: _ArenaRecordReader,
+        references: tuple[ResultRef, ...],
+        sources: IndexedPlanningSources,
+        *,
+        token: object,
+    ) -> None:
+        """Capture exact result addresses after source and arena checks.
+
+        Preconditions:
+            ``token`` is module-private; ``reader`` is an immutable reader over
+            the same arena as the detail context owned by ``sources``; and all
+            ``references`` select unique planning, section, or document rows.
+        Postconditions:
+            Result digests are computed from streamed logical bytes. Only
+            reader, primitive references/digests, and source bindings survive.
+        Essential behavior:
+            This is a data selector, never a production or support capability.
+        """
+        _require(
+            token is _INDEXED_CONSUMED_PROSE_TOKEN
+            and type(reader) is _ArenaRecordReader
+            and type(references) is tuple
+            and type(sources) is IndexedPlanningSources,
+            "invalid_indexed_consumed_prose",
+        )
+        source_state = _state(sources)
+        _require(
+            type(source_state) is _IndexedSourceState,
+            "invalid_indexed_consumed_prose",
+        )
+        detail_reader = source_state.details_context._arena_reader  # noqa: SLF001 # Require one accepted arena family.
+        _require(
+            detail_reader is not None
+            and detail_reader._owner_token is reader._owner_token,  # noqa: SLF001 # Compare arena identity without exposing it.
+            "indexed_consumed_arena_mismatch",
+        )
+        values = tuple(_result_reference_value(ref) for ref in references)
+        _require(
+            len({value[3] for value in values}) == len(values),
+            "duplicate_consumed_statement_producer",
+        )
+        digests = []
+        for value in values:
+            reference = _result_reference_from_value(value)
+            reader._stored_result(reference)  # noqa: SLF001 # Confirm arena, item key, and family bindings.
+            _require(
+                reference.kind in {"planning_card", "section", "document"},
+                "invalid_statement_producer",
+            )
+            digest = hashlib.sha256()
+            for chunk in reader.logical_chunks(reference):
+                digest.update(chunk)
+            digests.append(digest.hexdigest())
+        object.__setattr__(self, "_reader", reader)
+        object.__setattr__(self, "_sources", sources)
+        object.__setattr__(self, "_source_state", source_state)
+        object.__setattr__(self, "_reference_values", values)
+        object.__setattr__(self, "_result_digests", tuple(digests))
+        object.__setattr__(
+            self,
+            "_binding",
+            self._current_binding(),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Keep selector fields fixed after capture."""
+        if hasattr(self, name):
+            msg = "indexed_consumed_prose_is_immutable"
+            raise AttributeError(msg)
+        object.__setattr__(self, name, value)
+
+    def _current_binding(self) -> tuple[object, ...]:
+        """Return identity witnesses for the reader and selector bindings."""
+        reader = self._reader
+        state = self._source_state
+        return (
+            id(reader),
+            id(reader._owner_token),  # noqa: SLF001 # Pin exact arena ownership.
+            id(reader._tables),  # noqa: SLF001 # Pin its immutable record indexes.
+            id(reader._result_ids),  # noqa: SLF001 # Pin item-key bindings.
+            id(self._sources),
+            id(state),
+            state.binding_witness(),
+            id(self._reference_values),
+            id(self._result_digests),
+        )
+
+    def _check_bound(self) -> None:
+        """Reject copied, rebound, or mutated indexed selector state.
+
+        Preconditions:
+            The source adapter was live when this selector was captured.
+        Postconditions:
+            The original reader, arena, source registration, ordered addresses,
+            and streamed result-digest tuples still have their captured owners.
+        Essential behavior:
+            Checks exact immutable bindings in constant time. Public operations
+            separately check source liveness and selected result access resolves
+            its own row through the reader.
+        """
+        state = _state(self._sources)
+        _require(
+            state is self._source_state,
+            "indexed_consumed_prose_changed",
+        )
+        detail_reader = state.details_context._arena_reader  # noqa: SLF001 # Compare exact arena family.
+        _require(
+            detail_reader is not None
+            and detail_reader._owner_token is self._reader._owner_token,  # noqa: SLF001 # Reject cross-arena rebinding.
+            "indexed_consumed_arena_mismatch",
+        )
+        _require(
+            self._current_binding() == self._binding,
+            "indexed_consumed_prose_changed",
+        )
+
+    def check_current(self) -> None:
+        """Require this selector's ledger and citation scope to remain live.
+
+        Preconditions:
+            The selector is passed to a public indexed adapter.
+        Postconditions:
+            The original indexed source context and ledger remain current.
+        Essential behavior:
+            Uses the existing source and citation-scope liveness checks.
+        """
+        self._sources.check_current()
+        self._check_bound()
+
+    @property
+    def sources(self) -> IndexedPlanningSources:
+        """Return the exact registered source adapter used at capture."""
+        self.check_current()
+        return self._sources
+
+    @property
+    def item_keys(self) -> tuple[str, ...]:
+        """Return consumed item keys in their captured order."""
+        self.check_current()
+        return tuple(value[3] for value in self._reference_values)
+
+    def select(self, item_key: str) -> IndexedProseResult:
+        """Return one data-only selector by its exact consumed item key.
+
+        Preconditions:
+            ``item_key`` is a string.
+        Postconditions:
+            Returns a small handle backed by this reader; no producer model is
+            created or retained.
+        Essential behavior:
+            Unknown keys raise ``unconsumed_statement_producer``.
+        """
+        self.check_current()
+        return self._select_bound(item_key)
+
+    def _select_bound(self, item_key: str) -> IndexedProseResult:
+        """Select one result after the enclosing adapter checked liveness."""
+        _require(type(item_key) is str, "unconsumed_statement_producer")
+        for reference_index, value in enumerate(self._reference_values):
+            if value[3] == item_key:
+                return IndexedProseResult(
+                    self,
+                    value,
+                    reference_index,
+                    token=_INDEXED_CONSUMED_PROSE_TOKEN,
+                )
+        _reject("unconsumed_statement_producer")
+
+    def __getitem__(self, item_key: str) -> IndexedProseResult:
+        """Select one consumed result using mapping-style access."""
+        return self.select(item_key)
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate item keys in the accepted producer order."""
+        yield from self.item_keys
+
+    def __len__(self) -> int:
+        """Return the number of selected producers after a liveness check."""
+        return len(self.item_keys)
+
+    def __copy__(self) -> IndexedConsumedProse:
+        """Keep selectors local to their accepted source scope."""
+        msg = "indexed_consumed_prose_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __deepcopy__(self, _memo: dict[int, object]) -> IndexedConsumedProse:
+        """Keep selectors local to their accepted source scope."""
+        msg = "indexed_consumed_prose_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        """Prevent serialized selectors from transferring source liveness."""
+        msg = "indexed_consumed_prose_cannot_be_serialized"
+        raise TypeError(msg)
+
+
+class IndexedProseResult:
+    """Select one complete prose result without expanding its producer model.
+
+    The value stores only an ``IndexedConsumedProse`` reference and one
+    primitive result address. Accessors validate a selected statement and
+    return a detached model. The result digest is the exact SHA256 of streamed
+    expanded logical bytes, including defaults captured by the arena.
+
+    Attributes:
+        _selector: Exact consumed selector with a live source scope.
+        _reference_value: Four strings for table, prose family, result address,
+            and semantic item key. The table is ``results`` and the family is
+            planning card, section, or document.
+    """
+
+    __slots__ = (
+        "_reference_index",
+        "_reference_value",
+        "_selector",
+        "_selector_id",
+    )
+
+    def __init__(
+        self,
+        selector: IndexedConsumedProse,
+        reference_value: tuple[str, str, str, str],
+        reference_index: int,
+        *,
+        token: object,
+    ) -> None:
+        """Bind one primitive result address to its owning selector."""
+        _require(
+            token is _INDEXED_CONSUMED_PROSE_TOKEN
+            and type(selector) is IndexedConsumedProse
+            and type(reference_index) is int
+            and 0 <= reference_index < len(selector._reference_values)  # noqa: SLF001 # Check the selected slot.
+            and selector._reference_values[reference_index] is reference_value,  # noqa: SLF001 # Pin the exact primitive row.
+            "invalid_indexed_prose_result",
+        )
+        object.__setattr__(self, "_selector", selector)
+        object.__setattr__(self, "_reference_value", reference_value)
+        object.__setattr__(self, "_reference_index", reference_index)
+        object.__setattr__(self, "_selector_id", id(selector))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Keep the selected address fixed after construction."""
+        if hasattr(self, name):
+            msg = "indexed_prose_result_is_immutable"
+            raise AttributeError(msg)
+        object.__setattr__(self, name, value)
+
+    def _check_current(self, *, check_sources: bool = True) -> ResultRef:
+        """Resolve the exact selected reference after checking its owner."""
+        _require(
+            id(self._selector) == self._selector_id,
+            "indexed_prose_result_changed",
+        )
+        if check_sources:
+            self._selector.check_current()
+        else:
+            self._selector._check_bound()  # noqa: SLF001 # Caller checked current source authority.
+        _require(
+            0 <= self._reference_index < len(self._selector._reference_values)  # noqa: SLF001 # Keep the captured slot in range.
+            and self._selector._reference_values[self._reference_index]  # noqa: SLF001 # Select the exact captured row.
+            is self._reference_value,
+            "indexed_prose_result_changed",
+        )
+        reference = _result_reference_from_value(self._reference_value)
+        self._selector._reader._stored_result(reference)  # noqa: SLF001 # Resolve only the selected immutable row.
+        return reference
+
+    @property
+    def reference(self) -> ResultRef:
+        """Return a fresh immutable result address, never the retained tuple."""
+        return self._check_current()
+
+    @property
+    def item_key(self) -> str:
+        """Return the semantic key bound to this selected result."""
+        self._check_current()
+        return self._reference_value[3]
+
+    @property
+    def kind(self) -> str:
+        """Return its exact planning, section, or document family."""
+        self._check_current()
+        return self._reference_value[1]
+
+    @property
+    def result_digest(self) -> str:
+        """Return the complete streamed logical result digest."""
+        self._check_current()
+        return self._result_digest_bound()
+
+    def _result_digest_bound(self) -> str:
+        """Return this selected result's digest by its captured tuple index."""
+        _require(
+            id(self._selector) == self._selector_id
+            and 0
+            <= self._reference_index
+            < len(self._selector._reference_values)  # noqa: SLF001 # Keep the captured slot in range.
+            and self._selector._reference_values[self._reference_index]  # noqa: SLF001 # Select the exact captured row.
+            is self._reference_value,
+            "indexed_prose_result_changed",
+        )
+        return self._selector._result_digests[self._reference_index]  # noqa: SLF001 # Read one captured digest by index.
+
+    def _statement_projection(
+        self, path: StatementPath, *, check_sources: bool
+    ) -> tuple[SupportedStatement, str]:
+        """Materialize one selected statement and its exact logical digest."""
+        reference = self._check_current(check_sources=check_sources)
+        return self._statement_projection_bound(reference, path)
+
+    def _statement_projection_bound(
+        self, reference: ResultRef, path: StatementPath
+    ) -> tuple[SupportedStatement, str]:
+        """Project one statement after the enclosing call checked liveness."""
+        raw = self._selector._reader.statement_view(reference, path)  # noqa: SLF001 # Resolve one selected immutable statement.
+        encoded = canonical_bytes(_thaw(raw))
+        statement = SupportedStatement.model_validate_json(encoded)
+        return statement, content_digest(encoded)
+
+    def statement_at(self, path: StatementPath) -> SupportedStatement:
+        """Return a detached strict model for one exact selected location."""
+        path = StatementPath.model_validate(path)
+        reference = self._check_current()
+        return self._statement_projection_bound(reference, path)[0]
+
+    def statement_reference(self, path: StatementPath) -> StatementRef:
+        """Bind one selected implementation statement to exact logical bytes."""
+        path = StatementPath.model_validate(path)
+        return self._statement_reference_bound(path, check_sources=True)
+
+    def _statement_reference_bound(
+        self, path: StatementPath, *, check_sources: bool
+    ) -> StatementRef:
+        """Bind a statement after the caller selects its current-check boundary."""
+        return self._statement_reference_and_value_bound(
+            path, check_sources=check_sources
+        )[0]
+
+    def _statement_reference_and_value_bound(
+        self, path: StatementPath, *, check_sources: bool
+    ) -> tuple[StatementRef, SupportedStatement]:
+        """Return one exact statement and its reference after a liveness check."""
+        reference = self._check_current(check_sources=check_sources)
+        statement, statement_digest = self._statement_projection_bound(
+            reference, path
+        )
+        _require(
+            statement.kind == "implementation_claim",
+            "unsupported_statement_kind",
+        )
+        return (
+            StatementRef(
+                producer_item_key=reference.item_key,
+                result_digest=self._result_digest_bound(),
+                statement_path=path,
+                statement_digest=statement_digest,
+            ),
+            statement,
+        )
+
+    def statement_entries(
+        self,
+    ) -> tuple[tuple[StatementPath, SupportedStatement], ...]:
+        """Return only selected statements in expanded field order.
+
+        Preconditions:
+            The source scope is live.
+        Postconditions:
+            Every returned statement is a detached strict model for one exact
+            field or ``terminology.definition`` path.
+        Essential behavior:
+            Does not construct or retain a complete producer model.
+        """
+        reference = self._check_current()
+        return self._statement_entries_bound(reference)
+
+    def _statement_entries_bound(
+        self, reference: ResultRef
+    ) -> tuple[tuple[StatementPath, SupportedStatement], ...]:
+        """Materialize ordered statements after the caller checked liveness."""
+        paths = self._selector._reader.statement_paths(reference)  # noqa: SLF001 # Enumerate exact field selectors only.
+        return tuple(
+            (
+                path,
+                self._statement_projection_bound(reference, path)[0],
+            )
+            for path in paths
+        )
+
+    def terminology_term(self, index: int) -> str:
+        """Return one exact term label without expanding its producer."""
+        reference = self._check_current()
+        return self._selector._reader.terminology_term(  # noqa: SLF001 # Resolve the exact selected label.
+            reference, index
+        )
+
+    def terminology_terms(self) -> tuple[str, ...]:
+        """Return term labels in input order after one liveness check."""
+        reference = self._check_current()
+        count = sum(
+            path.field == "terminology"
+            for path in self._selector._reader.statement_paths(reference)  # noqa: SLF001 # Enumerate only term definition selectors.
+        )
+        return tuple(
+            self._selector._reader.terminology_term(reference, index)  # noqa: SLF001 # Select one exact term label.
+            for index in range(count)
+        )
+
+    def prose_projection(
+        self,
+        *,
+        index: LedgerIndex | None = None,
+    ) -> tuple[
+        str,
+        str,
+        tuple[tuple[StatementPath, SupportedStatement], ...],
+        tuple[str, ...],
+    ]:
+        """Return detached selected prose fields for wire serialization.
+
+        Preconditions:
+            The original result selector and indexed source scope are live.
+            If ``index`` is supplied, it is the exact ledger index bound by
+            that source scope.
+        Postconditions:
+            Returns item key, result family, ordered selected statements, and
+            exact term labels. All returned models are detached selections.
+        Essential behavior:
+            Performs one source liveness check and does not retain a result tree.
+        """
+        reference = self._check_current()
+        if index is not None:
+            _require(
+                type(index) is LedgerIndex
+                and self._selector._source_state.index is index,  # noqa: SLF001 # Bind wire aliases to the exact source index.
+                "citation_scope_binding_mismatch",
+            )
+        entries = self._statement_entries_bound(reference)
+        term_count = sum(
+            path.field == "terminology" for path, _statement in entries
+        )
+        terms = tuple(
+            self._selector._reader.terminology_term(reference, index)  # noqa: SLF001 # Read one term label after the single liveness check.
+            for index in range(term_count)
+        )
+        return reference.item_key, reference.kind, entries, terms
+
+    def __copy__(self) -> IndexedProseResult:
+        """Keep selected views within the original source scope."""
+        msg = "indexed_prose_result_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __deepcopy__(self, _memo: dict[int, object]) -> IndexedProseResult:
+        """Keep selected views within the original source scope."""
+        msg = "indexed_prose_result_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        """Prevent serialized views from transferring selector liveness."""
+        msg = "indexed_prose_result_cannot_be_serialized"
+        raise TypeError(msg)
+
+
+def capture_indexed_consumed_prose(
+    reader: _ArenaRecordReader,
+    references: tuple[ResultRef, ...],
+    sources: IndexedPlanningSources,
+) -> IndexedConsumedProse:
+    """Bind actual consumed result addresses to current indexed sources.
+
+    Preconditions:
+        ``reader`` and the detail context owned by ``sources`` come from the
+        same live ``_RecordArena``; ``references`` list the immediate consumed
+        planning, section, or document producers in their original order.
+    Postconditions:
+        Returns an immutable data selector with one streamed digest per result.
+        It retains no result models or complete logical byte buffers.
+    Essential behavior:
+        Structural storage addresses remain data only; every later adapter
+        checks the same live ledger, revision binding, and citation scope.
+    """
+    _require(
+        type(references) is tuple,
+        "invalid_indexed_consumed_prose",
+    )
+    return IndexedConsumedProse(
+        reader,
+        references,
+        sources,
+        token=_INDEXED_CONSUMED_PROSE_TOKEN,
+    )
 
 
 _SOURCES: WeakKeyDictionary = WeakKeyDictionary()
@@ -2267,10 +2844,21 @@ def planning_shapes(
 
 
 def statement_at(
-    result: ProseResult, path: StatementPath
+    result: ProseResult | IndexedProseResult, path: StatementPath
 ) -> SupportedStatement:
-    """Resolve only known statement fields in the exact result family."""
+    """Resolve one exact statement from an expanded or indexed result.
+
+    Preconditions:
+        ``result`` is one exact prose result model or a live indexed selector;
+        ``path`` is an allowlisted statement location for its family.
+    Postconditions:
+        Returns a detached ``SupportedStatement`` from only that path.
+    Essential behavior:
+        The indexed route materializes only the selected statement.
+    """
     path = StatementPath.model_validate(path)
+    if type(result) is IndexedProseResult:
+        return result.statement_at(path)
     allowed = {
         PlanningCardResult: ("abstraction",),
         SectionResult: ("title", "orientation", "synthesis", "transition"),
@@ -2296,9 +2884,23 @@ def statement_at(
 
 
 def statement_reference(
-    result: ProseResult, path: StatementPath
+    result: ProseResult | IndexedProseResult, path: StatementPath
 ) -> StatementRef:
-    """Bind an exact complete implementation statement; other kinds cannot prove it."""
+    """Bind one exact implementation statement in a complete result.
+
+    Preconditions:
+        ``result`` is one exact prose result model or a live indexed selector;
+        ``path`` names one of its statements.
+    Postconditions:
+        The returned reference binds item key, complete-result digest, exact
+        path, and selected statement digest. Other statement kinds cannot prove
+        implementation support.
+    Essential behavior:
+        Expanded models keep strict full-result validation; indexed results
+        stream the complete logical digest and validate only the selected row.
+    """
+    if type(result) is IndexedProseResult:
+        return result.statement_reference(path)
     _require(
         type(result) in {PlanningCardResult, SectionResult, DocumentResult},
         "invalid_statement_producer",
@@ -2316,15 +2918,42 @@ def statement_reference(
     )
 
 
-def validate_statement_reference(
-    ref: StatementRef, consumed: Mapping[str, ProseResult]
+def _validate_statement_reference_bound(
+    ref: StatementRef,
+    consumed: Mapping[str, ProseResult | IndexedProseResult]
+    | IndexedConsumedProse,
+    *,
+    source_checked: bool,
 ) -> SupportedStatement:
-    """Require an exact consumed producer/result/path/digest, without guessing keys."""
-    ref = StatementRef.model_validate(ref)
+    """Resolve one reference after or before checking indexed liveness."""
+    if type(consumed) is IndexedConsumedProse:
+        if source_checked:
+            consumed._check_bound()  # noqa: SLF001 # The enclosing adapter checked current source authority.
+        else:
+            consumed.check_current()
+            source_checked = True
+        result = consumed._select_bound(ref.producer_item_key)  # noqa: SLF001 # Select the exact accepted immediate producer.
+        actual, statement = result._statement_reference_and_value_bound(  # noqa: SLF001 # Validate one path without repeating the outer source check.
+            ref.statement_path, check_sources=not source_checked
+        )
+        _require(actual == ref, "statement_reference_changed")
+        return statement
     _require(
-        ref.producer_item_key in consumed, "unconsumed_statement_producer"
+        isinstance(consumed, Mapping) and ref.producer_item_key in consumed,
+        "unconsumed_statement_producer",
     )
     result = consumed[ref.producer_item_key]
+    if type(result) is IndexedProseResult:
+        if source_checked:
+            result._selector._check_bound()  # noqa: SLF001 # The enclosing adapter checked current source authority.
+        else:
+            result._selector.check_current()  # noqa: SLF001 # Mapping-held selectors retain their own source guard.
+            source_checked = True
+        actual, statement = result._statement_reference_and_value_bound(  # noqa: SLF001 # Resolve only the selected path.
+            ref.statement_path, check_sources=not source_checked
+        )
+        _require(actual == ref, "statement_reference_changed")
+        return statement
     _require(
         type(result) in {PlanningCardResult, SectionResult, DocumentResult},
         "invalid_statement_producer",
@@ -2336,6 +2965,28 @@ def validate_statement_reference(
         "statement_reference_changed",
     )
     return statement_at(result, ref.statement_path)
+
+
+def validate_statement_reference(
+    ref: StatementRef,
+    consumed: Mapping[str, ProseResult | IndexedProseResult]
+    | IndexedConsumedProse,
+) -> SupportedStatement:
+    """Require one exact consumed producer, result, path, and statement.
+
+    Preconditions:
+        ``consumed`` is the actual immediate producer set as expanded models
+        or one live indexed selector.
+    Postconditions:
+        Returns a detached selected statement only when both digests and every
+        item/path binding match.
+    Essential behavior:
+        Indexed selectors use their streamed result digest without rebuilding
+        the producer model.
+    """
+    return _validate_statement_reference_bound(
+        StatementRef.model_validate(ref), consumed, source_checked=False
+    )
 
 
 def material_support(
@@ -2423,9 +3074,18 @@ def source_reference(
 
 
 def statement_entries(
-    result: ProseResult,
+    result: ProseResult | IndexedProseResult,
 ) -> tuple[tuple[StatementPath, SupportedStatement], ...]:
-    """Enumerate exact statement locations for consumed-result support selection."""
+    """Enumerate exact statements without rebuilding an indexed producer.
+
+    Preconditions:
+        ``result`` is one exact prose model or a live indexed result selector.
+    Postconditions:
+        Returns statement paths and detached values in the same field order for
+        both result representations.
+    """
+    if type(result) is IndexedProseResult:
+        return result.statement_entries()
     fields = {
         PlanningCardResult: ("abstraction",),
         SectionResult: ("title", "orientation", "synthesis", "transition"),
@@ -2446,38 +3106,132 @@ def statement_entries(
 
 
 def inherited_support(
-    consumed: tuple[ProseResult, ...],
+    consumed: tuple[ProseResult | IndexedProseResult, ...],
     *,
     author_context_digest: str | None = None,
 ) -> SupportSet:
-    """Forward exact implementation statements, never their recursively expanded text.
+    """Forward exact implementation statements, never their expanded text.
 
     Producers must already pass their consumed-support and receipt validation.
     Author attribution is forwarded only when its actual child statement exists.
+
+    Preconditions:
+        ``consumed`` contains the actual immediate producers in input order.
+        Indexed values share one live source selector.
+    Postconditions:
+        Returns direct implementation statement references and matching author
+        attribution, with duplicates removed in first-seen order.
     """
-    refs = tuple(
-        statement_reference(result, path)
-        for result in consumed
-        for path, statement in statement_entries(result)
-        if statement.kind == "implementation_claim"
+    indexed = tuple(
+        item for item in consumed if type(item) is IndexedProseResult
     )
-    author = any(
-        s.kind == "author_motivation"
-        and s.author_context_digest == author_context_digest
-        for r in consumed
-        for _, s in statement_entries(r)
-    )
+    if indexed:
+        _require(len(indexed) == len(consumed), "mixed_consumed_prose")
+        selectors = {id(item._selector): item._selector for item in indexed}  # noqa: SLF001 # Require one current source selector.
+        _require(len(selectors) == 1, "mixed_consumed_prose")
+        selector = next(iter(selectors.values()))
+        selector.check_current()
+    else:
+        selector = None
+    entries_by_result = []
+    for result in consumed:
+        if type(result) is IndexedProseResult:
+            reference = result._check_current(check_sources=False)  # noqa: SLF001 # The shared selector was checked above.
+            entries = result._statement_entries_bound(reference)  # noqa: SLF001 # Materialize each selected statement once.
+        else:
+            entries = statement_entries(result)
+        entries_by_result.append((result, entries))
+    refs = []
+    author = False
+    for result, entries in entries_by_result:
+        for path, statement in entries:
+            if statement.kind == "implementation_claim":
+                if type(result) is IndexedProseResult:
+                    refs.append(
+                        StatementRef(
+                            producer_item_key=result._reference_value[3],  # noqa: SLF001 # Use the immutable scalar selector.
+                            result_digest=result._result_digest_bound(),  # noqa: SLF001 # Use the streamed digest witness.
+                            statement_path=path,
+                            statement_digest=content_digest(
+                                canonical_bytes(statement)
+                            ),
+                        )
+                    )
+                else:
+                    refs.append(statement_reference(result, path))
+            author = author or (
+                statement.kind == "author_motivation"
+                and statement.author_context_digest == author_context_digest
+            )
     return SupportSet(
         basis=tuple(dict.fromkeys(refs)),
         author_context_digest=author_context_digest if author else None,
     )
 
 
+def _current_consumed_support_root(
+    result: ProseResult | IndexedProseResult,
+    sources: PlanningSource,
+    consumed: Mapping[str, ProseResult | IndexedProseResult]
+    | IndexedConsumedProse,
+) -> tuple[
+    ProseResult | IndexedProseResult,
+    IndexedProseResult | None,
+    ResultRef | None,
+]:
+    """Validate source bindings and return one root's selected address.
+
+    Preconditions:
+        Indexed selectors are passed with their exact live source adapter.
+    Postconditions:
+        Expanded roots pass strict model validation; indexed roots and consumed
+        selectors remain bound to the exact accepted current source scope.
+    Essential behavior:
+        No producer result is expanded to establish indexed membership.
+    """
+    indexed_root: IndexedProseResult | None = None
+    root_reference: ResultRef | None = None
+    if type(result) is IndexedProseResult:
+        validated_result = result
+        _require(
+            result._selector._sources is sources,  # noqa: SLF001 # Bind the result to the exact source adapter.
+            "planning_sources_changed",
+        )
+        result._selector._check_bound()  # noqa: SLF001 # Source liveness was checked by the public boundary.
+        root_reference = result._check_current(check_sources=False)  # noqa: SLF001 # Keep the selected result address only.
+        indexed_root = result
+    else:
+        _require(
+            type(result)
+            in {PlanningCardResult, SectionResult, DocumentResult},
+            "invalid_prose_family",
+        )
+        validated_result = type(result).model_validate(result)
+    if type(consumed) is IndexedConsumedProse:
+        _require(
+            consumed._sources is sources,  # noqa: SLF001 # A selector cannot borrow a copied or rebound source adapter.
+            "planning_sources_changed",
+        )
+        consumed._check_bound()  # noqa: SLF001 # Current source authority was checked above.
+    elif isinstance(consumed, Mapping):
+        for producer in consumed.values():
+            if type(producer) is IndexedProseResult:
+                _require(
+                    producer._selector._sources is sources,  # noqa: SLF001 # Keep each mapping-held view in the same source scope.
+                    "planning_sources_changed",
+                )
+                producer._selector._check_bound()  # noqa: SLF001 # Current source authority was checked above.
+    else:
+        _reject("invalid_consumed_prose")
+    return validated_result, indexed_root, root_reference
+
+
 def validate_consumed_support(
-    result: ProseResult,
+    result: ProseResult | IndexedProseResult,
     allowed: SupportSet,
     sources: PlanningSource,
-    consumed: Mapping[str, ProseResult],
+    consumed: Mapping[str, ProseResult | IndexedProseResult]
+    | IndexedConsumedProse,
 ) -> None:
     """Check actual immediate support grants and exact inherited statement endpoints.
 
@@ -2492,12 +3246,22 @@ def validate_consumed_support(
         Every statement support reference is an exact member of those grants
         and resolves to the current source owner or consumed producer.
     Essential behavior:
-        Accepts the shared legacy or indexed planning source adapter.
+        Expanded values keep strict full-model validation. Indexed consumed
+        producers use selected statement views and the existing support rules.
     """
-    result = type(result).model_validate(result)
+    if type(sources) is IndexedPlanningSources:
+        sources.check_current()
     allowed = SupportSet.model_validate(allowed)
     state = _state(sources)
-    for _, statement in statement_entries(result):
+    result, indexed_root, root_reference = _current_consumed_support_root(
+        result, sources, consumed
+    )
+    statement_values = (
+        indexed_root._statement_entries_bound(root_reference)  # noqa: SLF001 # Resolve only selected root statements after liveness checks.
+        if indexed_root is not None and root_reference is not None
+        else statement_entries(result)
+    )
+    for _, statement in statement_values:
         _require(
             set(statement.claims) <= set(allowed.claims)
             and set(statement.citations) <= set(allowed.citations)
@@ -2515,7 +3279,9 @@ def validate_consumed_support(
             if isinstance(ref, SourceSliceRef):
                 validate_source_slice(ref, sources)
             else:
-                validate_statement_reference(ref, consumed)
+                _validate_statement_reference_bound(
+                    ref, consumed, source_checked=True
+                )
         _require(
             all(c in state.claim_records for c in statement.claims)
             and all(
@@ -2526,18 +3292,110 @@ def validate_consumed_support(
 
 
 def validate_support_chains(
-    result: ProseResult,
+    result: ProseResult | IndexedProseResult,
     sources: PlanningSource,
-    producers: Mapping[str, ProseResult],
+    producers: Mapping[str, ProseResult | IndexedProseResult]
+    | IndexedConsumedProse,
 ) -> None:
     """Validate one root through the shared current-source forest boundary."""
     validate_support_forest((result,), sources, producers)
 
 
-def validate_support_forest(
-    results: tuple[ProseResult, ...],
+def _forest_producer_mapping(
+    results: tuple[ProseResult | IndexedProseResult, ...],
     sources: PlanningSource,
-    producers: Mapping[str, ProseResult],
+    producers: Mapping[str, ProseResult | IndexedProseResult]
+    | IndexedConsumedProse,
+) -> Mapping[str, ProseResult | IndexedProseResult]:
+    """Resolve one checked endpoint map for the shared iterative forest walk."""
+    selectors = {
+        id(item._selector): item._selector  # noqa: SLF001 # Gather source-bound root selectors.
+        for item in results
+        if type(item) is IndexedProseResult
+    }
+    if type(producers) is IndexedConsumedProse:
+        selectors[id(producers)] = producers
+        values = {}
+        for reference_index, value in enumerate(
+            producers._reference_values  # noqa: SLF001 # Keep captured order.
+        ):
+            values[value[3]] = IndexedProseResult(
+                producers,
+                value,
+                reference_index,
+                token=_INDEXED_CONSUMED_PROSE_TOKEN,
+            )
+    elif isinstance(producers, Mapping):
+        values = dict(producers)
+        selectors.update(
+            {
+                id(item._selector): item._selector  # noqa: SLF001 # Gather mapping-held indexed selectors.
+                for item in values.values()
+                if type(item) is IndexedProseResult
+            }
+        )
+    else:
+        _reject("invalid_consumed_prose")
+    for selector in selectors.values():
+        _require(
+            selector._sources is sources,  # noqa: SLF001 # Reject copied and cross-scope source bindings.
+            "planning_sources_changed",
+        )
+        selector._check_bound()  # noqa: SLF001 # The forest checked current source authority.
+    return MappingProxyType(values)
+
+
+def _forest_root_statements(
+    results: tuple[ProseResult | IndexedProseResult, ...],
+    sources: PlanningSource,
+) -> tuple[SupportedStatement, ...]:
+    """Validate roots and select their ordered statement values."""
+    statements = []
+    for result in results:
+        if type(result) is IndexedProseResult:
+            _require(
+                result._selector._sources is sources,  # noqa: SLF001 # Keep roots in the exact current source scope.
+                "planning_sources_changed",
+            )
+            reference = result._check_current(check_sources=False)  # noqa: SLF001 # The forest checked source liveness above.
+            entries = result._statement_entries_bound(reference)  # noqa: SLF001 # Select only each root statement.
+        else:
+            _require(
+                type(result)
+                in {PlanningCardResult, SectionResult, DocumentResult},
+                "invalid_prose_family",
+            )
+            validated_result = type(result).model_validate(result)
+            entries = statement_entries(validated_result)
+        statements.extend(statement for _path, statement in entries)
+    return tuple(statements)
+
+
+def _forest_child_statement(
+    reference: StatementRef,
+    producers: Mapping[str, ProseResult | IndexedProseResult],
+) -> SupportedStatement:
+    """Resolve one exact child endpoint through either producer adapter."""
+    producer = producers.get(reference.producer_item_key)
+    _require(producer is not None, "unconsumed_statement_producer")
+    if type(producer) is IndexedProseResult:
+        actual, statement = producer._statement_reference_and_value_bound(  # noqa: SLF001 # Resolve only the selected endpoint.
+            reference.statement_path, check_sources=False
+        )
+        _require(actual == reference, "statement_reference_changed")
+        return statement
+    return _validate_statement_reference_bound(
+        reference,
+        {reference.producer_item_key: producer},
+        source_checked=True,
+    )
+
+
+def validate_support_forest(
+    results: tuple[ProseResult | IndexedProseResult, ...],
+    sources: PlanningSource,
+    producers: Mapping[str, ProseResult | IndexedProseResult]
+    | IndexedConsumedProse,
 ) -> None:
     """Iteratively validate complete inherited chains to valid current endpoints.
 
@@ -2551,27 +3409,17 @@ def validate_support_forest(
         Every inherited implementation endpoint terminates at a valid current
         claim, citation, source slice, or consumed statement.
     Essential behavior:
-        Uses current source membership shared by both source adapters.
+        Uses current source membership shared by both source adapters and one
+        iterative traversal for expanded models and indexed statement views.
     """
     sources.check_current()
-    # The visited set belongs to this immutable endpoint map and this call only.
-    producers = MappingProxyType(dict(producers))
     _require(type(results) is tuple, "invalid_prose_roots")
-    for result in results:
-        _require(
-            type(result)
-            in {PlanningCardResult, SectionResult, DocumentResult},
-            "invalid_prose_family",
-        )
-        type(result).model_validate(result)
+    producers = _forest_producer_mapping(results, sources, producers)
+    root_statements = _forest_root_statements(results, sources)
     state = _state(sources)
     visited: set[StatementRef] = set()
     active: set[StatementRef] = set()
-    pending = [
-        (s, None, False)
-        for result in results
-        for _, s in statement_entries(result)
-    ]
+    pending = [(statement, None, False) for statement in root_statements]
     while pending:
         statement, identity, leaving = pending.pop()
         if leaving:
@@ -2606,5 +3454,5 @@ def validate_support_forest(
                 # in this boundary. Never reuse this set across calls.
                 if ref in visited:
                     continue
-                child = validate_statement_reference(ref, producers)
+                child = _forest_child_statement(ref, producers)
                 pending.append((child, ref, False))

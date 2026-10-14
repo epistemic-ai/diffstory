@@ -7,7 +7,14 @@ import json
 import pickle
 import unittest
 from collections import defaultdict
+from typing import TYPE_CHECKING
 from unittest import mock
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
+    from collections.abc import Mapping
+    from types import FrameType
 
 from test_analysis import snap
 from test_narrative_plan import AFTER
@@ -32,6 +39,7 @@ from diffstory.narrative_contracts import SupportSet
 from diffstory.narrative_hierarchy import IndexedPlanningSources
 from diffstory.narrative_hierarchy import PlanningShape
 from diffstory.narrative_hierarchy import PlanningSources
+from diffstory.narrative_hierarchy import ProseResult
 from diffstory.narrative_hierarchy import _fragment
 from diffstory.narrative_hierarchy import _indexed_field
 from diffstory.narrative_hierarchy import atom_key
@@ -47,6 +55,7 @@ from diffstory.narrative_hierarchy import production_plan_id
 from diffstory.narrative_hierarchy import record_key
 from diffstory.narrative_hierarchy import record_material
 from diffstory.narrative_hierarchy import source_reference
+from diffstory.narrative_hierarchy import statement_entries
 from diffstory.narrative_hierarchy import statement_reference
 from diffstory.narrative_hierarchy import validate_consumed_support
 from diffstory.narrative_hierarchy import validate_production_plan
@@ -1751,6 +1760,919 @@ class SupportTests(unittest.TestCase):
                 validate_support_forest(tuple(roots), self.sources, producers)
         finally:
             object.__setattr__(span, "text", original)
+
+
+class IndexedConsumedProseTests(unittest.TestCase):
+    """Compare selected arena prose with strict expanded support and wire APIs."""
+
+    def setUp(self) -> None:
+        """Capture current details in the same arena used by prose results."""
+        from diffstory.narrative_plan import (
+            _capture_indexed_arena_detail_results,
+        )
+        from diffstory.report_storage import _RecordArena
+
+        self.ledger = build_evidence_ledger(golden_report(1))
+        self.index = build_ledger_index(self.ledger)
+        details = tuple(
+            authored_result(unit) for unit in self.index.units.values()
+        )
+        self.arena = _RecordArena()
+        detail_references = tuple(
+            self.arena.put_result(detail) for detail in details
+        )
+        context = _capture_indexed_arena_detail_results(
+            detail_references,
+            self.arena,
+            self.ledger,
+            index=self.index,
+        )
+        self.sources = derive_planning_sources_indexed(
+            self.index, context, author_context=AuthorContext()
+        )
+        self.claim = next(iter(self.sources._source_state.claim_records))  # noqa: SLF001 # Use one current accepted detail observation.
+        self.span = source_reference(
+            self.sources,
+            next(
+                record_material(self.sources, key).owner
+                for key in self.sources.record_keys
+                if record_material(self.sources, key).owner.kind == "source"
+            ),
+        )
+
+    def _statements(self) -> tuple[SupportedStatement, ...]:
+        """Return one valid statement of each supported provenance kind."""
+        return (
+            SupportedStatement(
+                kind="implementation_claim",
+                text="A current observation supports this implementation claim.",
+                claims=(self.claim,),
+                citations=(self.span,),
+            ),
+            SupportedStatement(
+                kind="author_motivation",
+                text="The author supplied this motivation.",
+                author_context_digest=self.sources.author_digest,
+            ),
+            SupportedStatement(
+                kind="editorial", text="Editorial context only."
+            ),
+            SupportedStatement(
+                kind="uncertainty", text="The result remains uncertain."
+            ),
+        )
+
+    def _result(
+        self, family: str, *, include_terms: bool = True
+    ) -> ProseResult:
+        """Build one strict result with every field for its prose family."""
+        from diffstory.narrative_contracts import DocumentResult
+        from diffstory.narrative_contracts import PlanningCardResult
+        from diffstory.narrative_contracts import SectionResult
+        from diffstory.narrative_contracts import SupportedTerminology
+
+        subject = semantic_digest(
+            "indexed prose subject", family, include_terms
+        )
+        plan_key = (
+            subject
+            if family == "document"
+            else semantic_digest("indexed prose plan", family)
+        )
+        binding = ProseBinding(
+            kind=family,
+            subject_key=subject,
+            plan_key=plan_key,
+            context_digest=semantic_digest(
+                "indexed prose context", family, include_terms
+            ),
+        )
+        statements = self._statements()
+        terminology = (
+            (
+                SupportedTerminology(
+                    term="fixture term", definition=statements[0]
+                ),
+            )
+            if include_terms
+            else ()
+        )
+        common = {
+            "item_key": binding.key,
+            "binding": binding,
+            "terminology": terminology,
+        }
+        if family == "planning_card":
+            return PlanningCardResult(**common, abstraction=statements)
+        if family == "section":
+            return SectionResult(
+                **common,
+                title=statements[0],
+                orientation=statements,
+                synthesis=(statements[2], statements[3]),
+                transition=(statements[1],),
+            )
+        if family == "document":
+            return DocumentResult(
+                **common,
+                preamble=(statements[0],),
+                lead=(statements[1], statements[2]),
+                closing=(statements[3],),
+            )
+        raise AssertionError(family)
+
+    def test_indexed_prose_and_wire_match_all_expanded_families(self) -> None:
+        """Selected fields could change order, defaults, digests, or aliases.
+
+        Input/expected case matrix:
+            planning card: abstraction and terminology definitions.
+            section: title, orientation, synthesis, transition, and terms.
+            document: preamble, lead, closing, and terms.
+            default row: omitted terminology expands to the same empty tuple.
+
+        Preconditions:
+            Each expanded result is strictly valid and its detail source is live.
+        Postconditions:
+            Selected statement entries, reference digests, wire dictionaries,
+            and enclosing request bytes exactly match expanded values.
+        """
+        from diffstory.narrative_hierarchy import (
+            capture_indexed_consumed_prose,
+        )
+        from diffstory.narrative_hierarchy import statement_entries
+        from diffstory.narrative_wire import WireAdapter
+
+        cases = tuple(
+            (family, self._result(family))
+            for family in ("planning_card", "section", "document")
+        )
+        cases += (
+            (
+                "default-row",
+                self._result("planning_card", include_terms=False),
+            ),
+        )
+        for name, expanded in cases:
+            with self.subTest(family=name):
+                reference = self.arena.put_result(expanded)
+                selector = capture_indexed_consumed_prose(
+                    self.arena._snapshot_reader(),  # noqa: SLF001 # The accepted arena owns the selected result.
+                    (reference,),
+                    self.sources,
+                )
+                from diffstory.narrative_wire import ProseContext
+
+                context = ProseContext(
+                    binding=expanded.binding,
+                    claims=(),
+                    citations=(),
+                    author_digest=self.sources.author_digest,
+                    consumed=selector,
+                    sources=self.sources,
+                )
+                self.assertIs(context.consumed, selector)
+                indexed = selector.select(expanded.item_key)
+                expected_entries = statement_entries(expanded)
+                self.assertEqual(indexed.statement_entries(), expected_entries)
+                self.assertEqual(
+                    indexed.result_digest,
+                    content_digest(canonical_bytes(expanded)),
+                )
+                expected_refs = tuple(
+                    statement_reference(expanded, path)
+                    for path, statement in expected_entries
+                    if statement.kind == "implementation_claim"
+                )
+                actual_refs = tuple(
+                    statement_reference(indexed, path)
+                    for path, statement in indexed.statement_entries()
+                    if statement.kind == "implementation_claim"
+                )
+                self.assertEqual(actual_refs, expected_refs)
+                expanded_input = WireAdapter(self.index).prose_input(expanded)
+                indexed_input = WireAdapter(self.index).prose_input(indexed)
+                self.assertEqual(
+                    canonical_bytes(indexed_input),
+                    canonical_bytes(expanded_input),
+                )
+                expanded_request = canonical_bytes(
+                    {"version": "fixture.request.v1", "data": expanded_input}
+                )
+                indexed_request = canonical_bytes(
+                    {"version": "fixture.request.v1", "data": indexed_input}
+                )
+                self.assertEqual(indexed_request, expanded_request)
+
+    def test_indexed_support_reuses_shared_membership_and_forest_rules(
+        self,
+    ) -> None:
+        """Indexed support could grant an unconsumed or stale child statement.
+
+        Input/expected case matrix:
+            exact child: inherited grant, author forwarding, and endpoint pass.
+            changed author digest: attribution is not forwarded or accepted.
+            changed result digest: reference validation rejects the mutation.
+            changed statement digest: reference validation rejects the mutation.
+            changed item key or path: lookup or path binding rejects the mutation.
+            changed current source: the original ledger guard rejects the scope.
+        """
+        from diffstory.narrative_hierarchy import (
+            capture_indexed_consumed_prose,
+        )
+        from diffstory.narrative_hierarchy import validate_consumed_support
+        from diffstory.narrative_hierarchy import validate_statement_reference
+        from diffstory.narrative_hierarchy import validate_support_forest
+
+        child = self._result("planning_card")
+        child_ref = self.arena.put_result(child)
+        child_selector = capture_indexed_consumed_prose(
+            self.arena._snapshot_reader(),  # noqa: SLF001 # Snapshot the accepted consumed child.
+            (child_ref,),
+            self.sources,
+        )
+        child_view = child_selector.select(child.item_key)
+        path = StatementPath(field="abstraction", index=0)
+        child_statement_ref = statement_reference(child_view, path)
+        self.assertEqual(
+            child_statement_ref,
+            statement_reference(child, path),
+        )
+        forwarded = inherited_support(
+            (child_view,), author_context_digest=self.sources.author_digest
+        )
+        self.assertEqual(
+            forwarded,
+            inherited_support(
+                (child,), author_context_digest=self.sources.author_digest
+            ),
+        )
+        expected_forwarded = tuple(
+            statement_reference(child, child_path)
+            for child_path, statement in statement_entries(child)
+            if statement.kind == "implementation_claim"
+        )
+        self.assertEqual(forwarded.basis, expected_forwarded)
+        self.assertEqual(
+            forwarded.author_context_digest, self.sources.author_digest
+        )
+        self.assertIsNone(
+            inherited_support(
+                (child_view,), author_context_digest="f" * 64
+            ).author_context_digest
+        )
+        parent_statement = SupportedStatement(
+            kind="implementation_claim",
+            text="The exact consumed child supports this result.",
+            basis=(child_statement_ref,),
+        )
+        parent = prose(semantic_digest("indexed parent"), parent_statement)
+        parent_ref = self.arena.put_result(parent)
+        references = (child_ref, parent_ref)
+        selector = capture_indexed_consumed_prose(
+            self.arena._snapshot_reader(),  # noqa: SLF001 # Capture the full immediate producer set.
+            references,
+            self.sources,
+        )
+        parent_view = selector.select(parent.item_key)
+        validate_consumed_support(
+            parent_view, forwarded, self.sources, selector
+        )
+        validate_support_forest((parent_view,), self.sources, selector)
+
+        bad_refs = (
+            (
+                "result digest",
+                child_statement_ref.model_copy(
+                    update={"result_digest": "f" * 64}
+                ),
+                "statement_reference_changed",
+            ),
+            (
+                "statement digest",
+                child_statement_ref.model_copy(
+                    update={"statement_digest": "e" * 64}
+                ),
+                "statement_reference_changed",
+            ),
+            (
+                "item key",
+                child_statement_ref.model_copy(
+                    update={"producer_item_key": "d" * 64}
+                ),
+                "unconsumed_statement_producer",
+            ),
+            (
+                "path index",
+                child_statement_ref.model_copy(
+                    update={
+                        "statement_path": StatementPath(
+                            field="abstraction", index=99
+                        )
+                    }
+                ),
+                "invalid_statement_path",
+            ),
+            (
+                "cross-family path",
+                child_statement_ref.model_copy(
+                    update={"statement_path": StatementPath(field="lead")}
+                ),
+                "invalid_statement_path",
+            ),
+        )
+        for name, bad_ref, reason in bad_refs:
+            with (
+                self.subTest(mutation=name),
+                self.assertRaisesRegex(ValueError, reason),
+            ):
+                validate_statement_reference(bad_ref, selector)
+        empty_reader = self.arena._snapshot_reader()  # noqa: SLF001 # Use the existing arena snapshot with an empty selected set.
+        empty = capture_indexed_consumed_prose(empty_reader, (), self.sources)
+        with self.assertRaisesRegex(
+            ValueError, "unconsumed_statement_producer"
+        ):
+            validate_statement_reference(child_statement_ref, empty)
+
+        author_result = prose(
+            semantic_digest("indexed author root"),
+            SupportedStatement(
+                kind="author_motivation",
+                text="The current author context supplied this statement.",
+                author_context_digest=self.sources.author_digest,
+            ),
+        )
+        author_reference = self.arena.put_result(author_result)
+        author_selector = capture_indexed_consumed_prose(
+            self.arena._snapshot_reader(),  # noqa: SLF001 # Capture one author-context statement.
+            (author_reference,),
+            self.sources,
+        )
+        for author_digest in (None, "f" * 64):
+            with (
+                self.subTest(author_digest=author_digest),
+                self.assertRaisesRegex(
+                    ValueError, "unconsumed_author_context"
+                ),
+            ):
+                validate_consumed_support(
+                    author_selector.select(author_result.item_key),
+                    SupportSet(author_context_digest=author_digest),
+                    self.sources,
+                    author_selector,
+                )
+
+        span = next(iter(self.sources._source_state.index.spans.values()))  # noqa: SLF001 # Mutate only a synthetic in-memory ledger row.
+        original = span.text
+        object.__setattr__(span, "text", "changed indexed source")
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                selector.check_current()
+        finally:
+            object.__setattr__(span, "text", original)
+
+    def test_indexed_support_preserves_slice_and_scope_boundaries(
+        self,
+    ) -> None:
+        """A source slice could accidentally grant its whole source or stale text.
+
+        Input/expected case matrix:
+            exact source slice: accepted as one basis grant.
+            whole span from slice-only grant: rejected as unconsumed support.
+            changed slice digest: rejected by current source validation.
+            closed source scope: rejected before selected records are used.
+        """
+        from diffstory.narrative_hierarchy import _fragment
+        from diffstory.narrative_hierarchy import (
+            capture_indexed_consumed_prose,
+        )
+        from diffstory.narrative_hierarchy import material_support
+        from diffstory.narrative_hierarchy import validate_consumed_support
+
+        source_key = next(
+            key
+            for key in self.sources.record_keys
+            if record_material(self.sources, key).owner.kind == "source"
+        )
+        material = record_material(self.sources, source_key)
+        field = next(
+            value for value in material.fields if value.path == "text"
+        )
+        fragment = _fragment(material.owner, field, 0, 1)
+        allowed = material_support(self.sources, fragments=(fragment,))
+        indexed = SupportedStatement(
+            kind="implementation_claim",
+            text="One supplied source byte supports this statement.",
+            basis=allowed.basis,
+        )
+        result = prose(semantic_digest("indexed slice root"), indexed)
+        result_ref = self.arena.put_result(result)
+        selector = capture_indexed_consumed_prose(
+            self.arena._snapshot_reader(),  # noqa: SLF001 # Capture one root address.
+            (result_ref,),
+            self.sources,
+        )
+        validate_consumed_support(
+            selector.select(result.item_key), allowed, self.sources, selector
+        )
+
+        whole = prose(
+            semantic_digest("indexed whole span root"),
+            SupportedStatement(
+                kind="implementation_claim",
+                text="A slice cannot grant the full source span.",
+                citations=(self.span,),
+            ),
+        )
+        whole_ref = self.arena.put_result(whole)
+        whole_selector = capture_indexed_consumed_prose(
+            self.arena._snapshot_reader(),  # noqa: SLF001 # Capture the changed root.
+            (whole_ref,),
+            self.sources,
+        )
+        with self.assertRaisesRegex(ValueError, "unconsumed_support"):
+            validate_consumed_support(
+                whole_selector.select(whole.item_key),
+                allowed,
+                self.sources,
+                whole_selector,
+            )
+
+        changed = allowed.basis[0].model_copy(
+            update={"content_digest": "f" * 64}
+        )
+        changed_allowed = SupportSet(basis=(changed,))
+        bad_slice_result = prose(
+            semantic_digest("indexed bad slice root"),
+            SupportedStatement(
+                kind="implementation_claim",
+                text="A changed slice digest is not current.",
+                basis=(changed,),
+            ),
+        )
+        bad_slice_reference = self.arena.put_result(bad_slice_result)
+        bad_slice_selector = capture_indexed_consumed_prose(
+            self.arena._snapshot_reader(),  # noqa: SLF001 # Capture the forged slice result.
+            (bad_slice_reference,),
+            self.sources,
+        )
+        with self.assertRaisesRegex(ValueError, "source_slice_digest"):
+            validate_consumed_support(
+                bad_slice_selector.select(bad_slice_result.item_key),
+                changed_allowed,
+                self.sources,
+                bad_slice_selector,
+            )
+        source_state = self.sources._source_state  # noqa: SLF001 # Close the exact captured source scope.
+        context_scope = source_state.details_context.citation_scope
+        context_scope.close()
+        with self.assertRaises(ValueError):
+            selector.select(result.item_key)
+
+    def test_indexed_adapters_materialize_only_selected_records(  # noqa: PLR0915
+        self,
+    ) -> None:
+        """Indexed support could hide full result expansion behind a new wrapper.
+
+        Input/expected case matrix:
+            three prose families: their complete model constructors stay unused.
+            support traversal: only selected statements and logical byte streams run.
+            wire serialization: exact expanded bytes survive without result views.
+
+        Preconditions:
+            Results are captured in the owned arena before full expansion is
+            patched to fail. Current detail sources remain live.
+        Postconditions:
+            No full producer model, expanded tree, or complete result accessor
+            is used; retained selector state contains references and digests only.
+        """
+        import sys
+        import tracemalloc
+        from collections import Counter
+        from unittest.mock import patch
+
+        from diffstory.narrative_contracts import DocumentResult
+        from diffstory.narrative_contracts import PlanningCardResult
+        from diffstory.narrative_contracts import SectionResult
+        from diffstory.narrative_hierarchy import (
+            capture_indexed_consumed_prose,
+        )
+        from diffstory.narrative_hierarchy import validate_support_forest
+        from diffstory.narrative_wire import WireAdapter
+        from diffstory.report_storage import ResultRef
+        from diffstory.report_storage import _ArenaRecordReader
+
+        results = (
+            self._result("planning_card"),
+            self._result("section"),
+            self._result("document"),
+        )
+        references = tuple(self.arena.put_result(result) for result in results)
+        counts: Counter[str] = Counter()
+        original_chunks = _ArenaRecordReader.logical_chunks
+        original_paths = _ArenaRecordReader.statement_paths
+        original_statement = _ArenaRecordReader.statement_view
+
+        def count_chunks(
+            reader: _ArenaRecordReader, reference: ResultRef
+        ) -> Iterator[bytes]:
+            counts["logical_chunks"] += 1
+            yield from original_chunks(reader, reference)
+
+        def count_paths(
+            reader: _ArenaRecordReader, reference: ResultRef
+        ) -> tuple[StatementPath, ...]:
+            counts["statement_paths"] += 1
+            return original_paths(reader, reference)
+
+        def count_statement(
+            reader: _ArenaRecordReader,
+            reference: ResultRef,
+            path: StatementPath,
+        ) -> Mapping[str, object]:
+            counts["statement_views"] += 1
+            return original_statement(reader, reference, path)
+
+        def count_nested_validation(
+            frame: FrameType, event: str, _arg: object
+        ) -> None:
+            if (
+                event == "call"
+                and frame.f_code.co_name == "support"
+                and type(frame.f_locals.get("self")) is SupportedStatement
+            ):
+                counts["supported_statement_validators"] += 1
+
+        previous_profiler = sys.getprofile()
+        tracemalloc.start()
+        sys.setprofile(count_nested_validation)
+        try:
+            with (
+                patch.object(
+                    _ArenaRecordReader, "logical_chunks", count_chunks
+                ),
+                patch.object(
+                    _ArenaRecordReader, "statement_paths", count_paths
+                ),
+                patch.object(
+                    _ArenaRecordReader, "statement_view", count_statement
+                ),
+                patch.object(
+                    _ArenaRecordReader,
+                    "result_record",
+                    side_effect=AssertionError("expanded one complete result"),
+                ),
+                patch.object(
+                    _ArenaRecordReader,
+                    "result_view",
+                    side_effect=AssertionError(
+                        "projected one complete result"
+                    ),
+                ),
+                patch(
+                    "diffstory.report_storage.expand_report_storage",
+                    side_effect=AssertionError("expanded report storage"),
+                ),
+                patch(
+                    "diffstory.narrative_plan.build_ledger_index",
+                    side_effect=AssertionError("rebuilt the ledger index"),
+                ),
+                patch.object(
+                    PlanningCardResult,
+                    "model_validate",
+                    side_effect=AssertionError(
+                        "constructed full planning result"
+                    ),
+                ),
+                patch.object(
+                    SectionResult,
+                    "model_validate",
+                    side_effect=AssertionError(
+                        "constructed full section result"
+                    ),
+                ),
+                patch.object(
+                    DocumentResult,
+                    "model_validate",
+                    side_effect=AssertionError(
+                        "constructed full document result"
+                    ),
+                ),
+            ):
+                reader = self.arena._snapshot_reader()  # noqa: SLF001 # Snapshot selected rows after capture.
+                selector = capture_indexed_consumed_prose(
+                    reader, references, self.sources
+                )
+                indexed_results = tuple(
+                    selector.select(result.item_key) for result in results
+                )
+                forwarded = inherited_support(
+                    indexed_results,
+                    author_context_digest=self.sources.author_digest,
+                )
+                expected_count = sum(
+                    statement.kind == "implementation_claim"
+                    for result in results
+                    for _path, statement in statement_entries(result)
+                )
+                self.assertEqual(len(forwarded.basis), expected_count)
+                for result in indexed_results:
+                    WireAdapter(self.index).prose_input(result)
+                validate_support_forest(
+                    indexed_results, self.sources, selector
+                )
+        finally:
+            sys.setprofile(previous_profiler)
+            _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+        self.assertEqual(counts["logical_chunks"], len(references))
+        self.assertGreater(counts["statement_paths"], 0)
+        self.assertGreater(counts["statement_views"], 0)
+        self.assertEqual(
+            counts["supported_statement_validators"],
+            counts["statement_views"],
+        )
+        self.assertGreater(peak_bytes, 0)
+        self.assertEqual(self.arena._builder.typed_results, {})  # noqa: SLF001 # The arena retains no producer models.
+        self.assertEqual(self.arena._builder.address_contents, {})  # noqa: SLF001 # The arena retains no duplicate canonical buffers.
+        self.assertEqual(
+            selector.item_keys, tuple(result.item_key for result in results)
+        )
+        self.assertEqual(len(selector._result_digests), len(references))  # noqa: SLF001 # Only one small digest survives per selected result.
+
+    def test_indexed_selected_work_ignores_unrelated_producer_count(
+        self,
+    ) -> None:
+        """Unrelated retained producers could amplify selected support checks.
+
+        Input/expected case matrix:
+            one retained producer: 2 forwarded statements, 7 record checks,
+                1 fingerprint, and 5 validators.
+            twenty retained producers: the same selected output and work counts.
+
+        Preconditions:
+            Every producer is captured before instrumentation and the selected
+            planning-card result has four abstraction statements and one term.
+        Postconditions:
+            ``inherited_support`` performs the same selected work as unrelated
+            retained producer rows grow from one to twenty.
+        """
+        import sys
+        from collections import Counter
+
+        from diffstory.narrative_hierarchy import _IndexedSourceState
+        from diffstory.narrative_hierarchy import (
+            capture_indexed_consumed_prose,
+        )
+        from diffstory.report_storage import ResultRef
+        from diffstory.report_storage import _ArenaRecordReader
+
+        cases = (
+            ("one producer", 1, (7, 1, 5)),
+            ("twenty producers", 20, (7, 1, 5)),
+        )
+        measurements = []
+        for name, producer_count, expected_counts in cases:
+            with self.subTest(case=name):
+                first = self._result("planning_card")
+                references = [self.arena.put_result(first)]
+                references.extend(
+                    self.arena.put_result(
+                        prose(
+                            semantic_digest("extra owned producer", index),
+                            first.abstraction[0],
+                        )
+                    )
+                    for index in range(producer_count - 1)
+                )
+                selector = capture_indexed_consumed_prose(
+                    self.arena._snapshot_reader(),  # noqa: SLF001 # Capture before instrumentation.
+                    tuple(references),
+                    self.sources,
+                )
+                selected = selector.select(first.item_key)
+                counts: Counter[str] = Counter()
+                original_stored_result = _ArenaRecordReader._stored_result  # noqa: SLF001 # Count the selected resolver boundary.
+                original_fingerprint = (
+                    _IndexedSourceState.current_metadata_fingerprint
+                )
+
+                def count_stored_result(
+                    reader: _ArenaRecordReader,
+                    reference: ResultRef,
+                    *,
+                    counters: Counter[str] = counts,
+                    original: Callable[
+                        [_ArenaRecordReader, ResultRef], Mapping[str, object]
+                    ] = original_stored_result,
+                ) -> Mapping[str, object]:
+                    counters["record_binding_checks"] += 1
+                    return original(reader, reference)
+
+                def count_fingerprint(
+                    state: _IndexedSourceState,
+                    *,
+                    counters: Counter[str] = counts,
+                    original: Callable[
+                        [_IndexedSourceState], str
+                    ] = original_fingerprint,
+                ) -> str:
+                    counters["metadata_fingerprints"] += 1
+                    return original(state)
+
+                def count_nested_validation(
+                    frame: FrameType,
+                    event: str,
+                    _arg: object,
+                    *,
+                    counters: Counter[str] = counts,
+                ) -> None:
+                    if (
+                        event == "call"
+                        and frame.f_code.co_name == "support"
+                        and type(frame.f_locals.get("self"))
+                        is SupportedStatement
+                    ):
+                        counters["supported_statement_validators"] += 1
+
+                previous_profiler = sys.getprofile()
+                sys.setprofile(count_nested_validation)
+                try:
+                    with (
+                        mock.patch.object(
+                            _ArenaRecordReader,
+                            "_stored_result",
+                            new=count_stored_result,
+                        ),
+                        mock.patch.object(
+                            _IndexedSourceState,
+                            "current_metadata_fingerprint",
+                            new=count_fingerprint,
+                        ),
+                    ):
+                        forwarded = inherited_support(
+                            (selected,),
+                            author_context_digest=self.sources.author_digest,
+                        )
+                finally:
+                    sys.setprofile(previous_profiler)
+
+                self.assertEqual(len(forwarded.basis), 2)
+                actual_counts = (
+                    counts["record_binding_checks"],
+                    counts["metadata_fingerprints"],
+                    counts["supported_statement_validators"],
+                )
+                self.assertEqual(actual_counts, expected_counts)
+                measurements.append(actual_counts)
+
+        self.assertEqual(measurements[0], measurements[1])
+
+    def test_indexed_selector_rejects_same_content_tuple_rebindings(
+        self,
+    ) -> None:
+        """Same-content tuple replacement could borrow an earlier binding.
+
+        Input/expected case matrix:
+            reference tuple replacement: selector binding rejects the change.
+            digest tuple replacement: selector binding rejects the change.
+            selected row replacement: the indexed result rejects the change.
+
+        Preconditions:
+            Each selector and selected result is captured in a live source scope.
+        Postconditions:
+            Equal tuple contents do not preserve authority after rebinding.
+        """
+        from diffstory.narrative_hierarchy import (
+            capture_indexed_consumed_prose,
+        )
+
+        result = self._result("planning_card")
+        reference = self.arena.put_result(result)
+        cases = (
+            ("references", "indexed_consumed_prose_changed"),
+            ("digests", "indexed_consumed_prose_changed"),
+            ("selected row", "indexed_prose_result_changed"),
+        )
+        for field, expected_error in cases:
+            with self.subTest(field=field):
+                selector = capture_indexed_consumed_prose(
+                    self.arena._snapshot_reader(),  # noqa: SLF001 # Capture each isolated mutation case.
+                    (reference,),
+                    self.sources,
+                )
+                selected = selector.select(result.item_key)
+                if field == "references":
+                    object.__setattr__(
+                        selector,
+                        "_reference_values",
+                        tuple(value for value in selector._reference_values),  # noqa: SLF001 # Rebind to an equal, distinct tuple.
+                    )
+                elif field == "digests":
+                    object.__setattr__(
+                        selector,
+                        "_result_digests",
+                        tuple(value for value in selector._result_digests),  # noqa: SLF001 # Rebind to an equal, distinct tuple.
+                    )
+                else:
+                    object.__setattr__(
+                        selected,
+                        "_reference_value",
+                        tuple(value for value in selected._reference_value),  # noqa: SLF001 # Rebind the selected row with equal strings.
+                    )
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    if field == "selected row":
+                        self.assertEqual(selected.reference, reference)
+                    else:
+                        selector.check_current()
+
+    def test_indexed_context_rejects_copy_rebind_and_raw_mutation(
+        self,
+    ) -> None:
+        """A copied selector could borrow another arena or stale source scope.
+
+        Input/expected case matrix:
+            copied/pickled selector: rejected at the public Python boundary.
+            replaced reader or result order: rejected by captured identity witness.
+            rebound source adapter: rejected by existing citation-scope registration.
+            changed owner scalar: rejected by the type-preserving metadata witness.
+            selected model mutation: detached and absent from later projections.
+        """
+        import copy
+        import pickle
+
+        from diffstory.narrative_hierarchy import (
+            capture_indexed_consumed_prose,
+        )
+
+        result = self._result("planning_card")
+        reference = self.arena.put_result(result)
+        reader = self.arena._snapshot_reader()  # noqa: SLF001 # Inspect one immutable arena snapshot.
+        selector = capture_indexed_consumed_prose(
+            reader, (reference,), self.sources
+        )
+        indexed = selector.select(result.item_key)
+        path = StatementPath(field="abstraction", index=0)
+        selected = indexed.statement_at(path)
+        original_text = selected.text
+        object.__setattr__(selected, "text", "detached caller mutation")
+        self.assertEqual(indexed.statement_at(path).text, original_text)
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+            with (
+                self.subTest(operation=operation.__name__),
+                self.assertRaises(TypeError),
+            ):
+                operation(selector)
+
+        changed_order = capture_indexed_consumed_prose(
+            reader, (reference,), self.sources
+        )
+        object.__setattr__(changed_order, "_reference_values", ())
+        with self.assertRaisesRegex(
+            ValueError, "indexed_consumed_prose_changed"
+        ):
+            changed_order.check_current()
+
+        other_arena_reader = self.arena._snapshot_reader()  # noqa: SLF001 # Same arena indexes can still be rebound without permission.
+        rebound_reader = capture_indexed_consumed_prose(
+            other_arena_reader, (reference,), self.sources
+        )
+        other_arena = type(self.arena)()
+        foreign_reader = other_arena._snapshot_reader()  # noqa: SLF001 # Use a different arena identity.
+        object.__setattr__(rebound_reader, "_reader", foreign_reader)
+        with self.assertRaisesRegex(
+            ValueError, "indexed_consumed_arena_mismatch"
+        ):
+            rebound_reader.check_current()
+
+        other_ledger, other_index, other_details, _unused = fixture()
+        other_context = capture_indexed_detail_results(
+            other_details, other_ledger, index=other_index
+        )
+        other_sources = derive_planning_sources_indexed(
+            other_index, other_context, author_context=AuthorContext()
+        )
+        object.__setattr__(selector, "_sources", other_sources)
+        with self.assertRaises(ValueError):
+            selector.check_current()
+        object.__setattr__(selector, "_sources", self.sources)
+
+        state = self.sources._source_state  # noqa: SLF001 # Mutate one retained owner with an uncoerced scalar.
+        owner_key = next(
+            key
+            for key, owner in state.record_owners.items()
+            if owner.kind == "detail"
+        )
+        owner = state.record_owners[owner_key]
+        original_kind = owner.record_kind
+        object.__setattr__(owner, "record_kind", 1)
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "planning_sources_changed"
+            ):
+                selector.check_current()
+        finally:
+            object.__setattr__(owner, "record_kind", original_kind)
 
 
 if __name__ == "__main__":
