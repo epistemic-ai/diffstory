@@ -40,6 +40,7 @@ from .narrative_contracts import result_key
 from .narrative_contracts import result_kind
 from .narrative_plan import _OwnedList
 from .narrative_plan import _OwnedMapping
+from .narrative_plan import _OwnedTuple
 from .narrative_plan import _thaw_owned
 from .narrative_plan import canonical_bytes
 from .narrative_plan import content_digest
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
 
     from .narrative_contracts import EvidenceLedger
     from .narrative_hierarchy import IndexedPlanningSources
+    from .narrative_hierarchy import IndexedProseResult
     from .narrative_plan import IndexedDetailContext
     from .narrative_plan import LedgerIndex
     from .narrative_protocol import V2Options
@@ -501,8 +503,10 @@ class GenerationManifest(Contract):
         )
 
 
-def validate_prose_support(
-    result: NarrativeResult, context: ProseContext, wire: WireAdapter
+def validate_prose_support(  # noqa: C901 # Keep the existing current prose predicates in one shared validation path.
+    result: NarrativeResult | IndexedProseResult,
+    context: ProseContext,
+    wire: WireAdapter,
 ) -> None:
     """Check binding and exact allowed support from a trusted current context.
 
@@ -517,8 +521,13 @@ def validate_prose_support(
         if not condition:
             raise ArtifactRuntimeError(reason)
 
-    require(result.binding == context.binding, "dependencies_changed")
-    require(result.item_key == context.binding.key, "dependencies_changed")
+    from .narrative_hierarchy import IndexedProseResult
+
+    indexed = type(result) is IndexedProseResult
+    binding = result.binding
+    require(binding == context.binding, "dependencies_changed")
+    item_key = result.item_key
+    require(item_key == context.binding.key, "dependencies_changed")
     if context.sources is not None:
         try:
             validate_consumed_support(
@@ -529,20 +538,25 @@ def validate_prose_support(
             raise ArtifactRuntimeError(msg) from None
     allowed_claims = frozenset(context.claims)
     allowed_citations = frozenset(context.citations)
-    values = [term.definition for term in result.terminology]
-    for name in (
-        "abstraction",
-        "title",
-        "orientation",
-        "synthesis",
-        "transition",
-        "preamble",
-        "lead",
-        "closing",
-    ):
-        if hasattr(result, name):
-            field = getattr(result, name)
-            values.extend((field,) if name == "title" else field)
+    indexed_entries = ()
+    if indexed:
+        indexed_entries = result.statement_entries()
+        values = [statement for _path, statement in indexed_entries]
+    else:
+        values = [term.definition for term in result.terminology]
+        for name in (
+            "abstraction",
+            "title",
+            "orientation",
+            "synthesis",
+            "transition",
+            "preamble",
+            "lead",
+            "closing",
+        ):
+            if hasattr(result, name):
+                field = getattr(result, name)
+                values.extend((field,) if name == "title" else field)
     for statement in values:
         require(set(statement.claims) <= allowed_claims)
         require(set(statement.citations) <= allowed_citations)
@@ -555,8 +569,16 @@ def validate_prose_support(
                 else None
             )
         )
-    if isinstance(result, SectionResult) and context.final:
-        require(result.transition == (), "coverage")
+    if context.final:
+        if indexed and result.kind == "section":
+            require(
+                not any(
+                    path.field == "transition" for path, _ in indexed_entries
+                ),
+                "coverage",
+            )
+        elif isinstance(result, SectionResult):
+            require(result.transition == (), "coverage")
     require(
         len(canonical_bytes(wire.prose_input(result)))
         <= context.max_wire_bytes,
@@ -808,13 +830,14 @@ def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed fam
     }
 
 
-def _indexed_assembly_bindings(
-    report: dict,
+def _indexed_assembly_bindings(  # noqa: PLR0913 # Keep exact capture ownership inputs explicit at this private boundary.
+    report: dict | _OwnedMapping,
     generation: GenerationRecordSet,
     *,
     arena: _RecordArena,
     details: IndexedDetailContext,
     sources: IndexedPlanningSources,
+    captured_input: object | None = None,
 ) -> tuple[object, object]:
     """Check one live arena/source binding before selected indexed work.
 
@@ -835,7 +858,22 @@ def _indexed_assembly_bindings(
     from .report_storage import GenerationRecordSet
     from .report_storage import _RecordArena
 
-    _require(type(report) is dict, "invalid_report_shape")
+    if type(report) is dict:
+        pass
+    elif type(report) is _OwnedMapping:
+        owns_report = getattr(captured_input, "owns_report_view", None)
+        assert_current = getattr(
+            captured_input, "assert_capture_current", None
+        )
+        _require(
+            callable(owns_report)
+            and owns_report(report)
+            and callable(assert_current),
+            "invalid_report_shape",
+        )
+        assert_current()
+    else:
+        _require(False, "invalid_report_shape")  # noqa: FBT003 # Deliberate stable failure branch.
     _require(
         type(generation) is GenerationRecordSet,
         "invalid_generation_record_set",
@@ -863,7 +901,7 @@ def _indexed_assembly_bindings(
     header = generation.header
     _require(ledger.id == header.get("ledger_digest"), "ledger_changed")
     meta = report.get("meta")
-    _require(type(meta) is dict, "invalid_report_metadata")
+    _require(type(meta) in {dict, _OwnedMapping}, "invalid_report_metadata")
     revisions = (meta.get("base_sha"), meta.get("head_sha"))
     _require(
         revisions == state.revision_binding,
@@ -897,13 +935,14 @@ def _indexed_assembly_bindings(
     return state, reader
 
 
-def assemble_indexed_reader(  # noqa: C901, PLR0912, PLR0915 # Keep one checked pass over selected assembly records.
-    report: dict,
+def assemble_indexed_reader(  # noqa: C901, PLR0912, PLR0913, PLR0915 # Keep one checked pass over selected assembly records.
+    report: dict | _OwnedMapping,
     generation: GenerationRecordSet,
     *,
     arena: _RecordArena,
     details: IndexedDetailContext,
     sources: IndexedPlanningSources,
+    captured_input: object | None = None,
 ) -> IndexedReaderProjection:
     """Assemble ordered annotation references from accepted arena records.
 
@@ -943,6 +982,7 @@ def assemble_indexed_reader(  # noqa: C901, PLR0912, PLR0915 # Keep one checked 
         arena=arena,
         details=details,
         sources=sources,
+        captured_input=captured_input,
     )
     plan_facts = arena.plan_assembly_facts(generation.plan_ref)
     plan_id = plan_facts.get("id")
@@ -1213,7 +1253,7 @@ def assemble_indexed_reader(  # noqa: C901, PLR0912, PLR0915 # Keep one checked 
     fragment_texts = {
         fragment["key"]: fragment["text"]
         for fragment in report["source_evidence"]["fragments"]
-        if type(fragment) is dict
+        if isinstance(fragment, Mapping)
         and type(fragment.get("key")) is str
         and type(fragment.get("text")) is str
     }
@@ -1684,13 +1724,14 @@ def _group_view(section: PresentationSection, group: dict) -> dict:
     )
 
 
-def indexed_applied_fields(  # noqa: PLR0915 # Select document and group fields in one bounded adapter.
+def indexed_applied_fields(  # noqa: PLR0913, PLR0915 # Select document and group fields in one bounded adapter.
     projection: IndexedReaderProjection,
     *,
     arena: _RecordArena,
     details: IndexedDetailContext,
     sources: IndexedPlanningSources,
     groups: Mapping[str, Mapping[str, object]],
+    captured_input: object | None = None,
 ) -> dict:
     """Return a small deterministic document/group overlay from owned records.
 
@@ -1727,6 +1768,37 @@ def indexed_applied_fields(  # noqa: PLR0915 # Select document and group fields 
         type(sources) is IndexedPlanningSources, "invalid_planning_sources"
     )
     _require(isinstance(groups, Mapping), "invalid_compiler_group_facts")
+    owned_group_values: set[int] = set()
+    if any(
+        type(group) is _OwnedMapping
+        or type(group.get("change_ids")) in {_OwnedList, _OwnedTuple}
+        for group in groups.values()
+        if isinstance(group, Mapping)
+    ):
+        report_view = getattr(captured_input, "report_view", None)
+        assert_current = getattr(
+            captured_input, "assert_capture_current", None
+        )
+        owned_groups = (
+            report_view.get("groups")
+            if isinstance(report_view, Mapping)
+            else None
+        )
+        _require(
+            callable(assert_current)
+            and type(owned_groups) in {_OwnedList, _OwnedTuple},
+            "invalid_compiler_group_facts",
+        )
+        assert_current()
+        owned_group_values = {id(group) for group in owned_groups}
+        _require(
+            all(
+                type(group) is _OwnedMapping
+                and id(group) in owned_group_values
+                for group in groups.values()
+            ),
+            "invalid_compiler_group_facts",
+        )
     sources.check_current()
     state = _state(sources)
     _require(
@@ -1810,10 +1882,16 @@ def indexed_applied_fields(  # noqa: PLR0915 # Select document and group fields 
         _require(isinstance(group, Mapping), "missing_compiler_group_facts")
         change_ids = group.get("change_ids")
         _require(
-            type(change_ids) in {tuple, list}
+            type(change_ids) in {tuple, list, _OwnedList, _OwnedTuple}
             and all(type(value) is str for value in change_ids),
             "invalid_compiler_group_facts",
         )
+        if type(change_ids) in {_OwnedList, _OwnedTuple}:
+            _require(
+                id(group) in owned_group_values,
+                "invalid_compiler_group_facts",
+            )
+            change_ids = list(change_ids)
         section_paths = reader.statement_paths(section.prose)
         title_values = [
             reader.statement_view(section.prose, path)

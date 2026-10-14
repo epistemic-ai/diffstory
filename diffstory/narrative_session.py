@@ -39,6 +39,17 @@ _ISSUER_TOKEN = object()
 _VALIDATION_VERSION = "diffstory.session.import-proof.v1"
 _ASSEMBLY_VERSION = "diffstory.session.apply-v1"
 _RENDER_SURFACE_VERSION = "diffstory.session.render-surface.v1"
+_StageWitness = tuple[str, tuple[str, ...], str]
+_StageWitnessCache = dict[
+    int, tuple[object, object, object | None, _StageWitness]
+]
+_ContextWitnessCache = dict[int, tuple[object, object | None, str | None]]
+
+
+def _require_session(condition: bool, reason: str) -> None:  # noqa: FBT001 # Keep internal boundary failures explicit.
+    """Raise the stable session reason when an owned invariant fails."""
+    if not condition:
+        raise ValueError(reason)
 
 
 def _production_binding_witness(production_inputs: object) -> str:
@@ -157,7 +168,13 @@ class ParsedRecords(_OpaqueCapability):
 
 
 class ValidatedGeneration(_OpaqueCapability):
-    """A complete imported-generation proof registered to one session."""
+    """A complete fresh or imported generation proof for one live session."""
+
+    __slots__ = ()
+
+
+class StageProof(_OpaqueCapability):
+    """A successfully validated production stage owned by one session."""
 
     __slots__ = ()
 
@@ -201,6 +218,39 @@ class _ReportProof:
     validation_version: str
     assembly_version: str
     render_surface_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedGenerationProof:
+    """Sealed indexed generation evidence retained for the later apply unit.
+
+    Attributes:
+        scope_digest: Owning session identity.
+        report_digest: Full captured pre-annotation report identity.
+        configuration_bytes: Exact normalized request descriptor.
+        compiler_fact_signature: Captured compiler-fact identity.
+        records: Exact ordered generation record references.
+        graph: Closed annotations graph sharing the owned result/audit rows.
+        reader: Ordered reader references retained by that graph.
+        overlay: Detached deterministic document/group fields for later apply.
+        run_ref: Captured pre-annotation run row.
+        stage_proofs: Exact capabilities that completed this production.
+        versions_digest: Captured validation and compatibility versions.
+        witness: Type-preserving digest of all retained payload bindings.
+    """
+
+    scope_digest: str
+    report_digest: str
+    configuration_bytes: bytes
+    compiler_fact_signature: str
+    records: object
+    graph: object
+    reader: object
+    overlay: object
+    run_ref: object
+    stage_proofs: tuple[StageProof, ...]
+    versions_digest: str
+    witness: str
 
 
 class _CapturedInput:
@@ -856,6 +906,45 @@ class _StageBinding:
     evidence_kind: str = "incomplete-stage-binding.v1"
 
 
+@dataclass(frozen=True, slots=True)
+class _StageProofEvidence:
+    """Immutable owned references and audit membership for one completed stage.
+
+    Attributes:
+        scope_digest: Owning session identity.
+        stage: Exact coordinator StageInputs object.
+        binding: Exact pre-execution binding from the session registry.
+        predecessors: Earlier StageProof tokens in their declared order.
+        result_refs: Ordered actual accepted result rows for stage coverage.
+        producer_refs: Ordered producer rows built from actual stored artifacts.
+        invocation_refs: Original invocation rows covered by the audit.
+        request_refs: Every successful request row in producer request order.
+        run_refs: Original run rows selected by each producer.
+        receipt_refs: Ordered receipts built from actual stored artifacts.
+        subject_audits: Planning subject audits completed before the next wave.
+        producer_views: Exact accepted compatibility view and binding per producer.
+        audit_replay: The codec replay instance that executed required audits.
+        replay_memo_witness: Digests of the stage and executing audit replay memos.
+        witness: Type-preserving digest pinning every field above.
+    """
+
+    scope_digest: str
+    stage: object
+    binding: _StageBinding
+    predecessors: tuple[StageProof, ...]
+    result_refs: tuple[object, ...]
+    producer_refs: tuple[object, ...]
+    invocation_refs: tuple[object, ...]
+    request_refs: tuple[object, ...]
+    run_refs: tuple[object, ...]
+    receipt_refs: tuple[object, ...]
+    subject_audits: tuple[object, ...]
+    producer_views: tuple[tuple[str, object, str], ...]
+    audit_replay: object
+    replay_memo_witness: str
+    witness: str
+
+
 def _close_source_caches(sources: object | None) -> None:
     """Close current citation scopes and selected-field memos when present."""
     if sources is None:
@@ -867,7 +956,7 @@ def _close_source_caches(sources: object | None) -> None:
     if hasattr(field_memo, "clear"):
         field_memo.clear()
     context = getattr(state, "details_context", None)
-    scope = getattr(context, "citation_scope", None)
+    scope = getattr(context, "_citation_scope", None)
     if scope is not None and not getattr(scope, "closed", True):
         scope.close()
 
@@ -881,8 +970,11 @@ class ReportSession:
     """
 
     __slots__ = (
+        "_arena",
         "_captured_input",
         "_closed",
+        "_pending_generation_records",
+        "_pending_generation_recordset_witness",
         "_registrations",
         "_scope_digest",
         "_stage_bindings",
@@ -916,6 +1008,9 @@ class ReportSession:
             int, tuple[_OpaqueCapability, str, object]
         ] = {}
         self._stage_bindings: dict[int, tuple[object, _StageBinding]] = {}
+        self._arena = None
+        self._pending_generation_records = None
+        self._pending_generation_recordset_witness = None
         self._closed = False
 
     @classmethod
@@ -970,11 +1065,52 @@ class ReportSession:
             _close_stage_caches(stage)
         self._stage_bindings.clear()
         self._registrations.clear()
+        self._arena = None
+        self._pending_generation_records = None
+        self._pending_generation_recordset_witness = None
         if self._captured_input is not None:
             self._captured_input.close()
         self._captured_input = None
         self._scope_digest = ""
         self._closed = True
+
+    def _adopt_preview_capture(self, captured_input: object) -> None:
+        """Adopt one matching unattached preview capture without recapturing.
+
+        Preconditions:
+            This session has no registered proof or stage, and the supplied
+            private capture has the same report/configuration as this session.
+        Postconditions:
+            The exact preview capture is owned by this session.
+        Essential behavior:
+            Retains the preview's existing detached report, ledger, and index.
+        """
+        self._require_open()
+        if type(captured_input) is not _CapturedInput:
+            msg = "invalid_captured_input"
+            raise ValueError(msg)
+        current = self._captured_input
+        if current is captured_input:
+            return
+        if (
+            self._registrations
+            or self._stage_bindings
+            or current._production_inputs is not None  # noqa: SLF001 # Check whether this capture is already bound to production inputs.
+            or captured_input.owner_session is not None
+            or current.report_digest != captured_input.report_digest
+            or current.shape_digest != captured_input.shape_digest
+            or current.configuration_bytes
+            != captured_input.configuration_bytes
+        ):
+            msg = "captured_input_session_mismatch"
+            raise ValueError(msg)
+        current.close()
+        self._captured_input = captured_input
+        captured_input.bind_session(self)
+        self._scope_digest = semantic_digest(
+            "diffstory.report-session.registration.v2",
+            captured_input.scope_identity,
+        )
 
     def captured_report(self) -> dict:
         """Return a detached explicit compatibility copy of the report."""
@@ -1248,9 +1384,6 @@ class ReportSession:
             dictionaries or issues a generation/report capability.
         """
         self._require_open()
-        stage_name, item_keys, witness = _stage_witness(
-            stage, self._captured_input
-        )
         existing = self._stage_bindings.get(id(stage))
         if existing is not None:
             if existing[0] is not stage:
@@ -1258,6 +1391,9 @@ class ReportSession:
                 raise ValueError(msg)
             self._check_stage_binding(stage)
             return existing[1]
+        stage_name, item_keys, witness = _stage_witness(
+            stage, self._captured_input
+        )
         wave_index = sum(
             binding.stage_name == stage_name
             for _registered, binding in self._stage_bindings.values()
@@ -1276,7 +1412,58 @@ class ReportSession:
 
     def _check_stage_binding(self, stage: object) -> _StageBinding:
         """Require the exact live stage and all captured input facts to match."""
+        return self._check_stage_binding_operation(stage)[0]
+
+    def _check_stage_binding_operation(
+        self, stage: object
+    ) -> tuple[
+        _StageBinding,
+        object,
+        object | None,
+        _StageWitnessCache,
+        _ContextWitnessCache,
+    ]:
+        """Check one stage and retain witnesses only for this caller operation.
+
+        Preconditions:
+            ``stage`` is the exact registered stage for this open session.
+        Postconditions:
+            Returns the live binding, its exact checked input/source owners,
+            and local identity-pinned witness maps for nested stage aliases.
+        Essential behavior:
+            Performs one full current-input check before private helpers reuse
+            the checked owner within this synchronous traversal.
+        """
         self._require_open()
+        inputs = _stage_production_inputs(stage, self._captured_input)
+        inputs.assert_capture_current()
+        checked_sources = inputs.sources
+        stage_witnesses: _StageWitnessCache = {}
+        context_witnesses: _ContextWitnessCache = {}
+        binding = self._check_stage_binding_current(
+            stage,
+            inputs,
+            checked_sources,
+            stage_witnesses,
+            context_witnesses,
+        )
+        return (
+            binding,
+            inputs,
+            checked_sources,
+            stage_witnesses,
+            context_witnesses,
+        )
+
+    def _check_stage_binding_current(
+        self,
+        stage: object,
+        checked_inputs: object,
+        checked_sources: object | None,
+        stage_witnesses: _StageWitnessCache,
+        context_witnesses: _ContextWitnessCache,
+    ) -> _StageBinding:
+        """Check one exact registered stage after its input owner was checked."""
         registration = self._stage_bindings.get(id(stage))
         if registration is None or registration[0] is not stage:
             msg = "invalid_stage_binding"
@@ -1285,8 +1472,13 @@ class ReportSession:
         if binding.scope_digest != self._scope_digest:
             msg = "stale_stage_binding"
             raise ValueError(msg)
-        stage_name, item_keys, witness = _stage_witness(
-            stage, self._captured_input
+        stage_name, item_keys, witness = _cached_stage_witness(
+            stage,
+            self._captured_input,
+            checked_inputs,
+            checked_sources,
+            stage_witnesses,
+            context_witnesses,
         )
         if (
             stage_name != binding.stage_name
@@ -1296,6 +1488,1092 @@ class ReportSession:
             msg = "stage_binding_changed"
             raise ValueError(msg)
         return binding
+
+    def _complete_stage(  # noqa: C901, PLR0915 # Keep stage completion and its exact evidence issuance in one validator.
+        self,
+        stage: object,
+        artifacts: tuple[object, ...],
+        *,
+        predecessors: tuple[StageProof, ...],
+    ) -> StageProof:
+        """Validate actual successful stage records and issue one local proof.
+
+        Preconditions:
+            ``stage`` is registered by this session's coordinator; artifacts
+            are the exact ordered successful runtime records; and predecessors
+            are the completed StageProof tokens required by the fixed traversal.
+        Postconditions:
+            One opaque proof binds current result, producer, invocation,
+            request, run, receipt, subject-audit, replay, and stage membership.
+        Essential behavior:
+            Strictly captures actual rows, executes the shared producer/result
+            audit, and retains only owned references plus compact audits.
+        """
+        from .narrative_hierarchy import capture_indexed_consumed_prose
+        from .narrative_manifest import build_receipts
+        from .narrative_manifest import validate_prose_support
+        from .narrative_runtime import StoredArtifact
+        from .narrative_v2 import CodecReplay
+        from .narrative_v2 import _audit_stage_records
+        from .narrative_v2 import result_key
+
+        self._require_open()
+        (
+            binding,
+            inputs,
+            checked_sources,
+            stage_witnesses,
+            context_witnesses,
+        ) = self._check_stage_binding_operation(stage)
+        _require_session(
+            getattr(inputs, "_captured_input", None) is self._captured_input,
+            "captured_input_mismatch",
+        )
+        coordinator_ref = self._captured_input._coordinator  # noqa: SLF001 # Completion uses the capture's exact bound coordinator.
+        coordinator = (
+            coordinator_ref() if coordinator_ref is not None else None
+        )
+        _require_session(
+            coordinator is not None, "captured_coordinator_binding_changed"
+        )
+        coordinator.check_approval(coordinator.approved_report)
+        _require_session(type(artifacts) is tuple, "invalid_stage_artifacts")
+        _require_session(
+            all(type(item) is StoredArtifact for item in artifacts),
+            "invalid_stage_artifacts",
+        )
+        item_keys = tuple(item.lookup.item_key for item in artifacts)
+        _require_session(item_keys == tuple(stage.items), "coverage")
+        prior = self._completed_stage_entries()
+        _require_session(
+            len(prior) == binding.sequence_index,
+            "incomplete_stage_predecessor",
+        )
+        expected_predecessors = self._expected_stage_predecessors(
+            binding, inputs, prior
+        )
+        _require_session(
+            type(predecessors) is tuple
+            and len(predecessors) == len(expected_predecessors)
+            and all(
+                actual is expected
+                for actual, expected in zip(
+                    predecessors, expected_predecessors, strict=True
+                )
+            ),
+            "stage_predecessor_mismatch",
+        )
+        for proof in predecessors:
+            self._check_stage_proof(
+                proof,
+                checked_inputs=inputs,
+                checked_sources=checked_sources,
+                stage_witnesses=stage_witnesses,
+                context_witnesses=context_witnesses,
+            )
+
+        from .report_storage import _RecordArena
+
+        if self._arena is None:
+            self._arena = _RecordArena()
+        arena = self._arena
+        result_refs = tuple(
+            arena.put_result(item.record.result) for item in artifacts
+        )
+        _require_session(
+            tuple(reference.item_key for reference in result_refs)
+            == item_keys,
+            "coverage",
+        )
+        for item, reference in zip(artifacts, result_refs, strict=True):
+            _require_session(
+                result_key(item.record.result) == reference.item_key,
+                "coverage",
+            )
+
+        if binding.stage_name == "detail":
+            _require_session(
+                inputs._indexed_details_context is None,  # noqa: SLF001 # The one detail context is bound only at successful completion.
+                "detail_context_already_bound",
+            )
+            inputs.bind_indexed_details(arena, result_refs)
+            # Detail completion creates the indexed source owner. Check that
+            # newly derived owner before any compatibility view uses it.
+            inputs.assert_capture_current()
+            checked_sources = inputs.sources
+            stage_witnesses = {}
+            context_witnesses = {}
+            _require_session(
+                self._check_stage_binding_current(
+                    stage,
+                    inputs,
+                    checked_sources,
+                    stage_witnesses,
+                    context_witnesses,
+                )
+                is binding,
+                "stage_binding_changed",
+            )
+            output_selector = None
+        else:
+            _require_session(
+                inputs._indexed_details_context is not None  # noqa: SLF001 # All prose stages depend on the accepted detail rows.
+                and inputs.sources is not None,
+                "detail_context_required",
+            )
+            output_selector = capture_indexed_consumed_prose(
+                arena._snapshot_reader(),  # noqa: SLF001 # Select actual owned stage outputs once.
+                result_refs,
+                inputs.sources,
+            )
+
+        producers, receipts = build_receipts(
+            artifacts,
+            coordinator.original_run,
+            frozenset(coordinator.reused),
+        )
+        audit_replay = CodecReplay(stage)
+        refs_by_key = {
+            reference.item_key: reference for reference in result_refs
+        }
+
+        def validate_owned_result(item_key: str) -> None:
+            """Run current checks against the exact arena-owned result row."""
+            reference = refs_by_key.get(item_key)
+            _require_session(reference is not None, "coverage")
+            if binding.stage_name == "detail":
+                _require_session(reference.kind == "detail", "coverage")
+                return
+            result = output_selector.select(item_key)
+            context = stage.contexts.get(item_key)
+            _require_session(context is not None, "dependencies_changed")
+            validate_prose_support(result, context, inputs.wire)
+            if binding.stage_name == "planning":
+                _require_session(
+                    len(canonical_bytes(inputs.forwarded_support(result)))
+                    <= context.max_support_bytes,
+                    "schema",
+                )
+
+        subject_audits, selected_views = _audit_stage_records(
+            stage,
+            item_keys,
+            producers,
+            receipts,
+            audit_replay,
+            validate_result=validate_owned_result,
+        )
+        receipt_by_item = {receipt.item_key: receipt for receipt in receipts}
+        producer_views = []
+        for producer_key, view in selected_views:
+            view_name, view_item_keys, view_witness = _cached_stage_witness(
+                view,
+                self._captured_input,
+                inputs,
+                checked_sources,
+                stage_witnesses,
+                context_witnesses,
+            )
+            _require_session(
+                view_name == binding.stage_name
+                and view_item_keys == item_keys,
+                "dependencies_changed",
+            )
+            for item in artifacts:
+                item_key = result_key(item.record.result)
+                if receipt_by_item[item_key].producer_key == producer_key:
+                    _require_session(
+                        item.lookup == view.lookups[item_key],
+                        "dependencies_changed",
+                    )
+            producer_views.append((producer_key, view, view_witness))
+
+        producer_refs = tuple(
+            arena.put_record("producer", producer) for producer in producers
+        )
+        receipt_refs = tuple(
+            arena.put_record("receipt", receipt) for receipt in receipts
+        )
+        invocation_refs = []
+        request_refs = []
+        run_refs = []
+        for producer, producer_ref in zip(
+            producers, producer_refs, strict=True
+        ):
+            producer_key, run_ref, invocation_ref, ordered_request_refs = (
+                arena.producer_audit_references(producer_ref)
+            )
+            _require_session(producer_key == producer.key, "producer_coverage")
+            _require_session(
+                arena.selected_audit_record(run_ref, kind="run")
+                == producer.original_run.model_dump(mode="json"),
+                "producer_run_mismatch",
+            )
+            _require_session(
+                arena.selected_audit_record(invocation_ref, kind="invocation")
+                == producer.invocation.model_dump(mode="python"),
+                "request_mismatch",
+            )
+            _require_session(
+                len(ordered_request_refs) == len(producer.requests),
+                "request_mismatch",
+            )
+            for request_ref, request in zip(
+                ordered_request_refs, producer.requests, strict=True
+            ):
+                _require_session(
+                    arena.selected_audit_record(request_ref, kind="request")
+                    == request.model_dump(mode="python"),
+                    "request_mismatch",
+                )
+            run_refs.append(run_ref)
+            invocation_refs.append(invocation_ref)
+            request_refs.extend(ordered_request_refs)
+
+        replay_memo_witness = semantic_digest(
+            "diffstory.session.stage-replay-memos.v1",
+            _replay_memo_witness(stage),
+            _codec_replay_memo_witness(audit_replay),
+        )
+        evidence = _StageProofEvidence(
+            scope_digest=self._scope_digest,
+            stage=stage,
+            binding=binding,
+            predecessors=predecessors,
+            result_refs=result_refs,
+            producer_refs=producer_refs,
+            invocation_refs=tuple(invocation_refs),
+            request_refs=tuple(request_refs),
+            run_refs=tuple(run_refs),
+            receipt_refs=receipt_refs,
+            subject_audits=subject_audits,
+            producer_views=tuple(producer_views),
+            audit_replay=audit_replay,
+            replay_memo_witness=replay_memo_witness,
+            witness="",
+        )
+        evidence = _StageProofEvidence(
+            **{
+                field: getattr(evidence, field)
+                for field in evidence.__dataclass_fields__
+                if field != "witness"
+            },
+            witness=_stage_proof_witness(evidence),
+        )
+        return self._register(StageProof, "stage", evidence)
+
+    def _completed_stage_entries(
+        self,
+    ) -> tuple[tuple[StageProof, _StageProofEvidence], ...]:
+        """Return registered stage proofs in their exact coordinator order."""
+        entries = []
+        for handle, kind, payload in self._registrations.values():
+            if kind == "stage":
+                _require_session(
+                    type(handle) is StageProof
+                    and type(payload) is _StageProofEvidence,
+                    "invalid_session_capability",
+                )
+                entries.append((handle, payload))
+        entries.sort(key=lambda item: item[1].binding.sequence_index)
+        return tuple(entries)
+
+    def _expected_stage_predecessors(
+        self,
+        binding: _StageBinding,
+        inputs: object,
+        prior: tuple[tuple[StageProof, _StageProofEvidence], ...],
+    ) -> tuple[StageProof, ...]:
+        """Derive required predecessors from the fixed production traversal."""
+        from .narrative_hierarchy import planning_waves
+
+        by_name: dict[str, list[tuple[StageProof, _StageProofEvidence]]] = {
+            "detail": [],
+            "planning": [],
+            "section": [],
+            "document": [],
+        }
+        for entry in prior:
+            by_name[entry[1].binding.stage_name].append(entry)
+        _require_session(
+            all(
+                len(by_name[name]) <= 1
+                for name in ("detail", "section", "document")
+            ),
+            "stage_order_mismatch",
+        )
+        planning = by_name["planning"]
+        expected_waves = (
+            len(planning_waves(inputs.plan)) if inputs.plan is not None else 0
+        )
+        if binding.stage_name == "detail":
+            _require_session(
+                not prior and binding.wave_index == 0, "stage_order_mismatch"
+            )
+            return ()
+        _require_session(
+            len(by_name["detail"]) == 1, "stage_predecessor_mismatch"
+        )
+        detail_token = by_name["detail"][0][0]
+        if binding.stage_name == "planning":
+            _require_session(
+                not by_name["section"]
+                and not by_name["document"]
+                and binding.wave_index == len(planning)
+                and binding.wave_index < expected_waves,
+                "stage_order_mismatch",
+            )
+            return (detail_token, *(token for token, _ in planning))
+        _require_session(
+            len(planning) == expected_waves,
+            "incomplete_planning_waves",
+        )
+        planning_tokens = tuple(token for token, _ in planning)
+        if binding.stage_name == "section":
+            _require_session(
+                not by_name["section"]
+                and not by_name["document"]
+                and binding.wave_index == 0,
+                "stage_order_mismatch",
+            )
+            return (detail_token, *planning_tokens)
+        _require_session(
+            binding.stage_name == "document"
+            and len(by_name["section"]) == 1
+            and not by_name["document"]
+            and binding.wave_index == 0,
+            "stage_predecessor_mismatch",
+        )
+        return (
+            detail_token,
+            *planning_tokens,
+            by_name["section"][0][0],
+        )
+
+    def _check_stage_proof(
+        self,
+        proof: StageProof,
+        *,
+        checked_inputs: object | None = None,
+        checked_sources: object | None = None,
+        stage_witnesses: _StageWitnessCache | None = None,
+        context_witnesses: _ContextWitnessCache | None = None,
+    ) -> _StageProofEvidence:
+        """Recheck exact proof identity, binding, replay memo, and row ownership.
+
+        Preconditions:
+            Direct calls omit operation owners and receive a full current-input
+            check. An enclosing ordered traversal may pass its exact checked
+            input/source owners and stack-local witness maps.
+        Postconditions:
+            Returns only the exact registered proof while all row and replay
+            bindings remain current.
+        Essential behavior:
+            Reuses source checks only within one synchronous operation and
+            keeps standalone calls fully guarded.
+        """
+        self._require_open()
+        if checked_inputs is None:
+            if (
+                checked_sources is not None
+                or stage_witnesses is not None
+                or context_witnesses is not None
+            ):
+                msg = "captured_input_mismatch"
+                raise ValueError(msg)
+            evidence = self._registered_payload_current(
+                proof, StageProof, "stage"
+            )
+            _require_session(
+                type(evidence) is _StageProofEvidence,
+                "invalid_session_capability",
+            )
+            inputs = _stage_production_inputs(
+                evidence.stage, self._captured_input
+            )
+            inputs.assert_capture_current()
+            checked_sources = inputs.sources
+            stage_witnesses = {}
+            context_witnesses = {}
+        else:
+            _require_session(
+                stage_witnesses is not None and context_witnesses is not None,
+                "invalid_stage_binding",
+            )
+            inputs = checked_inputs
+        return self._check_stage_proof_current(
+            proof,
+            inputs,
+            checked_sources,
+            stage_witnesses,
+            context_witnesses,
+        )
+
+    def _check_stage_proof_current(
+        self,
+        proof: StageProof,
+        checked_inputs: object,
+        checked_sources: object | None,
+        stage_witnesses: _StageWitnessCache,
+        context_witnesses: _ContextWitnessCache,
+    ) -> _StageProofEvidence:
+        """Check a proof using the exact source owner checked by its operation."""
+        from .report_storage import _RecordArena
+
+        evidence = self._registered_payload_current(proof, StageProof, "stage")
+        _require_session(
+            type(evidence) is _StageProofEvidence, "invalid_session_capability"
+        )
+        _require_session(
+            evidence.witness == _stage_proof_witness(evidence)
+            and evidence.scope_digest == self._scope_digest,
+            "stale_stage_proof",
+        )
+        _require_session(
+            self._check_stage_binding_current(
+                evidence.stage,
+                checked_inputs,
+                checked_sources,
+                stage_witnesses,
+                context_witnesses,
+            )
+            is evidence.binding,
+            "stale_stage_proof",
+        )
+        _require_session(
+            evidence.audit_replay.stage is evidence.stage
+            and semantic_digest(
+                "diffstory.session.stage-replay-memos.v1",
+                _replay_memo_witness(evidence.stage),
+                _codec_replay_memo_witness(evidence.audit_replay),
+            )
+            == evidence.replay_memo_witness,
+            "codec_replay_changed",
+        )
+        _require_session(
+            type(self._arena) is _RecordArena, "missing_record_arena"
+        )
+        arena = self._arena
+        _require_session(
+            all(
+                arena._owned_result_reference(reference, kind=reference.kind)  # noqa: SLF001 # Recheck exact arena row membership.
+                for reference in evidence.result_refs
+            ),
+            "foreign_storage_result_reference",
+        )
+        _require_session(
+            len(evidence.producer_refs)
+            == len(evidence.invocation_refs)
+            == len(evidence.run_refs)
+            == len({id(item) for item in evidence.producer_refs}),
+            "producer_coverage",
+        )
+        expected_invocations = []
+        expected_requests = []
+        expected_runs = []
+        for reference in evidence.producer_refs:
+            _producer_key, run_ref, invocation_ref, request_refs = (
+                arena.producer_audit_references(reference)
+            )
+            expected_runs.append(run_ref)
+            expected_invocations.append(invocation_ref)
+            expected_requests.extend(request_refs)
+        _require_session(
+            tuple(expected_runs) == evidence.run_refs
+            and tuple(expected_invocations) == evidence.invocation_refs
+            and tuple(expected_requests) == evidence.request_refs,
+            "stage_audit_membership_changed",
+        )
+        selected_view_map = {}
+        for producer_key, view, witness in evidence.producer_views:
+            checked_view = _cached_stage_witness(
+                view,
+                self._captured_input,
+                checked_inputs,
+                checked_sources,
+                stage_witnesses,
+                context_witnesses,
+            )
+            prior = selected_view_map.get(producer_key)
+            _require_session(
+                prior is None or (prior[0] is view and prior[1] == witness),
+                "stage_compatibility_view_changed",
+            )
+            selected_view_map[producer_key] = (view, witness, checked_view)
+        audit_views = (
+            *evidence.audit_replay.views,
+            *evidence.audit_replay.legacy_alternatives,
+        )
+        _require_session(
+            len(selected_view_map) == len(evidence.producer_refs)
+            and all(
+                any(view is candidate for candidate in audit_views)
+                and checked_view[2] == witness
+                for view, witness, checked_view in selected_view_map.values()
+            ),
+            "stage_compatibility_view_changed",
+        )
+        for reference in evidence.producer_refs:
+            producer_key, _run_ref, _invocation_ref, _request_refs = (
+                arena.producer_audit_references(reference)
+            )
+            _require_session(
+                producer_key in selected_view_map,
+                "stage_compatibility_view_changed",
+            )
+        for reference in (
+            *evidence.invocation_refs,
+            *evidence.request_refs,
+            *evidence.run_refs,
+        ):
+            _require_session(
+                arena.selected_audit_record(
+                    reference,
+                    kind=reference.kind,
+                )
+                is not None,
+                "stage_audit_membership_changed",
+            )
+        _require_session(
+            all(
+                arena._owned_record_reference(  # noqa: SLF001 # Recheck each exact receipt row without expansion.
+                    reference, table="receipts", kind="receipt"
+                )
+                for reference in evidence.receipt_refs
+            ),
+            "stage_audit_membership_changed",
+        )
+        return evidence
+
+    def _ordered_stage_proofs(
+        self, stage_proofs: tuple[StageProof, ...]
+    ) -> tuple[tuple[StageProof, _StageProofEvidence], ...]:
+        """Require every registered completed stage in fixed traversal order."""
+        from .narrative_hierarchy import planning_waves
+
+        _require_session(type(stage_proofs) is tuple, "invalid_stage_proofs")
+        registered = self._completed_stage_entries()
+        _require_session(
+            len(stage_proofs) == len(registered)
+            and all(
+                proof is entry[0]
+                for proof, entry in zip(stage_proofs, registered, strict=True)
+            ),
+            "stage_proof_coverage",
+        )
+        bindings = sorted(
+            (binding for _stage, binding in self._stage_bindings.values()),
+            key=lambda item: item.sequence_index,
+        )
+        _require_session(
+            len(bindings) == len(registered), "incomplete_stage_proof"
+        )
+        _require_session(bool(registered), "stage_proof_coverage")
+        inputs = _stage_production_inputs(
+            registered[0][1].stage, self._captured_input
+        )
+        _require_session(
+            all(entry[1].stage.inputs is inputs for entry in registered),
+            "captured_input_mismatch",
+        )
+        inputs.assert_capture_current()
+        checked_sources = inputs.sources
+        stage_witnesses: _StageWitnessCache = {}
+        context_witnesses: _ContextWitnessCache = {}
+        entries = []
+        for position, (proof, registered_entry, binding) in enumerate(
+            zip(stage_proofs, registered, bindings, strict=True)
+        ):
+            evidence = self._check_stage_proof(
+                proof,
+                checked_inputs=inputs,
+                checked_sources=checked_sources,
+                stage_witnesses=stage_witnesses,
+                context_witnesses=context_witnesses,
+            )
+            _require_session(
+                evidence is registered_entry[1]
+                and evidence.binding is binding
+                and binding.sequence_index == position,
+                "stage_order_mismatch",
+            )
+            entries.append((proof, evidence))
+        _require_session(bool(entries), "stage_proof_coverage")
+        detail = entries[0][1]
+        inputs = getattr(detail.stage, "inputs", None)
+        _require_session(
+            detail.binding.stage_name == "detail"
+            and detail.binding.wave_index == 0
+            and inputs is not None
+            and inputs.plan is not None
+            and inputs._indexed_details_context is not None,  # noqa: SLF001 # Fresh production must use the arena-backed detail context.
+            "stage_order_mismatch",
+        )
+        expected_waves = len(planning_waves(inputs.plan))
+        expected_names = (
+            "detail",
+            *("planning" for _ in range(expected_waves)),
+            "section",
+            "document",
+        )
+        _require_session(
+            tuple(item[1].binding.stage_name for item in entries)
+            == expected_names,
+            "stage_proof_coverage",
+        )
+        for position, (proof, evidence) in enumerate(entries):
+            prior = tuple(entries[:position])
+            expected_predecessors = self._expected_stage_predecessors(
+                evidence.binding, inputs, prior
+            )
+            _require_session(
+                len(evidence.predecessors) == len(expected_predecessors)
+                and all(
+                    actual is expected
+                    for actual, expected in zip(
+                        evidence.predecessors,
+                        expected_predecessors,
+                        strict=True,
+                    )
+                ),
+                "stage_predecessor_mismatch",
+            )
+            _require_session(
+                proof is stage_proofs[position], "stage_order_mismatch"
+            )
+        return tuple(entries)
+
+    def _recordset_for_production(  # noqa: PLR0915 # Assemble only the fixed ordered references from completed stages.
+        self, stage_proofs: tuple[StageProof, ...]
+    ) -> object:
+        """Build the data-only generation record set from completed stage rows.
+
+        Preconditions:
+            ``stage_proofs`` contains every exact registered stage token in
+            coordinator order; the owning rows are already session-owned.
+        Postconditions:
+            Returns one immutable record set assembled only from session-owned
+            result and audit references.
+        Essential behavior:
+            Projects data and saved bindings only; ``finish_production`` does
+            the complete ordered proof traversal before issuing authority.
+        """
+        from .narrative_contracts import StoryPlan
+        from .narrative_hierarchy import planning_waves
+        from .narrative_hierarchy import validate_production_requests
+        from .narrative_manifest import CurrentUsage
+        from .report_storage import GenerationRecordSet
+
+        self._require_open()
+        _require_session(type(stage_proofs) is tuple, "invalid_stage_proofs")
+        entries = self._completed_stage_entries()
+        _require_session(
+            len(stage_proofs) == len(entries)
+            and all(
+                proof is entry[0]
+                for proof, entry in zip(stage_proofs, entries, strict=True)
+            ),
+            "stage_proof_coverage",
+        )
+        _require_session(
+            len(self._stage_bindings) == len(entries),
+            "incomplete_stage_proof",
+        )
+        _require_session(bool(entries), "stage_proof_coverage")
+        if self._pending_generation_records is not None:
+            pending_witness = self._pending_generation_recordset_witness
+            _require_session(
+                pending_witness is not None
+                and _generation_recordset_witness(
+                    self._pending_generation_records
+                )
+                == pending_witness,
+                "production_recordset_changed",
+            )
+            return self._pending_generation_records
+        proofs = tuple(evidence for _proof, evidence in entries)
+        inputs = proofs[0].stage.inputs
+        coordinator_ref = self._captured_input._coordinator  # noqa: SLF001 # Use the exact bound usage/run owner.
+        coordinator = (
+            coordinator_ref() if coordinator_ref is not None else None
+        )
+        _require_session(
+            coordinator is not None, "captured_coordinator_binding_changed"
+        )
+        plan = inputs.plan
+        _require_session(
+            type(plan) is StoryPlan and plan.requests == (),
+            "production_plan_changed",
+        )
+        detail_evidence = proofs[0]
+        detail_refs = detail_evidence.result_refs
+        _require_session(
+            tuple(detail_refs) == inputs._detail_refs  # noqa: SLF001 # Reuse the exact validated detail order.
+            and tuple(ref.item_key for ref in detail_refs)
+            == tuple(inputs.index.units),
+            "detail_coverage",
+        )
+        planning_evidence = tuple(
+            evidence
+            for evidence in proofs
+            if evidence.binding.stage_name == "planning"
+        )
+        planning_refs = tuple(
+            reference
+            for evidence in planning_evidence
+            for reference in evidence.result_refs
+        )
+        section_evidence = next(
+            evidence
+            for evidence in proofs
+            if evidence.binding.stage_name == "section"
+        )
+        document_evidence = next(
+            evidence
+            for evidence in proofs
+            if evidence.binding.stage_name == "document"
+        )
+        section_refs = section_evidence.result_refs
+        document_refs = document_evidence.result_refs
+        _require_session(len(document_refs) == 1, "document_coverage")
+
+        arena = self._arena
+        reader = arena._snapshot_reader()  # noqa: SLF001 # Read selected binding/order facts without expanding models.
+        expected_planning_subjects = tuple(
+            key for wave in planning_waves(plan) for key in wave
+        )
+        planning_facts = tuple(
+            reader.result_binding_facts(reference)
+            for reference in planning_refs
+        )
+        _require_session(
+            len(planning_refs) == len(expected_planning_subjects)
+            and all(
+                kind == "planning_card"
+                for kind, _subject, _plan in planning_facts
+            )
+            and tuple(subject for _kind, subject, _plan in planning_facts)
+            == expected_planning_subjects
+            and all(
+                plan_id == plan.id
+                for _kind, _subject, plan_id in planning_facts
+            ),
+            "planning_coverage",
+        )
+        expected_section_subjects = tuple(
+            view.group_key for view in plan.production.section_views
+        )
+        section_facts = tuple(
+            reader.result_binding_facts(reference)
+            for reference in section_refs
+        )
+        _require_session(
+            len(section_refs) == len(expected_section_subjects)
+            and all(
+                kind == "section" for kind, _subject, _plan in section_facts
+            )
+            and tuple(subject for _kind, subject, _plan in section_facts)
+            == expected_section_subjects
+            and all(
+                plan_id == plan.id
+                for _kind, _subject, plan_id in section_facts
+            ),
+            "section_coverage",
+        )
+        document_facts = tuple(
+            reader.result_binding_facts(reference)
+            for reference in document_refs
+        )
+        _require_session(
+            document_facts == (("document", plan.id, plan.id),),
+            "document_coverage",
+        )
+
+        subject_audits = tuple(
+            audit
+            for evidence in planning_evidence
+            for audit in evidence.subject_audits
+        )
+        audit_ids = tuple(audit.id for audit in subject_audits)
+        _require_session(
+            len(audit_ids) == len(set(audit_ids)),
+            "duplicate_planning_request",
+        )
+        completed_plan = StoryPlan.model_validate(
+            plan.model_dump(mode="python") | {"requests": subject_audits}
+        )
+        _require_session(
+            completed_plan.model_dump(exclude={"requests"})
+            == plan.model_dump(exclude={"requests"}),
+            "production_plan_changed",
+        )
+        validate_production_requests(completed_plan)
+
+        producer_refs = tuple(
+            reference
+            for evidence in proofs
+            for reference in evidence.producer_refs
+        )
+        receipt_refs = tuple(
+            reference
+            for evidence in proofs
+            for reference in evidence.receipt_refs
+        )
+        _require_session(
+            len({(ref.kind, ref.storage_id) for ref in producer_refs})
+            == len(producer_refs)
+            and len({(ref.kind, ref.storage_id) for ref in receipt_refs})
+            == len(receipt_refs),
+            "producer_coverage",
+        )
+        current_run_json = inputs.run.model_dump(mode="json")
+        receipt_views = tuple(arena.receipt_view(ref) for ref in receipt_refs)
+        for producer_ref in producer_refs:
+            producer_key, original_run_ref, _invocation_ref, _request_refs = (
+                arena.producer_audit_references(producer_ref)
+            )
+            producer_receipts = tuple(
+                receipt
+                for receipt in receipt_views
+                if receipt.get("producer_key") == producer_key
+            )
+            _require_session(bool(producer_receipts), "producer_coverage")
+            dispositions = {
+                receipt.get("disposition") for receipt in producer_receipts
+            }
+            _require_session(
+                dispositions <= {"sent", "reused"}, "producer_coverage"
+            )
+            if "sent" in dispositions:
+                _require_session(
+                    canonical_bytes(
+                        arena.selected_audit_record(
+                            original_run_ref, kind="run"
+                        )
+                    )
+                    == canonical_bytes(current_run_json),
+                    "producer_run_mismatch",
+                )
+
+        run_ref = arena.put_record("run", inputs.run)
+        plan_ref = arena.put_record("story_plan", completed_plan)
+        compiler_signature = self._captured_input.compiler_signature
+        _require_session(
+            compiler_signature is not None, "compiler_facts_changed"
+        )
+        header = {
+            "version": "diffstory.generation.v2",
+            "provenance": "unverified",
+            "compiler_fact_signature": compiler_signature,
+            "current_usage": CurrentUsage(
+                **coordinator.usage.report()
+            ).model_dump(mode="json"),
+            "ledger_digest": inputs.ledger.id,
+            "ledger_parameters": inputs.options.ledger.model_dump(mode="json"),
+            "request_configuration": inputs.transport.descriptor.model_dump(
+                mode="json"
+            ),
+            "unit_keys": list(inputs.index.units),
+        }
+        records = GenerationRecordSet(
+            header,
+            run_ref=run_ref,
+            details=detail_refs,
+            plan_ref=plan_ref,
+            planning=planning_refs,
+            sections=section_refs,
+            document=document_refs[0],
+            producers=producer_refs,
+            receipts=receipt_refs,
+        )
+        self._pending_generation_records = records
+        self._pending_generation_recordset_witness = (
+            _generation_recordset_witness(records)
+        )
+        return records
+
+    def finish_production(
+        self,
+        records: object,
+        stage_proofs: tuple[StageProof, ...],
+    ) -> ValidatedGeneration:
+        """Seal fresh indexed production after its exact stages are complete.
+
+        Preconditions:
+            ``records`` is the session's record set and ``stage_proofs`` are
+            every exact completed StageProof in fixed order.
+        Postconditions:
+            Returns a session-registered generation token over the sealed
+            indexed graph and checked deterministic application overlay.
+        Essential behavior:
+            Reuses completed stage evidence, runs the indexed support forest
+            once, and performs no offline production or ledger reconstruction.
+        """
+        from .narrative_hierarchy import capture_indexed_consumed_prose
+        from .narrative_hierarchy import validate_support_forest
+        from .narrative_manifest import CurrentUsage
+        from .narrative_manifest import assemble_indexed_reader
+        from .narrative_manifest import indexed_applied_fields
+        from .report_storage import GenerationRecordSet
+
+        self._require_open()
+        expected = self._recordset_for_production(stage_proofs)
+        pending_witness = self._pending_generation_recordset_witness
+        _require_session(
+            type(records) is GenerationRecordSet
+            and records is expected
+            and pending_witness is not None
+            and _generation_recordset_witness(records) == pending_witness,
+            "production_recordset_changed",
+        )
+        entries = self._ordered_stage_proofs(stage_proofs)
+        inputs = entries[0][1].stage.inputs
+        coordinator_ref = self._captured_input._coordinator  # noqa: SLF001 # Usage and approval remain bound to this coordinator.
+        coordinator = (
+            coordinator_ref() if coordinator_ref is not None else None
+        )
+        _require_session(
+            coordinator is not None, "captured_coordinator_binding_changed"
+        )
+        # The ordered traversal above checked capture, ledger, index, source,
+        # run, configuration, and every registered stage exactly once.
+        coordinator.check_approval(coordinator.approved_report)
+        _require_session(
+            content_digest(_raw_integrity_bytes(inputs.plan))
+            == inputs._base_plan_integrity_digest,  # noqa: SLF001 # The request plan cannot drift after stage completion.
+            "production_plan_changed",
+        )
+        scope_check = getattr(inputs.citation_scope, "_check_current", None)
+        _require_session(callable(scope_check), "citation_scope_closed")
+        scope_check(
+            inputs.ledger,
+            inputs.index,
+            self._captured_input._revision_binding,  # noqa: SLF001 # Same explicit pair used before detail checks.
+        )
+        _require_session(
+            self._arena._owned_record_reference(  # noqa: SLF001 # Exact recorded run reference remains session-owned.
+                records.run_ref, table="runs", kind="run"
+            )["$ref"]
+            == records.run_ref.storage_id
+            and records.header.get("current_usage")
+            == CurrentUsage(**coordinator.usage.report()).model_dump(
+                mode="json"
+            ),
+            "production_usage_changed",
+        )
+
+        prose_refs = (*records.planning, *records.sections, records.document)
+        prose_selector = capture_indexed_consumed_prose(
+            self._arena._snapshot_reader(),  # noqa: SLF001 # One final selector spans only owned prose references.
+            tuple(prose_refs),
+            inputs.sources,
+        )
+        prose_results = tuple(
+            prose_selector.select(reference.item_key)
+            for reference in prose_refs
+        )
+        validate_support_forest(prose_results, inputs.sources, prose_selector)
+
+        report = self._captured_input.report_view
+        groups_value = report.get("groups")
+        _require_session(
+            type(groups_value).__name__ in {"_OwnedList", "_OwnedTuple"},
+            "invalid_compiler_group_facts",
+        )
+        groups = {}
+        for group in groups_value:
+            group_id = group.get("id")
+            _require_session(
+                type(group_id) is str and group_id not in groups,
+                "invalid_compiler_group_facts",
+            )
+            groups[group_id] = group
+        reader = assemble_indexed_reader(
+            report,
+            records,
+            arena=self._arena,
+            details=inputs._indexed_details_context,  # noqa: SLF001 # Exact arena-backed detail context.
+            sources=inputs.sources,
+            captured_input=self._captured_input,
+        )
+        overlay = indexed_applied_fields(
+            reader,
+            arena=self._arena,
+            details=inputs._indexed_details_context,  # noqa: SLF001 # Keep the same current detail owner.
+            sources=inputs.sources,
+            groups=groups,
+            captured_input=self._captured_input,
+        )
+        metadata = report["meta"]
+        graph = self._arena.seal(
+            records,
+            reader,
+            {
+                "shape": "annotations",
+                "metadata": {
+                    "schema": "diffstory.annotations.v2",
+                    "base_sha": metadata["base_sha"],
+                    "head_sha": metadata["head_sha"],
+                },
+            },
+        )
+        proof = _IndexedGenerationProof(
+            scope_digest=self._scope_digest,
+            report_digest=self._captured_input.report_digest,
+            configuration_bytes=self._captured_input.configuration_bytes,
+            compiler_fact_signature=self._captured_input.compiler_signature,
+            records=records,
+            graph=graph,
+            reader=reader,
+            overlay=_freeze_report(overlay),
+            run_ref=records.run_ref,
+            stage_proofs=stage_proofs,
+            versions_digest=self._captured_input._versions_digest,  # noqa: SLF001 # Bind the accepted validator/compatibility versions.
+            witness="",
+        )
+        proof = _IndexedGenerationProof(
+            **{
+                field: getattr(proof, field)
+                for field in proof.__dataclass_fields__
+                if field != "witness"
+            },
+            witness=_indexed_generation_proof_witness(proof),
+        )
+        self._pending_generation_records = None
+        self._pending_generation_recordset_witness = None
+        return self._register(ValidatedGeneration, "generation", proof)
+
+    def _discard_fresh_generation(
+        self,
+        generation: ValidatedGeneration,
+        stage_proofs: tuple[StageProof, ...],
+    ) -> None:
+        """Expire temporary proofs after a data-only compatibility expansion.
+
+        Preconditions:
+            ``generation`` and ``stage_proofs`` are the exact completed fresh
+            production capabilities registered in this open session.
+        Postconditions:
+            Those capabilities no longer authorize a follow-on session action.
+        Essential behavior:
+            Keeps compatibility ``generate`` output data-only while allowing
+            ``generate_validated`` callers to retain their explicit token.
+        """
+        proof = self._registered_payload(
+            generation, ValidatedGeneration, "generation"
+        )
+        _require_session(
+            type(proof) is _IndexedGenerationProof
+            and proof.stage_proofs == stage_proofs,
+            "invalid_session_capability",
+        )
+        for stage_proof in stage_proofs:
+            self._registered_payload(stage_proof, StageProof, "stage")
+        for stage_proof in stage_proofs:
+            self._registrations.pop(id(stage_proof))
+        self._registrations.pop(id(generation))
+        self._pending_generation_records = None
+        self._pending_generation_recordset_witness = None
 
     def _registered_payload(
         self, handle: object, cls: type, kind: str
@@ -1311,6 +2589,22 @@ class ReportSession:
         """
         self._require_open()
         self._captured_input.assert_capture_current()
+        return self._registered_payload_current(handle, cls, kind)
+
+    def _registered_payload_current(
+        self, handle: object, cls: type, kind: str
+    ) -> object:
+        """Resolve one exact registered payload after the operation checked input.
+
+        Preconditions:
+            The enclosing operation just checked this session's captured input.
+        Postconditions:
+            Returns only the payload registered to this exact handle identity.
+        Essential behavior:
+            Checks session, type, registry identity, kind, and scope without
+            starting another full input/source traversal.
+        """
+        self._require_open()
         if type(handle) is not cls:
             msg = "invalid_session_capability"
             raise ValueError(msg)
@@ -1334,9 +2628,55 @@ class ReportSession:
 
 
 def _stage_witness(
-    stage: object, captured_input: _CapturedInput
+    stage: object,
+    captured_input: _CapturedInput,
+    *,
+    checked_inputs: object | None = None,
+    checked_sources: object | None = None,
+    context_witnesses: _ContextWitnessCache | None = None,
 ) -> tuple[str, tuple[str, ...], str]:
-    """Hash only the selected immutable facts that define one stage binding."""
+    """Validate one stage boundary and hash its exact immutable binding.
+
+    Preconditions:
+        ``stage`` is a coordinator stage created from ``captured_input``.
+    Postconditions:
+        Returns stage name, ordered item keys, and an integrity witness.
+    Essential behavior:
+        Checks the exact current source owner once, then passes that owner to
+        private context and selector checks for this synchronous traversal.
+    """
+    if checked_inputs is None:
+        if checked_sources is not None or context_witnesses is not None:
+            msg = "captured_input_mismatch"
+            raise ValueError(msg)
+        inputs = _stage_production_inputs(stage, captured_input)
+        inputs.assert_capture_current()
+        checked_sources = inputs.sources
+        context_witnesses = {}
+    elif context_witnesses is None:
+        msg = "invalid_stage_binding"
+        raise ValueError(msg)
+    return _stage_witness_checked(
+        stage,
+        captured_input,
+        checked_inputs if checked_inputs is not None else inputs,
+        checked_sources,
+        context_witnesses,
+    )
+
+
+def _stage_production_inputs(
+    stage: object, captured_input: _CapturedInput
+) -> object:
+    """Return the exact production input owner attached to one stage.
+
+    Preconditions:
+        ``stage`` is expected to be a private ``StageInputs`` value.
+    Postconditions:
+        Returns its exact ``ProductionInputs`` object or raises a stable error.
+    Essential behavior:
+        Pins input identity without checking source liveness or content.
+    """
     if (
         type(stage).__name__ != "StageInputs"
         or type(stage).__module__ != "diffstory.narrative_v2"
@@ -1350,7 +2690,86 @@ def _stage_witness(
     ):
         msg = "captured_input_mismatch"
         raise ValueError(msg)
-    inputs.assert_capture_current()
+    return inputs
+
+
+def _cached_stage_witness(  # noqa: PLR0913 # Keep exact owners and both stack-local witness maps explicit.
+    stage: object,
+    captured_input: _CapturedInput,
+    checked_inputs: object,
+    checked_sources: object | None,
+    stage_witnesses: _StageWitnessCache,
+    context_witnesses: _ContextWitnessCache,
+) -> _StageWitness:
+    """Reuse one exact stage witness within its enclosing synchronous call.
+
+    Preconditions:
+        ``checked_inputs`` and ``checked_sources`` were just checked by that
+        operation; cache entries cannot escape the caller's stack frame.
+    Postconditions:
+        Returns the witness for this exact stage object and exact owners.
+    Essential behavior:
+        Reuses repeated aliases by object identity only; it keeps no session
+        or process-wide trust memo.
+    """
+    prior = stage_witnesses.get(id(stage))
+    if prior is not None:
+        if (
+            prior[0] is not stage
+            or prior[1] is not checked_inputs
+            or prior[2] is not checked_sources
+        ):
+            msg = "stage_binding_changed"
+            raise ValueError(msg)
+        return prior[3]
+    witness = _stage_witness(
+        stage,
+        captured_input,
+        checked_inputs=checked_inputs,
+        checked_sources=checked_sources,
+        context_witnesses=context_witnesses,
+    )
+    stage_witnesses[id(stage)] = (
+        stage,
+        checked_inputs,
+        checked_sources,
+        witness,
+    )
+    return witness
+
+
+def _stage_witness_checked(
+    stage: object,
+    captured_input: _CapturedInput,
+    checked_inputs: object,
+    checked_sources: object | None,
+    context_witnesses: _ContextWitnessCache,
+) -> _StageWitness:
+    """Hash one stage after the enclosing operation checked its source owner.
+
+    Preconditions:
+        ``checked_inputs`` is the exact current ProductionInputs for the
+        capture, and ``checked_sources`` is its just-checked source owner.
+    Postconditions:
+        Returns the exact stage witness or rejects owner and raw-field drift.
+    Essential behavior:
+        Retains payload, context, compatibility-view, transport, and replay
+        checks while selector helpers use the exact checked source object.
+    """
+    if (
+        type(stage).__name__ != "StageInputs"
+        or type(stage).__module__ != "diffstory.narrative_v2"
+    ):
+        msg = "invalid_stage_binding"
+        raise ValueError(msg)
+    inputs = getattr(stage, "inputs", None)
+    if (
+        inputs is not checked_inputs
+        or getattr(inputs, "_captured_input", None) is not captured_input
+        or getattr(inputs, "sources", None) is not checked_sources
+    ):
+        msg = "captured_input_mismatch"
+        raise ValueError(msg)
     stage_name = getattr(stage, "stage", None)
     if stage_name not in {"detail", "planning", "section", "document"}:
         msg = "invalid_stage_binding"
@@ -1360,32 +2779,49 @@ def _stage_witness(
         msg = "invalid_stage_binding"
         raise ValueError(msg)
     item_keys = tuple(items)
-    item_facts = _items_witness(items)
+    item_facts = _items_witness(items, checked_sources, context_witnesses)
     transport_facts = _transport_witness(stage.transport)
     replay = getattr(stage, "replay", None)
     if replay is None:
         compatibility_views = None
     else:
         selected_views = (*replay.views, *replay.legacy_alternatives)
-        compatibility_views = tuple(
-            (
-                id(view),
-                view.stage,
-                tuple(view.items),
-                _items_witness(view.items),
-                tuple(
-                    (key, id(value), _context_witness(value))
-                    for key, value in view.contexts.items()
-                ),
-                content_digest(_raw_integrity_bytes(view.handles)),
-                _transport_witness(view.transport),
-                content_digest(_raw_integrity_bytes(view.static)),
-                content_digest(_raw_integrity_bytes(view.lookups)),
-                content_digest(_raw_integrity_bytes(view.dynamic)),
-                content_digest(_raw_integrity_bytes(view.registry)),
+        compatibility_view_facts = []
+        for view in selected_views:
+            view_items = getattr(view, "items", None)
+            view_contexts = getattr(view, "contexts", None)
+            if not isinstance(view_items, Mapping) or not isinstance(
+                view_contexts, Mapping
+            ):
+                msg = "invalid_stage_binding"
+                raise ValueError(msg)
+            compatibility_view_facts.append(
+                (
+                    id(view),
+                    view.stage,
+                    tuple(view_items),
+                    _items_witness(
+                        view_items, checked_sources, context_witnesses
+                    ),
+                    tuple(
+                        (
+                            key,
+                            id(value),
+                            _cached_context_witness(
+                                value, checked_sources, context_witnesses
+                            ),
+                        )
+                        for key, value in view_contexts.items()
+                    ),
+                    content_digest(_raw_integrity_bytes(view.handles)),
+                    _transport_witness(view.transport),
+                    content_digest(_raw_integrity_bytes(view.static)),
+                    content_digest(_raw_integrity_bytes(view.lookups)),
+                    content_digest(_raw_integrity_bytes(view.dynamic)),
+                    content_digest(_raw_integrity_bytes(view.registry)),
+                )
             )
-            for view in selected_views
-        )
+        compatibility_views = tuple(compatibility_view_facts)
     witness = semantic_digest(
         "diffstory.session.stage-binding.v1",
         id(stage),
@@ -1417,8 +2853,12 @@ def _stage_witness(
     return stage_name, item_keys, witness
 
 
-def _items_witness(items: Mapping[str, object]) -> tuple[object, ...]:
-    """Capture ordered request payload and support identities compactly."""
+def _items_witness(
+    items: Mapping[str, object],
+    checked_sources: object | None,
+    context_witnesses: _ContextWitnessCache,
+) -> tuple[object, ...]:
+    """Capture ordered payloads and contexts under one checked source owner."""
     facts = []
     for key, item in items.items():
         payload = getattr(item, "payload", None)
@@ -1435,10 +2875,174 @@ def _items_witness(items: Mapping[str, object]) -> tuple[object, ...]:
                 len(payload),
                 content_digest(payload),
                 item.output_tokens,
-                _context_witness(item.context),
+                _cached_context_witness(
+                    item.context, checked_sources, context_witnesses
+                ),
             )
         )
     return tuple(facts)
+
+
+def _cached_context_witness(
+    context: object | None,
+    checked_sources: object | None,
+    context_witnesses: _ContextWitnessCache,
+) -> str | None:
+    """Reuse one exact context witness within the current operation only."""
+    if context is None:
+        return None
+    prior = context_witnesses.get(id(context))
+    if prior is not None:
+        if prior[0] is not context or prior[1] is not checked_sources:
+            msg = "stage_context_changed"
+            raise ValueError(msg)
+        return prior[2]
+    witness = _context_witness(context, checked_sources)
+    context_witnesses[id(context)] = (context, checked_sources, witness)
+    return witness
+
+
+def _replay_memo_witness(stage: object) -> str:
+    """Bind the exact post-execution codec memo without treating it as proof."""
+    replay = getattr(stage, "replay", None)
+    return _codec_replay_memo_witness(replay)
+
+
+def _codec_replay_memo_witness(replay: object) -> str:
+    """Bind one exact codec replay object's executed request memo."""
+    memo = getattr(replay, "_requests", None)
+    if (
+        type(replay).__name__ != "CodecReplay"
+        or type(replay).__module__ != "diffstory.narrative_v2"
+        or type(memo) is not set
+        or any(type(value) is not str for value in memo)
+    ):
+        msg = "codec_replay_changed"
+        raise ValueError(msg)
+    return semantic_digest(
+        "diffstory.session.codec-replay-memo.v1",
+        id(replay),
+        content_digest(_raw_integrity_bytes(memo)),
+    )
+
+
+def _record_reference_facts(reference: object) -> tuple[object, ...]:
+    """Return typed scalar facts for one immutable arena address."""
+    from .report_storage import RecordRef
+    from .report_storage import ResultRef
+
+    if type(reference) is ResultRef:
+        return (
+            "result",
+            reference.table,
+            reference.kind,
+            reference.storage_id,
+            reference.item_key,
+        )
+    if type(reference) is RecordRef:
+        return (
+            "record",
+            reference.table,
+            reference.kind,
+            reference.storage_id,
+        )
+    msg = "invalid_generation_record_reference"
+    raise ValueError(msg)
+
+
+def _stage_proof_witness(evidence: _StageProofEvidence) -> str:
+    """Hash every immutable row and membership binding in one stage proof."""
+    return semantic_digest(
+        "diffstory.session.stage-proof.v1",
+        evidence.scope_digest,
+        id(evidence.stage),
+        evidence.binding.stage_name,
+        evidence.binding.wave_index,
+        evidence.binding.sequence_index,
+        evidence.binding.item_keys,
+        evidence.binding.witness,
+        tuple(id(item) for item in evidence.predecessors),
+        tuple(_record_reference_facts(item) for item in evidence.result_refs),
+        tuple(
+            _record_reference_facts(item) for item in evidence.producer_refs
+        ),
+        tuple(
+            _record_reference_facts(item) for item in evidence.invocation_refs
+        ),
+        tuple(_record_reference_facts(item) for item in evidence.request_refs),
+        tuple(_record_reference_facts(item) for item in evidence.run_refs),
+        tuple(_record_reference_facts(item) for item in evidence.receipt_refs),
+        tuple(
+            content_digest(_raw_integrity_bytes(item))
+            for item in evidence.subject_audits
+        ),
+        tuple(
+            (key, id(view), witness)
+            for key, view, witness in evidence.producer_views
+        ),
+        evidence.replay_memo_witness,
+    )
+
+
+def _generation_recordset_witness(records: object) -> str:
+    """Hash exact generation header and ordered arena references."""
+    return semantic_digest(
+        "diffstory.session.generation-record-set.v1",
+        content_digest(_raw_integrity_bytes(records.header)),
+        _record_reference_facts(records.run_ref),
+        tuple(_record_reference_facts(item) for item in records.details),
+        _record_reference_facts(records.plan_ref),
+        tuple(_record_reference_facts(item) for item in records.planning),
+        tuple(_record_reference_facts(item) for item in records.sections),
+        _record_reference_facts(records.document),
+        tuple(_record_reference_facts(item) for item in records.producers),
+        tuple(_record_reference_facts(item) for item in records.receipts),
+    )
+
+
+def _indexed_generation_proof_witness(
+    proof: _IndexedGenerationProof,
+) -> str:
+    """Pin the small owned generation payload without expanding its graph."""
+    reader = proof.reader
+    reader_facts = (
+        reader.shape,
+        _record_reference_facts(reader.document),
+        tuple(
+            (
+                section.group_id,
+                section.group_key,
+                section.number,
+                section.next_id,
+                _record_reference_facts(section.prose),
+                tuple(
+                    _record_reference_facts(item) for item in section.details
+                ),
+            )
+            for section in reader.sections
+        ),
+        tuple(
+            _record_reference_facts(item) for item in reader.context_details
+        ),
+        tuple(_record_reference_facts(item) for item in reader.citations),
+        tuple(
+            _record_reference_facts(item) for item in reader.support_provenance
+        ),
+    )
+    return semantic_digest(
+        "diffstory.session.indexed-generation-proof.v1",
+        proof.scope_digest,
+        proof.report_digest,
+        content_digest(proof.configuration_bytes),
+        proof.compiler_fact_signature,
+        _generation_recordset_witness(proof.records),
+        id(proof.graph),
+        reader_facts,
+        content_digest(_raw_integrity_bytes(proof.overlay)),
+        _record_reference_facts(proof.run_ref),
+        tuple(id(item) for item in proof.stage_proofs),
+        proof.versions_digest,
+    )
 
 
 def _transport_witness(transport: object) -> tuple[object, ...]:
@@ -1461,23 +3065,68 @@ def _transport_witness(transport: object) -> tuple[object, ...]:
     )
 
 
-def _context_witness(context: object | None) -> str | None:
-    """Hash exact consumed support selectors without retaining model copies."""
+def _context_witness(
+    context: object | None, checked_sources: object | None
+) -> str | None:
+    """Hash exact context selectors under one already-checked source owner.
+
+    Preconditions:
+        The enclosing synchronous operation just checked ``checked_sources``
+        through its exact ProductionInputs owner.
+    Postconditions:
+        Returns the raw context witness or rejects a mismatched owner/selector.
+    Essential behavior:
+        Keeps all support and selector binding checks while using ``_check_bound``
+        instead of repeating the full indexed source traversal.
+    """
     if context is None:
         return None
     sources = getattr(context, "sources", None)
-    check_current = getattr(sources, "check_current", None)
-    if callable(check_current):
-        check_current()
+    if sources is not checked_sources:
+        msg = "stage_context_source_mismatch"
+        raise ValueError(msg)
     consumed = getattr(context, "consumed", {})
-    consumed_facts = tuple(
-        (
-            key,
-            id(value),
-            content_digest(_raw_integrity_bytes(value)),
+    if isinstance(consumed, Mapping):
+        consumed_facts = tuple(
+            (
+                key,
+                id(value),
+                content_digest(_raw_integrity_bytes(value)),
+            )
+            for key, value in consumed.items()
         )
-        for key, value in consumed.items()
-    )
+    elif (
+        type(consumed).__name__ == "IndexedConsumedProse"
+        and type(consumed).__module__ == "diffstory.narrative_hierarchy"
+        and callable(getattr(consumed, "_check_bound", None))
+    ):
+        if getattr(consumed, "_sources", None) is not checked_sources:
+            msg = "stage_selector_source_mismatch"
+            raise ValueError(msg)
+        consumed._check_bound()  # noqa: SLF001 # The enclosing traversal checked this exact source owner.
+        reference_values = getattr(consumed, "_reference_values", None)
+        result_digests = getattr(consumed, "_result_digests", None)
+        source_state = getattr(consumed, "_source_state", None)
+        selector_binding = getattr(consumed, "_binding", None)
+        if (
+            type(reference_values) is not tuple
+            or type(result_digests) is not tuple
+            or len(reference_values) != len(result_digests)
+            or source_state is None
+            or type(selector_binding) is not tuple
+        ):
+            msg = "invalid_stage_binding"
+            raise ValueError(msg)
+        consumed_facts = (
+            id(consumed),
+            id(source_state),
+            selector_binding,
+            tuple(reference_values),
+            tuple(result_digests),
+        )
+    else:
+        msg = "invalid_stage_binding"
+        raise ValueError(msg)
     return semantic_digest(
         "diffstory.session.stage-context.v1",
         id(context),

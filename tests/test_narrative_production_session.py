@@ -439,7 +439,32 @@ class NarrativeProductionSessionTests(unittest.TestCase):
                 for _handle, kind, _data in session._registrations.values()
             )
         )
-        self.assertFalse(hasattr(session, "finish_production"))
+        completion_cases = [
+            (
+                "partial manifest data",
+                partial_data,
+                (),
+                "incomplete_stage_proof",
+            ),
+            (
+                "incomplete stage binding",
+                partial_data,
+                (bindings[0],),
+                "stage_proof_coverage",
+            ),
+            (
+                "arbitrary data",
+                {"details": [], "producers": [], "receipts": []},
+                (),
+                "incomplete_stage_proof",
+            ),
+        ]
+        for name, records, stage_proofs, expected_error in completion_cases:
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, expected_error),
+            ):
+                session.finish_production(records, stage_proofs)
 
         other = ReportSession.capture(report, self.configuration)
         with self.assertRaises(ValueError):
@@ -510,7 +535,20 @@ class NarrativeProductionSessionTests(unittest.TestCase):
             with self.assertRaises((ValueError, ArtifactRuntimeError)):
                 session.validate_import(partial)
             self.assertEqual(session._registrations, {})
-            self.assertNotIn("finish_production", dir(session))
+            completion_cases = [
+                ("partial manifest", partial),
+                (
+                    "arbitrary parsed data",
+                    {"generation": {"details": [], "producers": []}},
+                ),
+            ]
+            for name, records in completion_cases:
+                with (
+                    self.subTest(name=name),
+                    self.assertRaisesRegex(ValueError, "stage_proof_coverage"),
+                ):
+                    session.finish_production(records, ())
+            self.assertEqual(session._registrations, {})
 
 
 if __name__ == "__main__":

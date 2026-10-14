@@ -44,6 +44,7 @@ from diffstory.narrative_contracts import PlanningBounds
 from diffstory.narrative_contracts import PlanningCardResult
 from diffstory.narrative_contracts import PlanningGroup
 from diffstory.narrative_contracts import ProductionHierarchy
+from diffstory.narrative_contracts import ProseBinding
 from diffstory.narrative_contracts import RecordEncoding
 from diffstory.narrative_contracts import RecordFragment
 from diffstory.narrative_contracts import RecordOwner
@@ -521,8 +522,10 @@ class IndexedConsumedProse:
             the same arena as the detail context owned by ``sources``; and all
             ``references`` select unique planning, section, or document rows.
         Postconditions:
-            Result digests are computed from streamed logical bytes. Only
-            reader, primitive references/digests, and source bindings survive.
+            Result digests use the captured canonical result fact only when
+            raw field presence and defaults match; otherwise they are computed
+            from streamed logical bytes. Only reader, primitive references,
+            digests, and source bindings survive.
         Essential behavior:
             This is a data selector, never a production or support capability.
         """
@@ -557,10 +560,13 @@ class IndexedConsumedProse:
                 reference.kind in {"planning_card", "section", "document"},
                 "invalid_statement_producer",
             )
-            digest = hashlib.sha256()
-            for chunk in reader.logical_chunks(reference):
-                digest.update(chunk)
-            digests.append(digest.hexdigest())
+            digest = reader.reusable_result_content_digest(reference)
+            if digest is None:
+                streamed = hashlib.sha256()
+                for chunk in reader.logical_chunks(reference):
+                    streamed.update(chunk)
+                digest = streamed.hexdigest()
+            digests.append(digest)
         object.__setattr__(self, "_reader", reader)
         object.__setattr__(self, "_sources", sources)
         object.__setattr__(self, "_source_state", source_state)
@@ -709,8 +715,9 @@ class IndexedProseResult:
 
     The value stores only an ``IndexedConsumedProse`` reference and one
     primitive result address. Accessors validate a selected statement and
-    return a detached model. The result digest is the exact SHA256 of streamed
-    expanded logical bytes, including defaults captured by the arena.
+    return a detached model. Its result digest is the exact SHA256 of the
+    selected expanded logical bytes, reusing the arena fact only when the
+    captured input already had identical canonical field presence and defaults.
 
     Attributes:
         _selector: Exact consumed selector with a live source scope.
@@ -793,8 +800,25 @@ class IndexedProseResult:
         return self._reference_value[1]
 
     @property
+    def binding(self) -> ProseBinding:
+        """Return the selected typed binding without expanding the result.
+
+        Preconditions:
+            The result address and its indexed source owner are still live.
+        Postconditions:
+            Returns the complete detached binding from the owned result row.
+        Essential behavior:
+            Supports exact current-context checks over normalized arena data.
+        """
+        reference = self._check_current()
+        value = self._selector._reader.result_prose_binding(  # noqa: SLF001 # Select only this owned result's binding.
+            reference
+        )
+        return ProseBinding.model_validate(dict(value))
+
+    @property
     def result_digest(self) -> str:
-        """Return the complete streamed logical result digest."""
+        """Return the exact canonical logical digest for this selected result."""
         self._check_current()
         return self._result_digest_bound()
 

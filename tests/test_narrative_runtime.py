@@ -3048,33 +3048,52 @@ except ArtifactRuntimeError as error:
             writer.execute_batch(
                 invocation, registry, self.callbacks(results, [])
             )
-            store = runtime_v2.ArtifactStore(directory)
-            costs = []
-            for selected in (registry, current):
-                reads = 0
-                with patch.object(
-                    ArtifactDependency, "__getattribute__", counted
-                ):
-                    self.assertIsNotNone(
-                        store.lookup(
-                            invocation.lookups[0], selected, validate_v2
+
+            def run_lookup_work(
+                store: runtime_v2.ArtifactStore,
+                reader: runtime_v2.ArtifactRuntime,
+                selected: runtime_v2.DependencyRegistry,
+            ) -> None:
+                """Run the same direct lookup and runtime prefetch workload."""
+                self.assertIsNotNone(
+                    store.lookup(invocation.lookups[0], selected, validate_v2)
+                )
+                self.assertEqual(
+                    len(
+                        reader.prefetch(
+                            invocation.lookups, selected, validate_v2
                         )
-                    )
+                    ),
+                    1,
+                )
+
+            comparison_cases = [
+                ("equally cold caches", False, 0),
+                ("equally warm caches", True, 0),
+            ]
+            registry_cases = [("small", registry), ("large", current)]
+            for name, warm_first, expected_read_delta in comparison_cases:
+                costs = []
+                for _registry_name, selected in registry_cases:
+                    store = runtime_v2.ArtifactStore(directory)
                     reader = runtime_v2.ArtifactRuntime(
                         identity(),
                         recovery_dir=directory,
                         artifact_dir=directory,
                     )
-                    self.assertEqual(
-                        len(
-                            reader.prefetch(
-                                invocation.lookups, selected, validate_v2
-                            )
-                        ),
-                        1,
-                    )
-                costs.append(reads)
-            self.assertEqual(costs[0], costs[1])
+                    if warm_first:
+                        run_lookup_work(store, reader, selected)
+                    reads = 0
+                    with patch.object(
+                        ArtifactDependency, "__getattribute__", counted
+                    ):
+                        run_lookup_work(store, reader, selected)
+                    costs.append(reads)
+                self.assertEqual(
+                    costs[1] - costs[0],
+                    expected_read_delta,
+                    name,
+                )
 
     def test_runtime_identity_rejects_a_mismatched_provider_or_model(
         self,

@@ -2871,20 +2871,29 @@ class _ArenaRecordReader:
         _owner_token: Arena identity token; it carries no proof authority.
     """
 
-    __slots__ = ("_owner_token", "_result_ids", "_tables")
+    __slots__ = (
+        "_owner_token",
+        "_result_content_digest_matches_record",
+        "_result_content_digests",
+        "_result_ids",
+        "_tables",
+    )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 # The reader binds both exact arena digest witnesses.
         self,
         token: object,
         owner_token: object,
         tables: Mapping[str, Mapping[str, Mapping[str, object]]],
         result_ids: Mapping[str, tuple[str, str]],
+        result_content_digests: Mapping[str, str],
+        result_content_digest_matches_record: Mapping[str, bool],
     ) -> None:
         """Capture immutable record indexes for one private consumer.
 
         Preconditions:
             ``token`` is the module-private reader token and all record entries
-            already have immutable primitive contents.
+            already have immutable primitive contents. Digest mappings are
+            arena-owned facts for the same result addresses.
         Postconditions:
             The reader owns shallow index copies and no result models or trees.
         Essential behavior:
@@ -2901,6 +2910,10 @@ class _ArenaRecordReader:
             }
         )
         self._result_ids = MappingProxyType(dict(result_ids))
+        self._result_content_digests = result_content_digests
+        self._result_content_digest_matches_record = (
+            result_content_digest_matches_record
+        )
 
     def __setattr__(self, name: str, value: object) -> None:
         """Keep an arena snapshot fixed after the private reader is created.
@@ -2981,6 +2994,66 @@ class _ArenaRecordReader:
         ):
             _fail("invalid_prose_binding")
         return kind, subject_key, plan_key
+
+    def reusable_result_content_digest(
+        self, reference: ResultRef
+    ) -> str | None:
+        """Return a captured digest only when its logical bytes are identical.
+
+        Preconditions:
+            ``reference`` is an exact result row in this reader snapshot.
+        Postconditions:
+            Returns the typed canonical content digest only when insertion
+            proved the raw row already matched defaults and field presence;
+            otherwise returns ``None`` for the existing streaming fallback.
+        Essential behavior:
+            Reuses a stable arena fact only under the same canonical result
+            contract used by selected hierarchy results.
+        """
+        self._stored_result(reference)
+        identifier = reference.storage_id
+        if not self._result_content_digest_matches_record.get(
+            identifier, False
+        ):
+            return None
+        digest = self._result_content_digests.get(identifier)
+        if type(digest) is not str:
+            _fail("foreign_storage_result_reference")
+        return digest
+
+    def result_prose_binding(
+        self, reference: ResultRef
+    ) -> Mapping[str, object]:
+        """Select the complete immutable binding for one owned prose result.
+
+        Preconditions:
+            ``reference`` names one arena-owned planning, section, or document
+            result with a strictly captured ``ProseBinding``.
+        Postconditions:
+            Returns all declared binding fields without materializing the result.
+        Essential behavior:
+            Lets fresh stage validation compare actual owned binding bytes with
+            the current request context while keeping storage addresses as data.
+        """
+        if type(reference) is not ResultRef or reference.kind not in {
+            "planning_card",
+            "section",
+            "document",
+        }:
+            _fail("invalid_prose_binding")
+        stored = self._stored_result(reference)
+        binding = stored.get("binding")
+        if not isinstance(binding, Mapping) or set(binding) != {
+            "version",
+            "kind",
+            "subject_key",
+            "plan_key",
+            "context_digest",
+        }:
+            _fail("invalid_prose_binding")
+        if any(type(binding.get(name)) is not str for name in binding):
+            _fail("invalid_prose_binding")
+        return binding
 
     def _result_view(self, reference: ResultRef) -> Mapping[str, object]:
         """Expose one immutable normalized result row to private adapters.
@@ -3298,7 +3371,9 @@ class _RecordArena:
         "_owner_token",
         "_plan_facts",
         "_producer_facts",
+        "_producer_keys_by_record_id",
         "_relationship_counts",
+        "_result_content_digest_matches_record",
         "_result_content_digests",
         "_result_digests",
         "_sealed",
@@ -3342,7 +3417,9 @@ class _RecordArena:
         self._owner_token = object()
         self._plan_facts: dict[str, Mapping[str, object]] = {}
         self._producer_facts: dict[str, Mapping[str, object]] = {}
+        self._producer_keys_by_record_id: dict[str, str] = {}
         self._result_content_digests: dict[str, str] = {}
+        self._result_content_digest_matches_record: dict[str, bool] = {}
         self._result_digests: dict[str, str] = {}
         self._relationship_counts: dict[str, int] = {}
         self._sealed = False
@@ -3387,9 +3464,15 @@ class _RecordArena:
             "typed_results": dict(builder.typed_results),
             "validation_counts": dict(self._validation_counts),
             "producer_facts": dict(self._producer_facts),
+            "producer_keys_by_record_id": dict(
+                self._producer_keys_by_record_id
+            ),
             "plan_facts": dict(self._plan_facts),
             "result_digests": dict(self._result_digests),
             "result_content_digests": dict(self._result_content_digests),
+            "result_content_digest_matches_record": dict(
+                self._result_content_digest_matches_record
+            ),
             "relationship_counts": dict(self._relationship_counts),
         }
 
@@ -3418,10 +3501,16 @@ class _RecordArena:
         builder.typed_results = dict(checkpoint["typed_results"])
         self._validation_counts = dict(checkpoint["validation_counts"])
         self._producer_facts = dict(checkpoint["producer_facts"])
+        self._producer_keys_by_record_id = dict(
+            checkpoint["producer_keys_by_record_id"]
+        )
         self._plan_facts = dict(checkpoint["plan_facts"])
         self._result_digests = dict(checkpoint["result_digests"])
         self._result_content_digests = dict(
             checkpoint["result_content_digests"]
+        )
+        self._result_content_digest_matches_record = dict(
+            checkpoint["result_content_digest_matches_record"]
         )
         self._relationship_counts = dict(checkpoint["relationship_counts"])
 
@@ -3522,7 +3611,12 @@ class _RecordArena:
                 for identifier, reference in self._result_refs().items()
             }
         return _ArenaRecordReader(
-            _ARENA_READER_TOKEN, self._owner_token, tables, result_ids
+            _ARENA_READER_TOKEN,
+            self._owner_token,
+            tables,
+            result_ids,
+            MappingProxyType(self._result_content_digests),
+            MappingProxyType(self._result_content_digest_matches_record),
         )
 
     def _result_refs(self) -> dict[str, ResultRef]:
@@ -3589,7 +3683,7 @@ class _RecordArena:
         else:
             _model(StatementRef, raw)
 
-    def _validate_result(self, kind: str, raw: dict) -> tuple[str, str]:
+    def _validate_result(self, kind: str, raw: dict) -> tuple[str, str, bool]:
         """Strictly parse the complete supplied result and capture its digests.
 
         Args:
@@ -3597,7 +3691,9 @@ class _RecordArena:
             raw: Raw-type-preserving snapshot of the complete result.
 
         Returns:
-            tuple[str, str]: Semantic receipt digest and content digest.
+            tuple[str, str, bool]: Semantic receipt digest, defaulted typed
+            content digest, and whether the incoming JSON has identical
+            canonical field presence and values.
 
         Preconditions:
             ``raw`` is a raw-type-preserving snapshot for one supported result.
@@ -3610,9 +3706,11 @@ class _RecordArena:
         validated = _model(_RESULT_MODELS[kind], raw)
         self._add_validation("results", kind)
         logical = validated.model_dump(mode="json")
+        logical_bytes = canonical_bytes(logical)
         return (
             semantic_digest("diffstory.receipt-result.v2", logical),
-            content_digest(canonical_bytes(logical)),
+            content_digest(logical_bytes),
+            canonical_bytes(raw) == logical_bytes,
         )
 
     @staticmethod
@@ -3686,9 +3784,11 @@ class _RecordArena:
             return self._make_result_ref(kind, prior, item_key)
         checkpoint = self._capture_checkpoint()
         try:
-            result_digest_value, result_content_digest = self._validate_result(
-                kind, raw
-            )
+            (
+                result_digest_value,
+                result_content_digest,
+                content_digest_matches_record,
+            ) = self._validate_result(kind, raw)
             evidence_ids = set(builder.records["evidence_refs"])
             pointer = builder.add_result(kind, raw)
             self._count_new_evidence_rows(evidence_ids)
@@ -3698,6 +3798,9 @@ class _RecordArena:
             reference = self._make_result_ref(kind, result_id, item_key)
             self._result_digests[result_id] = result_digest_value
             self._result_content_digests[result_id] = result_content_digest
+            self._result_content_digest_matches_record[result_id] = (
+                content_digest_matches_record
+            )
         except Exception:
             self._restore_checkpoint(checkpoint)
             raise
@@ -3727,7 +3830,11 @@ class _RecordArena:
         prior_facts = self._producer_facts.get(model.key)
         if prior_facts is not None and prior_facts["record_id"] != producer_id:
             _fail("duplicate_producer")
+        prior_key = self._producer_keys_by_record_id.get(producer_id)
+        if prior_key is not None and prior_key != model.key:
+            _fail("duplicate_producer")
         self._producer_facts[model.key] = facts
+        self._producer_keys_by_record_id[producer_id] = model.key
         return pointer, facts
 
     def _validate_citation(self, raw: dict) -> None:
@@ -3972,27 +4079,115 @@ class _RecordArena:
         Postconditions:
             Returns unique producer keys in the supplied order.
         Essential behavior:
-            Builds one temporary address index over captured producer facts and
-            performs constant-time membership selection for each reference.
+            Uses each normalized producer row's semantic key to select its
+            matching captured facts without scanning unrelated producers.
         """
         if type(references) not in {tuple, list}:
             _fail("invalid_producer_reference_set")
-        by_record_id = {
-            facts["record_id"]: key
-            for key, facts in self._producer_facts.items()
-        }
         keys = []
         for reference in references:
             pointer = self._owned_record_reference(
                 reference, table="producers", kind="producer"
             )
-            key = by_record_id.get(pointer["$ref"])
-            if type(key) is not str:
+            key = self._producer_keys_by_record_id.get(pointer["$ref"])
+            facts = self._producer_facts.get(key)
+            if (
+                type(key) is not str
+                or not isinstance(facts, Mapping)
+                or facts.get("key") != key
+                or facts.get("record_id") != pointer["$ref"]
+            ):
                 _fail("producer_coverage")
             keys.append(key)
         if len(set(keys)) != len(keys):
             _fail("duplicate_producer")
         return tuple(keys)
+
+    def producer_audit_references(
+        self, reference: RecordRef
+    ) -> tuple[str, RecordRef, RecordRef, tuple[RecordRef, ...]]:
+        """Select one producer's run, invocation, and ordered request rows.
+
+        Preconditions:
+            ``reference`` is an exact producer record owned by this arena.
+        Postconditions:
+            Returns its key and typed child references in original order.
+        Essential behavior:
+            Reads the normalized producer row without constructing a complete
+            manifest or expanding unrelated producers.
+        """
+        pointer = self._owned_record_reference(
+            reference, table="producers", kind="producer"
+        )
+        producer_key = self._producer_keys_by_record_id.get(pointer["$ref"])
+        facts = self._producer_facts.get(producer_key)
+        if (
+            type(producer_key) is not str
+            or not isinstance(facts, Mapping)
+            or facts.get("key") != producer_key
+            or facts.get("record_id") != pointer["$ref"]
+        ):
+            _fail("invalid_producer_record")
+        record = self._builder.records["producers"][pointer["$ref"]]["record"]
+        if not isinstance(record, Mapping) or record.get(
+            "original_run", {}
+        ).get("$ref") != facts.get("run_id"):
+            _fail("invalid_producer_record")
+
+        def selected(value: object, *, table: str, kind: str) -> RecordRef:
+            identifier, actual_kind = _check_reference_shape(value)
+            if actual_kind != kind:
+                _fail("wrong_kind_storage_reference")
+            pointer = self._owned_record_reference(
+                RecordRef(table, kind, identifier), table=table, kind=kind
+            )
+            return RecordRef(table, kind, pointer["$ref"])
+
+        raw_requests = record.get("requests")
+        if type(raw_requests) not in {tuple, list}:
+            _fail("invalid_producer_record")
+        run_ref = selected(
+            record.get("original_run"), table="runs", kind="run"
+        )
+        invocation_ref = selected(
+            record.get("invocation"), table="invocations", kind="invocation"
+        )
+        request_refs = tuple(
+            selected(item, table="requests", kind="request")
+            for item in raw_requests
+        )
+        return producer_key, run_ref, invocation_ref, request_refs
+
+    def selected_audit_record(
+        self, reference: RecordRef, *, kind: str
+    ) -> Mapping[str, object]:
+        """Return one detached immutable run, invocation, or request record.
+
+        Preconditions:
+            ``reference`` names an owned row whose kind is one of the three
+            supported producer-audit families.
+        Postconditions:
+            The selected logical mapping is immutable and detached from builder
+            indexes; no neighboring row is expanded.
+        Essential behavior:
+            Supplies a narrow selector for exact completion evidence checks.
+        """
+        tables = {
+            "run": ("runs", "run"),
+            "invocation": ("invocations", "invocation"),
+            "request": ("requests", "request"),
+        }
+        selected_table = tables.get(kind)
+        if selected_table is None:
+            _fail("invalid_storage_audit_kind")
+        table, record_kind = selected_table
+        pointer = self._owned_record_reference(
+            reference, table=table, kind=record_kind
+        )
+        record = _arena_logical_record(
+            table, pointer["$ref"], self._builder.records
+        )
+        return _freeze(record)
 
     def receipt_reference_for_item(self, item_key: str) -> RecordRef:
         """Select one captured receipt by its semantic result key.

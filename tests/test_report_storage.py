@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from collections import Counter
+from collections.abc import ItemsView
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 
     from pydantic import BaseModel
 
+from test_narrative_manifest import manifest_fixture
 from test_narrative_runtime import changed_record
 from test_narrative_v2 import FixtureProvider
 from test_narrative_v2 import golden_report
@@ -1957,6 +1959,80 @@ class ReportStorageTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "reader_section_mismatch"):
             graph_for(presentation)
+
+    def test_selected_producer_lookup_ignores_unrelated_producers(
+        self,
+    ) -> None:
+        """Unrelated producer rows could make one selected audit lookup linear.
+
+        Input/expected case matrix:
+            one captured producer: 0 fact rows visited, 2 key selections,
+                and the selected producer's 2 requests.
+            four captured producers: the same visits, key selections, and
+                selected requests.
+
+        Preconditions:
+            Producers come from the locally authored manifest fixture and are
+            inserted through the arena's strict typed record path.
+        Postconditions:
+            Selecting one producer reads its normalized semantic key directly
+            and does not scan or rebuild an index over unrelated rows.
+        """
+
+        class CountingFacts(dict[str, Mapping[str, object]]):
+            """Count fact reads without changing selected producer values."""
+
+            def __init__(
+                self, values: Mapping[str, Mapping[str, object]]
+            ) -> None:
+                super().__init__(values)
+                self.fact_rows_visited = 0
+                self.key_lookups = 0
+
+            def get(self, key: object, default: object = None) -> object:
+                self.key_lookups += 1
+                return super().get(key, default)
+
+            def items(self) -> ItemsView[str, Mapping[str, object]]:
+                self.fact_rows_visited += len(self)
+                return super().items()
+
+        _report, manifest = manifest_fixture()
+        producers = manifest.producers
+        selected = producers[0]
+        expected_request_count = len(selected.requests)
+        self.assertEqual(expected_request_count, 2)
+        cases = (
+            ("one producer", 1, (0, 2, expected_request_count)),
+            ("four producers", 4, (0, 2, expected_request_count)),
+        )
+        measurements = []
+        for name, producer_count, expected in cases:
+            with self.subTest(case=name):
+                arena = report_storage._RecordArena()  # noqa: SLF001 # Use the actual owned producer selector.
+                references = tuple(
+                    arena.put_record("producer", producer)
+                    for producer in producers[:producer_count]
+                )
+                counted_facts = CountingFacts(arena._producer_facts)  # noqa: SLF001 # Count reverse scans and direct key selection.
+                arena._producer_facts = counted_facts  # noqa: SLF001 # Instrument the existing local facts mapping only.
+
+                selected_keys = arena.producer_keys((references[0],))
+                key, _run_ref, _invocation_ref, request_refs = (
+                    arena.producer_audit_references(references[0])
+                )
+
+                actual = (
+                    counted_facts.fact_rows_visited,
+                    counted_facts.key_lookups,
+                    len(request_refs),
+                )
+                self.assertEqual(selected_keys, (selected.key,))
+                self.assertEqual(key, selected.key)
+                self.assertEqual(actual, expected)
+                measurements.append(actual)
+
+        self.assertEqual(measurements[0], measurements[1])
 
     def test_typed_constructor_defaults_match_canonical_models(self) -> None:
         """Include default schema versions omitted by fresh model constructors."""

@@ -2380,17 +2380,28 @@ def _detach_detail_value(value: object) -> object:
 
 @dataclass(frozen=True, slots=True)
 class _DetailExplanationView:
-    """Ephemeral primitive explanation fields for ledger contextual checks.
+    """Ephemeral explanation fields for ledger contextual checks.
 
     Attributes:
-        obligation_ids: Ordered obligation digests from one owned detail.
-        citations: Strictly prevalidated source-span models for this check only.
-        limitations: Ordered explicit limitation values from the result.
+        obligation_ids: Non-empty, ordered 64-character lowercase hex
+            obligation digests from one owned detail. Contextual validation
+            rejects duplicates and unknown digests.
+        citations: Ordered, strictly prevalidated ``SpanRef`` values for this
+            check; current unit, group, and source bindings are checked later.
+        limitations: Ordered, strictly prevalidated ``EvidenceLimitation``
+            values for this check. Codes are ``unavailable``, ``partial``,
+            ``unpaired_excerpt``, ``unmatched_definition``, ``parse_failed``,
+            ``text_only``, or ``unclassified_changed_source``; sides are
+            ``base`` or ``head``; paths are repository-relative; and reasons
+            are exact non-whitespace text.
+
+    The selected values are temporary and preserve the stored field values and
+    array order. They are used only by the existing contextual validator.
     """
 
     obligation_ids: tuple[str, ...]
     citations: tuple[SpanRef, ...]
-    limitations: tuple[object, ...]
+    limitations: tuple[EvidenceLimitation, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2449,6 +2460,8 @@ def _detail_result_check_view(
         ledger-unit, obligation, citation, and context checks.
     Essential behavior:
         No complete ``DetailResult`` or second detail snapshot is retained.
+        Limitation rows become temporary typed values only after their owning
+        arena has strictly parsed the complete result.
     """
     _require(
         type(record.get("unit_key")) is str,
@@ -2484,6 +2497,25 @@ def _detail_result_check_view(
             output.append(SpanRef.model_construct(**dict(raw)))
         return tuple(output)
 
+    def limitations(value: object) -> tuple[EvidenceLimitation, ...]:
+        """Project validated limitation rows into temporary typed values.
+
+        Preconditions:
+            Each item in ``value`` is an arena-owned mapping that already
+            passed the strict ``EvidenceLimitation`` structural validation.
+        Postconditions:
+            Returns the exact code, side, path, reason, and order in temporary
+            ``EvidenceLimitation`` values.
+        Essential behavior:
+            Uses model construction only after the arena's structural parse;
+            it does not supply defaults or normalize stored fields.
+        """
+        output = []
+        for raw in array(value):
+            _require(isinstance(raw, Mapping), "invalid_typed_storage_record")
+            output.append(EvidenceLimitation.model_construct(**dict(raw)))
+        return tuple(output)
+
     explanations = []
     for item in array(record.get("explanations", ())):
         _require(isinstance(item, Mapping), "invalid_typed_storage_record")
@@ -2491,7 +2523,7 @@ def _detail_result_check_view(
             _DetailExplanationView(
                 obligation_ids=array(item.get("obligation_ids", ())),
                 citations=spans(item.get("citations", ())),
-                limitations=array(item.get("limitations", ())),
+                limitations=limitations(item["limitations"]),
             )
         )
     observations = []

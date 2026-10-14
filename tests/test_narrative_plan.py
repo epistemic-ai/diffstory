@@ -2750,6 +2750,256 @@ class IndexedGraphDetailTests(unittest.TestCase):
         self.assertEqual(sum(arena.retained_record_counts.values()), 0)
 
 
+class IndexedArenaLimitationTests(unittest.TestCase):
+    """Keep arena limitation projection equivalent to typed validation."""
+
+    def test_supported_limitations_keep_exact_typed_and_indexed_bytes(
+        self,
+    ) -> None:
+        """Indexed projection must retain each supported limitation value."""
+        from diffstory.narrative_plan import (
+            _capture_indexed_arena_detail_results,
+        )
+        from diffstory.report_storage import _RecordArena
+
+        unavailable = snap(
+            {},
+            {"x.py": AFTER},
+            overrides={
+                ("base", "x.py"): {
+                    "state": "unavailable",
+                    "reason": "read_failed",
+                }
+            },
+        )
+        partial = snap(
+            {"x.py": BEFORE},
+            {"x.py": AFTER},
+            overrides={
+                (side, "x.py"): {
+                    "state": "supplied",
+                    "coverage": "partial",
+                }
+                for side in ("base", "head")
+            },
+        )
+        text_only = snap({"x.txt": "old\n"}, {"x.txt": "new\n"})
+        cases = (
+            (
+                "unavailable base",
+                unavailable,
+                (("unavailable", "base", "x.py", "read_failed"),),
+            ),
+            (
+                "partial excerpts",
+                partial,
+                (
+                    (
+                        "partial",
+                        "base",
+                        "x.py",
+                        "Only the supplied excerpt is available for comparison.",
+                    ),
+                    (
+                        "partial",
+                        "head",
+                        "x.py",
+                        "Only the supplied excerpt is available for comparison.",
+                    ),
+                ),
+            ),
+            (
+                "text-only files",
+                text_only,
+                (
+                    (
+                        "text_only",
+                        "base",
+                        "x.txt",
+                        "The supplied file is not fully parsed.",
+                    ),
+                    (
+                        "text_only",
+                        "head",
+                        "x.txt",
+                        "The supplied file is not fully parsed.",
+                    ),
+                ),
+            ),
+        )
+        for case_name, source, expected_limitations in cases:
+            with self.subTest(case=case_name):
+                ledger = build_evidence_ledger(compile_snapshot(source))
+                index = plan_module.build_ledger_index(ledger)
+                details = tuple(authored_result(unit) for unit in ledger.units)
+                actual_limitations = tuple(
+                    dict.fromkeys(
+                        (
+                            limitation.code,
+                            limitation.side,
+                            limitation.path,
+                            limitation.reason,
+                        )
+                        for detail in details
+                        for explanation in detail.explanations
+                        for limitation in explanation.limitations
+                    )
+                )
+                self.assertEqual(actual_limitations, expected_limitations)
+                for detail in details:
+                    validate_detail_result(
+                        detail,
+                        index.units[detail.unit_key],
+                        ledger,
+                        index=index,
+                    )
+
+                arena = _RecordArena()
+                references = tuple(
+                    arena.put_result(detail) for detail in details
+                )
+                self.assertEqual(
+                    arena.typed_validation_counts.get("results:detail", 0),
+                    len(details),
+                )
+                context = _capture_indexed_arena_detail_results(
+                    references, arena, ledger, index=index
+                )
+                try:
+                    self.assertEqual(
+                        context.unit_keys,
+                        tuple(detail.unit_key for detail in details),
+                    )
+                    for detail in details:
+                        self.assertEqual(
+                            canonical_bytes(
+                                context.detail_record(detail.unit_key)
+                            ),
+                            canonical_bytes(detail.model_dump(mode="json")),
+                        )
+                finally:
+                    context.citation_scope.close()
+
+    def test_invalid_limitations_match_typed_and_indexed_rejections(
+        self,
+    ) -> None:
+        """Missing or foreign limits must fail the same contextual rule."""
+        from diffstory.narrative_plan import (
+            _capture_indexed_arena_detail_results,
+        )
+        from diffstory.report_storage import _RecordArena
+
+        source = snap(
+            {},
+            {"x.py": AFTER, "y.py": AFTER},
+            overrides={
+                ("base", path): {
+                    "state": "unavailable",
+                    "reason": "read_failed",
+                }
+                for path in ("x.py", "y.py")
+            },
+        )
+        ledger = build_evidence_ledger(compile_snapshot(source))
+        index = plan_module.build_ledger_index(ledger)
+        details = tuple(authored_result(unit) for unit in ledger.units)
+        limited_details = tuple(
+            detail
+            for detail in details
+            if any(
+                explanation.limitations for explanation in detail.explanations
+            )
+        )
+        self.assertEqual(len(limited_details), 2)
+        target, other = limited_details
+        target_explanation_index = next(
+            index
+            for index, explanation in enumerate(target.explanations)
+            if explanation.limitations
+        )
+        other_explanation_index = next(
+            index
+            for index, explanation in enumerate(other.explanations)
+            if explanation.limitations
+        )
+        original_limit = target.explanations[
+            target_explanation_index
+        ].limitations[0]
+        altered_limit = original_limit.model_copy(
+            update={"reason": "different limitation"}
+        )
+        cases = (
+            (
+                "missing explicit limitation",
+                change_result(
+                    target, target_explanation_index, limitations=()
+                ),
+                "explicit_limitation_required",
+            ),
+            (
+                "altered limitation text",
+                change_result(
+                    target,
+                    target_explanation_index,
+                    limitations=(altered_limit,),
+                ),
+                "explicit_limitation_required",
+            ),
+            (
+                "duplicate limitation row",
+                change_result(
+                    target,
+                    target_explanation_index,
+                    limitations=(original_limit, original_limit),
+                ),
+                "explicit_limitation_required",
+            ),
+            (
+                "limitation from another unit",
+                change_result(
+                    target,
+                    target_explanation_index,
+                    limitations=other.explanations[
+                        other_explanation_index
+                    ].limitations,
+                ),
+                "explicit_limitation_required",
+            ),
+        )
+        target_unit = index.units[target.unit_key]
+        for case_name, damaged, expected_reason in cases:
+            with self.subTest(case=case_name):
+                candidates = tuple(
+                    damaged if detail.unit_key == target.unit_key else detail
+                    for detail in details
+                )
+                with self.assertRaisesRegex(
+                    ValueError, expected_reason
+                ) as typed:
+                    validate_detail_result(
+                        damaged, target_unit, ledger, index=index
+                    )
+
+                arena = _RecordArena()
+                references = tuple(
+                    arena.put_result(detail) for detail in candidates
+                )
+                self.assertEqual(
+                    arena.typed_validation_counts.get("results:detail", 0),
+                    len(candidates),
+                )
+                with self.assertRaisesRegex(
+                    ValueError, expected_reason
+                ) as indexed:
+                    _capture_indexed_arena_detail_results(
+                        references, arena, ledger, index=index
+                    )
+                self.assertEqual(
+                    type(indexed.exception), type(typed.exception)
+                )
+                self.assertEqual(str(indexed.exception), str(typed.exception))
+
+
 class ProseInputFixture(Contract):
     """Complete immutable request atoms containing already-produced child prose."""
 

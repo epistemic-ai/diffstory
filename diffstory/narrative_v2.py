@@ -13,6 +13,7 @@ import tempfile
 import time
 from copy import copy
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -24,6 +25,7 @@ from .narrative_contracts import AuxCard
 from .narrative_contracts import CardBudget
 from .narrative_contracts import ClaimRef
 from .narrative_contracts import Contract
+from .narrative_contracts import DetailResult
 from .narrative_contracts import Digest
 from .narrative_contracts import PlanningBounds
 from .narrative_contracts import ProseBinding
@@ -34,7 +36,9 @@ from .narrative_contracts import SupportSet
 from .narrative_contracts import result_key
 from .narrative_hierarchy import atom_key
 from .narrative_hierarchy import build_production_plan
+from .narrative_hierarchy import capture_indexed_consumed_prose
 from .narrative_hierarchy import derive_planning_sources
+from .narrative_hierarchy import derive_planning_sources_indexed
 from .narrative_hierarchy import fragment_material
 from .narrative_hierarchy import inherited_support
 from .narrative_hierarchy import material_support
@@ -43,14 +47,13 @@ from .narrative_hierarchy import projection_material
 from .narrative_hierarchy import validate_production_plan
 from .narrative_hierarchy import validate_production_requests
 from .narrative_hierarchy import validate_support_forest
-from .narrative_manifest import CurrentUsage
 from .narrative_manifest import GenerationManifest
 from .narrative_manifest import ProducerDescriptor
 from .narrative_manifest import assemble_candidate
-from .narrative_manifest import build_receipts
 from .narrative_manifest import candidate_storage_semantics
 from .narrative_manifest import compiler_fact_signature
 from .narrative_manifest import validate_prose_support
+from .narrative_plan import CitationResolutionScope
 from .narrative_plan import PackingError
 from .narrative_plan import RequestPackingLimits
 from .narrative_plan import _raw_integrity_bytes
@@ -95,7 +98,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from .narrative_contracts import BatchSpec
-    from .narrative_contracts import DetailResult
     from .narrative_contracts import MaterialProjection
     from .narrative_contracts import NarrativeResult
     from .narrative_contracts import PlanningCardResult
@@ -215,6 +217,44 @@ def statements(result: NarrativeResult) -> tuple[SupportedStatement, ...]:
             field = getattr(result, name)
             values.extend((field,) if name == "title" else field)
     return tuple(values)
+
+
+def _indexed_plan_context_digest(
+    author_digest: str,
+    detail_refs: tuple[object, ...],
+    arena: object,
+    compiler_test_runs: object,
+    options: V2Options,
+) -> str:
+    """Hash the legacy plan context from owned detail rows without expansion.
+
+    Preconditions:
+        ``detail_refs`` are complete arena-owned detail rows; their semantic
+        item keys identify the original unit-key order.
+    Postconditions:
+        The returned SHA256 equals ``semantic_digest`` over the same sorted
+        typed detail sequence, including each model's declared defaults.
+    Essential behavior:
+        Streams the canonical tuple shape and selected logical rows directly.
+    """
+    digest = sha256()
+    digest.update(b"[")
+    digest.update(canonical_bytes("diffstory.plan-context.v3"))
+    digest.update(b",")
+    digest.update(canonical_bytes(author_digest))
+    digest.update(b",[")
+    for position, reference in enumerate(
+        sorted(detail_refs, key=lambda item: item.item_key)
+    ):
+        if position:
+            digest.update(b",")
+        digest.update(b"".join(arena.logical_chunks(reference)))
+    digest.update(b"],")
+    digest.update(canonical_bytes(compiler_test_runs))
+    digest.update(b",")
+    digest.update(canonical_bytes(options))
+    digest.update(b"]")
+    return digest.hexdigest()
 
 
 def stage_identities() -> tuple[StageIdentity, ...]:
@@ -512,6 +552,11 @@ class ProductionInputs:
                 self.options.ledger,
             )
         self.wire = WireAdapter(self.index)
+        self.citation_scope = CitationResolutionScope(
+            self.ledger,
+            self.index,
+            revision_binding=captured_input._revision_binding,  # noqa: SLF001 # Reuse the exact captured base/head pair.
+        )
         author = AuthorContext(
             **{
                 key: str(self.report["meta"].get(field) or "")
@@ -541,6 +586,11 @@ class ProductionInputs:
         self.card_groups: dict[str, tuple[str, ...]] = {}
         self.sources = None
         self._source_binding = None
+        self._indexed_arena = None
+        self._indexed_details_context = None
+        self._detail_refs = ()
+        self._indexed_reader = None
+        self._base_plan_integrity_digest = None
         captured_input.bind_production_inputs(self)
 
     def detail_items(self) -> tuple[InputItem, ...]:
@@ -577,6 +627,71 @@ class ProductionInputs:
         for claim in self.observations:
             self.wire.claim_alias(claim)
         return self.sources.groups
+
+    def bind_indexed_details(
+        self, arena: object, detail_refs: tuple[object, ...]
+    ) -> tuple[PlanningGroup, ...]:
+        """Bind completed detail rows through the existing indexed validators.
+
+        Preconditions:
+            ``arena`` owns exactly one strictly captured detail row per current
+            unit, and this input has not already bound a detail context.
+        Postconditions:
+            Current detail, citation, revision, and planning-source checks share
+            one scope; only result references and compact selectors are retained.
+        Essential behavior:
+            Reuses the existing indexed arena detail capture and planning-source
+            derivation without rebuilding the ledger or retaining detail models.
+        """
+        from .narrative_plan import _capture_indexed_arena_detail_results
+
+        require(self._indexed_arena is None, "detail_context_already_bound")
+        revision_binding = self._captured_input._revision_binding  # noqa: SLF001 # Pin the original captured revisions.
+        context = _capture_indexed_arena_detail_results(
+            detail_refs,
+            arena,
+            self.ledger,
+            index=self.index,
+            citation_scope=self.citation_scope,
+            revision_binding=revision_binding,
+        )
+        sources = derive_planning_sources_indexed(
+            self.index,
+            context,
+            author_context=self.author,
+            revision_binding=revision_binding,
+        )
+        self._indexed_arena = arena
+        self._indexed_details_context = context
+        self._detail_refs = context.references
+        self.sources = sources
+        self._source_binding = sources
+        self.details = {}
+        self.observations = {}
+        for unit_key in context.unit_keys:
+            _detail_digest, observation_ids, _counts = (
+                context.planning_detail_facts(unit_key)
+            )
+            for observation_id in observation_ids:
+                self.wire.claim_alias(
+                    ClaimRef(
+                        unit_key=unit_key,
+                        observation_id=observation_id,
+                    )
+                )
+        return sources.groups
+
+    def begin_indexed_items(self) -> None:
+        """Share one current arena reader while constructing a request stage."""
+        if self._indexed_arena is not None:
+            require(
+                self._indexed_reader is None, "indexed_reader_already_bound"
+            )
+            self._indexed_reader = self._indexed_arena._snapshot_reader()  # noqa: SLF001 # Snapshot selected owned rows once for this stage.
+
+    def end_indexed_items(self) -> None:
+        """Release the builder's reader alias after request contexts are built."""
+        self._indexed_reader = None
 
     def assert_capture_current(self) -> None:
         """Reject changed captured content or derived production bindings.
@@ -637,16 +752,40 @@ class ProductionInputs:
         self.plan = None
         self.group_roots.clear()
         self.card_groups.clear()
+        citation_scope = self.citation_scope
+        if citation_scope is not None:
+            citation_scope.close()
+        self.citation_scope = None
+        self._indexed_arena = None
+        self._indexed_details_context = None
+        self._detail_refs = ()
+        self._indexed_reader = None
+        self._base_plan_integrity_digest = None
 
     def support_payload(self, support: SupportSet) -> dict:
         """Serialize only immediate consumed support, never source ancestry."""
         return self.wire.support_input(support)
 
-    def result_support(
-        self, results: tuple[NarrativeResult, ...]
-    ) -> SupportSet:
+    def result_support(self, results: tuple[object, ...]) -> SupportSet:
         """Collect the typed immediate proof used by complete result statements."""
-        values = tuple(s for r in results for s in statements(r))
+        from .narrative_hierarchy import IndexedProseResult
+
+        values = []
+        for result in results:
+            if type(result) is IndexedProseResult:
+                entries = result.statement_entries()
+                values.extend(
+                    statement
+                    for path, statement in entries
+                    if path.field == "terminology"
+                )
+                values.extend(
+                    statement
+                    for path, statement in entries
+                    if path.field != "terminology"
+                )
+            else:
+                values.extend(statements(result))
         return SupportSet(
             claims=tuple(dict.fromkeys(c for s in values for c in s.claims)),
             citations=tuple(
@@ -658,7 +797,7 @@ class ProductionInputs:
             else None,
         )
 
-    def forwarded_support(self, result: PlanningCardResult) -> dict:
+    def forwarded_support(self, result: object) -> dict:
         """Bound both proof and exact handles exported to the next consumer."""
         return {
             "proof": self.support_payload(self.result_support((result,))),
@@ -738,11 +877,27 @@ class ProductionInputs:
         groups: tuple[str, ...],
         material: dict,
         dependencies: tuple[str, ...],
-        produced: Mapping[str, PlanningCardResult],
+        produced: Mapping[str, object],
         budget: CardBudget,
     ) -> InputItem:
         """Build only actual immutable request bytes and explicit consumed producers."""
-        children = tuple(produced[k] for k in dict.fromkeys(dependencies))
+        indexed = self._indexed_arena is not None
+        selector = None
+        if indexed:
+            require(
+                self._indexed_reader is not None, "indexed_reader_required"
+            )
+            child_refs = tuple(
+                produced[k] for k in dict.fromkeys(dependencies)
+            )
+            selector = capture_indexed_consumed_prose(
+                self._indexed_reader, child_refs, self.sources
+            )
+            children = tuple(
+                selector.select(reference.item_key) for reference in child_refs
+            )
+        else:
+            children = tuple(produced[k] for k in dict.fromkeys(dependencies))
         support = self.merge_support(
             self.material_grants(material),
             inherited_support(
@@ -759,7 +914,12 @@ class ProductionInputs:
             "children": [
                 {
                     "subject": self.wire.aliases.add(
-                        "c", r.binding.subject_key
+                        "c",
+                        self._indexed_reader.result_binding_facts(r.reference)[
+                            1
+                        ]
+                        if indexed
+                        else r.binding.subject_key,
                     ),
                     "prose": self.wire.prose_input(r),
                     "proof": self.forwarded_support(r)["proof"],
@@ -785,7 +945,11 @@ class ProductionInputs:
             final=material.get("final", False),
             max_wire_bytes=budget.result_wire_bytes,
             support=support,
-            consumed=MappingProxyType({r.item_key: r for r in children}),
+            consumed=(
+                selector
+                if selector is not None
+                else MappingProxyType({r.item_key: r for r in children})
+            ),
             sources=self.sources,
             max_support_bytes=budget.support_bytes,
         )
@@ -801,7 +965,7 @@ class ProductionInputs:
     def card_item(
         self,
         card: StoryCard | AuxCard,
-        produced: Mapping[str, PlanningCardResult],
+        produced: Mapping[str, object],
     ) -> InputItem:
         """Reconstruct declared primary or auxiliary inputs in dependency order."""
         if isinstance(card, AuxCard):
@@ -966,13 +1130,22 @@ class ProductionInputs:
             # 516 canonical bytes with 21-byte aliases and an index-zero path.
             min_card_support_bytes=MIN_CARD_SUPPORT_BYTES,
         )
-        self.context_digest = semantic_digest(
-            "diffstory.plan-context.v3",
-            self.author_digest,
-            tuple(self.details[k] for k in sorted(self.details)),
-            self.ledger.compiler_test_runs,
-            self.options,
-        )
+        if self._indexed_details_context is not None:
+            self.context_digest = _indexed_plan_context_digest(
+                self.author_digest,
+                self._detail_refs,
+                self._indexed_arena,
+                self.ledger.compiler_test_runs,
+                self.options,
+            )
+        else:
+            self.context_digest = semantic_digest(
+                "diffstory.plan-context.v3",
+                self.author_digest,
+                tuple(self.details[k] for k in sorted(self.details)),
+                self.ledger.compiler_test_runs,
+                self.options,
+            )
         arguments = {
             "context_digest": self.context_digest,
             "bounds": self.bounds,
@@ -1013,6 +1186,9 @@ class ProductionInputs:
                         )
                     )
                 )
+        self._base_plan_integrity_digest = content_digest(
+            _raw_integrity_bytes(self.plan)
+        )
         return self.plan
 
     def terminal_item(
@@ -1073,19 +1249,27 @@ class ProductionInputs:
         )
 
     def section_items(
-        self, produced: Mapping[str, PlanningCardResult]
+        self, produced: Mapping[str, object]
     ) -> tuple[InputItem, ...]:
         """Prepare exactly one complete section for each validated ordered view."""
-        return tuple(
-            self.terminal_item(v, produced)
-            for v in self.plan.production.section_views
-        )
+        self.begin_indexed_items()
+        try:
+            return tuple(
+                self.terminal_item(v, produced)
+                for v in self.plan.production.section_views
+            )
+        finally:
+            self.end_indexed_items()
 
     def document_items(
-        self, produced: Mapping[str, PlanningCardResult]
+        self, produced: Mapping[str, object]
     ) -> tuple[InputItem, ...]:
         """Use the same frozen plan and bounded global abstraction."""
-        return (self.terminal_item(None, produced),)
+        self.begin_indexed_items()
+        try:
+            return (self.terminal_item(None, produced),)
+        finally:
+            self.end_indexed_items()
 
 
 class StageInputs:
@@ -1295,12 +1479,22 @@ class StageInputs:
         )
         if self.stage == "detail":
             try:
-                validate_detail_result(
-                    result,
-                    self.inputs.index.units[lookup.item_key],
-                    self.inputs.ledger,
-                    index=self.inputs.index,
-                )
+                if type(result) is DetailResult:
+                    from .narrative_plan import _validate_detail_result
+
+                    _validate_detail_result(
+                        result,
+                        self.inputs.index.units[lookup.item_key],
+                        self.inputs.index,
+                        citation_scope=self.inputs.citation_scope,
+                    )
+                else:
+                    validate_detail_result(
+                        result,
+                        self.inputs.index.units[lookup.item_key],
+                        self.inputs.ledger,
+                        index=self.inputs.index,
+                    )
             except ValueError as error:
                 msg = (
                     "coverage"
@@ -1709,6 +1903,97 @@ class CodecReplay:
         return tuple(complete[k] for k in invocation.batch.item_keys)
 
 
+def _audit_stage_records(  # noqa: PLR0913 # Keep stage identity, audit rows, replay, and result checks explicit.
+    stage: StageInputs,
+    item_keys: tuple[str, ...],
+    producers: tuple[ProducerDescriptor, ...],
+    receipts: tuple[object, ...],
+    replay: CodecReplay,
+    *,
+    validate_result: Callable[[str], None],
+) -> tuple[tuple[BatchSpec, ...], tuple[tuple[str, StageInputs], ...]]:
+    """Audit actual stage producers, successful requests, and accepted rows.
+
+    Preconditions:
+        ``stage`` is the exact current stage; ``producers`` and ``receipts``
+        came from actual successful artifacts or the complete imported
+        manifest; and ``replay`` uses the existing codec audit rules.
+    Postconditions:
+        Every ordered stage result is checked, every referenced producer and
+        successful request is audited, planning subject audits are returned in
+        first-receipt order, and the exact accepted compatibility view is bound
+        to each producer.
+    Essential behavior:
+        Shares fresh completion and independent import's producer/result loop.
+    """
+    expected_keys = tuple(stage.items)
+    require(item_keys == expected_keys, "coverage")
+    producer_by_key = {producer.key: producer for producer in producers}
+    receipt_by_key = {
+        getattr(receipt, "item_key", None): receipt for receipt in receipts
+    }
+    require(
+        len(producer_by_key) == len(producers)
+        and len(receipt_by_key) == len(receipts)
+        and set(receipt_by_key) == set(expected_keys),
+        "coverage",
+    )
+    producer_order = tuple(
+        dict.fromkeys(
+            getattr(receipt_by_key[key], "producer_key", None)
+            for key in expected_keys
+        )
+    )
+    require(
+        None not in producer_order
+        and set(producer_order) == set(producer_by_key),
+        "coverage",
+    )
+    subject_audits = []
+    selected_views = []
+    for producer_key in producer_order:
+        producer = producer_by_key[producer_key]
+        invocation = producer.invocation
+        lookup_by_item = {
+            lookup.item_key: lookup for lookup in invocation.lookups
+        }
+        require(
+            bool(invocation.batch.item_keys)
+            and set(invocation.batch.item_keys) <= set(expected_keys),
+            "dependencies_changed",
+        )
+        requests = {request.batch.id: request for request in producer.requests}
+        require(len(requests) == len(producer.requests), "request_mismatch")
+        producer_receipts = tuple(
+            receipt_by_key[item_key]
+            for item_key in expected_keys
+            if receipt_by_key[item_key].producer_key == producer_key
+        )
+        referenced_requests = set()
+        for receipt in producer_receipts:
+            require(
+                receipt.request_key in requests
+                and receipt.item_key
+                in requests[receipt.request_key].batch.item_keys,
+                "request_mismatch",
+            )
+            referenced_requests.add(receipt.request_key)
+        require(referenced_requests == set(requests), "request_mismatch")
+        view = replay.required(invocation, producer.requests)
+        require(view.stage == stage.stage, "dependencies_changed")
+        for item_key in invocation.batch.item_keys:
+            require(
+                lookup_by_item.get(item_key) == view.lookups[item_key],
+                "dependencies_changed",
+            )
+        selected_views.append((producer_key, view))
+        if stage.stage == "planning":
+            subject_audits.append(view.subject_audit(invocation))
+    for item_key in expected_keys:
+        validate_result(item_key)
+    return tuple(subject_audits), tuple(selected_views)
+
+
 class BatchedNarrator:
     """One approved generation job; new instances resume original durable work."""
 
@@ -1743,6 +2028,7 @@ class BatchedNarrator:
         self.reused: set[str] = set()
         self.approved_report: dict | None = None
         self.session = None
+        self._last_stage_proof = None
         self._approved_options_integrity_digest: str | None = None
 
     def preview(self, report: dict, *, session: object | None = None) -> dict:
@@ -1841,6 +2127,7 @@ class BatchedNarrator:
         self.session = None
         self.stages.clear()
         self.reused.clear()
+        self._last_stage_proof = None
         self.runtime = None
         self.provider = None
         self.options = None
@@ -1895,7 +2182,14 @@ class BatchedNarrator:
             raise ArtifactRuntimeError(msg) from None
         return run
 
-    def execute(self, stage: StageInputs) -> tuple[StoredArtifact, ...]:  # noqa: C901, PLR0912, PLR0915 # Preserve one logical ownership pass across original views.
+    def execute(  # noqa: C901, PLR0912, PLR0915 # Preserve one logical ownership pass across original producer views.
+        self,
+        stage: StageInputs,
+        *,
+        predecessors: tuple[object, ...] = (),
+    ) -> tuple[
+        StoredArtifact, ...
+    ]:  # Preserve one logical ownership pass across original views.
         """Discover and audit every compatible original before packing new work."""
         self.stages.append(stage)
         replay = CodecReplay(stage)
@@ -2065,16 +2359,50 @@ class BatchedNarrator:
             for a in outcome.artifacts
         )
         require(set(artifacts) == set(stage.items), "coverage")
+        ordered_artifacts = tuple(artifacts[k] for k in stage.items)
         if session is not None:
             session._check_stage_binding(stage)  # noqa: SLF001 # Reject post-execution stage rebinding.
-        return tuple(artifacts[k] for k in stage.items)
+            self._last_stage_proof = session._complete_stage(  # noqa: SLF001 # Execute the session validator at successful ordered coverage.
+                stage,
+                ordered_artifacts,
+                predecessors=predecessors,
+            )
+        else:
+            require(not predecessors, "stage_predecessor_mismatch")
+            self._last_stage_proof = None
+        return ordered_artifacts
 
-    def generate(self, report: dict) -> dict:
-        """Generate and validate a v2 candidate without applying it to the reader."""
+    def generate_validated(  # noqa: PLR0915 # Keep the fixed detail-to-document traversal visible in one method.
+        self, report: dict, *, session: object
+    ) -> object:
+        """Complete fixed-order production and return its session token.
+
+        Preconditions:
+            ``session`` is an open ``ReportSession`` for this report and the
+            request descriptor used by this coordinator.
+        Postconditions:
+            Every stage has a registered ``StageProof`` and finish compares the
+            record set with those actual owned rows.
+        Essential behavior:
+            Uses the existing detail, dependency-wave, section, and document
+            traversal without a generation-wide artifact or model collection.
+        """
+        from .narrative_session import ReportSession
+        from .narrative_session import StageProof
+
+        require(type(session) is ReportSession)
         require(not self.started, "busy")
         if self.inputs is None:
-            self.preview(report)
+            self.preview(report, session=session)
+        elif self.session is None:
+            session._adopt_preview_capture(  # noqa: SLF001 # Reuse an earlier unattached preview snapshot exactly.
+                self.inputs._captured_input  # noqa: SLF001 # Adopt the exact earlier preview capture.
+            )
+            self.session = session
+        else:
+            require(session is self.session, "dependencies_changed")
         self.check_approval(report)
+        require(not self.stages, "busy")
         self.started = True
         self.provider.require_credentials()
         self.runtime = ArtifactRuntime(
@@ -2086,80 +2414,139 @@ class BatchedNarrator:
             usage=self.usage,
         )
         self.save_run()
-        details = self.execute(
-            StageInputs(self.inputs, "detail", self.inputs.detail_items())
+
+        stage_proofs = []
+        detail_stage = StageInputs(
+            self.inputs, "detail", self.inputs.detail_items()
         )
-        detail_results = tuple(a.record.result for a in details)
-        groups = self.inputs.bind_details(detail_results)
+        detail_artifacts = self.execute(detail_stage)
+        detail_proof = self._last_stage_proof
+        require(type(detail_proof) is StageProof, "stage_proof_missing")
+        stage_proofs.append(detail_proof)
+        del detail_artifacts
+
+        groups = self.inputs.sources.groups
         plan = self.inputs.build_plan(groups)
-        planning: dict[str, PlanningCardResult] = {}
-        artifacts = list(details)
-        audits = []
+        produced: dict[str, object] = {}
+        planning_proofs = []
         for wave in planning_waves(plan):
-            stage = StageInputs(
-                self.inputs,
-                "planning",
-                tuple(
-                    self.inputs.card_item(self.inputs.cards[k], planning)
-                    for k in wave
-                ),
+            self.inputs.begin_indexed_items()
+            try:
+                items = tuple(
+                    self.inputs.card_item(self.inputs.cards[key], produced)
+                    for key in wave
+                )
+            finally:
+                self.inputs.end_indexed_items()
+            stage = StageInputs(self.inputs, "planning", items)
+            artifacts = self.execute(
+                stage,
+                predecessors=(detail_proof, *planning_proofs),
             )
-            result = self.execute(stage)
-            artifacts.extend(result)
-            invocations = {
-                a.invocation.semantic_key: a.invocation for a in result
-            }
-            audits.extend(
-                stage.replay.required(invocation, ()).subject_audit(invocation)
-                for invocation in invocations.values()
+            proof = self._last_stage_proof
+            require(type(proof) is StageProof, "stage_proof_missing")
+            stage_proofs.append(proof)
+            planning_proofs.append(proof)
+            evidence = self.session._check_stage_proof(proof)  # noqa: SLF001 # Read only owned result references.
+            reader = self.inputs._indexed_arena._snapshot_reader()  # noqa: SLF001 # Select current binding facts without result expansion.
+            for reference in evidence.result_refs:
+                kind, subject, plan_key = reader.result_binding_facts(
+                    reference
+                )
+                require(
+                    kind == "planning_card"
+                    and plan_key == plan.id
+                    and subject not in produced,
+                    "planning_coverage",
+                )
+                produced[subject] = reference
+            del artifacts
+
+        section_stage = StageInputs(
+            self.inputs, "section", self.inputs.section_items(produced)
+        )
+        section_proof = None
+        section_artifacts = self.execute(
+            section_stage,
+            predecessors=(detail_proof, *planning_proofs),
+        )
+        section_proof = self._last_stage_proof
+        require(type(section_proof) is StageProof, "stage_proof_missing")
+        stage_proofs.append(section_proof)
+        del section_artifacts
+
+        document_stage = StageInputs(
+            self.inputs, "document", self.inputs.document_items(produced)
+        )
+        document_artifacts = self.execute(
+            document_stage,
+            predecessors=(detail_proof, *planning_proofs, section_proof),
+        )
+        document_proof = self._last_stage_proof
+        require(type(document_proof) is StageProof, "stage_proof_missing")
+        stage_proofs.append(document_proof)
+        del document_artifacts
+
+        ordered_proofs = tuple(stage_proofs)
+        records = self.session._recordset_for_production(  # noqa: SLF001 # Data input only; finish rechecks every reference against proof rows.
+            ordered_proofs
+        )
+        return self.session.finish_production(records, ordered_proofs)
+
+    def generate(self, report: dict) -> dict:
+        """Return an explicitly expanded, data-only compatibility candidate."""
+        from .narrative_manifest import persisted_manifest
+        from .narrative_manifest import stored_generation
+        from .narrative_session import ReportSession
+        from .narrative_session import StageProof
+        from .narrative_session import ValidatedGeneration
+        from .narrative_session import _indexed_generation_proof_witness
+        from .narrative_session import _IndexedGenerationProof
+        from .report_storage import expand_report_storage
+
+        created_session = self.session is None
+        if created_session:
+            descriptor = (
+                Transport(self.provider, self.options).descriptor
+                if self.inputs is None
+                else self.inputs.transport.descriptor
             )
-            planning.update(
-                (a.record.result.binding.subject_key, a.record.result)
-                for a in result
+            session = ReportSession.capture(report, descriptor)
+            if self.inputs is not None:
+                session._adopt_preview_capture(  # noqa: SLF001 # Adopt the exact earlier preview capture.
+                    self.inputs._captured_input  # noqa: SLF001 # Adopt the exact earlier preview capture.
+                )
+        else:
+            session = self.session
+        generation = self.generate_validated(report, session=session)
+        proof = session._registered_payload(  # noqa: SLF001 # Only the exact live capability can enter compatibility expansion.
+            generation, ValidatedGeneration, "generation"
+        )
+        require(
+            type(proof) is _IndexedGenerationProof,
+            "invalid_session_capability",
+        )
+        require(
+            proof.witness == _indexed_generation_proof_witness(proof),
+            "stale_session_capability",
+        )
+        require(
+            all(type(item) is StageProof for item in proof.stage_proofs),
+            "invalid_session_capability",
+        )
+        session._ordered_stage_proofs(proof.stage_proofs)  # noqa: SLF001 # Check stage and replay liveness before explicit expansion.
+        try:
+            candidate = expand_report_storage(
+                proof.graph,
+                max_output_bytes=(1 << 63) - 1,
             )
-        plan = StoryPlan(**(plan.model_dump() | {"requests": tuple(audits)}))
-        validate_production_requests(plan)
-        self.inputs.plan = plan
-        sections = self.execute(
-            StageInputs(
-                self.inputs, "section", self.inputs.section_items(planning)
+            manifest = persisted_manifest(candidate["generation"])
+            candidate["generation"] = stored_generation(manifest)
+            return candidate
+        finally:
+            session._discard_fresh_generation(  # noqa: SLF001 # Compatibility output carries no reusable session authority.
+                generation, proof.stage_proofs
             )
-        )
-        document = self.execute(
-            StageInputs(
-                self.inputs, "document", self.inputs.document_items(planning)
-            )
-        )
-        artifacts.extend((*sections, *document))
-        producers, receipts = build_receipts(
-            tuple(artifacts), self.original_run, frozenset(self.reused)
-        )
-        manifest = GenerationManifest(
-            run=self.inputs.run,
-            compiler_fact_signature=self.inputs._captured_input.compiler_signature  # noqa: SLF001 # Reuse the immutable capture's exact compiler-fact digest.
-            or compiler_fact_signature(self.inputs.report),
-            current_usage=CurrentUsage(**self.usage.report()),
-            ledger_digest=self.inputs.ledger.id,
-            ledger_parameters=self.options.ledger,
-            request_configuration=self.inputs.transport.descriptor,
-            unit_keys=tuple(self.inputs.index.units),
-            details=detail_results,
-            plan=plan,
-            planning=tuple(
-                planning[k] for wave in planning_waves(plan) for k in wave
-            ),
-            sections=tuple(a.record.result for a in sections),
-            document=document[0].record.result,
-            producers=producers,
-            receipts=receipts,
-        )
-        self.validate_manifest(manifest)
-        return assemble_candidate(
-            self.inputs.report,
-            manifest,
-            ledger=self.inputs.ledger,
-            index=self.inputs.index,
-        )
 
     def validate_manifest(self, manifest: GenerationManifest) -> None:
         """Check actual producers against the current production stage registries."""
@@ -2169,25 +2556,61 @@ class BatchedNarrator:
         validate_support_forest(
             prose, self.inputs.sources, {r.item_key: r for r in prose}
         )
-        stages = {key: stage for stage in self.stages for key in stage.items}
-        for producer in manifest.producers:
-            keys = producer.invocation.batch.item_keys
-            stage = stages[keys[0]]
-            require(
-                all(stages[k] is stage for k in keys), "dependencies_changed"
-            )
-            stage.replay.required(producer.invocation, producer.requests)
-        for result in (
+        ordered_results = (
             *manifest.details,
             *manifest.planning,
             *manifest.sections,
             manifest.document,
-        ):
-            key = result_key(result)
-            stages[key].validate(stages[key].lookups[key], result)
+        )
+        result_by_key = {
+            result_key(result): result for result in ordered_results
+        }
+        require(len(result_by_key) == len(ordered_results), "coverage")
+        receipt_by_key = {
+            receipt.item_key: receipt for receipt in manifest.receipts
+        }
+        producer_by_key = {
+            producer.key: producer for producer in manifest.producers
+        }
+        require(
+            len(receipt_by_key) == len(manifest.receipts)
+            and set(receipt_by_key) == set(result_by_key),
+            "coverage",
+        )
+        audited = set()
+        covered_keys = set()
+        for stage in self.stages:
+            keys = tuple(stage.items)
+            require(not covered_keys.intersection(keys), "coverage")
+            covered_keys.update(keys)
+            producer_keys = tuple(
+                dict.fromkeys(receipt_by_key[key].producer_key for key in keys)
+            )
+            require(
+                all(key not in audited for key in producer_keys),
+                "dependencies_changed",
+            )
+            stage_producers = tuple(
+                producer_by_key[key] for key in producer_keys
+            )
+            stage_receipts = tuple(receipt_by_key[key] for key in keys)
+            replay = CodecReplay(stage)
+            _audit_stage_records(
+                stage,
+                keys,
+                stage_producers,
+                stage_receipts,
+                replay,
+                validate_result=lambda key, stage=stage: stage.validate(
+                    stage.lookups[key], result_by_key[key]
+                ),
+            )
+            audited.update(producer_keys)
+        require(covered_keys == set(result_by_key), "coverage")
+        require(audited == set(producer_by_key), "coverage")
 
 
-def validate_production(  # noqa: C901, PLR0915 # Preserve one full ordered offline proof path.
+def validate_production(  # noqa: PLR0915 # Preserve one full ordered offline proof path.
     report: dict,
     manifest: GenerationManifest,
     *,
@@ -2251,34 +2674,35 @@ def validate_production(  # noqa: C901, PLR0915 # Preserve one full ordered offl
     def accept_stage(
         stage: StageInputs, results: tuple[NarrativeResult, ...]
     ) -> None:
-        # Audit original peers and each successful request before a child can
-        # confer support on the next dependency wave. Receipt structure and
-        # result digests were independently checked by GenerationManifest.
-        require(
-            {result_key(r) for r in results} == set(stage.items), "coverage"
-        )
+        result_keys = tuple(result_key(result) for result in results)
+        require(result_keys == tuple(stage.items), "coverage")
         replay = CodecReplay(stage)
         stage.replay = replay
         session = inputs._captured_input.owner_session  # noqa: SLF001 # The imported proof binds its actual stage to the matching capture.
         if session is not None:
             session._bind_stage(stage)  # noqa: SLF001 # Register incomplete stage data, not a proof.
-        for key in dict.fromkeys(
-            receipts[result_key(r)].producer_key for r in results
-        ):
-            require(key not in audited, "dependencies_changed")
-            producer = producers[key]
-            require(
-                set(producer.invocation.batch.item_keys) <= set(stage.items),
-                "dependencies_changed",
-            )
-            view = replay.required(producer.invocation, producer.requests)
-            audited.add(key)
-            if stage.stage == "planning":
-                audit = view.subject_audit(producer.invocation)
-                actual_audits[audit.id] = audit
-        for result in results:
-            key = result_key(result)
-            stage.validate(stage.lookups[key], result)
+        producer_keys = tuple(
+            dict.fromkeys(receipts[key].producer_key for key in result_keys)
+        )
+        require(
+            all(key not in audited for key in producer_keys),
+            "dependencies_changed",
+        )
+        stage_producers = tuple(producers[key] for key in producer_keys)
+        stage_receipts = tuple(receipts[key] for key in result_keys)
+        result_by_key = dict(zip(result_keys, results, strict=True))
+        stage_audits, _selected_views = _audit_stage_records(
+            stage,
+            result_keys,
+            stage_producers,
+            stage_receipts,
+            replay,
+            validate_result=lambda key: stage.validate(
+                stage.lookups[key], result_by_key[key]
+            ),
+        )
+        audited.update(producer_keys)
+        actual_audits.update((audit.id, audit) for audit in stage_audits)
 
     detail_stage = StageInputs(inputs, "detail", inputs.detail_items())
     accept_stage(detail_stage, manifest.details)

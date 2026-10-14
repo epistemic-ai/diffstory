@@ -1963,6 +1963,75 @@ class IndexedConsumedProseTests(unittest.TestCase):
                 )
                 self.assertEqual(indexed_request, expanded_request)
 
+    def test_arena_digest_reuse_preserves_defaulted_and_raw_result_bytes(
+        self,
+    ) -> None:
+        """A typed digest could differ from the selector's canonical bytes.
+
+        Input/expected case matrix:
+            planning card, section, and document typed rows: the arena's
+                content digest equals the canonical expanded selector stream.
+            planning card mapping without default terminology: no arena digest
+                reuse; the selector keeps the exact streamed digest.
+
+        Preconditions:
+            Every typed result belongs to a prose family supported by the
+            indexed selector and the matching source scope is live.
+        Postconditions:
+            Stored digest reuse follows exact default and field-presence
+            semantics across all prose families.
+        """
+        from diffstory.narrative_hierarchy import (
+            capture_indexed_consumed_prose,
+        )
+
+        typed_cases = tuple(
+            (family, self._result(family))
+            for family in ("planning_card", "section", "document")
+        )
+        for family, result in typed_cases:
+            with self.subTest(family=family):
+                reference = self.arena.put_result(result)
+                reader = self.arena._snapshot_reader()  # noqa: SLF001 # Compare stored facts with the exact logical stream.
+                expected_bytes = canonical_bytes(
+                    result.model_dump(mode="json")
+                )
+                streamed_bytes = b"".join(reader.logical_chunks(reference))
+                expected_digest = content_digest(expected_bytes)
+                self.assertEqual(streamed_bytes, expected_bytes)
+                self.assertEqual(
+                    reader.reusable_result_content_digest(reference),
+                    expected_digest,
+                )
+                selector = capture_indexed_consumed_prose(
+                    reader, (reference,), self.sources
+                )
+                self.assertEqual(
+                    selector.select(result.item_key).result_digest,
+                    expected_digest,
+                )
+
+        raw_default = self._result(
+            "planning_card", include_terms=False
+        ).model_dump(mode="json")
+        raw_default.pop("terminology")
+        reference = self.arena.put_result(raw_default)
+        reader = self.arena._snapshot_reader()  # noqa: SLF001 # Preserve raw field presence for the fallback case.
+        streamed_bytes = b"".join(reader.logical_chunks(reference))
+        streamed_digest = content_digest(streamed_bytes)
+        self.assertIsNone(reader.reusable_result_content_digest(reference))
+        selector = capture_indexed_consumed_prose(
+            reader, (reference,), self.sources
+        )
+        self.assertEqual(
+            selector.select(raw_default["item_key"]).result_digest,
+            streamed_digest,
+        )
+        self.assertNotEqual(
+            streamed_digest,
+            self.arena.result_digests(reference)[1],
+        )
+
     def test_indexed_support_reuses_shared_membership_and_forest_rules(
         self,
     ) -> None:
@@ -2385,7 +2454,7 @@ class IndexedConsumedProseTests(unittest.TestCase):
             _current_bytes, peak_bytes = tracemalloc.get_traced_memory()
             tracemalloc.stop()
 
-        self.assertEqual(counts["logical_chunks"], len(references))
+        self.assertEqual(counts["logical_chunks"], 0)
         self.assertGreater(counts["statement_paths"], 0)
         self.assertGreater(counts["statement_views"], 0)
         self.assertEqual(
