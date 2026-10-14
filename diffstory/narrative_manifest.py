@@ -1951,6 +1951,73 @@ def indexed_applied_fields(  # noqa: PLR0913, PLR0915 # Select document and grou
     return {"document": document, "groups": tuple(group_overlays)}
 
 
+def validate_indexed_applied_fields(
+    report: dict | _OwnedMapping, overlay: Mapping[str, object]
+) -> None:
+    """Compare stored report application fields with indexed derivation.
+
+    Preconditions:
+        ``overlay`` is the result of ``indexed_applied_fields`` for the exact
+        current reader, detail context, and captured compiler report.
+    Postconditions:
+        Returns only when document text, group order, labels, and every applied
+        narrative field match the existing expanded validation predicates.
+    Essential behavior:
+        Selects small applied fields and does not build an expanded candidate
+        or copy the full report.
+    """
+    _require(
+        type(report) in {dict, _OwnedMapping}
+        and isinstance(overlay, Mapping)
+        and set(overlay) == {"document", "groups"},
+        "invalid_indexed_application",
+    )
+    document = report.get("document")
+    expected_document = overlay.get("document")
+    _require(
+        isinstance(document, Mapping)
+        and canonical_bytes(document) == canonical_bytes(expected_document),
+        "document_changed",
+    )
+    groups = report.get("groups")
+    expected_groups = overlay.get("groups")
+    _require(
+        type(groups) in {list, tuple, _OwnedList, _OwnedTuple}
+        and type(expected_groups) in {list, tuple},
+        "invalid_compiler_group_facts",
+    )
+    expected_ids = tuple(
+        group.get("group_id")
+        for group in expected_groups
+        if isinstance(group, Mapping)
+    )
+    _require(
+        len(expected_ids) == len(expected_groups)
+        and tuple(
+            group.get("id") for group in groups if isinstance(group, Mapping)
+        )
+        == expected_ids,
+        "presentation_order_changed",
+    )
+    for group, expected in zip(groups, expected_groups, strict=True):
+        _require(
+            isinstance(group, Mapping) and isinstance(expected, Mapping),
+            "invalid_compiler_group_facts",
+        )
+        actual_fields = {
+            name: group.get(name)
+            for name in ("title", "number", "next_id", "narrative")
+        }
+        expected_fields = {
+            name: expected[name]
+            for name in ("title", "number", "next_id", "narrative")
+        }
+        _require(
+            canonical_bytes(actual_fields) == canonical_bytes(expected_fields),
+            "section_presentation_changed",
+        )
+
+
 def _apply_v2_candidate(
     report: dict | _OwnedMapping,
     manifest: GenerationManifest,

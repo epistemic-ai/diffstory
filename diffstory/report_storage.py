@@ -53,6 +53,9 @@ from .narrative_manifest import ResultReceipt
 from .narrative_manifest import V2Presentation
 from .narrative_manifest import expanded_generation
 from .narrative_manifest import result_digest
+from .narrative_plan import _OwnedList
+from .narrative_plan import _OwnedMapping
+from .narrative_plan import _OwnedTuple
 from .narrative_plan import canonical_bytes
 from .narrative_plan import content_digest
 from .narrative_plan import semantic_digest
@@ -155,10 +158,90 @@ def _freeze(value: object) -> object:
     return value
 
 
+def _capture_import_base_report(value: object) -> _OwnedMapping:
+    """Freeze one imported compiler base into the session's report views.
+
+    Preconditions:
+        ``value`` is the strict JSON object from a fresh canonical report
+        storage parse, with only JSON values and string keys.
+    Postconditions:
+        Returns one recursively immutable ``_OwnedMapping`` report tree.
+    Essential behavior:
+        Makes the parser's base the exact object that ``_CapturedInput`` owns,
+        without a later thaw and recapture of this complete tree.
+    """
+    captured = _capture_import_base_value(value)
+    if type(captured) is not _OwnedMapping:
+        _fail("invalid_report_base")
+    return captured
+
+
+def _capture_import_base_value(value: object) -> object:
+    """Freeze one child of a fresh compiler-base JSON object.
+
+    Preconditions:
+        ``value`` is a strict JSON primitive, object, or array.
+    Postconditions:
+        Returns immutable report traversal views while preserving list shape.
+    Essential behavior:
+        Allocates each nested compiler-base container exactly once.
+    """
+    if type(value) is dict:
+        entries: list[tuple[str, object]] = []
+        for key, item in value.items():
+            if type(key) is not str:
+                _fail("invalid_report_base")
+            entries.append((key, _capture_import_base_value(item)))
+        return _OwnedMapping(tuple(entries))
+    if type(value) is list:
+        return _OwnedList(
+            tuple(_capture_import_base_value(item) for item in value)
+        )
+    if type(value) is tuple:
+        return _OwnedTuple(
+            tuple(_capture_import_base_value(item) for item in value)
+        )
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    _fail("invalid_report_base")
+    return None
+
+
+def _freeze_graph_root(value: dict) -> Mapping[str, object]:
+    """Freeze a small graph root while sharing a captured compiler base.
+
+    Preconditions:
+        ``value`` passed arena root checks, and any ``_OwnedMapping`` base is
+        the exact immutable compiler report owned by the current session.
+    Postconditions:
+        Root selectors are frozen, while the already immutable base object is
+        retained by identity instead of copied into a second report tree.
+    Essential behavior:
+        Keeps the private application handoff to one captured base plus a
+        small overlay.
+    """
+    if (
+        value.get("shape") == "report"
+        and type(value.get("base_report")) is _OwnedMapping
+    ):
+        return MappingProxyType(
+            {
+                "shape": "report",
+                "base_report": value["base_report"],
+                "generation": _freeze(value["generation"]),
+                "reader": _freeze(value["reader"]),
+            }
+        )
+    frozen = _freeze(value)
+    if not isinstance(frozen, Mapping):
+        _fail("invalid_storage_root")
+    return frozen
+
+
 def _thaw(value: object) -> object:
     if isinstance(value, Mapping):
         return {key: _thaw(item) for key, item in value.items()}
-    if type(value) in {list, tuple}:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [_thaw(item) for item in value]
     return value
 
@@ -1562,14 +1645,20 @@ def encode_report_storage(value: object, artifact_kind: str) -> bytes:
     return encoded
 
 
-def _strict_json_load(raw_bytes: bytes | str) -> tuple[dict, bytes]:
+def _strict_json_load(
+    raw_bytes: bytes | str, *, max_input_bytes: int = _MAX_INPUT_BYTES
+) -> tuple[dict, bytes]:
     if type(raw_bytes) is bytes:
         raw = raw_bytes
     elif type(raw_bytes) is str:
         raw = raw_bytes.encode("utf-8")
     else:
         _fail("storage_input_must_be_bytes_or_text")
-    if len(raw) > _MAX_INPUT_BYTES:
+    if (
+        type(max_input_bytes) is not int
+        or max_input_bytes < 0
+        or len(raw) > min(max_input_bytes, _MAX_INPUT_BYTES)
+    ):
         _fail("storage_input_too_large")
     _check_json_depth(raw)
 
@@ -2419,6 +2508,152 @@ class ReportRecordGraph(ReportStorageView):
             _result_by_key=MappingProxyType(by_key),
             _result_by_id=MappingProxyType(by_id),
             _typed_validation_counts=MappingProxyType(validation_counts),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _StorageImportFacts:
+    """Small checked selectors transferred from one independent parse pass.
+
+    Attributes:
+        result_ids: Unique ``(kind, item_key)`` to storage-address bindings.
+        receipt_ids: Unique result item keys to receipt storage addresses.
+        result_digests: Typed receipt digests keyed by result address.
+        result_content_digests: Typed logical content digests by result address.
+        result_content_digest_matches_record: Whether raw logical bytes already
+            match typed default-expanded bytes for safe digest reuse.
+        plan_facts: Compact validated plan selectors by plan address.
+        producer_facts: Compact audit selectors by producer key.
+        producer_keys_by_record_id: Direct address-to-producer-key index.
+        validation_counts: Unique logical row counts by table and kind.
+    """
+
+    result_ids: Mapping[tuple[str, str], str]
+    receipt_ids: Mapping[str, str]
+    result_digests: Mapping[str, str]
+    result_content_digests: Mapping[str, str]
+    result_content_digest_matches_record: Mapping[str, bool]
+    plan_facts: Mapping[str, Mapping[str, object]]
+    producer_facts: Mapping[str, Mapping[str, object]]
+    producer_keys_by_record_id: Mapping[str, str]
+    validation_counts: Mapping[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedStorageImport:
+    """Freshly parsed bytes prepared for one session-owned arena transfer.
+
+    This private value stores no raw input buffer, expanded presentation,
+    parsed model map, or logical-record map. Its root and tables contain only
+    immutable primitives produced by the strict storage parser.
+    """
+
+    artifact_kind: str
+    root: Mapping[str, object]
+    tables: Mapping[str, Mapping[str, Mapping[str, object]]]
+    result_by_key: Mapping[tuple[str, str], ResultRef]
+    result_by_id: Mapping[str, ResultRef]
+    facts: _StorageImportFacts
+
+    def graph(self, *, base_report: object | None = None) -> ReportRecordGraph:
+        """Return the independently parsed graph as immutable data only.
+
+        Preconditions:
+            This value came directly from ``_parse_report_storage_for_import``.
+        Postconditions:
+            The graph shares the exact table rows from that parse and retains
+            no source bytes or mutable validation models.
+        Essential behavior:
+            It creates no authority; a ReportSession must still prove use.
+        """
+        root = self.root
+        if base_report is not None:
+            if (
+                self.artifact_kind != "report"
+                or type(base_report) is not _OwnedMapping
+            ):
+                _fail("invalid_report_base")
+            root = MappingProxyType(
+                {
+                    "shape": "report",
+                    "base_report": base_report,
+                    "generation": self.root["generation"],
+                    "reader": self.root["reader"],
+                }
+            )
+        return ReportRecordGraph(
+            _raw=None,
+            _artifact_kind=self.artifact_kind,
+            _root=root,
+            _tables=self.tables,
+            _result_by_key=self.result_by_key,
+            _result_by_id=self.result_by_id,
+            _typed_validation_counts=self.facts.validation_counts,
+        )
+
+    def generation_record_set(self) -> GenerationRecordSet:
+        """Capture ordered header and row addresses without a manifest model.
+
+        Preconditions:
+            The normalized root passed closed generation-shell validation.
+        Postconditions:
+            Returns a data-only record set that preserves header field
+            presence and every stored result, producer, and receipt order.
+        Essential behavior:
+            Resolves only root pointers and does not expand table records.
+        """
+        generation = self.root["generation"]
+        header_names = {
+            "version",
+            "provenance",
+            "compiler_fact_signature",
+            "current_usage",
+            "ledger_digest",
+            "ledger_parameters",
+            "request_configuration",
+            "unit_keys",
+        }
+        header = {
+            key: _thaw(value)
+            for key, value in generation.items()
+            if key in header_names
+        }
+
+        def record_ref(pointer: Mapping[str, object], table: str) -> RecordRef:
+            """Resolve one checked root pointer to a strict data address."""
+            identifier, kind = _check_reference_shape(pointer)
+            entry = self.tables[table].get(identifier)
+            if entry is None or entry["kind"] != kind:
+                _fail("wrong_kind_storage_reference")
+            return RecordRef(table, kind, identifier)
+
+        def result_ref(pointer: Mapping[str, object]) -> ResultRef:
+            """Resolve one checked result pointer and item binding."""
+            identifier, kind = _check_reference_shape(pointer)
+            result = self.result_by_id.get(identifier)
+            if result is None or result.kind != kind:
+                _fail("wrong_kind_storage_reference")
+            return result
+
+        return GenerationRecordSet(
+            header,
+            run_ref=record_ref(generation["run"], "runs"),
+            details=tuple(result_ref(item) for item in generation["details"]),
+            plan_ref=record_ref(generation["plan"], "plans"),
+            planning=tuple(
+                result_ref(item) for item in generation["planning"]
+            ),
+            sections=tuple(
+                result_ref(item) for item in generation["sections"]
+            ),
+            document=result_ref(generation["document"]),
+            producers=tuple(
+                record_ref(item, "producers")
+                for item in generation["producers"]
+            ),
+            receipts=tuple(
+                record_ref(item, "receipts") for item in generation["receipts"]
+            ),
         )
 
 
@@ -3428,6 +3663,48 @@ class _RecordArena:
         ) = None
         self._validation_counts: dict[str, int] = {}
 
+    @classmethod
+    def _from_parsed_storage(
+        cls, parsed: _ParsedStorageImport
+    ) -> _RecordArena:
+        """Transfer parser-owned immutable rows into one new session arena.
+
+        Preconditions:
+            ``parsed`` is the private result of a fresh bytes-only storage
+            parse; its rows passed strict independent validation and all row
+            contents are recursively immutable.
+        Postconditions:
+            Returns an open arena whose table entries are the exact same row
+            objects. Only top-level indexes and small fact maps are copied.
+        Essential behavior:
+            It does not trust caller-supplied graph fields or validation counts.
+        """
+        if type(parsed) is not _ParsedStorageImport:
+            _fail("invalid_parsed_storage_import")
+        arena = cls()
+        facts = parsed.facts
+        builder = arena._builder
+        builder.records = {
+            table: dict(parsed.tables[table]) for table in _TABLES
+        }
+        builder.record_count = sum(
+            len(records) for records in builder.records.values()
+        )
+        builder.result_ids = dict(facts.result_ids)
+        builder.receipt_ids = dict(facts.receipt_ids)
+        arena._result_digests = dict(facts.result_digests)
+        arena._result_content_digests = dict(facts.result_content_digests)
+        arena._result_content_digest_matches_record = dict(
+            facts.result_content_digest_matches_record
+        )
+        arena._plan_facts = dict(facts.plan_facts)
+        arena._producer_facts = dict(facts.producer_facts)
+        arena._producer_keys_by_record_id = dict(
+            facts.producer_keys_by_record_id
+        )
+        arena._validation_counts = dict(facts.validation_counts)
+        return arena
+
     def _ensure_writable(self) -> _Builder:
         """Return the mutable builder only while this arena remains open.
 
@@ -4047,6 +4324,79 @@ class _RecordArena:
         if receipt_digest is None or content_digest_value is None:
             _fail("foreign_storage_result_reference")
         return receipt_digest, content_digest_value
+
+    def selected_result_model(self, reference: ResultRef) -> BaseModel:
+        """Build one transient strict model for the accepted stage validator.
+
+        Preconditions:
+            ``reference`` is an exact result address captured in this arena.
+        Postconditions:
+            Returns one typed detail, planning, section, or document result.
+        Essential behavior:
+            Materializes only the selected result and retains no model alias.
+        """
+        pointer = self._owned_result_reference(reference, kind=reference.kind)
+        logical = _arena_logical_record(
+            "results", pointer["$ref"], self._builder.records
+        )
+        return _model(_RESULT_MODELS[reference.kind], logical)
+
+    def selected_plan_model(self, reference: RecordRef) -> StoryPlan:
+        """Build the exact plan model needed to rederive the current plan.
+
+        Preconditions:
+            ``reference`` selects this arena's one story-plan row.
+        Postconditions:
+            Returns a strict ``StoryPlan`` for the existing checked planner.
+        Essential behavior:
+            Does not construct a generation manifest or copy other audit rows.
+        """
+        pointer = self._owned_record_reference(
+            reference, table="plans", kind="story_plan"
+        )
+        logical = _arena_logical_record(
+            "plans", pointer["$ref"], self._builder.records
+        )
+        return _model(StoryPlan, logical)
+
+    def selected_producer_model(
+        self, reference: RecordRef
+    ) -> ProducerDescriptor:
+        """Build one producer's exact original request closure for audit.
+
+        Preconditions:
+            ``reference`` selects an owned producer named by the generation.
+        Postconditions:
+            Returns a strict producer with its original run, invocation peers,
+            and successful-request metadata.
+        Essential behavior:
+            Materializes one selected producer instead of the full audit set.
+        """
+        pointer = self._owned_record_reference(
+            reference, table="producers", kind="producer"
+        )
+        logical = _arena_logical_record(
+            "producers", pointer["$ref"], self._builder.records
+        )
+        return _model(ProducerDescriptor, logical)
+
+    def selected_receipt_model(self, reference: RecordRef) -> ResultReceipt:
+        """Build one strict receipt for the current stage audit.
+
+        Preconditions:
+            ``reference`` selects an owned receipt named by the generation.
+        Postconditions:
+            Returns one strict receipt model with exact scalar values.
+        Essential behavior:
+            Keeps receipt validation transient and avoids a complete manifest.
+        """
+        pointer = self._owned_record_reference(
+            reference, table="receipts", kind="receipt"
+        )
+        logical = _arena_logical_record(
+            "receipts", pointer["$ref"], self._builder.records
+        )
+        return _model(ResultReceipt, logical)
 
     def plan_assembly_facts(
         self, reference: RecordRef
@@ -4744,11 +5094,18 @@ class _RecordArena:
         """
         if artifact_kind not in {"report", "annotations"}:
             _fail("invalid_artifact_kind")
-        _read_root_generation_shape(root)
+        root_for_shape = root
+        if (
+            artifact_kind == "report"
+            and type(root.get("base_report")) is _OwnedMapping
+        ):
+            root_for_shape = dict(root)
+            root_for_shape["base_report"] = {}
+        _read_root_generation_shape(root_for_shape)
         if (artifact_kind == "report") != (root.get("shape") == "report"):
             _fail("artifact_root_kind_mismatch")
         if artifact_kind == "report" and (
-            type(root["base_report"]) is not dict
+            type(root["base_report"]) not in {dict, _OwnedMapping}
             or {
                 "generation",
                 "narrative_v2",
@@ -4756,7 +5113,134 @@ class _RecordArena:
             & set(root["base_report"])
         ):
             _fail("invalid_report_base")
-        _strict_json_value(root)
+        if (
+            artifact_kind == "report"
+            and type(root["base_report"]) is _OwnedMapping
+        ):
+            _strict_json_value(root_for_shape)
+        else:
+            _strict_json_value(root)
+
+    def compare_imported_reader(
+        self,
+        reader_id: str,
+        projection: IndexedReaderProjection,
+        *,
+        root_shape: str,
+    ) -> None:
+        """Compare an incoming reader with a fresh indexed derivation.
+
+        Preconditions:
+            ``reader_id`` names the parser-validated reader row, and
+            ``projection`` was derived from current source, result, and audit
+            inputs in this exact arena.
+        Postconditions:
+            Returns only when complete logical reader bytes, scalar types,
+            field presence, citation bindings, provenance, and order match.
+        Essential behavior:
+            Streams selected result records and never constructs a presentation
+            or annotation model tree.
+        """
+        entry = self._builder.records["readers"].get(reader_id)
+        if entry is None or entry["kind"] != "reader":
+            _fail("missing_storage_record")
+        expected = self._reader_record_from_projection(
+            projection, root_shape=root_shape
+        )
+        if not _reader_records_stream_equal(
+            entry["record"], expected, self._builder.records
+        ):
+            _fail("reader_mismatch")
+
+    def drop_imported_reader(self, reader_id: str) -> None:
+        """Remove the validated annotation root's obsolete reader row.
+
+        Preconditions:
+            ``reader_id`` is the exact reader row in this fresh imported arena;
+            the row has already been compared with the independently derived
+            annotation projection.
+        Postconditions:
+            The open arena no longer retains that root-only reader address.
+        Essential behavior:
+            Lets a derived report root keep exact table closure and shared rows.
+        """
+        builder = self._ensure_writable()
+        entry = builder.records["readers"].get(reader_id)
+        if entry is None or entry["kind"] != "reader":
+            _fail("missing_storage_record")
+        del builder.records["readers"][reader_id]
+        builder.record_count -= 1
+        key = "readers:reader"
+        count = self._validation_counts.get(key, 0)
+        if count <= 1:
+            self._validation_counts.pop(key, None)
+        else:
+            self._validation_counts[key] = count - 1
+
+    def derive_imported_report_graph(
+        self,
+        generation_refs: GenerationRecordSet,
+        reader_projection: IndexedReaderProjection,
+        *,
+        base_report: object,
+    ) -> ReportRecordGraph:
+        """Derive a report root over the imported rows without a second proof.
+
+        Preconditions:
+            ``base_report`` is the exact immutable capture owned by the
+            importing session; incoming annotation reader storage was compared
+            before its obsolete row was removed; and generation references are
+            the exact independently validated record set.
+        Postconditions:
+            Returns one report graph whose complete result and audit rows are
+            physically shared with the import graph. Only the new reader row
+            and small root are added.
+        Essential behavior:
+            Checks the new reader schema and root closure but does not rerun
+            generation, producer, request, receipt, or support proof work.
+        """
+        builder = self._ensure_writable()
+        if type(base_report) is not _OwnedMapping:
+            _fail("invalid_report_base")
+        reader_record = self._reader_record_from_projection(
+            reader_projection, root_shape="report"
+        )
+        reader_id = self._insert_reader(reader_record)
+        root = {
+            "shape": "report",
+            "base_report": base_report,
+            "generation": self._generation_skeleton(generation_refs),
+            "reader": _ref(reader_id, "reader"),
+        }
+        self._check_arena_root(root, "report")
+        _check_graph_and_addresses(root, builder.records)
+
+        frozen_tables = MappingProxyType(
+            {
+                table: MappingProxyType(dict(entries))
+                for table, entries in builder.records.items()
+            }
+        )
+        result_by_key: dict[tuple[str, str], ResultRef] = {}
+        result_by_id: dict[str, ResultRef] = {}
+        for (kind, item_key), identifier in builder.result_ids.items():
+            reference = ResultRef("results", kind, identifier, item_key)
+            result_by_key[(kind, item_key)] = reference
+            result_by_id[identifier] = reference
+        graph = ReportRecordGraph(
+            _raw=None,
+            _artifact_kind="report",
+            _root=_freeze_graph_root(root),
+            _tables=frozen_tables,
+            _result_by_key=MappingProxyType(result_by_key),
+            _result_by_id=MappingProxyType(result_by_id),
+            _typed_validation_counts=MappingProxyType(
+                dict(self._validation_counts)
+            ),
+        )
+        self._sealed_tables = frozen_tables
+        self._sealed = True
+        return graph
 
     def seal(
         self,
@@ -4979,6 +5463,71 @@ def _validate_logical_record(
         typed_records[f"{table}:{identifier}"] = typed
     memo[f"{table}:{identifier}"] = copy.deepcopy(logical)
     return logical
+
+
+def _logical_record_for_validation(
+    view_tables: dict[str, dict[str, dict]],
+    table: str,
+    identifier: str,
+) -> tuple[dict | None, bytes, BaseModel | None]:
+    """Resolve and strictly validate one logical row without retaining it.
+
+    Preconditions:
+        ``table`` and ``identifier`` select one row whose declared references
+        passed envelope and graph-closure checks.
+    Postconditions:
+        Returns its transient logical mapping, exact logical bytes, and strict
+        model where that row family has one. Reader rows return their skeleton
+        only and are never expanded into a reader tree.
+    Essential behavior:
+        Shares the parser's closed row checks while keeping import lifetime to
+        one logical row and one transient model at a time.
+    """
+    entry = view_tables[table][identifier]
+    record = entry["record"]
+    kind = entry["kind"]
+    if table == "resolved_citations":
+        _expect_keys(
+            record,
+            {
+                "key",
+                "reference",
+                "byte_start",
+                "byte_end",
+                "line_start",
+                "line_end",
+                "consumption",
+                "source_target",
+                "url",
+            },
+            "invalid_normalized_resolved_citation",
+        )
+    elif table == "inherited_provenance":
+        _expect_keys(
+            record,
+            {"key", "reference", "result", "consumption", "receipt"},
+            "invalid_normalized_inherited_provenance",
+        )
+    elif table == "readers":
+        _validate_reader_record(record)
+        return None, b"", None
+    if table == "urls":
+        _expect_keys(record, {"value"}, "invalid_url_record")
+        logical = {"value": record.get("value")}
+        logical_bytes = canonical_bytes(logical)
+    else:
+        try:
+            logical_bytes = b"".join(
+                _record_logical_chunks(table, identifier, view_tables)
+            )
+            logical = json.loads(logical_bytes)
+        except (TypeError, json.JSONDecodeError, RecursionError) as error:
+            msg = "invalid_logical_storage_record"
+            raise ValueError(msg) from error
+    if type(logical) is not dict:
+        _fail("invalid_logical_storage_record")
+    typed = _validate_typed_table_record(table, kind, logical)
+    return logical, logical_bytes, typed
 
 
 def _logical_record(
@@ -5702,6 +6251,136 @@ def _validate_table_records(
     return memo, typed_records, validation_counts
 
 
+def _validate_import_table_records(  # noqa: C901, PLR0912, PLR0915
+    root: Mapping[str, object],
+    indexes: dict[str, dict[str, dict]],
+) -> _StorageImportFacts:
+    """Validate imported rows one at a time and keep only compact witnesses.
+
+    Preconditions:
+        ``root`` and ``indexes`` passed the closed envelope, reference-closure,
+        cycle, and canonical-address checks for one storage byte input.
+    Postconditions:
+        Every unique logical row passed its existing strict schema and shared
+        relationship checks. Only immutable digest and relationship facts
+        remain; parsed models and expanded logical maps are released per row.
+    Essential behavior:
+        Reader rows use their skeleton validator and are never expanded into a
+        presentation or complete annotation tree.
+    """
+    validation_counts: dict[str, int] = {}
+    result_ids: dict[tuple[str, str], str] = {}
+    receipt_ids: dict[str, str] = {}
+    result_digests: dict[str, str] = {}
+    result_content_digests: dict[str, str] = {}
+    result_content_digest_matches_record: dict[str, bool] = {}
+    producer_facts_by_id: dict[str, Mapping[str, object]] = {}
+    producer_facts_by_key: dict[str, Mapping[str, object]] = {}
+    producer_keys_by_record_id: dict[str, str] = {}
+    plan_facts: dict[str, Mapping[str, object]] = {}
+
+    for table in _TABLES:
+        for identifier, entry in indexes[table].items():
+            logical, logical_bytes, model = _logical_record_for_validation(
+                indexes, table, identifier
+            )
+            count_key = f"{table}:{entry['kind']}"
+            validation_counts[count_key] = (
+                validation_counts.get(count_key, 0) + 1
+            )
+            if table == "results":
+                if model is None:
+                    _fail("missing_validated_storage_model:results")
+                item_key = result_key(model)
+                pair = (entry["kind"], item_key)
+                if pair in result_ids:
+                    _fail("duplicate_result_identity")
+                result_ids[pair] = identifier
+                result_digests[identifier] = result_digest(model)
+                typed_bytes = canonical_bytes(model)
+                result_content_digests[identifier] = content_digest(
+                    typed_bytes
+                )
+                result_content_digest_matches_record[identifier] = (
+                    logical_bytes == typed_bytes
+                )
+            elif table == "plans":
+                if not isinstance(model, StoryPlan):
+                    _fail("missing_validated_storage_model:plans:story_plan")
+                plan_facts[identifier] = _plan_relationship_facts(model)
+            elif table == "producers":
+                if not isinstance(model, ProducerDescriptor):
+                    _fail("missing_validated_storage_model:producers:producer")
+                if logical is None:
+                    _fail("invalid_logical_storage_record")
+                run_pointer = entry["record"].get("original_run")
+                run_id, _run_kind = _check_reference_shape(run_pointer)
+                facts = _producer_relationship_facts(model, identifier, run_id)
+                producer_key = facts.get("key")
+                if (
+                    type(producer_key) is not str
+                    or producer_key in producer_facts_by_key
+                ):
+                    _fail("duplicate_producer")
+                producer_facts_by_id[identifier] = facts
+                producer_facts_by_key[producer_key] = facts
+                producer_keys_by_record_id[identifier] = producer_key
+            elif table == "receipts":
+                if not isinstance(model, ResultReceipt):
+                    _fail("missing_validated_storage_model:receipts:receipt")
+                if model.item_key in receipt_ids:
+                    _fail("receipt_coverage")
+                receipt_ids[model.item_key] = identifier
+            del logical, logical_bytes, model
+
+    plan_id, _plan = _relationship_record_at(
+        indexes, "plans", root["generation"]["plan"], "story_plan"
+    )
+    if plan_id not in plan_facts:
+        _fail("missing_validated_storage_model:plans:story_plan")
+
+    def inherited_statement_info(
+        reference: Mapping[str, object], result_id: str
+    ) -> tuple[str, object]:
+        """Return the selected statement facts through the shared resolver."""
+        return _normalized_statement_info(indexes, result_id, reference)
+
+    _validate_shared_relationships(
+        root,
+        indexes,
+        result_digests=result_digests,
+        result_content_digests=result_content_digests,
+        producer_facts_by_id=producer_facts_by_id,
+        plan_facts_by_id={plan_id: plan_facts[plan_id]},
+        inherited_statement_info=inherited_statement_info,
+    )
+    return _StorageImportFacts(
+        result_ids=MappingProxyType(result_ids),
+        receipt_ids=MappingProxyType(receipt_ids),
+        result_digests=MappingProxyType(result_digests),
+        result_content_digests=MappingProxyType(result_content_digests),
+        result_content_digest_matches_record=MappingProxyType(
+            result_content_digest_matches_record
+        ),
+        plan_facts=MappingProxyType(
+            {
+                key: MappingProxyType(dict(value))
+                for key, value in plan_facts.items()
+            }
+        ),
+        producer_facts=MappingProxyType(
+            {
+                key: MappingProxyType(dict(value))
+                for key, value in producer_facts_by_key.items()
+            }
+        ),
+        producer_keys_by_record_id=MappingProxyType(
+            producer_keys_by_record_id
+        ),
+        validation_counts=MappingProxyType(validation_counts),
+    )
+
+
 def _check_graph_and_addresses(  # noqa: C901, PLR0912 # Check every typed edge, cycle, and closure.
     root: dict, indexes: dict[str, dict[str, dict]]
 ) -> None:
@@ -5957,6 +6636,62 @@ def parse_report_storage(raw_bytes: bytes | str) -> ReportStorageView:
         _result_by_key=MappingProxyType(result_by_key),
         _result_by_id=MappingProxyType(result_by_id),
         _typed_validation_counts=MappingProxyType(validation_counts),
+    )
+
+
+def _parse_report_storage_for_import(
+    raw_bytes: bytes, *, max_input_bytes: int
+) -> _ParsedStorageImport:
+    """Strictly parse bytes for a new session without retaining parse copies.
+
+    Preconditions:
+        ``raw_bytes`` is exact bytes, and ``max_input_bytes`` is a nonnegative
+        exact integer supplied by the caller.
+    Postconditions:
+        Returns immutable shared rows and compact checked facts. The result
+        retains no raw bytes, full logical-record map, or parsed model map.
+    Essential behavior:
+        Reuses the existing closed envelope, pointer, address, row, and shared
+        relationship validators while checking the explicit caller byte cap.
+    """
+    if type(raw_bytes) is not bytes:
+        _fail("storage_input_must_be_bytes")
+    envelope, raw = _strict_json_load(
+        raw_bytes, max_input_bytes=max_input_bytes
+    )
+    artifact_kind, root, indexes = _validate_envelope_shape(envelope)
+    _check_graph_and_addresses(root, indexes)
+    facts = _validate_import_table_records(root, indexes)
+    _verify_storage_addresses(indexes)
+    if raw != canonical_bytes(envelope):
+        _fail("noncanonical_storage_json")
+    if artifact_kind == "report":
+        root["base_report"] = _capture_import_base_report(root["base_report"])
+
+    frozen_tables = MappingProxyType(
+        {
+            table: MappingProxyType(
+                {
+                    identifier: _freeze(entry)
+                    for identifier, entry in index.items()
+                }
+            )
+            for table, index in indexes.items()
+        }
+    )
+    result_by_key: dict[tuple[str, str], ResultRef] = {}
+    result_by_id: dict[str, ResultRef] = {}
+    for (kind, item_key), identifier in facts.result_ids.items():
+        reference = ResultRef("results", kind, identifier, item_key)
+        result_by_key[(kind, item_key)] = reference
+        result_by_id[identifier] = reference
+    return _ParsedStorageImport(
+        artifact_kind=artifact_kind,
+        root=_freeze(root),
+        tables=frozen_tables,
+        result_by_key=MappingProxyType(result_by_key),
+        result_by_id=MappingProxyType(result_by_id),
+        facts=facts,
     )
 
 

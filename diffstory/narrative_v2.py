@@ -67,6 +67,7 @@ from .narrative_plan import prepare_request_items
 from .narrative_plan import semantic_digest
 from .narrative_plan import validate_detail_result
 from .narrative_protocol import AdapterIdentity
+from .narrative_protocol import LedgerParameters
 from .narrative_protocol import RequestConfiguration
 from .narrative_protocol import StageIdentity
 from .narrative_protocol import V2Options
@@ -2709,24 +2710,14 @@ def validate_production(  # noqa: PLR0915 # Preserve one full ordered offline pr
     groups = inputs.bind_details(manifest.details)
     plan = inputs.build_plan(groups, expected=manifest.plan)
     validate_production_requests(manifest.plan)
-    produced = {}
     planning = {r.binding.subject_key: r for r in manifest.planning}
-    for wave in planning_waves(plan):
-        stage = StageInputs(
-            inputs,
-            "planning",
-            tuple(inputs.card_item(inputs.cards[k], produced) for k in wave),
-        )
-        results = tuple(planning[k] for k in wave)
-        accept_stage(stage, results)
-        produced.update((r.binding.subject_key, r) for r in results)
-    accept_stage(
-        StageInputs(inputs, "section", inputs.section_items(produced)),
+    _accept_production_stages(
+        inputs,
+        plan,
+        planning,
         manifest.sections,
-    )
-    accept_stage(
-        StageInputs(inputs, "document", inputs.document_items(produced)),
-        (manifest.document,),
+        manifest.document,
+        accept_stage,
     )
     require(audited == set(producers), "coverage")
     require(
@@ -2748,3 +2739,361 @@ def validate_production(  # noqa: PLR0915 # Preserve one full ordered offline pr
             "coverage",
         )
     return expected
+
+
+def _accept_production_stages(  # noqa: PLR0913
+    inputs: ProductionInputs,
+    plan: StoryPlan,
+    planning_by_subject: Mapping[str, object],
+    sections: tuple[object, ...],
+    document: object,
+    accept_stage: Callable[[StageInputs, tuple[object, ...]], None],
+) -> None:
+    """Run the one ordered planning, section, and document stage traversal.
+
+    Preconditions:
+        Details are already accepted and ``plan`` was independently derived
+        from their current indexed or expanded representation. The planning
+        map covers every card and auxiliary card by subject.
+    Postconditions:
+        Calls the same stage acceptance callback for each planning wave, then
+        exact plan-ordered sections, then the one document result.
+    Essential behavior:
+        Shares produced-card dependencies only after each complete wave passes
+        its caller's existing ``_audit_stage_records`` algorithm.
+    """
+    produced: dict[str, object] = {}
+    for wave in planning_waves(plan):
+        inputs.begin_indexed_items()
+        try:
+            items = tuple(
+                inputs.card_item(inputs.cards[key], produced) for key in wave
+            )
+        finally:
+            inputs.end_indexed_items()
+        stage = StageInputs(inputs, "planning", items)
+        results = tuple(planning_by_subject[key] for key in wave)
+        accept_stage(stage, results)
+        produced.update(zip(wave, results, strict=True))
+    accept_stage(
+        StageInputs(inputs, "section", inputs.section_items(produced)),
+        sections,
+    )
+    accept_stage(
+        StageInputs(inputs, "document", inputs.document_items(produced)),
+        (document,),
+    )
+
+
+def _audit_indexed_import_stage(  # noqa: PLR0913
+    stage: StageInputs,
+    references: tuple[object, ...],
+    *,
+    arena: object,
+    producer_ref_by_key: Mapping[str, object],
+    receipt_ref_by_item: Mapping[str, object],
+    replay: CodecReplay,
+    audited: set[str],
+    actual_audits: dict[str, BatchSpec],
+) -> None:
+    """Audit one imported stage before its results feed a later request.
+
+    Preconditions:
+        ``stage`` is derived from current ``ProductionInputs``; references are
+        in the accepted stage order; and producer/receipt maps name rows from
+        this parser-created arena.
+    Postconditions:
+        Every result is revalidated against current sources and support, all
+        original producer peers and successful requests pass ``CodecReplay``,
+        and accepted planning request audits are added to ``actual_audits``.
+    Essential behavior:
+        Reuses the same ``_audit_stage_records`` algorithm as expanded imports
+        and session-owned fresh completion.
+    """
+    from .report_storage import RecordRef
+    from .report_storage import ResultRef
+    from .report_storage import _RecordArena
+
+    require(type(arena) is _RecordArena, "invalid_record_arena")
+    require(
+        all(type(reference) is ResultRef for reference in references),
+        "invalid_generation_record_references",
+    )
+    item_keys = tuple(reference.item_key for reference in references)
+    require(item_keys == tuple(stage.items), "coverage")
+    receipt_records = tuple(
+        arena.receipt_view(receipt_ref_by_item[key]) for key in item_keys
+    )
+    producer_keys = tuple(
+        dict.fromkeys(record.get("producer_key") for record in receipt_records)
+    )
+    require(
+        all(
+            type(key) is str and key in producer_ref_by_key
+            for key in producer_keys
+        )
+        and not set(producer_keys) & audited,
+        "dependencies_changed",
+    )
+    producer_refs = tuple(producer_ref_by_key[key] for key in producer_keys)
+    require(
+        all(type(reference) is RecordRef for reference in producer_refs),
+        "producer_coverage",
+    )
+    producers = tuple(
+        arena.selected_producer_model(reference) for reference in producer_refs
+    )
+    receipts = tuple(
+        arena.selected_receipt_model(receipt_ref_by_item[key])
+        for key in item_keys
+    )
+    result_ref_by_key = dict(zip(item_keys, references, strict=True))
+
+    def validate_result(item_key: str) -> None:
+        """Validate only the selected result needed by this stage."""
+        stage.validate(
+            stage.lookups[item_key],
+            arena.selected_result_model(result_ref_by_key[item_key]),
+        )
+
+    subject_audits, _selected_views = _audit_stage_records(
+        stage,
+        item_keys,
+        producers,
+        receipts,
+        replay,
+        validate_result=validate_result,
+    )
+    audited.update(producer_keys)
+    actual_audits.update((audit.id, audit) for audit in subject_audits)
+
+
+def validate_indexed_production(  # noqa: PLR0915
+    report: object,
+    records: object,
+    *,
+    arena: object,
+    captured_input: object,
+) -> tuple[object, dict, RunIdentity]:
+    """Independently validate one parsed graph without full report expansion.
+
+    Preconditions:
+        ``report`` is the exact captured compiler view; ``records`` is the
+        complete data-only record set from the bytes parser; and ``arena`` owns
+        the parser-validated rows in a new session.
+    Postconditions:
+        Returns the freshly derived annotation reader, deterministic applied
+        overlay, and the embedded original pre-annotation run. No generation
+        capability is issued by this function.
+    Essential behavior:
+        Reuses ``ProductionInputs``, stage construction, planning waves,
+        ``_audit_stage_records``, support validators, indexed citation
+        resolution, and current indexed assembly.
+    """
+    from .narrative_manifest import indexed_applied_fields
+    from .report_storage import GenerationRecordSet
+    from .report_storage import RecordRef
+    from .report_storage import ResultRef
+    from .report_storage import _RecordArena
+
+    require(
+        type(records) is GenerationRecordSet, "invalid_generation_record_set"
+    )
+    require(type(arena) is _RecordArena, "invalid_record_arena")
+    owns_report = getattr(captured_input, "owns_report_view", None)
+    require(
+        callable(owns_report) and owns_report(report), "invalid_report_shape"
+    )
+    header = records.header
+    descriptor = RequestConfiguration.model_validate_json(
+        canonical_bytes(header["request_configuration"])
+    )
+    transport = OfflineTransport(descriptor)
+    inputs = ProductionInputs(report, transport, captured_input=captured_input)
+    captured_facts = inputs._captured_input.compiler_signature  # noqa: SLF001 # The fact digest belongs to this exact private capture.
+    if captured_facts is None:
+        captured_facts = compiler_fact_signature(report)
+    require(
+        captured_facts == header["compiler_fact_signature"],
+        "dependencies_changed",
+    )
+    require(
+        inputs.ledger.id == header["ledger_digest"]
+        and inputs.options.ledger
+        == LedgerParameters.model_validate_json(
+            canonical_bytes(header["ledger_parameters"])
+        ),
+        "coverage",
+    )
+    require(
+        tuple(inputs.index.units) == tuple(header["unit_keys"]), "coverage"
+    )
+    original_run = RunIdentity.model_validate_json(
+        canonical_bytes(
+            arena.selected_audit_record(records.run_ref, kind="run")
+        )
+    )
+    require(
+        original_run.base_revision == inputs.run.base_revision
+        and original_run.head_revision == inputs.run.head_revision
+        and original_run.provider_destination == descriptor.destination
+        and original_run.model == descriptor.model,
+        "dependencies_changed",
+    )
+
+    result_reader = arena._snapshot_reader()  # noqa: SLF001 # One direct indexed selector spans this proof.
+    producer_keys = arena.producer_keys(records.producers)
+    require(len(producer_keys) == len(records.producers), "producer_coverage")
+    producer_ref_by_key = dict(
+        zip(producer_keys, records.producers, strict=True)
+    )
+    receipt_ref_by_item: dict[str, RecordRef] = {}
+    for reference in records.receipts:
+        receipt = arena.receipt_view(reference)
+        item_key = receipt.get("item_key")
+        require(
+            type(item_key) is str and item_key not in receipt_ref_by_item,
+            "receipt_coverage",
+        )
+        receipt_ref_by_item[item_key] = reference
+
+    detail_stage = StageInputs(inputs, "detail", inputs.detail_items())
+    require(
+        tuple(reference.item_key for reference in records.details)
+        == tuple(detail_stage.items),
+        "coverage",
+    )
+    audited: set[str] = set()
+    actual_audits: dict[str, BatchSpec] = {}
+    _audit_indexed_import_stage(
+        detail_stage,
+        records.details,
+        arena=arena,
+        producer_ref_by_key=producer_ref_by_key,
+        receipt_ref_by_item=receipt_ref_by_item,
+        replay=CodecReplay(detail_stage),
+        audited=audited,
+        actual_audits=actual_audits,
+    )
+
+    groups = inputs.bind_indexed_details(arena, records.details)
+    plan = arena.selected_plan_model(records.plan_ref)
+    inputs.build_plan(groups, expected=plan)
+    validate_production_requests(plan)
+
+    planning_by_subject: dict[str, ResultRef] = {}
+    for reference in records.planning:
+        kind, subject, plan_id = result_reader.result_binding_facts(reference)
+        require(
+            kind == "planning_card"
+            and plan_id == plan.id
+            and subject not in planning_by_subject,
+            "planning_coverage",
+        )
+        planning_by_subject[subject] = reference
+    require(
+        set(planning_by_subject)
+        == {
+            card.id for card in (*plan.cards, *plan.production.auxiliary_cards)
+        },
+        "planning_coverage",
+    )
+
+    expected_sections = tuple(
+        view.group_key for view in plan.production.section_views
+    )
+    section_by_subject: dict[str, ResultRef] = {}
+    for reference in records.sections:
+        kind, subject, plan_id = result_reader.result_binding_facts(reference)
+        require(
+            kind == "section"
+            and plan_id == plan.id
+            and subject not in section_by_subject,
+            "section_coverage",
+        )
+        section_by_subject[subject] = reference
+    require(
+        tuple(section_by_subject) == expected_sections,
+        "section_coverage",
+    )
+    document_kind, document_subject, document_plan = (
+        result_reader.result_binding_facts(records.document)
+    )
+    require(
+        (document_kind, document_subject, document_plan)
+        == ("document", plan.id, plan.id),
+        "document_coverage",
+    )
+
+    def accept_indexed_stage(
+        stage: StageInputs, references: tuple[object, ...]
+    ) -> None:
+        """Audit one shared stage against exact indexed result references."""
+        _audit_indexed_import_stage(
+            stage,
+            references,
+            arena=arena,
+            producer_ref_by_key=producer_ref_by_key,
+            receipt_ref_by_item=receipt_ref_by_item,
+            replay=CodecReplay(stage),
+            audited=audited,
+            actual_audits=actual_audits,
+        )
+
+    _accept_production_stages(
+        inputs,
+        plan,
+        planning_by_subject,
+        tuple(section_by_subject[key] for key in expected_sections),
+        records.document,
+        accept_indexed_stage,
+    )
+    require(audited == set(producer_ref_by_key), "coverage")
+    require(
+        actual_audits == {batch.id: batch for batch in plan.requests}
+        and len(actual_audits) == len(plan.requests),
+        "request_mismatch",
+    )
+
+    prose_refs = (*records.planning, *records.sections, records.document)
+    prose_selector = capture_indexed_consumed_prose(
+        result_reader, tuple(prose_refs), inputs.sources
+    )
+    prose_results = tuple(
+        prose_selector.select(reference.item_key) for reference in prose_refs
+    )
+    validate_support_forest(prose_results, inputs.sources, prose_selector)
+
+    from .narrative_manifest import assemble_indexed_reader
+
+    reader = assemble_indexed_reader(
+        report,
+        records,
+        arena=arena,
+        details=inputs._indexed_details_context,  # noqa: SLF001 # The current detail owner remains private to this import operation.
+        sources=inputs.sources,
+        captured_input=captured_input,
+    )
+    report_view = getattr(captured_input, "report_view", None)
+    groups_value = report_view.get("groups")
+    require(
+        type(groups_value).__name__ in {"_OwnedList", "_OwnedTuple"},
+        "invalid_compiler_group_facts",
+    )
+    groups_by_id = {}
+    for group in groups_value:
+        group_id = group.get("id")
+        require(
+            type(group_id) is str and group_id not in groups_by_id,
+            "invalid_compiler_group_facts",
+        )
+        groups_by_id[group_id] = group
+    overlay = indexed_applied_fields(
+        reader,
+        arena=arena,
+        details=inputs._indexed_details_context,  # noqa: SLF001 # Same current detail owner as reader assembly.
+        sources=inputs.sources,
+        groups=groups_by_id,
+        captured_input=captured_input,
+    )
+    return reader, overlay, original_run

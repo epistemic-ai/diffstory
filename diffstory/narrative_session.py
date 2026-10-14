@@ -234,6 +234,7 @@ class _IndexedGenerationProof:
         reader: Ordered reader references retained by that graph.
         overlay: Detached deterministic document/group fields for later apply.
         run_ref: Captured pre-annotation run row.
+        application_payload: Optional data-only graph/base/overlay handoff.
         stage_proofs: Exact capabilities that completed this production.
         versions_digest: Captured validation and compatibility versions.
         witness: Type-preserving digest of all retained payload bindings.
@@ -248,9 +249,42 @@ class _IndexedGenerationProof:
     reader: object
     overlay: object
     run_ref: object
+    application_payload: _IndexedApplicationPayload | None
     stage_proofs: tuple[StageProof, ...]
     versions_digest: str
     witness: str
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedApplicationPayload:
+    """Data-only M6 handoff over the captured base and shared graph rows.
+
+    Attributes:
+        graph: Report root with shared result/audit rows and a presentation
+            reader projection. It is not a ``ValidatedReport`` capability.
+        records: Exact registered generation record set for that root.
+        reader: Ordered selected result/citation/provenance references.
+        base_report: The exact immutable report owned by the live session.
+        overlay: Small deterministic document and group fields derived from the
+            independently validated annotation reader.
+        original_run_bytes: Canonical bytes for the embedded pre-annotation
+            run identity, separate from the current captured report digest.
+        versions_digest: Captured validation and compatibility version binding.
+
+    M6 may consume this value only through the exact registered generation
+    proof. Before ``apply`` registers ``ValidatedReport``, it must adapt the
+    existing renderer schema, collection, identifier, numeric, link, tag, and
+    provenance predicates to ``base_report``, ``overlay``, and selected reader
+    rows. This value carries data only and cannot skip those checks.
+    """
+
+    graph: object
+    records: object
+    reader: object
+    base_report: object
+    overlay: object
+    original_run_bytes: bytes
+    versions_digest: str
 
 
 class _CapturedInput:
@@ -316,8 +350,70 @@ class _CapturedInput:
         Essential behavior:
             Does not retain canonical report bytes or a second parsed tree.
         """
+        self._initialize_capture(
+            _snapshot_report(report),
+            request_configuration,
+            report_type=(
+                type(report) if isinstance(report, BaseModel) else None
+            ),
+        )
+
+    @classmethod
+    def _from_parsed_report(
+        cls, parsed: object, request_configuration: object
+    ) -> Self:
+        """Transfer the parser-owned immutable base into this capture.
+
+        Preconditions:
+            ``parsed`` is the exact private parser result for report bytes,
+            and its base was frozen into this module's owned report types.
+        Postconditions:
+            The capture retains that exact base object and shares all normal
+            configuration, digest, and version initialization checks.
+        Essential behavior:
+            Does not thaw or recursively copy the compiler base report.
+        """
+        from .report_storage import _ParsedStorageImport
+
+        if (
+            type(parsed) is not _ParsedStorageImport
+            or parsed.artifact_kind != "report"
+        ):
+            msg = "invalid_parsed_report_capture"
+            raise ValueError(msg)
+        report_view = parsed.root.get("base_report")
+        if type(report_view) is not _OwnedMapping:
+            msg = "invalid_parsed_report_capture"
+            raise ValueError(msg)
+        instance = object.__new__(cls)
+        instance._initialize_capture(  # noqa: SLF001 # Share the standard capture initializer without entering public capture.
+            _owned_report_snapshot(report_view, None),
+            request_configuration,
+            report_type=None,
+        )
+        return instance
+
+    def _initialize_capture(
+        self,
+        report_snapshot: tuple[_OwnedMapping, str, str, str | None],
+        request_configuration: object,
+        *,
+        report_type: type[BaseModel] | None,
+    ) -> None:
+        """Initialize the shared capture state from one immutable report.
+
+        Preconditions:
+            ``report_snapshot`` contains one owned report and its exact raw
+            digest, shape digest, and optional original-model witness.
+        Postconditions:
+            Installs the report plus normalized configuration and all current
+            version, source-revision, compiler-fact, and scope witnesses.
+        Essential behavior:
+            Gives public detached capture and private parser transfer the same
+            configuration and registration checks.
+        """
         report_view, report_digest, shape_digest, model_digest = (
-            _snapshot_report(report)
+            report_snapshot
         )
         configuration_input = _snapshot_object(
             request_configuration, "request_configuration"
@@ -331,9 +427,7 @@ class _CapturedInput:
         self._report_digest = report_digest
         self._report_shape_digest = shape_digest
         self._model_integrity_digest = model_digest
-        self._report_type = (
-            type(report) if isinstance(report, BaseModel) else None
-        )
+        self._report_type = report_type
         self._configuration_bytes = configuration_bytes
         self._configuration_digest = content_digest(configuration_bytes)
         try:
@@ -842,6 +936,7 @@ class _CapturedInput:
         owner = self._production_inputs() if self._production_inputs else None
         if owner is not None:
             owner._release_capture_data()  # noqa: SLF001 # Release the current input alias when its owning session closes.
+        _close_source_caches(self._source_binding)
         coordinator = self._coordinator() if self._coordinator else None
         if coordinator is not None:
             coordinator._release_capture_bindings()  # noqa: SLF001 # Expire the matching preview and coordinator-owned aliases.
@@ -1033,6 +1128,71 @@ class ReportSession:
             issuer=_ISSUER_TOKEN,
         )
 
+    @classmethod
+    def import_indexed(
+        cls,
+        storage_bytes: bytes,
+        *,
+        compiler_report: object | None = None,
+        max_input_bytes: int,
+    ) -> tuple[ReportSession, ValidatedGeneration]:
+        """Create a new session and independently prove shared storage bytes.
+
+        Preconditions:
+            ``storage_bytes`` is exact bytes; ``max_input_bytes`` is a
+            nonnegative exact integer; and annotation storage has the matching
+            compiler report. Report storage supplies its own complete base.
+        Postconditions:
+            Returns a new live session and one registered generation token
+            after independent structure, production, reader, and application
+            checks. No prior session or public graph object supplies authority.
+        Essential behavior:
+            Uses the parser-to-arena transfer path and retains one data-only M6
+            application payload without issuing ``ValidatedReport``.
+        """
+        from .report_storage import _parse_report_storage_for_import
+        from .report_storage import _RecordArena
+
+        if type(max_input_bytes) is not int or max_input_bytes < 0:
+            msg = "invalid_input_limit"
+            raise ValueError(msg)
+        parsed = _parse_report_storage_for_import(
+            storage_bytes, max_input_bytes=max_input_bytes
+        )
+        if parsed.artifact_kind == "report" and compiler_report is not None:
+            msg = "compiler_report_not_used_for_report"
+            raise ValueError(msg)
+        if parsed.artifact_kind == "annotations" and compiler_report is None:
+            msg = "compiler_report_required"
+            raise ValueError(msg)
+        descriptor = RequestConfiguration.model_validate_json(
+            canonical_bytes(parsed.root["generation"]["request_configuration"])
+        )
+        if parsed.artifact_kind == "report":
+            captured_input = _CapturedInput._from_parsed_report(  # noqa: SLF001 # Transfer only the exact fresh parser result.
+                parsed, descriptor
+            )
+        else:
+            captured_input = _CapturedInput(compiler_report, descriptor)
+        session = cls(captured_input, issuer=_ISSUER_TOKEN)
+        try:
+            session._arena = _RecordArena._from_parsed_storage(  # noqa: SLF001 # Transfer fresh parser-owned rows into the new session arena.
+                parsed
+            )
+            graph = parsed.graph(
+                base_report=session._captured_input.report_view
+                if parsed.artifact_kind == "report"
+                else None
+            )
+            records = parsed.generation_record_set()
+            generation = session._validate_indexed_import(
+                parsed, graph, records
+            )
+        except Exception:
+            session.close()
+            raise
+        return session, generation
+
     def __enter__(self) -> Self:
         """Return this live session for a context-managed scope."""
         self._require_open()
@@ -1203,6 +1363,134 @@ class ReportSession:
             parsed = self._parse_import(manifest, candidate)
         return self._validate_parsed(parsed)
 
+    def _validate_indexed_import(
+        self, parsed: object, graph: object, records: object
+    ) -> ValidatedGeneration:
+        """Prove parsed rows and retain their data-only application handoff.
+
+        Preconditions:
+            ``parsed`` and ``graph`` came from this method's bytes-only parser;
+            ``records`` names the same ordered graph closure; and this new
+            session owns the compiler report and its configuration.
+        Postconditions:
+            Registers one complete generation proof only after current source,
+            request, producer, receipt, support, reader, and applied-field
+            comparisons pass.
+        Essential behavior:
+            Does not expand a generation, presentation, annotation, or report;
+            application preparation does not rerun production proof.
+        """
+        from .narrative_manifest import validate_indexed_applied_fields
+        from .narrative_runtime import RunIdentity
+        from .narrative_v2 import validate_indexed_production
+        from .report_storage import IndexedReaderProjection
+        from .report_storage import ReportRecordGraph
+        from .report_storage import _ParsedStorageImport
+
+        self._require_open()
+        _require_session(
+            type(parsed) is _ParsedStorageImport
+            and type(graph) is ReportRecordGraph,
+            "invalid_parsed_storage_import",
+        )
+        arena = self._arena
+        _require_session(arena is not None, "invalid_record_arena")
+        report = self._captured_input.report_view
+        reader, overlay, original_run = validate_indexed_production(
+            report,
+            records,
+            arena=arena,
+            captured_input=self._captured_input,
+        )
+        _require_session(
+            type(reader) is IndexedReaderProjection
+            and type(overlay) is dict
+            and type(original_run) is RunIdentity,
+            "invalid_indexed_import_result",
+        )
+        reader_id = parsed.root["reader"]["$ref"]
+        if parsed.artifact_kind == "annotations":
+            metadata = parsed.root["metadata"]
+            meta = report.get("meta")
+            _require_session(
+                type(meta) in {dict, _OwnedMapping}
+                and metadata.get("base_sha") == meta.get("base_sha")
+                and metadata.get("head_sha") == meta.get("head_sha"),
+                "dependencies_changed",
+            )
+            arena.compare_imported_reader(
+                reader_id, reader, root_shape="annotations"
+            )
+            application_reader = IndexedReaderProjection(
+                shape="presentation",
+                document=reader.document,
+                sections=reader.sections,
+                context_details=reader.context_details,
+                citations=reader.citations,
+                support_provenance=reader.support_provenance,
+                version="diffstory.presentation.v2",
+                provenance="model-generated · unverified",
+            )
+            arena.drop_imported_reader(reader_id)
+            application_graph = arena.derive_imported_report_graph(
+                records,
+                application_reader,
+                base_report=report,
+            )
+        else:
+            application_reader = IndexedReaderProjection(
+                shape="presentation",
+                document=reader.document,
+                sections=reader.sections,
+                context_details=reader.context_details,
+                citations=reader.citations,
+                support_provenance=reader.support_provenance,
+                version="diffstory.presentation.v2",
+                provenance="model-generated · unverified",
+            )
+            arena.compare_imported_reader(
+                reader_id, application_reader, root_shape="report"
+            )
+            validate_indexed_applied_fields(report, overlay)
+            application_graph = graph
+
+        overlay_value = _freeze_report(overlay)
+        application_payload = _IndexedApplicationPayload(
+            graph=application_graph,
+            records=records,
+            reader=application_reader,
+            base_report=report,
+            overlay=overlay_value,
+            original_run_bytes=canonical_bytes(
+                original_run.model_dump(mode="json")
+            ),
+            versions_digest=self._captured_input._versions_digest,  # noqa: SLF001 # Bind current validation and compatibility rules.
+        )
+        proof = _IndexedGenerationProof(
+            scope_digest=self._scope_digest,
+            report_digest=self._captured_input.report_digest,
+            configuration_bytes=self._captured_input.configuration_bytes,
+            compiler_fact_signature=self._captured_input.compiler_signature,
+            records=records,
+            graph=graph,
+            reader=reader,
+            overlay=overlay_value,
+            run_ref=records.run_ref,
+            application_payload=application_payload,
+            stage_proofs=(),
+            versions_digest=self._captured_input._versions_digest,  # noqa: SLF001 # Bind captured validation and compatibility rules.
+            witness="",
+        )
+        proof = _IndexedGenerationProof(
+            **{
+                field: getattr(proof, field)
+                for field in proof.__dataclass_fields__
+                if field != "witness"
+            },
+            witness=_indexed_generation_proof_witness(proof),
+        )
+        return self._register(ValidatedGeneration, "generation", proof)
+
     def apply(self, generation: ValidatedGeneration) -> ValidatedReport:
         """Apply the retained expected candidate without rebuilding proof.
 
@@ -1218,6 +1506,21 @@ class ReportSession:
         proof = self._registered_payload(
             generation, ValidatedGeneration, "generation"
         )
+        if type(proof) is _IndexedGenerationProof:
+            if (
+                proof.scope_digest != self._scope_digest
+                or proof.report_digest != self._captured_input.report_digest
+                or proof.configuration_bytes
+                != self._captured_input.configuration_bytes
+                or proof.versions_digest
+                != self._captured_input._versions_digest  # noqa: SLF001 # Compare this import's captured validator versions.
+                or proof.witness != _indexed_generation_proof_witness(proof)
+                or proof.application_payload is None
+            ):
+                msg = "stale_session_capability"
+                raise ValueError(msg)
+            msg = "indexed_report_renderer_seal_deferred"
+            raise ValueError(msg)
         if type(proof) is not _GenerationProof:
             msg = "invalid_session_capability"
             raise ValueError(msg)
@@ -2527,6 +2830,7 @@ class ReportSession:
             reader=reader,
             overlay=_freeze_report(overlay),
             run_ref=records.run_ref,
+            application_payload=None,
             stage_proofs=stage_proofs,
             versions_digest=self._captured_input._versions_digest,  # noqa: SLF001 # Bind the accepted validator/compatibility versions.
             witness="",
@@ -3004,8 +3308,51 @@ def _indexed_generation_proof_witness(
     proof: _IndexedGenerationProof,
 ) -> str:
     """Pin the small owned generation payload without expanding its graph."""
-    reader = proof.reader
-    reader_facts = (
+    reader_facts = _indexed_reader_facts(proof.reader)
+    application = proof.application_payload
+    application_facts = (
+        None
+        if application is None
+        else (
+            id(application),
+            id(application.graph),
+            _generation_recordset_witness(application.records),
+            _indexed_reader_facts(application.reader),
+            id(application.base_report),
+            content_digest(_raw_integrity_bytes(application.overlay)),
+            content_digest(application.original_run_bytes),
+            application.versions_digest,
+        )
+    )
+    return semantic_digest(
+        "diffstory.session.indexed-generation-proof.v1",
+        proof.scope_digest,
+        proof.report_digest,
+        content_digest(proof.configuration_bytes),
+        proof.compiler_fact_signature,
+        _generation_recordset_witness(proof.records),
+        id(proof.graph),
+        reader_facts,
+        content_digest(_raw_integrity_bytes(proof.overlay)),
+        _record_reference_facts(proof.run_ref),
+        application_facts,
+        tuple(id(item) for item in proof.stage_proofs),
+        proof.versions_digest,
+    )
+
+
+def _indexed_reader_facts(reader: object) -> tuple[object, ...]:
+    """Return ordered primitive reference facts for one indexed reader.
+
+    Preconditions:
+        ``reader`` is the exact immutable projection retained by a session
+        generation or M6 application payload.
+    Postconditions:
+        Returns only shape, scalar section selectors, and typed addresses.
+    Essential behavior:
+        Does not resolve or expand any referenced prose or audit record.
+    """
+    return (
         reader.shape,
         _record_reference_facts(reader.document),
         tuple(
@@ -3028,20 +3375,8 @@ def _indexed_generation_proof_witness(
         tuple(
             _record_reference_facts(item) for item in reader.support_provenance
         ),
-    )
-    return semantic_digest(
-        "diffstory.session.indexed-generation-proof.v1",
-        proof.scope_digest,
-        proof.report_digest,
-        content_digest(proof.configuration_bytes),
-        proof.compiler_fact_signature,
-        _generation_recordset_witness(proof.records),
-        id(proof.graph),
-        reader_facts,
-        content_digest(_raw_integrity_bytes(proof.overlay)),
-        _record_reference_facts(proof.run_ref),
-        tuple(id(item) for item in proof.stage_proofs),
-        proof.versions_digest,
+        getattr(reader, "version", None),
+        getattr(reader, "provenance", None),
     )
 
 
@@ -3203,15 +3538,39 @@ def _snapshot_report(
     if type(report) is not _OwnedMapping:
         msg = "report_must_be_json_object"
         raise ValueError(msg)
-    report_digest = canonical_digest(report)
-    shape_digest = _shape_digest(report)
+    report_snapshot = _owned_report_snapshot(report, model_digest)
     if (
         isinstance(value, BaseModel)
-        and canonical_digest(value) != report_digest
+        and canonical_digest(value) != report_snapshot[1]
     ):
         msg = "report_snapshot_mismatch"
         raise ValueError(msg)
-    return report, report_digest, shape_digest, model_digest
+    return report_snapshot
+
+
+def _owned_report_snapshot(
+    report_view: object, model_digest: str | None
+) -> tuple[_OwnedMapping, str, str, str | None]:
+    """Compute standard report witnesses for one already owned report.
+
+    Preconditions:
+        ``report_view`` is the exact immutable report representation produced
+        by detached capture or the private fresh storage parser.
+    Postconditions:
+        Returns the report with its canonical digest, shape digest, and model
+        integrity witness without allocating a report copy.
+    Essential behavior:
+        Keeps both capture routes on the same full-root digest semantics.
+    """
+    if type(report_view) is not _OwnedMapping:
+        msg = "report_must_be_json_object"
+        raise ValueError(msg)
+    return (
+        report_view,
+        canonical_digest(report_view),
+        _shape_digest(report_view),
+        model_digest,
+    )
 
 
 def _report_identity(value: object) -> tuple[str, str, str | None]:
