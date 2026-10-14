@@ -18,6 +18,7 @@ from bisect import bisect_right
 from collections import Counter
 from collections import defaultdict
 from collections.abc import Mapping
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from dataclasses import field
 from difflib import SequenceMatcher
@@ -42,7 +43,10 @@ from diffstory.narrative_contracts import Contract
 from diffstory.narrative_contracts import DetailResult
 from diffstory.narrative_contracts import EvidenceLedger
 from diffstory.narrative_contracts import EvidenceLimitation
+from diffstory.narrative_contracts import EvidenceQuestion
 from diffstory.narrative_contracts import EvidenceUnit
+from diffstory.narrative_contracts import Explanation
+from diffstory.narrative_contracts import FactualObservation
 from diffstory.narrative_contracts import FileAvailability
 from diffstory.narrative_contracts import GroupBinding
 from diffstory.narrative_contracts import GroupSpec
@@ -1425,6 +1429,7 @@ def _citation_binding_key(
 _REVISION_PAIR_SIZE = 2
 
 _CITATION_SCOPE_TOKEN = object()
+_INDEXED_PLANNING_SOURCE_TOKEN = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1440,6 +1445,10 @@ class _DetailContextBinding:
         typed_mapping: Exact immutable typed-stage map, if present.
         backing_tables: Exact immutable graph or arena table index.
         backing_result_ids: Exact arena result identity index, if present.
+        detail_digests: Exact immutable semantic identities captured at validation.
+        detail_raw_digests: Type-preserving integrity hashes for typed details.
+        observation_ids: Ordered claim identifiers captured from validated details.
+        detail_counts: Nested record counts used to build compact selectors.
     """
 
     graph: object | None
@@ -1450,10 +1459,36 @@ class _DetailContextBinding:
     typed_mapping: object
     backing_tables: object | None
     backing_result_ids: object | None
+    detail_digests: object
+    detail_raw_digests: object
+    observation_ids: object
+    detail_counts: object
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedPlanningSourceBinding:
+    """Scope-local ownership for one hierarchy source adapter.
+
+    Attributes:
+        context_ref: Callable weak reference to the context that issued the adapter.
+        witness: Immutable adapter binding tuple captured at registration.
+        field_memo: Bounded encoded-field memo released when the scope closes.
+    """
+
+    context_ref: Callable[[], IndexedDetailContext | None]
+    witness: object
+    field_memo: MutableMapping[object, object]
 
 
 class _CitationScopeOwner:
-    """Factory-owned binding and memo state for one exact scope object."""
+    """Factory-owned binding and memo state for one exact scope object.
+
+    Attributes:
+        detail_contexts: Weak, exact registrations for accepted detail contexts.
+        indexed_planning_sources: Weak source adapters scoped to this owner.
+        memo: Scope-local current-source citation resolutions.
+        closed: Whether close released all context and source memo state.
+    """
 
     __slots__ = (
         "availability_by_source",
@@ -1461,6 +1496,7 @@ class _CitationScopeOwner:
         "detail_contexts",
         "explicit_revision_binding",
         "index",
+        "indexed_planning_sources",
         "ledger",
         "memo",
         "resolution_count",
@@ -1491,6 +1527,7 @@ class _CitationScopeOwner:
         self.closed = False
         self.resolution_count = 0
         self.detail_contexts: WeakKeyDictionary = WeakKeyDictionary()
+        self.indexed_planning_sources: WeakKeyDictionary = WeakKeyDictionary()
 
 
 class CitationResolutionScope:
@@ -1691,6 +1728,10 @@ class CitationResolutionScope:
             typed_mapping=context._typed_by_unit,  # noqa: SLF001 # Pin the immutable typed-stage map.
             backing_tables=backing_tables,
             backing_result_ids=backing_result_ids,
+            detail_digests=context._detail_digests,  # noqa: SLF001 # Pin compact semantic identities.
+            detail_raw_digests=context._detail_raw_digests,  # noqa: SLF001 # Pin type-preserving integrity hashes.
+            observation_ids=context._observation_ids,  # noqa: SLF001 # Pin ordered claim facts.
+            detail_counts=context._detail_counts,  # noqa: SLF001 # Pin nested record counts.
         )
 
     def _owns_detail_context(self, context: IndexedDetailContext) -> bool:
@@ -1743,6 +1784,71 @@ class CitationResolutionScope:
             and context._typed_by_unit is binding.typed_mapping  # noqa: SLF001 # Reject typed-stage map rebinding.
             and backing_tables is binding.backing_tables
             and backing_result_ids is binding.backing_result_ids
+            and context._detail_digests is binding.detail_digests  # noqa: SLF001 # Keep detail identity facts fixed.
+            and context._detail_raw_digests is binding.detail_raw_digests  # noqa: SLF001 # Keep raw-type witnesses fixed.
+            and context._observation_ids is binding.observation_ids  # noqa: SLF001 # Keep group facts fixed.
+            and context._detail_counts is binding.detail_counts  # noqa: SLF001 # Keep selected record counts fixed.
+        )
+
+    def _register_indexed_planning_sources(
+        self,
+        context: IndexedDetailContext,
+        sources: object,
+        witness: object,
+        field_memo: MutableMapping[object, object],
+        *,
+        token: object,
+    ) -> None:
+        """Register hierarchy material access inside the owning detail scope.
+
+        Preconditions:
+            ``context`` is live in this scope; ``sources`` is the newly created
+            identity-bearing adapter; and ``field_memo`` is its bounded cache.
+        Postconditions:
+            The exact adapter, context identity, witness, and memo are registered
+            only for this scope's lifetime.
+        Essential behavior:
+            Avoids any process-global registry for indexed source authority.
+        """
+        owner = self._owned_state()
+        _require(
+            token is _INDEXED_PLANNING_SOURCE_TOKEN
+            and not owner.closed
+            and self._owns_detail_context(context),
+            "unregistered_detail_context",
+        )
+        owner.indexed_planning_sources[sources] = (
+            _IndexedPlanningSourceBinding(
+                context_ref=weakref_ref(context),
+                witness=witness,
+                field_memo=field_memo,
+            )
+        )
+
+    def _owns_indexed_planning_sources(
+        self,
+        context: IndexedDetailContext,
+        sources: object,
+        witness: object,
+    ) -> bool:
+        """Check exact live registration for one indexed source adapter.
+
+        Preconditions:
+            ``sources`` is an adapter presented with its original detail context.
+        Postconditions:
+            Returns true only when the scope is open and the original witness
+            and context identity still match.
+        Essential behavior:
+            Rejects copied, rebound, closed, and cross-context source adapters.
+        """
+        owner = self._owned_state()
+        binding = owner.indexed_planning_sources.get(sources)
+        return bool(
+            not owner.closed
+            and binding is not None
+            and binding.context_ref() is context
+            and binding.witness == witness
+            and self._owns_detail_context(context)
         )
 
     def resolve_many(
@@ -1785,9 +1891,18 @@ class CitationResolutionScope:
         )[0]
 
     def close(self) -> None:
-        """Release cached spans and the bound ledger/index references."""
+        """Release spans, indexed field bytes, and bound ledger/index references.
+
+        Postconditions:
+            The scope is closed and no source-field memo remains registered.
+        Essential behavior:
+            Ends the lifetime of both citation and indexed-planning caches.
+        """
         owner = self._owned_state()
         owner.memo.clear()
+        for binding in tuple(owner.indexed_planning_sources.values()):
+            binding.field_memo.clear()
+        owner.indexed_planning_sources.clear()
         owner.detail_contexts.clear()
         owner.ledger = None
         owner.index = None
@@ -2053,6 +2168,31 @@ def _tuple_detail_record(value: object) -> object:
     return record
 
 
+def _detach_detail_value(value: object) -> object:
+    """Copy one selected detail value without changing its scalar types.
+
+    Preconditions:
+        ``value`` is an owned JSON-shaped value or typed immutable contract.
+    Postconditions:
+        Mappings and sequences are detached; booleans, integers, and strings
+        retain their exact Python types.
+    Essential behavior:
+        Supports selected indexed detail fields without adapting a full result.
+    """
+    if isinstance(value, BaseModel):
+        return value.model_copy(deep=True)
+    if isinstance(value, Mapping):
+        return {key: _detach_detail_value(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return tuple(_detach_detail_value(item) for item in value)
+    if type(value) is list:
+        return [_detach_detail_value(item) for item in value]
+    if value is None or type(value) in {str, bool, int, float}:
+        return value
+    _require(type(value) is bytes, "invalid_typed_detail_record")
+    return bytes(value)
+
+
 @dataclass(frozen=True, slots=True)
 class _DetailExplanationView:
     """Ephemeral primitive explanation fields for ledger contextual checks.
@@ -2212,15 +2352,24 @@ class IndexedDetailContext:
         references: Result addresses for graph/arena contexts; empty for stage
             model contexts. Access returns fresh typed reference objects.
         detail_record: Explicit detached access to one selected logical detail.
+        planning_detail_facts: Compact semantic digest, observation IDs, and
+            nested record counts captured by the strict validator.
+        detail raw hashes: Type-preserving integrity fingerprints for mutable
+            typed-stage models; these are not source or record identities.
+        indexed_detail_record_view: Detached view of one selected nested row.
     """
 
     __slots__ = (
         "__weakref__",
         "_arena_reader",
         "_citation_scope",
+        "_detail_counts",
+        "_detail_digests",
+        "_detail_raw_digests",
         "_graph",
         "_index",
         "_ledger",
+        "_observation_ids",
         "_references",
         "_references_by_unit",
         "_typed_by_unit",
@@ -2239,6 +2388,10 @@ class IndexedDetailContext:
         arena_reader: _DetailRecordReader | None = None,
         references: tuple[ResultRef, ...] = (),
         typed_by_unit: Mapping[str, DetailResult] | None = None,
+        detail_digests: Mapping[str, str],
+        detail_raw_digests: Mapping[str, str],
+        observation_ids: Mapping[str, tuple[str, ...]],
+        detail_counts: Mapping[str, tuple[int, int, int]],
     ) -> None:
         """Store one graph-backed, arena-backed, or typed stage context.
 
@@ -2247,10 +2400,13 @@ class IndexedDetailContext:
             supplied references or typed-detail mapping.
         Postconditions:
             Ordered unit keys, references, and backing selectors are detached
-            and immutable to ordinary callers.
+            and immutable to ordinary callers. Compact semantic identities,
+            raw-type integrity hashes, observation IDs, and nested record
+            counts match validated details.
         Essential behavior:
             Arena-backed contexts keep a reader and addresses, not complete
-            detail models or duplicate logical snapshots.
+            detail models or duplicate logical snapshots. Validation captures
+            only small detail facts for later planning-source construction.
         """
         _require(token is _DETAIL_CONTEXT_TOKEN, "invalid_detail_context")
         self._ledger = ledger
@@ -2265,6 +2421,10 @@ class IndexedDetailContext:
             else {}
         )
         self._typed_by_unit = MappingProxyType(dict(typed_by_unit or {}))
+        self._detail_digests = MappingProxyType(dict(detail_digests))
+        self._detail_raw_digests = MappingProxyType(dict(detail_raw_digests))
+        self._observation_ids = MappingProxyType(dict(observation_ids))
+        self._detail_counts = MappingProxyType(dict(detail_counts))
         self._unit_keys = unit_keys
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -2302,6 +2462,163 @@ class IndexedDetailContext:
         """Check membership without revalidating or resolving the detail."""
         self._check_registered()
         return unit_key in self._unit_keys
+
+    def planning_detail_facts(
+        self, unit_key: str
+    ) -> tuple[str, tuple[str, ...], tuple[int, int, int]]:
+        """Return the small, already validated facts used by planning sources.
+
+        Preconditions:
+            The context is registered and ``unit_key`` is in its ordered set.
+        Postconditions:
+            Returns the exact semantic detail digest, observation IDs, and
+            explanation/observation/question counts captured at validation.
+        Essential behavior:
+            Does not expand or revalidate a complete detail result.
+        """
+        self._check_registered()
+        digest = self._detail_digests.get(unit_key)
+        observations = self._observation_ids.get(unit_key)
+        counts = self._detail_counts.get(unit_key)
+        _require(
+            digest is not None
+            and observations is not None
+            and counts is not None,
+            "unknown_detail_unit",
+        )
+        return digest, observations, counts
+
+    def assert_detail_witnesses_current(self) -> None:
+        """Reject bypass mutation of typed details captured by this context.
+
+        Preconditions:
+            The context is registered and open.
+        Postconditions:
+            Typed details still match their original semantic digests; graph and
+            arena contexts retain their registered immutable backing selectors.
+        Essential behavior:
+            Checks current detail data without nested model revalidation.
+        """
+        self._check_registered()
+        if self._typed_by_unit:
+            for unit_key, detail in self._typed_by_unit.items():
+                _require(
+                    content_digest(_raw_integrity_bytes(detail))
+                    == self._detail_raw_digests.get(unit_key),
+                    "detail_context_changed",
+                )
+
+    def indexed_detail_record_view(
+        self, unit_key: str, record_kind: str, ordinal: int
+    ) -> Mapping[str, object]:
+        """Resolve one selected explanation, observation, or question record.
+
+        Preconditions:
+            The context is registered; ``record_kind`` is one of the three
+            detail families; and ``ordinal`` selects an existing row.
+        Postconditions:
+            Returns a detached mapping with the exact logical fields and span
+            citation records for only that selected nested record.
+        Essential behavior:
+            Reads one nested row from owned selectors without reconstructing or
+            parsing the complete detail result.
+        """
+        self._check_registered()
+        _require(
+            type(unit_key) is str
+            and record_kind in {"explanation", "observation", "question"}
+            and type(ordinal) is int
+            and ordinal >= 0,
+            "invalid_detail_record_selector",
+        )
+        family, model = {
+            "explanation": ("explanations", Explanation),
+            "observation": ("observations", FactualObservation),
+            "question": ("questions", EvidenceQuestion),
+        }[record_kind]
+        if self._typed_by_unit:
+            detail = self._typed_by_unit.get(unit_key)
+            _require(detail is not None, "unknown_detail_unit")
+            records = getattr(detail, family)
+            _require(ordinal < len(records), "unknown_detail_record")
+            selected = records[ordinal]
+            _require(type(selected) is model, "invalid_typed_detail_record")
+            return {
+                name: copy.deepcopy(getattr(selected, name))
+                for name in model.model_fields
+            }
+
+        reference = self._references_by_unit.get(unit_key)
+        _require(reference is not None, "unknown_detail_unit")
+        if self._graph is not None:
+            entry = self._graph._tables["results"].get(  # noqa: SLF001 # Read one immutable normalized result row.
+                reference.storage_id
+            )
+            _require(
+                entry is not None
+                and entry["kind"] == "detail"
+                and entry["record"].get("unit_key") == unit_key,
+                "detail_result_reference_mismatch",
+            )
+            row = entry["record"]
+        else:
+            _require(self._arena_reader is not None, "invalid_detail_context")
+            row = self._arena_reader._result_view(  # noqa: SLF001 # Select a checked arena row without materialization.
+                _copy_result_ref(reference)
+            )
+            _require(
+                row.get("unit_key") == unit_key,
+                "detail_result_reference_mismatch",
+            )
+        records = row.get(family)
+        _require(
+            type(records) in {tuple, list} and ordinal < len(records),
+            "unknown_detail_record",
+        )
+        selected = records[ordinal]
+        _require(isinstance(selected, Mapping), "invalid_typed_detail_record")
+        _require(
+            set(selected) == set(model.model_fields),
+            "invalid_typed_detail_record",
+        )
+        output = {
+            name: _detach_detail_value(selected[name])
+            for name in model.model_fields
+        }
+        citations = output["citations"]
+        _require(
+            type(citations) in {tuple, list}, "invalid_typed_detail_record"
+        )
+        output["citations"] = tuple(
+            self._indexed_span_record(pointer) for pointer in citations
+        )
+        return output
+
+    def _indexed_span_record(self, pointer: object) -> Mapping[str, object]:
+        """Resolve one validated nested citation to its current logical record."""
+        if self._arena_reader is not None:
+            value = self._arena_reader._evidence_view(  # noqa: SLF001 # Use the reader's strict evidence selector.
+                pointer, kind="span_ref"
+            )
+            return _detach_detail_value(value)
+        _require(
+            self._graph is not None and isinstance(pointer, Mapping),
+            "invalid_typed_detail_record",
+        )
+        _require(
+            set(pointer) == {"$ref", "kind"}
+            and type(pointer.get("$ref")) is str
+            and pointer.get("kind") == "span_ref",
+            "invalid_typed_detail_record",
+        )
+        entry = self._graph._tables["evidence_refs"].get(  # noqa: SLF001 # Resolve one accepted graph reference.
+            pointer["$ref"]
+        )
+        _require(
+            entry is not None and entry["kind"] == "span_ref",
+            "invalid_typed_detail_record",
+        )
+        return _detach_detail_value(entry["record"])
 
     def detail_record(self, unit_key: str) -> dict:
         """Return one detached full detail mapping for a validated unit.
@@ -2362,6 +2679,102 @@ class IndexedDetailContext:
         raise TypeError(msg)
 
 
+def planning_groups_from_indexed_details(
+    index: LedgerIndex,
+    details_context: IndexedDetailContext,
+    *,
+    revision_binding: tuple[str, str] | None = None,
+) -> tuple[PlanningGroup, ...]:
+    """Build ordered claim groups from one already validated detail context.
+
+    Preconditions:
+        ``index`` and ``details_context`` are exact live owners for the same
+        ledger, and the optional revision binding matches their local scope.
+    Postconditions:
+        Returns the same group and claim ordering as
+        :func:`planning_groups_from_details` without parsing details again.
+    Essential behavior:
+        Reads only captured observation IDs and current group/unit membership.
+    """
+    _require(
+        type(index) is LedgerIndex
+        and type(details_context) is IndexedDetailContext,
+        "invalid_indexed_detail_context",
+    )
+    details_context.assert_current(
+        details_context._ledger,  # noqa: SLF001 # Reuse the context's exact owner ledger.
+        index,
+        revision_binding=revision_binding,
+    )
+    details_context.assert_detail_witnesses_current()
+    _require(
+        Counter(details_context.unit_keys) == Counter(index.units.keys()),
+        "detail_set_coverage_mismatch",
+    )
+    observations = {
+        unit_key: details_context.planning_detail_facts(unit_key)[1]
+        for unit_key in details_context.unit_keys
+    }
+    return tuple(
+        PlanningGroup(
+            group=group,
+            claims=tuple(
+                ClaimRef(unit_key=unit_key, observation_id=observation_id)
+                for unit_key in group.unit_keys
+                for observation_id in observations[unit_key]
+            ),
+            terminology=(),
+        )
+        for group in index.groups.values()
+    )
+
+
+def indexed_detail_semantic_digest(
+    details_context: IndexedDetailContext, unit_key: str
+) -> str:
+    """Return one captured DetailResult semantic digest without expanding it.
+
+    Preconditions:
+        ``details_context`` is live and ``unit_key`` belongs to its validated
+        detail set.
+    Postconditions:
+        The digest equals ``content_digest(canonical_bytes(DetailResult))``,
+        including the existing default ``version`` field.
+    Essential behavior:
+        Reads only the compact identity retained during strict detail capture.
+    """
+    _require(
+        type(details_context) is IndexedDetailContext,
+        "invalid_indexed_detail_context",
+    )
+    return details_context.planning_detail_facts(unit_key)[0]
+
+
+def indexed_detail_record_view(
+    details_context: IndexedDetailContext,
+    unit_key: str,
+    record_kind: str,
+    ordinal: int,
+) -> Mapping[str, object]:
+    """Expose one checked nested detail record to the planning source adapter.
+
+    Preconditions:
+        ``details_context`` is the exact registered owner and the selector names
+        one existing explanation, observation, or question.
+    Postconditions:
+        Returns a detached selected-record view without rebuilding its detail.
+    Essential behavior:
+        Keeps the indexed adapter limited to the detail fields it consumes.
+    """
+    _require(
+        type(details_context) is IndexedDetailContext,
+        "invalid_indexed_detail_context",
+    )
+    return details_context.indexed_detail_record_view(
+        unit_key, record_kind, ordinal
+    )
+
+
 def _copy_result_ref(reference: ResultRef) -> ResultRef:
     """Copy one exact typed result reference without accepting subclasses.
 
@@ -2417,6 +2830,18 @@ def _validate_indexed_detail_models(
     index: LedgerIndex,
     citation_scope: CitationResolutionScope,
 ) -> IndexedDetailContext:
+    """Validate stage details and capture compact planning facts.
+
+    Preconditions:
+        Every result is a strictly parsed ``DetailResult`` and the scope is
+        bound to this exact ledger and index.
+    Postconditions:
+        Returns a registered context with exact semantic digests, ordered
+        observation IDs, and nested record counts for every unit.
+    Essential behavior:
+        Reuses the strict detail validator once and retains the typed stage
+        owner without creating canonical snapshots or field-byte copies.
+    """
     _require(
         Counter(result.unit_key for result in results)
         == Counter(index.units.keys()),
@@ -2429,6 +2854,26 @@ def _validate_indexed_detail_models(
             index,
             citation_scope=citation_scope,
         )
+    detail_digests = {
+        result.unit_key: content_digest(canonical_bytes(result))
+        for result in results
+    }
+    detail_raw_digests = {
+        result.unit_key: content_digest(_raw_integrity_bytes(result))
+        for result in results
+    }
+    observation_ids = {
+        result.unit_key: tuple(item.id for item in result.observations)
+        for result in results
+    }
+    detail_counts = {
+        result.unit_key: (
+            len(result.explanations),
+            len(result.observations),
+            len(result.questions),
+        )
+        for result in results
+    }
     context = IndexedDetailContext(
         token=_DETAIL_CONTEXT_TOKEN,
         ledger=ledger,
@@ -2436,6 +2881,10 @@ def _validate_indexed_detail_models(
         citation_scope=citation_scope,
         unit_keys=tuple(result.unit_key for result in results),
         typed_by_unit={result.unit_key: result for result in results},
+        detail_digests=detail_digests,
+        detail_raw_digests=detail_raw_digests,
+        observation_ids=observation_ids,
+        detail_counts=detail_counts,
     )
     citation_scope._register_detail_context(  # noqa: SLF001 # Keep registration in the owning scope.
         context
@@ -2491,8 +2940,18 @@ def validate_indexed_detail_results(  # noqa: PLR0913 # Explicit current source/
     ``result_refs`` must name unique detail results in ``graph`` and collectively
     cover every unit in ``ledger``. The graph's addresses are only structural
     indexes; each fetched record is strictly parsed and checked against the
-    current ledger. The returned context retains addresses, not duplicate
-    detail models or canonical detail snapshots.
+    current ledger. The returned context retains addresses and compact detail
+    digests, observation IDs, and record counts, not duplicate detail models or
+    canonical detail snapshots.
+
+    Preconditions:
+        References select each current graph detail exactly once, and the
+        supplied ledger/index/revision binding passes the scope guards.
+    Postconditions:
+        Every selected detail has passed strict nested and citation validation;
+        the returned context is registered to the local citation scope.
+    Essential behavior:
+        Does not expand the complete report or retain complete detail models.
     """
     from diffstory.report_storage import ReportRecordGraph
     from diffstory.report_storage import ReportStorageView
@@ -2526,6 +2985,9 @@ def validate_indexed_detail_results(  # noqa: PLR0913 # Explicit current source/
         }
         results = []
         unit_keys = []
+        detail_digests = {}
+        observation_ids = {}
+        detail_counts = {}
         for reference in references:
             _require(
                 reference.table == "results" and reference.kind == "detail",
@@ -2557,6 +3019,17 @@ def validate_indexed_detail_results(  # noqa: PLR0913 # Explicit current source/
                 result.unit_key == canonical_ref.item_key,
                 "detail_result_reference_mismatch",
             )
+            detail_digests[result.unit_key] = content_digest(
+                canonical_bytes(result)
+            )
+            observation_ids[result.unit_key] = tuple(
+                item.id for item in result.observations
+            )
+            detail_counts[result.unit_key] = (
+                len(result.explanations),
+                len(result.observations),
+                len(result.questions),
+            )
             results.append(result)
             unit_keys.append(result.unit_key)
         _require(
@@ -2578,6 +3051,10 @@ def validate_indexed_detail_results(  # noqa: PLR0913 # Explicit current source/
             unit_keys=tuple(unit_keys),
             graph=owned_graph,
             references=references,
+            detail_digests=detail_digests,
+            detail_raw_digests={},
+            observation_ids=observation_ids,
+            detail_counts=detail_counts,
         )
         scope._register_detail_context(  # noqa: SLF001 # Keep registration in the owning scope.
             context
@@ -2607,11 +3084,16 @@ def _capture_indexed_arena_detail_results(  # noqa: PLR0913 # Current ledger and
         scope and current-source integrity checks.
     Postconditions:
         Full ledger, obligation, context, and citation validation has run for
-        every ordered detail. The context stores only copied addresses and a
-        shallow immutable arena reader.
+        every ordered detail. Semantic detail digests, observation IDs, and
+        nested record counts are captured; the context stores only copied
+        addresses and a shallow immutable arena reader.
     Essential behavior:
-        Reuses the arena's strict structural parsing and resolves current source
-        citations through the same scope-local memo as existing detail adapters.
+        Reuses the arena's strict structural view for nested validation. It
+        transiently materializes each selected logical result once to capture
+        the exact normalized semantic digest, including ``DetailResult``'s
+        default version, then discards that mapping. Later planning-source
+        derivation uses the compact facts and selected-record views. Current
+        source citations use the same scope-local memo as existing adapters.
     """
     from diffstory.report_storage import ResultRef as StorageResultRef
     from diffstory.report_storage import _RecordArena
@@ -2638,12 +3120,31 @@ def _capture_indexed_arena_detail_results(  # noqa: PLR0913 # Current ledger and
         reader = arena._detail_reader(references)  # noqa: SLF001 # Private owned-record path.
         detail_views = []
         unit_keys = []
+        detail_digests = {}
+        observation_ids = {}
+        detail_counts = {}
         for reference in references:
             raw = reader._result_view(reference)  # noqa: SLF001 # Read the strict normalized result.
             detail = _detail_result_check_view(raw, reader)
             _require(
                 detail.unit_key == reference.item_key,
                 "detail_result_reference_mismatch",
+            )
+            raw_detail = reader.result_record(_copy_result_ref(reference))
+            _require(type(raw_detail) is dict, "invalid_typed_storage_record")
+            raw_detail.setdefault(
+                "version", DetailResult.model_fields["version"].default
+            )
+            detail_digests[detail.unit_key] = content_digest(
+                canonical_bytes(raw_detail)
+            )
+            observation_ids[detail.unit_key] = tuple(
+                item.id for item in detail.observations
+            )
+            detail_counts[detail.unit_key] = (
+                len(detail.explanations),
+                len(detail.observations),
+                len(detail.questions),
             )
             detail_views.append(detail)
             unit_keys.append(detail.unit_key)
@@ -2666,6 +3167,10 @@ def _capture_indexed_arena_detail_results(  # noqa: PLR0913 # Current ledger and
             unit_keys=tuple(unit_keys),
             arena_reader=reader,
             references=references,
+            detail_digests=detail_digests,
+            detail_raw_digests={},
+            observation_ids=observation_ids,
+            detail_counts=detail_counts,
         )
         scope._register_detail_context(  # noqa: SLF001 # Keep registration in the owning scope.
             context

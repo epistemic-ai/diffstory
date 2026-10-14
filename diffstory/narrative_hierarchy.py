@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from collections import OrderedDict
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -28,6 +29,9 @@ from diffstory.narrative_contracts import DetailRecordOwner
 from diffstory.narrative_contracts import DetailResult
 from diffstory.narrative_contracts import Digest
 from diffstory.narrative_contracts import DocumentResult
+from diffstory.narrative_contracts import EvidenceQuestion
+from diffstory.narrative_contracts import Explanation
+from diffstory.narrative_contracts import FactualObservation
 from diffstory.narrative_contracts import GroupRoot
 from diffstory.narrative_contracts import HeadingRecordOwner
 from diffstory.narrative_contracts import MaterialProjection
@@ -52,13 +56,18 @@ from diffstory.narrative_contracts import StoryCard
 from diffstory.narrative_contracts import StoryPlan
 from diffstory.narrative_contracts import SupportedStatement
 from diffstory.narrative_contracts import SupportSet
+from diffstory.narrative_plan import _INDEXED_PLANNING_SOURCE_TOKEN
+from diffstory.narrative_plan import IndexedDetailContext
 from diffstory.narrative_plan import LedgerIndex
 from diffstory.narrative_plan import PackingError
+from diffstory.narrative_plan import _raw_integrity_bytes
 from diffstory.narrative_plan import canonical_bytes
 from diffstory.narrative_plan import content_digest
+from diffstory.narrative_plan import indexed_detail_record_view
 from diffstory.narrative_plan import ordered_components
 from diffstory.narrative_plan import planning_atoms
 from diffstory.narrative_plan import planning_groups_from_details
+from diffstory.narrative_plan import planning_groups_from_indexed_details
 from diffstory.narrative_plan import semantic_digest
 from diffstory.narrative_plan import span_reference
 from diffstory.narrative_plan import story_card
@@ -74,6 +83,7 @@ UTF8_CONTINUATION = 0x80
 DIGEST_HEX_LENGTH = 64
 PRODUCTION_PLANNER_VERSION = "diffstory.production-planner.v1"
 PRODUCTION_SUPPORT_VERSION = "diffstory.production-support.v1"
+REVISION_BINDING_WIDTH = 2
 
 
 def _require(condition: bool, reason: str) -> None:  # noqa: FBT001
@@ -183,15 +193,263 @@ class _SourceState:
     author_record: str
 
 
+INDEXED_FIELD_MEMO_MAX_WEIGHT = 32_768
+INDEXED_FIELD_MEMO_MAX_ENTRY_WEIGHT = 8_192
+
+
+@dataclass(frozen=True)
+class _IndexedSourceState:
+    """Selectors and small source metadata over one owned detail context.
+
+    Attributes:
+        index: Exact current ledger index accepted with ``details_context``.
+        details_context: Scope-owned selectors for already validated details.
+        revision_binding: The exact base/head revision pair accepted at capture.
+        author_bytes: Canonical detached normalized author context.
+        author_digest: Existing semantic author-context identity.
+        group_bytes: Ordered canonical planning group facts.
+        record_keys: Record identities in legacy source/detail/heading/author order.
+        record_owners: Immutable owner metadata for each record key.
+        detail_selectors: Detail record keys mapped to unit/kind/ordinal selectors.
+        source_records: Exact source references mapped to their record keys.
+        source_by_record: Source record keys mapped to exact atomic references.
+        unit_records: Detail record keys in header/explanation/observation/question order.
+        claim_records: Validated claims mapped to observation record keys.
+        heading_records: Group keys mapped to heading record keys.
+        author_record: The author metadata record key.
+        field_memo: Scope-cleared LRU of bounded selected field bytes. Each
+            entry weighs encoded data bytes, UTF-8 key/path/encoding bytes,
+            ASCII digest bytes, and 64 fixed accounting bytes. Total weight is
+            capped at 32,768 bytes and one entry at 8,192 bytes. Only one detail
+            field per unit can remain cached.
+        metadata_fingerprint: Digest of static selector and metadata state.
+    """
+
+    index: LedgerIndex
+    details_context: IndexedDetailContext
+    revision_binding: tuple[str, str]
+    author_bytes: bytes
+    author_digest: str
+    group_bytes: tuple[bytes, ...]
+    record_keys: tuple[str, ...]
+    record_owners: Mapping[str, RecordOwner]
+    detail_selectors: Mapping[str, tuple[str, str, int]]
+    detail_units_by_key: Mapping[str, str]
+    source_records: Mapping[SpanRef, str]
+    source_by_record: Mapping[str, SpanRef]
+    unit_records: Mapping[str, tuple[str, ...]]
+    claim_records: Mapping[ClaimRef, str]
+    heading_records: Mapping[str, str]
+    author_record: str
+    field_memo: OrderedDict
+    metadata_fingerprint: str
+
+    def binding_witness(self) -> tuple[object, ...]:
+        """Return identity-only registration facts for the owning scope.
+
+        Postconditions:
+            Contains the identities of all immutable source selectors and the
+            accepted context, revision, and normalized author bindings.
+        Essential behavior:
+            Excludes field-byte memo contents, which may change during use.
+        """
+        return (
+            id(self),
+            id(self.index),
+            id(self.details_context),
+            id(self.field_memo),
+            id(self.record_keys),
+            id(self.record_owners),
+            id(self.detail_selectors),
+            id(self.detail_units_by_key),
+            id(self.source_records),
+            id(self.source_by_record),
+            id(self.unit_records),
+            id(self.claim_records),
+            id(self.heading_records),
+            id(self.group_bytes),
+            self.revision_binding,
+            self.author_bytes,
+            self.author_digest,
+            self.metadata_fingerprint,
+        )
+
+    def current_metadata_fingerprint(self) -> str:
+        """Hash static selectors and metadata without reading detail prose.
+
+        Postconditions:
+            The result identifies the current adapter metadata and selector
+            values, excluding mutable memo contents.
+        Essential behavior:
+            Does not materialize complete detail records.
+        """
+        return semantic_digest(
+            "production.indexed-source-metadata.v1",
+            self.author_bytes.decode("utf-8"),
+            self.author_digest,
+            tuple(value.decode("utf-8") for value in self.group_bytes),
+            self.record_keys,
+            content_digest(_raw_integrity_bytes(self.record_owners)),
+            tuple(sorted(self.detail_selectors.items())),
+            tuple(sorted(self.detail_units_by_key.items())),
+            content_digest(_raw_integrity_bytes(self.source_by_record)),
+            content_digest(_raw_integrity_bytes(self.source_records)),
+            tuple(sorted(self.unit_records.items())),
+            content_digest(_raw_integrity_bytes(self.claim_records)),
+            tuple(sorted(self.heading_records.items())),
+            self.author_record,
+            self.revision_binding,
+        )
+
+
+@dataclass(frozen=True, eq=False)
+class IndexedPlanningSources:
+    """Hierarchy source adapter over one live ``IndexedDetailContext``.
+
+    The value owns normalized author input and small semantic indexes. It keeps
+    no duplicate detail model, canonical detail snapshot, or all-field byte
+    arrays. Its LRU counts encoded bytes, key/path/encoding/digest bytes, and a
+    64-byte fixed allowance per entry. It evicts least-recently-used entries
+    above 32,768 bytes, skips entries above 8,192 bytes, keeps at most one
+    detail field per unit, and clears when its citation scope closes. A
+    scope-local identity witness prevents copies or rebindings from borrowing
+    its authority. The selected detail expansion property is an explicit
+    compatibility accessor; the normal hierarchy builder does not call it.
+    """
+
+    _source_state: _IndexedSourceState
+
+    def check_current(self) -> None:
+        """Require the original ledger, selectors, author, and scope to remain live.
+
+        Preconditions:
+            This is the exact adapter registered by its detail context.
+        Postconditions:
+            Raises when ledger content, source revisions, detail witnesses,
+            adapter metadata, scope identity, or registration changed.
+        Essential behavior:
+            Reuses the accepted index and context instead of rebuilding them.
+        """
+        state = _state(self)
+        state.details_context.assert_current(
+            state.details_context._ledger,  # noqa: SLF001 # Verify the context's exact ledger object.
+            state.index,
+            revision_binding=state.revision_binding,
+        )
+        state.details_context.assert_detail_witnesses_current()
+        _require(
+            state.current_metadata_fingerprint() == state.metadata_fingerprint,
+            "planning_sources_changed",
+        )
+
+    @property
+    def groups(self) -> tuple[PlanningGroup, ...]:
+        """Return detached ordered compiler groups and observation claims.
+
+        Preconditions:
+            This adapter remains registered in its live detail scope.
+        Postconditions:
+            Returned values preserve the expanded oracle's group and claim
+            order and are detached models.
+        """
+        return tuple(
+            PlanningGroup.model_validate_json(value)
+            for value in _state(self).group_bytes
+        )
+
+    @property
+    def details(self) -> tuple[DetailResult, ...]:
+        """Explicitly expand all detail results for compatibility callers.
+
+        Preconditions:
+            The original detail context is live.
+        Postconditions:
+            Returns detached strict models in captured detail order.
+        Essential behavior:
+            This compatibility accessor is not used by the normal builder.
+        """
+        state = _state(self)
+        self.check_current()
+        return tuple(
+            DetailResult.model_validate_json(
+                canonical_bytes(state.details_context.detail_record(unit_key))
+            )
+            for unit_key in state.details_context.unit_keys
+        )
+
+    @property
+    def author(self) -> AuthorContext:
+        """Return a fresh normalized copy of the owned author context.
+
+        Postconditions:
+            The caller receives a detached model with the stored author digest.
+        """
+        return AuthorContext.model_validate_json(_state(self).author_bytes)
+
+    @property
+    def author_digest(self) -> str:
+        """Return the existing normalized author-context semantic digest.
+
+        Postconditions:
+            The digest uses the legacy normalized author semantic identity.
+        """
+        return _state(self).author_digest
+
+    @property
+    def record_keys(self) -> tuple[str, ...]:
+        """List every record key in deterministic expanded-compatible order.
+
+        Postconditions:
+            Source, detail, heading, and author keys use their existing
+            content-stable semantic identities.
+        """
+        return _state(self).record_keys
+
+    def __copy__(self) -> IndexedPlanningSources:
+        """Keep indexed source ownership with the original scope registration."""
+        msg = "indexed_planning_sources_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __deepcopy__(self, _memo: dict[int, object]) -> IndexedPlanningSources:
+        """Keep indexed source ownership with the original scope registration."""
+        msg = "indexed_planning_sources_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        """Prevent serialized data from transferring indexed source authority."""
+        msg = "indexed_planning_sources_cannot_be_serialized"
+        raise TypeError(msg)
+
+
+PlanningSource = PlanningSources | IndexedPlanningSources
+
+
 _SOURCES: WeakKeyDictionary = WeakKeyDictionary()
 
 
-def _state(sources: PlanningSources) -> _SourceState:
+def _state(
+    sources: PlanningSources | IndexedPlanningSources,
+) -> _SourceState | _IndexedSourceState:
+    """Resolve one exact legacy or scope-registered indexed source owner."""
+    if type(sources) is PlanningSources:
+        _require(sources in _SOURCES, "unregistered_planning_sources")
+        return _SOURCES[sources]
     _require(
-        type(sources) is PlanningSources and sources in _SOURCES,
+        type(sources) is IndexedPlanningSources,
         "unregistered_planning_sources",
     )
-    return _SOURCES[sources]
+    state = sources._source_state  # noqa: SLF001 # Resolve this opaque adapter's private index.
+    _require(
+        type(state) is _IndexedSourceState, "unregistered_planning_sources"
+    )
+    scope = state.details_context.citation_scope
+    _require(
+        scope._owns_indexed_planning_sources(  # noqa: SLF001 # Verify local adapter identity.
+            state.details_context, sources, state.binding_witness()
+        ),
+        "unregistered_planning_sources",
+    )
+    return state
 
 
 def _record_bytes(
@@ -221,8 +479,19 @@ def _record_bytes(
     )
 
 
-def record_material(sources: PlanningSources, key: str) -> RecordMaterial:
-    """Resolve exact current fields in O(record size), without scanning source."""
+def record_material(sources: PlanningSource, key: str) -> RecordMaterial:
+    """Resolve one record's exact current fields without scanning source text.
+
+    Preconditions:
+        ``sources`` is a live registered source owner and ``key`` is present.
+    Postconditions:
+        Returns fields, citations, and claim data with expanded-path ordering,
+        framing, and logical digests.
+    Essential behavior:
+        Indexed sources resolve only this record's selected fields.
+    """
+    if type(sources) is IndexedPlanningSources:
+        return _indexed_record_material(sources, key)
     state = _state(sources)
     _require(key in state.record_metadata, "unknown_record")
     value = json.loads(state.record_metadata[key])
@@ -401,6 +670,409 @@ def derive_planning_sources(
     return result
 
 
+def _indexed_source_record_maps(
+    index: LedgerIndex,
+) -> tuple[
+    list[str], dict[str, RecordOwner], dict[SpanRef, str], dict[str, SpanRef]
+]:
+    """Build source record addresses from the accepted current ledger index.
+
+    Preconditions:
+        ``index`` is the exact index bound to the detail context.
+    Postconditions:
+        Returns source keys in legacy unit/span order and direct reference
+        lookups without copying any source text.
+    Essential behavior:
+        Reuses ``span_reference`` and ``record_key`` for every identity.
+    """
+    keys: list[str] = []
+    owners: dict[str, RecordOwner] = {}
+    by_reference: dict[SpanRef, str] = {}
+    by_key: dict[str, SpanRef] = {}
+    for unit in index.units.values():
+        for span in unit.spans:
+            reference = span_reference(span, unit)
+            owner = SourceRecordOwner(
+                unit_key=unit.id,
+                span_id=span.id,
+                content_digest=span.content_digest,
+            )
+            key = record_key(owner)
+            keys.append(key)
+            owners[key] = owner
+            by_reference[reference] = key
+            by_key[key] = reference
+    return keys, owners, by_reference, by_key
+
+
+def _indexed_detail_record_maps(
+    details_context: IndexedDetailContext,
+) -> tuple[
+    list[str],
+    dict[str, RecordOwner],
+    dict[str, tuple[str, str, int]],
+    dict[str, str],
+    dict[str, tuple[str, ...]],
+    dict[ClaimRef, str],
+]:
+    """Build compact detail selectors from captured digest and claim facts.
+
+    Preconditions:
+        ``details_context`` is the exact live context accepted for the ledger.
+    Postconditions:
+        Returns legacy header/detail key order and selectors without resolving
+        complete detail records or retaining field bytes.
+    Essential behavior:
+        Uses the context's existing semantic digests and ordered observations.
+    """
+    keys: list[str] = []
+    owners: dict[str, RecordOwner] = {}
+    selectors: dict[str, tuple[str, str, int]] = {}
+    units_by_key: dict[str, str] = {}
+    unit_records: dict[str, tuple[str, ...]] = {}
+    claim_records: dict[ClaimRef, str] = {}
+    for unit_key in sorted(details_context.unit_keys):
+        detail_digest, observation_ids, counts = (
+            details_context.planning_detail_facts(unit_key)
+        )
+        header_owner = DetailRecordOwner(
+            unit_key=unit_key,
+            detail_digest=detail_digest,
+            record_kind="detail",
+            ordinal=0,
+        )
+        header = record_key(header_owner)
+        keys.append(header)
+        owners[header] = header_owner
+        units_by_key[header] = unit_key
+        unit_keys = [header]
+        for record_kind, count in zip(
+            ("explanation", "observation", "question"), counts, strict=True
+        ):
+            for ordinal in range(count):
+                owner = DetailRecordOwner(
+                    unit_key=unit_key,
+                    detail_digest=detail_digest,
+                    record_kind=record_kind,
+                    ordinal=ordinal,
+                )
+                key = record_key(owner)
+                keys.append(key)
+                owners[key] = owner
+                selectors[key] = (unit_key, record_kind, ordinal)
+                units_by_key[key] = unit_key
+                unit_keys.append(key)
+                if record_kind == "observation":
+                    claim = ClaimRef(
+                        unit_key=unit_key,
+                        observation_id=observation_ids[ordinal],
+                    )
+                    claim_records[claim] = key
+        unit_records[unit_key] = tuple(unit_keys)
+    return keys, owners, selectors, units_by_key, unit_records, claim_records
+
+
+def derive_planning_sources_indexed(
+    index: LedgerIndex,
+    details_context: IndexedDetailContext,
+    *,
+    author_context: AuthorContext,
+    revision_binding: tuple[str, str] | None = None,
+) -> IndexedPlanningSources:
+    """Create hierarchy sources over one accepted indexed detail context.
+
+    Preconditions:
+        ``index`` and ``details_context`` are exact live owners for the same
+        validated ledger; all detail units and current revisions match; and
+        ``author_context`` is a normalized ``AuthorContext``.
+    Postconditions:
+        The result preserves legacy group, record-key, owner, field, claim,
+        source-reference, author, and semantic detail identities. It retains no
+        complete detail models, canonical detail snapshots, or extracted
+        detail field byte arrays.
+    Essential behavior:
+        Reuses captured detail digests/observation IDs and the existing ledger
+        index; it does not call the expanded derivation path.
+    """
+    _require(
+        type(index) is LedgerIndex
+        and type(details_context) is IndexedDetailContext
+        and type(author_context) is AuthorContext,
+        "invalid_indexed_planning_sources",
+    )
+    groups = planning_groups_from_indexed_details(
+        index, details_context, revision_binding=revision_binding
+    )
+    if revision_binding is not None:
+        _require(
+            type(revision_binding) is tuple
+            and len(revision_binding) == REVISION_BINDING_WIDTH
+            and all(type(value) is str for value in revision_binding),
+            "citation_scope_revision_mismatch",
+        )
+    normalized_author = AuthorContext.model_validate_json(
+        canonical_bytes(AuthorContext.model_validate(author_context))
+    )
+    author_bytes = canonical_bytes(normalized_author)
+    author_digest = semantic_digest(
+        "diffstory.author-context.v2", normalized_author
+    )
+    claim_records: dict[ClaimRef, str] = {}
+    heading_records: dict[str, str] = {}
+    source_keys, source_owners, source_records, source_by_record = (
+        _indexed_source_record_maps(index)
+    )
+    (
+        detail_keys,
+        detail_owners,
+        selectors,
+        detail_units_by_key,
+        unit_records,
+        claim_records,
+    ) = _indexed_detail_record_maps(details_context)
+    owners = {**source_owners, **detail_owners}
+    record_keys = [*source_keys, *detail_keys]
+
+    for group in groups:
+        owner = HeadingRecordOwner(group_key=group.group.key)
+        key = record_key(owner)
+        record_keys.append(key)
+        owners[key] = owner
+        heading_records[group.group.key] = key
+    author_owner = AuthorRecordOwner(context_digest=author_digest)
+    author_record = record_key(author_owner)
+    record_keys.append(author_record)
+    owners[author_record] = author_owner
+
+    scope = details_context.citation_scope
+    state = _IndexedSourceState(
+        index=index,
+        details_context=details_context,
+        revision_binding=scope.revision_binding,
+        author_bytes=author_bytes,
+        author_digest=author_digest,
+        group_bytes=tuple(canonical_bytes(group) for group in groups),
+        record_keys=tuple(record_keys),
+        record_owners=MappingProxyType(owners),
+        detail_selectors=MappingProxyType(selectors),
+        detail_units_by_key=MappingProxyType(detail_units_by_key),
+        source_records=MappingProxyType(source_records),
+        source_by_record=MappingProxyType(source_by_record),
+        unit_records=MappingProxyType(unit_records),
+        claim_records=MappingProxyType(claim_records),
+        heading_records=MappingProxyType(heading_records),
+        author_record=author_record,
+        field_memo=OrderedDict(),
+        metadata_fingerprint="",
+    )
+    object.__setattr__(
+        state, "metadata_fingerprint", state.current_metadata_fingerprint()
+    )
+    result = IndexedPlanningSources(state)
+    scope._register_indexed_planning_sources(  # noqa: SLF001 # Register authority in the exact owning scope.
+        details_context,
+        result,
+        state.binding_witness(),
+        state.field_memo,
+        token=_INDEXED_PLANNING_SOURCE_TOKEN,
+    )
+    return result
+
+
+def _indexed_record_values(
+    state: _IndexedSourceState, key: str
+) -> tuple[tuple[str, object], ...]:
+    """Read one record's ordered field values from its accepted owner."""
+    owner = state.record_owners[key]
+    if owner.kind == "detail":
+        detail_owner = DetailRecordOwner.model_validate(owner)
+        selector = state.detail_selectors.get(key)
+        if selector is None:
+            _, _, counts = state.details_context.planning_detail_facts(
+                detail_owner.unit_key
+            )
+            values = {
+                "version": DetailResult.model_fields["version"].default,
+                "unit_key": detail_owner.unit_key,
+                **{
+                    name: {"type": "sequence", "length": count}
+                    for name, count in zip(
+                        ("explanations", "observations", "questions"),
+                        counts,
+                        strict=True,
+                    )
+                },
+            }
+            return tuple(values.items())
+        unit_key, record_kind, ordinal = selector
+        selected = indexed_detail_record_view(
+            state.details_context, unit_key, record_kind, ordinal
+        )
+        model = {
+            "explanation": Explanation,
+            "observation": FactualObservation,
+            "question": EvidenceQuestion,
+        }[record_kind]
+        return tuple((name, selected[name]) for name in model.model_fields)
+    if owner.kind == "source":
+        source_owner = SourceRecordOwner.model_validate(owner)
+        span = state.index.spans.get(source_owner.span_id)
+        unit = state.index.units.get(source_owner.unit_key)
+        reference = state.source_by_record[key]
+        _require(
+            span is not None
+            and unit is not None
+            and source_owner.span_id
+            in state.index.unit_span_ids[source_owner.unit_key],
+            "unknown_source_owner",
+        )
+        return (("reference", reference), ("text", span.text))
+    if owner.kind == "heading":
+        heading_owner = HeadingRecordOwner.model_validate(owner)
+        group = state.index.groups.get(heading_owner.group_key)
+        _require(group is not None, "unknown_heading_owner")
+        return (("path", group.path), ("theme", group.theme))
+    author = AuthorContext.model_validate_json(state.author_bytes)
+    return tuple(author.model_dump().items())
+
+
+def _encoded_field(path: str, value: object) -> tuple[str, str, bytes, str]:
+    """Encode one selected value with the legacy field encoding convention."""
+    encoding = "utf8" if isinstance(value, str) else "canonical_json"
+    data = (
+        value.encode("utf-8")
+        if isinstance(value, str)
+        else canonical_bytes(value)
+    )
+    return path, encoding, data, content_digest(data)
+
+
+def _indexed_field(
+    state: _IndexedSourceState, key: str, path: str, *, cache: bool
+) -> tuple[str, str, bytes, str]:
+    """Resolve one selected field and maintain a bounded scope-owned byte memo.
+
+    Preconditions:
+        ``key`` and ``path`` select a field in the indexed source state.
+    Postconditions:
+        Returns the legacy encoded bytes and digest. Cached weight is encoded
+        bytes plus UTF-8 key/path/encoding bytes, ASCII digest bytes, and a
+        64-byte accounting allowance; total and entry limits are enforced.
+    Essential behavior:
+        The LRU skips oversized fields, evicts its oldest entries at the total
+        limit, and retains at most one detail field for each unit.
+    """
+    cache_key = (key, path)
+    cached = state.field_memo.get(cache_key)
+    if cached is not None:
+        state.field_memo.move_to_end(cache_key)
+        return cached[0]
+    values = dict(_indexed_record_values(state, key))
+    _require(path in values, "unknown_record_path")
+    encoded = _encoded_field(path, values[path])
+    if not cache:
+        return encoded
+    owner = state.record_owners[key]
+    weight = (
+        len(encoded[2])
+        + len(key.encode("utf-8"))
+        + len(path.encode("utf-8"))
+        + len(encoded[1].encode("utf-8"))
+        + len(encoded[3].encode("ascii"))
+        + 64
+    )
+    if (
+        weight > INDEXED_FIELD_MEMO_MAX_ENTRY_WEIGHT
+        or weight > INDEXED_FIELD_MEMO_MAX_WEIGHT
+    ):
+        return encoded
+    if owner.kind == "detail":
+        unit_key = state.detail_units_by_key[key]
+        for prior_key in tuple(state.field_memo):
+            if state.detail_units_by_key.get(prior_key[0]) == unit_key:
+                del state.field_memo[prior_key]
+    while state.field_memo and (
+        sum(item[1] for item in state.field_memo.values()) + weight
+        > INDEXED_FIELD_MEMO_MAX_WEIGHT
+    ):
+        state.field_memo.popitem(last=False)
+    state.field_memo[cache_key] = (encoded, weight)
+    return encoded
+
+
+def _indexed_record_material(
+    sources: IndexedPlanningSources, key: str
+) -> RecordMaterial:
+    """Resolve one record with detached metadata and exact selected fields.
+
+    Preconditions:
+        ``key`` selects a record in the live indexed source owner.
+    Postconditions:
+        Returned owner, citations, and claim models do not alias retained
+        source metadata.
+    Essential behavior:
+        Only the selected record's fields are resolved from its owner.
+    """
+    state = _state(sources)
+    _require(key in state.record_owners, "unknown_record")
+    owner = state.record_owners[key].model_copy(deep=True)
+    values = _indexed_record_values(state, key)
+    fields = tuple(
+        FieldMaterial(*_encoded_field(path, value)) for path, value in values
+    )
+    citations: tuple[SpanRef, ...] = ()
+    claim = None
+    selector = state.detail_selectors.get(key)
+    if selector is not None:
+        selected = indexed_detail_record_view(state.details_context, *selector)
+        citations = tuple(
+            SpanRef.model_validate(value) for value in selected["citations"]
+        )
+        if selector[1] == "observation":
+            claim = ClaimRef(
+                unit_key=selector[0], observation_id=selected["id"]
+            )
+    return RecordMaterial(key, owner, fields, citations, claim)
+
+
+def _source_bytes(sources: PlanningSource, reference: SpanRef) -> bytes | None:
+    """Resolve one source's current bytes from its owning ledger index."""
+    state = _state(sources)
+    if type(sources) is not IndexedPlanningSources:
+        return state.source_text.get(reference)
+    key = state.source_records.get(reference)
+    _require(key is not None, "invalid_source_slice")
+    span = state.index.spans.get(reference.span_id)
+    unit = state.index.units.get(reference.unit_key)
+    _require(span is not None and unit is not None, "invalid_source_slice")
+    _require(
+        span_reference(span, unit) == reference
+        and reference in state.source_records,
+        "invalid_source_slice",
+    )
+    return span.text.encode("utf-8")
+
+
+def _has_source_reference(sources: PlanningSource, reference: SpanRef) -> bool:
+    """Check source membership through the selected legacy or indexed owner."""
+    state = _state(sources)
+    return (
+        reference in state.source_records
+        if type(sources) is IndexedPlanningSources
+        else reference in state.source_text
+    )
+
+
+def _source_reference_for_record(sources: PlanningSource, key: str) -> SpanRef:
+    """Return the exact source reference attached to one record key."""
+    state = _state(sources)
+    value = state.source_by_record.get(key)
+    _require(value is not None, "unknown_source_owner")
+    if type(sources) is IndexedPlanningSources:
+        return SpanRef.model_validate(value)
+    return SpanRef.model_validate_json(value)
+
+
 def _fragment(
     owner: RecordOwner, field: FieldMaterial, start: int, end: int
 ) -> RecordFragment:
@@ -420,14 +1092,31 @@ def _fragment(
 
 
 def fragment_material(
-    sources: PlanningSources, fragment: RecordFragment
+    sources: PlanningSource, fragment: RecordFragment
 ) -> bytes:
-    """Validate owner, field, range, UTF-8 boundaries and both current digests."""
+    """Validate and return the exact current field byte range.
+
+    Preconditions:
+        ``sources`` is current and the fragment names one owned field.
+    Postconditions:
+        The returned bytes match both digests and decode as complete UTF-8.
+    Essential behavior:
+        Indexed sources resolve only the selected field and bound any memoized
+        bytes by the scope-local byte-weighted LRU.
+    """
     fragment = RecordFragment.model_validate(fragment)
     state = _state(sources)
     key = record_key(fragment.owner)
-    _require(key in state.record_fields, "unknown_record")
-    fields = {f[0]: FieldMaterial(*f) for f in state.record_fields[key]}
+    if type(sources) is IndexedPlanningSources:
+        _require(key in state.record_owners, "unknown_record")
+        fields = {
+            fragment.path: FieldMaterial(
+                *_indexed_field(state, key, fragment.path, cache=True)
+            )
+        }
+    else:
+        _require(key in state.record_fields, "unknown_record")
+        fields = {f[0]: FieldMaterial(*f) for f in state.record_fields[key]}
     _require(fragment.path in fields, "unknown_record_path")
     field = fields[fragment.path]
     _require(
@@ -448,11 +1137,20 @@ def fragment_material(
 
 
 def validate_source_slice(
-    ref: SourceSliceRef, sources: PlanningSources
+    ref: SourceSliceRef, sources: PlanningSource
 ) -> bytes:
-    """Resolve relative atomic bytes; absolute binding lines never enter offsets."""
+    """Resolve exact source bytes using relative offsets and current bindings.
+
+    Preconditions:
+        ``sources`` is current and ``ref`` names an owned source record.
+    Postconditions:
+        Returned UTF-8 bytes match ``ref.content_digest`` and byte range.
+    Essential behavior:
+        Absolute source line numbers never enter byte offsets; indexed sources
+        read current text from the accepted ledger index.
+    """
     ref = SourceSliceRef.model_validate(ref)
-    data = _state(sources).source_text.get(ref.source)
+    data = _source_bytes(sources, ref.source)
     _require(
         data is not None and ref.byte_end <= len(data), "invalid_source_slice"
     )
@@ -517,7 +1215,7 @@ class PlanningShape:
 
 
 def projection_material(
-    sources: PlanningSources, projection: MaterialProjection
+    sources: PlanningSource, projection: MaterialProjection
 ) -> tuple[RecordMaterial, ...]:
     """Resolve whole inline records; reduced projections consume their root."""
     projection = MaterialProjection.model_validate(projection)
@@ -527,12 +1225,29 @@ def projection_material(
 
 
 def _inline(
-    sources: PlanningSources, keys: tuple[str, ...]
+    sources: PlanningSource, keys: tuple[str, ...]
 ) -> tuple[dict, ...]:
     # Complete structured fields need one JSON frame. Their citation metadata
     # is already a field; repeating the indexed metadata would inflate a whole-
     # fit record. Partial canonical fields use fragment text instead.
     state = _state(sources)
+    if type(sources) is IndexedPlanningSources:
+        output = []
+        for key in keys:
+            record = _indexed_record_material(sources, key)
+            output.append(
+                {
+                    "key": key,
+                    "owner": record.owner,
+                    "fields": {
+                        field.path: field.data.decode("utf-8")
+                        if field.encoding == "utf8"
+                        else json.loads(field.data)
+                        for field in record.fields
+                    },
+                }
+            )
+        return tuple(output)
     return tuple(
         {
             "key": key,
@@ -549,7 +1264,7 @@ def _inline(
 
 
 def _projection_payload(
-    sources: PlanningSources, projection: MaterialProjection
+    sources: PlanningSource, projection: MaterialProjection
 ) -> dict:
     return {
         "records": _inline(sources, projection.record_keys),
@@ -558,7 +1273,7 @@ def _projection_payload(
 
 
 def _atom_records(
-    sources: PlanningSources, atom: PlanningAtom
+    sources: PlanningSource, atom: PlanningAtom
 ) -> tuple[str, ...]:
     state = _state(sources)
     if atom.kind == "member":
@@ -571,7 +1286,7 @@ def _atom_records(
 
 
 def _with_sources(
-    sources: PlanningSources, keys: tuple[str, ...]
+    sources: PlanningSource, keys: tuple[str, ...]
 ) -> tuple[str, ...]:
     state = _state(sources)
     return tuple(
@@ -642,7 +1357,7 @@ def _relation(  # noqa: PLR0913 # Explicit typed relationship endpoints.
 class _Builder:
     def __init__(
         self,
-        sources: PlanningSources,
+        sources: PlanningSource,
         bounds: PlanningBounds,
         budget: CardBudget,
         check: Callable[[PlanningShape], None],
@@ -1230,7 +1945,7 @@ def production_plan_id(plan: StoryPlan) -> str:
 
 
 def build_production_plan(
-    sources: PlanningSources,
+    sources: PlanningSource,
     *,
     context_digest: Digest,
     bounds: PlanningBounds,
@@ -1242,6 +1957,16 @@ def build_production_plan(
     failure reduces only new abstraction budgets and retries structure creation.
     Configured output guards and original detailed writing never change.
     check_shape signals measured capacity failures with PackingError only.
+
+    Preconditions:
+        ``sources`` is current, bounds are valid, and ``check_shape`` raises
+        ``PackingError`` only for measured capacity failures.
+    Postconditions:
+        Returns the deterministic production structure derived from source
+        records, bounds, and the requested context digest.
+    Essential behavior:
+        Uses either legacy sources or one scope-owned indexed adapter through
+        the same sizing and planning algorithms.
     """
     _require(
         type(context_digest) is str
@@ -1293,7 +2018,7 @@ def validate_production_requests(plan: StoryPlan) -> None:
 
 def validate_production_plan(
     plan: StoryPlan,
-    sources: PlanningSources,
+    sources: PlanningSource,
     *,
     context_digest: Digest,
     bounds: PlanningBounds,
@@ -1304,6 +2029,14 @@ def validate_production_plan(
     A frozen pre-execution plan has no requests. If requests are attached, their
     subject union must be complete. Final consumers must always also call
     validate_production_requests, including when the supplied audit is empty.
+
+    Preconditions:
+        ``sources`` is current and ``check_shape`` measures the same serializer
+        used to construct the candidate plan.
+    Postconditions:
+        Raises if the plan differs from a fresh build over current sources.
+    Essential behavior:
+        The plan is rederived through the shared legacy/indexed source adapter.
     """
     plan = StoryPlan.model_validate(plan)
     expected = build_production_plan(
@@ -1497,12 +2230,20 @@ def planning_waves(plan: StoryPlan) -> tuple[tuple[Digest, ...], ...]:  # noqa: 
 
 
 def planning_shapes(
-    plan: StoryPlan, sources: PlanningSources
+    plan: StoryPlan, sources: PlanningSource
 ) -> tuple[PlanningShape, ...]:
     """Reconstruct sizing descriptions after explicit current production validation.
 
     These are useful for serializer calibration/tests, never actual request
     audits. Call validate_production_plan before trusting a persisted plan.
+
+    Preconditions:
+        ``plan`` contains a production hierarchy and ``sources`` is current.
+    Postconditions:
+        Returns sizing shapes in deterministic dependency-wave order.
+    Essential behavior:
+        Resolves fragment bytes from either source adapter without expanding all
+        indexed detail results.
     """
     _require(plan.production is not None, "production_hierarchy_required")
     h = plan.production
@@ -1598,7 +2339,7 @@ def validate_statement_reference(
 
 
 def material_support(
-    sources: PlanningSources,
+    sources: PlanningSource,
     *,
     record_keys: tuple[str, ...] = (),
     fragments: tuple[RecordFragment, ...] = (),
@@ -1608,11 +2349,19 @@ def material_support(
     Fragment coverage alone does not grant a whole ClaimRef or SpanRef. A source
     text fragment grants just its exact slice. Author fragments retain author
     provenance, without adding implementation support.
+
+    Preconditions:
+        Every supplied key and fragment belongs to the current source owner.
+    Postconditions:
+        Whole claims/references are granted only by complete record material;
+        text fragments grant exact source slices.
+    Essential behavior:
+        Uses the same support rules for legacy and indexed source state.
     """
     state = _state(sources)
     records = tuple(record_material(sources, key) for key in record_keys)
     whole = tuple(
-        SpanRef.model_validate_json(state.source_by_record[key])
+        _source_reference_for_record(sources, key)
         for key in dict.fromkeys(record_keys)
         if key in state.source_by_record
     )
@@ -1654,11 +2403,21 @@ def material_support(
 
 
 def source_reference(
-    sources: PlanningSources, owner: SourceRecordOwner
+    sources: PlanningSource, owner: SourceRecordOwner
 ) -> SpanRef:
-    """Resolve a compact source owner to its exact current stable atomic reference."""
+    """Resolve a compact source owner to its exact current atomic reference.
+
+    Preconditions:
+        ``owner`` identifies a source record in the current source adapter.
+    Postconditions:
+        Returns the legacy stable span reference for that source record.
+    """
     state = _state(sources)
     key = record_key(owner)
+    if type(sources) is IndexedPlanningSources:
+        reference = state.source_by_record.get(key)
+        _require(reference is not None, "unknown_source_owner")
+        return SpanRef.model_validate(reference)
     _require(key in state.source_by_record, "unknown_source_owner")
     return SpanRef.model_validate_json(state.source_by_record[key])
 
@@ -1717,7 +2476,7 @@ def inherited_support(
 def validate_consumed_support(
     result: ProseResult,
     allowed: SupportSet,
-    sources: PlanningSources,
+    sources: PlanningSource,
     consumed: Mapping[str, ProseResult],
 ) -> None:
     """Check actual immediate support grants and exact inherited statement endpoints.
@@ -1725,6 +2484,15 @@ def validate_consumed_support(
     Integration supplies the validated, actually consumed producer set and owns
     receipt/binding/budget checks. Use validate_support_chains on final output to
     prove iterative termination at current source endpoints as well.
+
+    Preconditions:
+        ``allowed`` is the actual immediate grant set and ``consumed`` contains
+        only validated producers consumed by this result.
+    Postconditions:
+        Every statement support reference is an exact member of those grants
+        and resolves to the current source owner or consumed producer.
+    Essential behavior:
+        Accepts the shared legacy or indexed planning source adapter.
     """
     result = type(result).model_validate(result)
     allowed = SupportSet.model_validate(allowed)
@@ -1750,14 +2518,16 @@ def validate_consumed_support(
                 validate_statement_reference(ref, consumed)
         _require(
             all(c in state.claim_records for c in statement.claims)
-            and all(r in state.source_text for r in statement.citations),
+            and all(
+                _has_source_reference(sources, r) for r in statement.citations
+            ),
             "invalid_current_support",
         )
 
 
 def validate_support_chains(
     result: ProseResult,
-    sources: PlanningSources,
+    sources: PlanningSource,
     producers: Mapping[str, ProseResult],
 ) -> None:
     """Validate one root through the shared current-source forest boundary."""
@@ -1766,7 +2536,7 @@ def validate_support_chains(
 
 def validate_support_forest(
     results: tuple[ProseResult, ...],
-    sources: PlanningSources,
+    sources: PlanningSource,
     producers: Mapping[str, ProseResult],
 ) -> None:
     """Iteratively validate complete inherited chains to valid current endpoints.
@@ -1774,6 +2544,14 @@ def validate_support_forest(
     This does not establish consumption or receipts; validate_consumed_support
     must have checked every producer against its independently derived inputs.
     Nonimplementation statements cannot establish implementation support.
+
+    Preconditions:
+        ``sources`` is current and producer keys match their result item keys.
+    Postconditions:
+        Every inherited implementation endpoint terminates at a valid current
+        claim, citation, source slice, or consumed statement.
+    Essential behavior:
+        Uses current source membership shared by both source adapters.
     """
     sources.check_current()
     # The visited set belongs to this immutable endpoint map and this call only.
@@ -1808,7 +2586,9 @@ def validate_support_forest(
             pending.append((statement, identity, True))
         _require(
             all(c in state.claim_records for c in statement.claims)
-            and all(r in state.source_text for r in statement.citations),
+            and all(
+                _has_source_reference(sources, r) for r in statement.citations
+            ),
             "invalid_current_support",
         )
         if statement.kind == "implementation_claim":

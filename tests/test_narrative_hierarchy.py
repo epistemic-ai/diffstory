@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import pickle
 import unittest
 from collections import defaultdict
 from unittest import mock
@@ -28,11 +29,15 @@ from diffstory.narrative_contracts import StatementPath
 from diffstory.narrative_contracts import StoryPlan
 from diffstory.narrative_contracts import SupportedStatement
 from diffstory.narrative_contracts import SupportSet
+from diffstory.narrative_hierarchy import IndexedPlanningSources
 from diffstory.narrative_hierarchy import PlanningShape
 from diffstory.narrative_hierarchy import PlanningSources
+from diffstory.narrative_hierarchy import _fragment
+from diffstory.narrative_hierarchy import _indexed_field
 from diffstory.narrative_hierarchy import atom_key
 from diffstory.narrative_hierarchy import build_production_plan
 from diffstory.narrative_hierarchy import derive_planning_sources
+from diffstory.narrative_hierarchy import derive_planning_sources_indexed
 from diffstory.narrative_hierarchy import fragment_material
 from diffstory.narrative_hierarchy import inherited_support
 from diffstory.narrative_hierarchy import material_support
@@ -50,10 +55,12 @@ from diffstory.narrative_hierarchy import validate_source_slice
 from diffstory.narrative_hierarchy import validate_statement_reference
 from diffstory.narrative_hierarchy import validate_support_chains
 from diffstory.narrative_hierarchy import validate_support_forest
+from diffstory.narrative_plan import IndexedDetailContext
 from diffstory.narrative_plan import PackingError
 from diffstory.narrative_plan import build_evidence_ledger
 from diffstory.narrative_plan import build_ledger_index
 from diffstory.narrative_plan import canonical_bytes
+from diffstory.narrative_plan import capture_indexed_detail_results
 from diffstory.narrative_plan import content_digest
 from diffstory.narrative_plan import planning_atoms
 from diffstory.narrative_plan import resolve_span_ref
@@ -304,9 +311,8 @@ class HierarchyTests(unittest.TestCase):
         stage = StageInputs(inputs, "detail", inputs.detail_items())
         request = stage.prepare(tuple(stage.items), repair=False, partition=0)
         raw = FixtureProvider.respond(json.loads(request.body)["data"])
-        raw["items"][0]["explanations"][0]["before"] = (
-            "Authored long-detail handoff fixture. " * 1200
-        )
+        long_text = "Authored long-detail handoff fixture. " * 1200
+        raw["items"][0]["explanations"][0]["before"] = long_text
         self.assertEqual(len(canonical_bytes(raw)), 47267)
         envelope = inputs.wire.envelope(
             raw, request.metadata.batch, stage.contexts
@@ -322,6 +328,88 @@ class HierarchyTests(unittest.TestCase):
             inputs.index, details, author_context=AuthorContext()
         )
         plan = build(sources)
+        indexed_context = capture_indexed_detail_results(
+            details, inputs.ledger, index=inputs.index
+        )
+        with (
+            mock.patch(
+                "diffstory.narrative_hierarchy.derive_planning_sources",
+                side_effect=AssertionError(
+                    "indexed path used legacy derivation"
+                ),
+            ),
+            mock.patch(
+                "diffstory.report_storage.expand_report_storage",
+                side_effect=AssertionError("indexed path expanded the report"),
+            ),
+            mock.patch(
+                "diffstory.narrative_plan.build_evidence_ledger",
+                side_effect=AssertionError("indexed path rebuilt the ledger"),
+            ),
+            mock.patch(
+                "diffstory.narrative_plan.build_ledger_index",
+                side_effect=AssertionError("indexed path rebuilt the index"),
+            ),
+            mock.patch(
+                "diffstory.narrative_plan._validate_detail_result",
+                side_effect=AssertionError("indexed path revalidated details"),
+            ),
+            mock.patch(
+                "diffstory.narrative_plan._resolve_span_ref",
+                side_effect=AssertionError(
+                    "indexed path resolved citations again"
+                ),
+            ),
+            mock.patch.object(
+                IndexedDetailContext,
+                "detail_record",
+                side_effect=AssertionError("normal builder expanded a detail"),
+            ),
+        ):
+            indexed = derive_planning_sources_indexed(
+                inputs.index, indexed_context, author_context=AuthorContext()
+            )
+            indexed_plan = build(indexed)
+        self.assertEqual(plan, indexed_plan)
+        self.assertEqual(indexed.record_keys, sources.record_keys)
+        for expanded_fragment, indexed_fragment in zip(
+            plan.production.fragments,
+            indexed_plan.production.fragments,
+            strict=True,
+        ):
+            self.assertEqual(
+                fragment_material(indexed, indexed_fragment),
+                fragment_material(sources, expanded_fragment),
+            )
+        long_key = next(
+            key
+            for key in indexed.record_keys
+            if record_material(indexed, key).owner.kind == "detail"
+            and record_material(indexed, key).owner.record_kind
+            == "explanation"
+            and any(
+                field.path == "before"
+                and field.data == long_text.encode("utf-8")
+                for field in record_material(indexed, key).fields
+            )
+        )
+        self.assertEqual(
+            record_material(indexed, long_key).fields[1].data,
+            long_text.encode("utf-8"),
+        )
+        memo = indexed._source_state.field_memo  # noqa: SLF001 # Inspect the documented bounded field memo.
+        memo_weight = sum(weight for _fields, weight in memo.values())
+        self.assertLessEqual(memo_weight, 32_768)
+        self.assertTrue(
+            all(weight <= 8_192 for _fields, weight in memo.values())
+        )
+        self.assertNotIn((long_key, "before"), memo)
+        memo_units = [
+            indexed._source_state.detail_units_by_key[key]  # noqa: SLF001 # Inspect per-unit detail memo coverage.
+            for key, _path in memo
+            if key in indexed._source_state.detail_units_by_key  # noqa: SLF001 # Separate detail fields from other owners.
+        ]
+        self.assertEqual(len(memo_units), len(set(memo_units)))
         self.assert_valid(plan, sources)
         self.assertTrue(plan.production.fragments)
         self.assertTrue(
@@ -915,6 +1003,454 @@ class HierarchyTests(unittest.TestCase):
                     len(fragment_material(sources, fragment)),
                     fragment.byte_end - fragment.byte_start,
                 )
+
+
+class IndexedPlanningSourceTests(unittest.TestCase):
+    """Compare the indexed hierarchy adapter with its expanded oracle."""
+
+    def test_indexed_sources_match_expanded_material_and_plan(self) -> None:
+        """All indexed source bytes and plan outputs must match legacy values."""
+        cases = (
+            (
+                "default-author",
+                AuthorContext(),
+                None,
+            ),
+            (
+                "unicode-crlf-empty-author",
+                AuthorContext(
+                    title="", repository="", author_reported_motivation=""
+                ),
+                '  \u03b1😀\r\nline\rpart\nLS\u2028PS\u2029\\"  ',
+            ),
+        )
+        for name, author, before in cases:
+            with self.subTest(name=name):
+                ledger, index, details, _unused = fixture(author=author)
+                if before is not None:
+                    details = changed_detail(details, before)
+                expanded = derive_planning_sources(
+                    index, details, author_context=author
+                )
+                context = capture_indexed_detail_results(
+                    details, ledger, index=index
+                )
+                expected_plan = build(expanded)
+                with (
+                    mock.patch(
+                        "diffstory.narrative_hierarchy.derive_planning_sources",
+                        side_effect=AssertionError(
+                            "indexed path used legacy derivation"
+                        ),
+                    ),
+                    mock.patch(
+                        "diffstory.report_storage.expand_report_storage",
+                        side_effect=AssertionError(
+                            "indexed path expanded the report"
+                        ),
+                    ),
+                    mock.patch(
+                        "diffstory.narrative_plan.build_evidence_ledger",
+                        side_effect=AssertionError(
+                            "indexed path rebuilt the ledger"
+                        ),
+                    ),
+                    mock.patch(
+                        "diffstory.narrative_plan.build_ledger_index",
+                        side_effect=AssertionError(
+                            "indexed path rebuilt the index"
+                        ),
+                    ),
+                    mock.patch(
+                        "diffstory.narrative_plan._validate_detail_result",
+                        side_effect=AssertionError(
+                            "indexed path revalidated details"
+                        ),
+                    ),
+                    mock.patch(
+                        "diffstory.narrative_plan._resolve_span_ref",
+                        side_effect=AssertionError(
+                            "indexed path resolved citations again"
+                        ),
+                    ),
+                    mock.patch.object(
+                        IndexedDetailContext,
+                        "detail_record",
+                        side_effect=AssertionError(
+                            "normal planning rebuilt complete details"
+                        ),
+                    ),
+                ):
+                    indexed = derive_planning_sources_indexed(
+                        index, context, author_context=author
+                    )
+                    self.assertEqual(indexed.groups, expanded.groups)
+                    self.assertEqual(indexed.record_keys, expanded.record_keys)
+                    actual_plan = build(indexed)
+                    for key in expanded.record_keys:
+                        self.assertEqual(
+                            record_material(indexed, key),
+                            record_material(expanded, key),
+                        )
+                    for fragment in expected_plan.production.fragments:
+                        self.assertEqual(
+                            fragment_material(indexed, fragment),
+                            fragment_material(expanded, fragment),
+                        )
+                    source_key = next(
+                        key
+                        for key in indexed.record_keys
+                        if record_material(indexed, key).owner.kind == "source"
+                    )
+                    source_record = record_material(indexed, source_key)
+                    source_text = next(
+                        field
+                        for field in source_record.fields
+                        if field.path == "text" and field.data
+                    )
+                    source_fragment = _fragment(
+                        source_record.owner,
+                        source_text,
+                        0,
+                        min(12, len(source_text.data)),
+                    )
+                    self.assertEqual(
+                        fragment_material(indexed, source_fragment),
+                        fragment_material(expanded, source_fragment),
+                    )
+                    expected_support = material_support(
+                        expanded,
+                        record_keys=expanded.record_keys,
+                        fragments=(source_fragment,),
+                    )
+                    actual_support = material_support(
+                        indexed,
+                        record_keys=indexed.record_keys,
+                        fragments=(source_fragment,),
+                    )
+                    self.assertEqual(actual_support, expected_support)
+                    self.assertEqual(
+                        validate_source_slice(
+                            actual_support.basis[0], indexed
+                        ),
+                        validate_source_slice(
+                            expected_support.basis[0], expanded
+                        ),
+                    )
+                self.assertEqual(actual_plan, expected_plan)
+                self.assertEqual(
+                    production_plan_id(actual_plan),
+                    production_plan_id(expected_plan),
+                )
+                expanded_details = indexed.details
+                self.assertEqual(expanded_details, details)
+                if expanded_details[0].explanations:
+                    original_before = details[0].explanations[0].before
+                    object.__setattr__(
+                        expanded_details[0].explanations[0],
+                        "before",
+                        "detached accessor mutation",
+                    )
+                    self.assertEqual(indexed.details, details)
+                    self.assertEqual(
+                        details[0].explanations[0].before, original_before
+                    )
+                context.citation_scope.close()
+
+    def test_indexed_record_material_returns_a_detached_owner(self) -> None:
+        """A returned owner alias could corrupt captured record metadata."""
+        cases = (("explanation", 0, False, int, 0),)
+        for (
+            record_kind,
+            ordinal,
+            replacement,
+            expected_type,
+            expected_value,
+        ) in cases:
+            with self.subTest(record_kind=record_kind, ordinal=ordinal):
+                ledger, index, details, _unused = fixture()
+                context = capture_indexed_detail_results(
+                    details, ledger, index=index
+                )
+                indexed = derive_planning_sources_indexed(
+                    index, context, author_context=AuthorContext()
+                )
+                try:
+                    state = indexed._source_state  # noqa: SLF001 # Inspect the exact retained owner.
+                    key = next(
+                        key
+                        for key in indexed.record_keys
+                        if state.record_owners[key].kind == "detail"
+                        and state.record_owners[key].record_kind == record_kind
+                        and state.record_owners[key].ordinal == ordinal
+                    )
+                    original_fingerprint = state.current_metadata_fingerprint()
+                    public_material = record_material(indexed, key)
+                    public_owner = public_material.owner
+                    self.assertIsNot(public_owner, state.record_owners[key])
+                    object.__setattr__(public_owner, "ordinal", replacement)
+                    self.assertIs(type(public_owner.ordinal), bool)
+                    self.assertIs(
+                        type(state.record_owners[key].ordinal), expected_type
+                    )
+                    self.assertEqual(
+                        state.record_owners[key].ordinal, expected_value
+                    )
+                    self.assertEqual(
+                        state.current_metadata_fingerprint(),
+                        original_fingerprint,
+                    )
+                    indexed.check_current()
+                    later_material = record_material(indexed, key)
+                    self.assertEqual(
+                        later_material.owner, state.record_owners[key]
+                    )
+                    self.assertIs(
+                        type(later_material.owner.ordinal), expected_type
+                    )
+                    self.assertEqual(
+                        later_material.owner.ordinal, expected_value
+                    )
+                    self.assertEqual(
+                        later_material.fields, public_material.fields
+                    )
+                    self.assertEqual(
+                        later_material.citations, public_material.citations
+                    )
+                    self.assertEqual(
+                        later_material.claim, public_material.claim
+                    )
+                finally:
+                    context.citation_scope.close()
+
+    def test_indexed_metadata_witness_preserves_raw_scalar_types(self) -> None:
+        """Canonical model serialization could hide raw owner or reference changes."""
+        cases = (
+            ("record_owner", "ordinal", 0, False),
+            ("source_reference", "line_start", 1, True),
+        )
+        for metadata_kind, field_name, original_value, replacement in cases:
+            with self.subTest(
+                metadata_kind=metadata_kind, field_name=field_name
+            ):
+                ledger, index, details, _unused = fixture()
+                context = capture_indexed_detail_results(
+                    details, ledger, index=index
+                )
+                indexed = derive_planning_sources_indexed(
+                    index, context, author_context=AuthorContext()
+                )
+                try:
+                    state = indexed._source_state  # noqa: SLF001 # Mutate retained metadata to exercise its witness.
+                    if metadata_kind == "record_owner":
+                        target = next(
+                            owner
+                            for owner in state.record_owners.values()
+                            if owner.kind == "detail"
+                            and owner.record_kind == "explanation"
+                            and getattr(owner, field_name) == original_value
+                        )
+                    else:
+                        target = next(
+                            reference
+                            for reference in state.source_by_record.values()
+                            if type(getattr(reference, field_name)) is int
+                            and getattr(reference, field_name)
+                            == original_value
+                        )
+                    original = getattr(target, field_name)
+                    original_fingerprint = state.current_metadata_fingerprint()
+                    object.__setattr__(target, field_name, replacement)
+                    self.assertIs(type(getattr(target, field_name)), bool)
+                    self.assertNotEqual(
+                        state.current_metadata_fingerprint(),
+                        original_fingerprint,
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "planning_sources_changed"
+                    ):
+                        indexed.check_current()
+                    object.__setattr__(target, field_name, original)
+                    self.assertEqual(
+                        state.current_metadata_fingerprint(),
+                        original_fingerprint,
+                    )
+                    indexed.check_current()
+                finally:
+                    context.citation_scope.close()
+
+    def test_indexed_sources_own_normalized_author_input(self) -> None:
+        """Later caller mutation must not change the adapter's author record."""
+        author = AuthorContext(
+            title="Original title",
+            repository="repo",
+            author_reported_motivation="Keep the change small.",
+        )
+        ledger, index, details, _unused = fixture(author=author)
+        context = capture_indexed_detail_results(details, ledger, index=index)
+        indexed = derive_planning_sources_indexed(
+            index, context, author_context=author
+        )
+        original_digest = indexed.author_digest
+        object.__setattr__(author, "title", "mutated after capture")
+        indexed.check_current()
+        self.assertEqual(indexed.author.title, "Original title")
+        self.assertEqual(indexed.author_digest, original_digest)
+        context.citation_scope.close()
+
+    def test_indexed_sources_reject_changed_index_revision_and_source_lines(
+        self,
+    ) -> None:
+        """Source authority must stay on its current ledger, index, and revisions."""
+        ledger, index, details, _unused = fixture()
+        revision = ("base-revision-a", "head-revision-a")
+        context = capture_indexed_detail_results(
+            details,
+            ledger,
+            index=index,
+            revision_binding=revision,
+        )
+        indexed = derive_planning_sources_indexed(
+            index,
+            context,
+            author_context=AuthorContext(),
+            revision_binding=revision,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "citation_scope_revision_mismatch"
+        ):
+            derive_planning_sources_indexed(
+                index,
+                context,
+                author_context=AuthorContext(),
+                revision_binding=("base-revision-b", revision[1]),
+            )
+        with self.assertRaisesRegex(
+            ValueError, "citation_scope_binding_mismatch"
+        ):
+            derive_planning_sources_indexed(
+                build_ledger_index(ledger),
+                context,
+                author_context=AuthorContext(),
+                revision_binding=revision,
+            )
+        span = ledger.spans[0]
+        original_line = span.line_start
+        object.__setattr__(span, "line_start", original_line + 1)
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                indexed.check_current()
+        finally:
+            object.__setattr__(span, "line_start", original_line)
+        indexed.check_current()
+        context.citation_scope.close()
+
+    def test_indexed_source_registration_rejects_copies_and_closes_memo(
+        self,
+    ) -> None:
+        """Copies cannot borrow source scope and closing releases its field memo."""
+        ledger, index, details, _unused = fixture()
+        context = capture_indexed_detail_results(details, ledger, index=index)
+        indexed = derive_planning_sources_indexed(
+            index, context, author_context=AuthorContext()
+        )
+        self.assertFalse(hasattr(indexed, "validated_generation"))
+        self.assertFalse(hasattr(indexed, "validated_report"))
+        with mock.patch.object(
+            IndexedDetailContext,
+            "detail_record",
+            side_effect=AssertionError("normal planning expanded details"),
+        ):
+            build(indexed)
+        state = indexed._source_state  # noqa: SLF001 # Inspect scope-owned cache behavior.
+        detail_key = next(
+            key
+            for key in indexed.record_keys
+            if state.record_owners[key].kind == "detail"
+            and state.record_owners[key].record_kind == "explanation"
+        )
+        _indexed_field(state, detail_key, "before", cache=True)
+        self.assertTrue(state.field_memo)
+        _indexed_field(state, detail_key, "after", cache=True)
+        self.assertNotIn((detail_key, "before"), state.field_memo)
+        self.assertIn((detail_key, "after"), state.field_memo)
+        for forged in (IndexedPlanningSources(state),):
+            with self.assertRaisesRegex(
+                ValueError, "unregistered_planning_sources"
+            ):
+                forged.check_current()
+        with self.assertRaises(TypeError):
+            context.citation_scope._register_indexed_planning_sources(  # noqa: SLF001 # Public callers cannot issue a scope registration.
+                context,
+                IndexedPlanningSources(state),
+                state.binding_witness(),
+                state.field_memo,
+            )
+        with self.assertRaisesRegex(TypeError, "cannot_be_copied"):
+            copy.copy(indexed)
+        with self.assertRaisesRegex(TypeError, "cannot_be_copied"):
+            copy.deepcopy(indexed)
+        with self.assertRaisesRegex(TypeError, "cannot_be_serialized"):
+            pickle.dumps(indexed)
+        original_units = context._unit_keys  # noqa: SLF001 # Preserve the accepted selector order.
+        object.__setattr__(context, "_unit_keys", ("f" * 64,))
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "unregistered_detail_context"
+            ):
+                indexed.check_current()
+        finally:
+            object.__setattr__(context, "_unit_keys", original_units)
+        original_backing = context._graph  # noqa: SLF001 # Preserve the accepted backing selector.
+        object.__setattr__(context, "_graph", object())
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "unregistered_detail_context"
+            ):
+                indexed.check_current()
+        finally:
+            object.__setattr__(context, "_graph", original_backing)
+        context.citation_scope.close()
+        self.assertFalse(state.field_memo)
+        with self.assertRaisesRegex(ValueError, "unregistered_detail_context"):
+            indexed.check_current()
+
+    def test_indexed_field_memo_evicts_oldest_by_configured_weight(
+        self,
+    ) -> None:
+        """Indexed source fields must obey byte-weighted LRU eviction."""
+        ledger, index, details, _unused = fixture(max_span_bytes=128)
+        context = capture_indexed_detail_results(details, ledger, index=index)
+        indexed = derive_planning_sources_indexed(
+            index, context, author_context=AuthorContext()
+        )
+        state = indexed._source_state  # noqa: SLF001 # Inspect the bounded memo.
+        source_keys = tuple(
+            key
+            for key in indexed.record_keys
+            if state.record_owners[key].kind == "source"
+        )
+        measured = []
+        for key in source_keys:
+            _indexed_field(state, key, "text", cache=True)
+            measured.append((key, state.field_memo[(key, "text")][1]))
+        state.field_memo.clear()
+        largest = sorted(measured, key=lambda item: item[1], reverse=True)[:3]
+        self.assertEqual(len(largest), 3)
+        limit = largest[0][1] + largest[1][1]
+        with mock.patch(
+            "diffstory.narrative_hierarchy.INDEXED_FIELD_MEMO_MAX_WEIGHT",
+            limit,
+        ):
+            for key, _weight in largest:
+                _indexed_field(state, key, "text", cache=True)
+        self.assertLessEqual(
+            sum(weight for _field, weight in state.field_memo.values()), limit
+        )
+        self.assertNotIn((largest[0][0], "text"), state.field_memo)
+        self.assertIn((largest[1][0], "text"), state.field_memo)
+        self.assertIn((largest[2][0], "text"), state.field_memo)
+        context.citation_scope.close()
 
 
 class SupportTests(unittest.TestCase):

@@ -40,12 +40,16 @@ from diffstory.narrative_plan import build_story_plan
 from diffstory.narrative_plan import canonical_bytes
 from diffstory.narrative_plan import capture_indexed_detail_results
 from diffstory.narrative_plan import check_evidence_batch
+from diffstory.narrative_plan import content_digest
 from diffstory.narrative_plan import detail_output_allowance
+from diffstory.narrative_plan import indexed_detail_record_view
+from diffstory.narrative_plan import indexed_detail_semantic_digest
 from diffstory.narrative_plan import ordered_components
 from diffstory.narrative_plan import pack_evidence_units
 from diffstory.narrative_plan import pack_request_items
 from diffstory.narrative_plan import planning_groups
 from diffstory.narrative_plan import planning_groups_from_details
+from diffstory.narrative_plan import planning_groups_from_indexed_details
 from diffstory.narrative_plan import prepare_request_items
 from diffstory.narrative_plan import reconstruct_buffer
 from diffstory.narrative_plan import resolve_span_ref
@@ -1513,6 +1517,147 @@ class IndexedDetailValidationTests(unittest.TestCase):
         self.assertFalse(hasattr(context, "validated_generation"))
         self.assertFalse(hasattr(context, "validated_report"))
 
+    def test_indexed_planning_views_use_captured_group_facts(self) -> None:
+        """Planning source facts must not reparse accepted complete details."""
+        context = self.capture(tuple(reversed(self.results)))
+        expected_groups = planning_groups_from_details(
+            self.ledger, tuple(reversed(self.results)), index=self.index
+        )
+        detail = next(item for item in self.results if item.explanations)
+        expected_record = detail.explanations[0]
+        with (
+            mock.patch.object(
+                plan_module,
+                "_validate_detail_result",
+                side_effect=AssertionError(
+                    "indexed planning revalidated details"
+                ),
+            ),
+            mock.patch.object(
+                DetailResult,
+                "model_validate",
+                side_effect=AssertionError("indexed planning parsed details"),
+            ),
+            mock.patch.object(
+                plan_module,
+                "build_evidence_ledger",
+                side_effect=AssertionError(
+                    "indexed planning rebuilt the ledger"
+                ),
+            ),
+            mock.patch.object(
+                plan_module,
+                "build_ledger_index",
+                side_effect=AssertionError(
+                    "indexed planning rebuilt the index"
+                ),
+            ),
+        ):
+            groups = planning_groups_from_indexed_details(self.index, context)
+            digest = indexed_detail_semantic_digest(context, detail.unit_key)
+            record = indexed_detail_record_view(
+                context, detail.unit_key, "explanation", 0
+            )
+        self.assertEqual(groups, expected_groups)
+        self.assertEqual(digest, content_digest(canonical_bytes(detail)))
+        self.assertEqual(
+            canonical_bytes(record), canonical_bytes(expected_record)
+        )
+
+    def test_indexed_digest_keeps_the_detail_version_default(self) -> None:
+        """An omitted accepted version must keep its existing semantic identity."""
+        source = next(item for item in self.results if item.explanations)
+        raw = source.model_dump(mode="json")
+        raw.pop("version")
+        candidates = tuple(
+            raw if item.unit_key == source.unit_key else item
+            for item in self.results
+        )
+        context = self.capture(candidates)
+        normalized = DetailResult.model_validate_json(canonical_bytes(raw))
+        self.assertEqual(
+            indexed_detail_semantic_digest(context, source.unit_key),
+            content_digest(canonical_bytes(normalized)),
+        )
+
+    def test_indexed_capture_rejects_boolean_detail_version(self) -> None:
+        """A raw boolean must not be normalized into the string version default."""
+        source = next(item for item in self.results if item.explanations)
+        raw = source.model_dump(mode="json")
+        raw["version"] = True
+        candidates = tuple(
+            raw if item.unit_key == source.unit_key else item
+            for item in self.results
+        )
+        with self.assertRaises((ValidationError, ValueError)):
+            self.capture(candidates)
+
+    def test_indexed_capture_rejects_omitted_required_detail_fields(
+        self,
+    ) -> None:
+        """Only the declared detail version default may be omitted from input."""
+        source = next(item for item in self.results if item.explanations)
+        cases = (
+            ("explanation", "effect"),
+            ("explanation", "limitations"),
+            ("citation", "line_start"),
+        )
+        for record_kind, field_name in cases:
+            with self.subTest(record_kind=record_kind, field_name=field_name):
+                raw = source.model_dump(mode="json")
+                if record_kind == "citation":
+                    raw["explanations"][0]["citations"][0].pop(field_name)
+                else:
+                    raw["explanations"][0].pop(field_name)
+                candidates = tuple(
+                    raw if item.unit_key == source.unit_key else item
+                    for item in self.results
+                )
+                with self.assertRaises((ValidationError, ValueError)):
+                    self.capture(candidates)
+
+    def test_indexed_context_rejects_bypass_mutation_of_owned_detail(
+        self,
+    ) -> None:
+        """Changed typed detail data must invalidate its captured digest witness."""
+        context = self.capture()
+        result = next(item for item in self.results if item.explanations)
+        owned = context._typed_by_unit[result.unit_key]  # noqa: SLF001 # Mutate the context-owned witness value.
+        original = owned.explanations[0].before
+        object.__setattr__(owned.explanations[0], "before", "changed")
+        try:
+            with self.assertRaisesRegex(ValueError, "detail_context_changed"):
+                context.assert_detail_witnesses_current()
+        finally:
+            object.__setattr__(owned.explanations[0], "before", original)
+            context.citation_scope.close()
+
+    def test_indexed_context_rejects_raw_boolean_citation_mutation(
+        self,
+    ) -> None:
+        """Raw bool must not hide behind canonical serialization of integer one."""
+        context = self.capture()
+        result = next(
+            item
+            for item in self.results
+            if item.explanations and item.explanations[0].citations
+        )
+        owned = context._typed_by_unit[result.unit_key]  # noqa: SLF001 # Mutate the exact captured typed detail.
+        citation = owned.explanations[0].citations[0]
+        original = citation.line_start
+        self.assertEqual(original, 1)
+        semantic_digest = content_digest(canonical_bytes(owned))
+        object.__setattr__(citation, "line_start", True)
+        try:
+            self.assertEqual(
+                content_digest(canonical_bytes(owned)), semantic_digest
+            )
+            with self.assertRaisesRegex(ValueError, "detail_context_changed"):
+                context.assert_detail_witnesses_current()
+        finally:
+            object.__setattr__(citation, "line_start", original)
+            context.citation_scope.close()
+
     def test_missing_duplicate_and_reordered_coverage_match_strict_oracle(
         self,
     ) -> None:
@@ -2306,6 +2451,51 @@ class IndexedGraphDetailTests(unittest.TestCase):
                 )
         finally:
             object.__setattr__(reference, "storage_id", old_id)
+
+    def test_graph_planning_view_selects_one_record_without_detail_expansion(
+        self,
+    ) -> None:
+        """Graph planning helpers must not rebuild a complete selected detail."""
+        references = self.graph.generation_result_refs["details"]
+        context = validate_indexed_detail_results(
+            references, self.graph, self.ledger, index=self.index
+        )
+        expected_details = tuple(
+            DetailResult.model_validate_json(canonical_bytes(value))
+            for value in self.expanded_details
+        )
+        expected_groups = planning_groups_from_details(
+            self.ledger, expected_details, index=self.index
+        )
+        expected_detail = next(
+            value for value in expected_details if value.explanations
+        )
+        expected_record = expected_detail.explanations[0]
+        with (
+            mock.patch.object(
+                plan_module.IndexedDetailContext,
+                "detail_record",
+                side_effect=AssertionError(
+                    "planning expanded a complete detail"
+                ),
+            ),
+            mock.patch.object(
+                DetailResult,
+                "model_validate",
+                side_effect=AssertionError("planning reparsed a detail"),
+            ),
+        ):
+            actual_groups = planning_groups_from_indexed_details(
+                self.index, context
+            )
+            actual_record = indexed_detail_record_view(
+                context, expected_detail.unit_key, "explanation", 0
+            )
+        self.assertEqual(actual_groups, expected_groups)
+        self.assertEqual(
+            canonical_bytes(actual_record), canonical_bytes(expected_record)
+        )
+        context.citation_scope.close()
 
     def test_context_owns_graph_view_when_caller_rebinds_tables(self) -> None:
         """Rebinding the caller's graph tables cannot change captured details."""
