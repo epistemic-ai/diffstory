@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
+import pickle
 import unittest
+from types import MappingProxyType
 from unittest import mock
 
 from pydantic import ValidationError
@@ -27,11 +29,13 @@ from diffstory.narrative_contracts import PlanningGroup
 from diffstory.narrative_contracts import SourceSpan
 from diffstory.narrative_contracts import SupportedStatement
 from diffstory.narrative_contracts import Terminology
+from diffstory.narrative_plan import CitationResolutionScope
 from diffstory.narrative_plan import PackingError
 from diffstory.narrative_plan import RequestPackingLimits
 from diffstory.narrative_plan import build_evidence_ledger
 from diffstory.narrative_plan import build_story_plan
 from diffstory.narrative_plan import canonical_bytes
+from diffstory.narrative_plan import capture_indexed_detail_results
 from diffstory.narrative_plan import check_evidence_batch
 from diffstory.narrative_plan import detail_output_allowance
 from diffstory.narrative_plan import ordered_components
@@ -47,6 +51,7 @@ from diffstory.narrative_plan import span_reference
 from diffstory.narrative_plan import validate_detail_result
 from diffstory.narrative_plan import validate_detail_results
 from diffstory.narrative_plan import validate_evidence_ledger
+from diffstory.narrative_plan import validate_indexed_detail_results
 from diffstory.narrative_plan import validate_planning_claims
 from diffstory.narrative_plan import validate_story_order
 from diffstory.narrative_plan import validate_story_plan
@@ -1398,6 +1403,923 @@ class LedgerIndexTests(unittest.TestCase):
         # for each citation exceeds this bound by several orders of magnitude.
         self.assertLessEqual(unit_equality_calls, 100)
         self.assertLessEqual(equality_calls, 100 * len(unit.spans))
+
+
+class IndexedDetailValidationTests(unittest.TestCase):
+    """Keep indexed detail data owned and current-source checks scope-local."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Create one complete synthetic ledger and one checked index."""
+        cls.ledger = build_evidence_ledger(
+            compile_snapshot(snap({"x.py": BEFORE}, {"x.py": AFTER}))
+        )
+        cls.index = plan_module.build_ledger_index(cls.ledger)
+        cls.results = tuple(authored_result(unit) for unit in cls.ledger.units)
+
+    def capture(
+        self,
+        results: tuple[DetailResult | dict, ...] | None = None,
+        *,
+        scope: CitationResolutionScope | None = None,
+        revision_binding: tuple[str, str] | None = None,
+    ) -> object:
+        """Capture the whole detail set with the same current index."""
+        return capture_indexed_detail_results(
+            self.results if results is None else results,
+            self.ledger,
+            index=self.index,
+            citation_scope=scope,
+            revision_binding=revision_binding,
+        )
+
+    def _assert_parity_failure(
+        self,
+        result: DetailResult,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        unit = self.index.units[result.unit_key]
+        strict_failure: Exception | None = None
+        with self.assertRaises(Exception) as strict:
+            validate_detail_result(result, unit, self.ledger, index=self.index)
+        strict_failure = strict.exception
+        candidates = tuple(
+            result if original.unit_key == result.unit_key else original
+            for original in self.results
+        )
+        with self.assertRaises(type(strict_failure)) as indexed:
+            self.capture(candidates)
+        if reason is not None:
+            self.assertIn(reason, str(strict_failure))
+            self.assertIn(reason, str(indexed.exception))
+        else:
+            self.assertEqual(str(indexed.exception), str(strict_failure))
+
+    def test_capture_preserves_full_detail_and_expanded_acceptance_order(
+        self,
+    ) -> None:
+        """Keep every detail field and allow the same reordered set as strict validation."""
+        reversed_results = tuple(reversed(self.results))
+        validate_detail_results(
+            reversed_results, self.ledger, index=self.index
+        )
+        context = self.capture(reversed_results)
+        self.assertEqual(
+            context.unit_keys,
+            tuple(result.unit_key for result in reversed_results),
+        )
+        for result in reversed_results:
+            self.assertEqual(
+                canonical_bytes(context.detail_record(result.unit_key)),
+                canonical_bytes(result.model_dump(mode="python")),
+            )
+        self.assertTrue(context.contains_unit(reversed_results[0].unit_key))
+        self.assertFalse(context.contains_unit("f" * 64))
+        context.assert_current(self.ledger, self.index)
+        self.assertFalse(hasattr(context, "validated_generation"))
+        self.assertFalse(hasattr(context, "validated_report"))
+
+    def test_missing_duplicate_and_reordered_coverage_match_strict_oracle(
+        self,
+    ) -> None:
+        """Reject incomplete or repeated units and retain accepted input order."""
+        for candidates in (
+            self.results[:-1],
+            (*self.results, self.results[0]),
+        ):
+            with self.subTest(count=len(candidates)):
+                with self.assertRaisesRegex(
+                    ValueError, "detail_set_coverage_mismatch"
+                ):
+                    validate_detail_results(
+                        candidates, self.ledger, index=self.index
+                    )
+                with self.assertRaisesRegex(
+                    ValueError, "detail_set_coverage_mismatch"
+                ):
+                    self.capture(candidates)
+        context = self.capture(tuple(reversed(self.results)))
+        self.assertEqual(
+            context.unit_keys,
+            tuple(item.unit_key for item in reversed(self.results)),
+        )
+
+    def test_citation_and_obligation_rejections_match_strict_oracle(
+        self,
+    ) -> None:
+        """Keep source, citation-uniqueness, obligation, and limitation checks."""
+        result = next(item for item in self.results if item.explanations)
+        first = result.explanations[0]
+        ref = first.citations[0]
+        for update in (
+            {"side": "head" if ref.side == "base" else "base"},
+            {"path": "wrong.py"},
+            {"content_digest": "f" * 64},
+            {"byte_end": ref.byte_end + 1},
+            {"line_end": ref.line_end + 1},
+            {"group_key": "c" * 64},
+        ):
+            with self.subTest(update=update):
+                damaged = change_result(
+                    result,
+                    0,
+                    citations=(
+                        ref.model_copy(update=update),
+                        *first.citations[1:],
+                    ),
+                )
+                self._assert_parity_failure(damaged)
+        duplicate = change_result(
+            result, 0, citations=(*first.citations, first.citations[0])
+        )
+        self._assert_parity_failure(duplicate, reason="duplicate_citation")
+        missing_support = change_result(result, 0, citations=())
+        self._assert_parity_failure(
+            missing_support, reason="missing_changed_region_citation"
+        )
+        repeated_obligation = result.model_copy(
+            update={"explanations": (*result.explanations, first)}
+        )
+        self._assert_parity_failure(repeated_obligation)
+
+    def test_invalid_observations_questions_and_limits_match_strict_oracle(
+        self,
+    ) -> None:
+        """Keep observation IDs, question links, and explicit limitations checked."""
+        result = next(item for item in self.results if item.observations)
+        observation = result.observations[0]
+        duplicate_observation = result.model_copy(
+            update={"observations": (*result.observations, observation)}
+        )
+        self._assert_parity_failure(
+            duplicate_observation, reason="duplicate_observation"
+        )
+        question = result.questions[0]
+        unlinked_question = result.model_copy(
+            update={
+                "questions": (
+                    question.model_copy(
+                        update={"citations": (), "obligation_ids": ()}
+                    ),
+                )
+            }
+        )
+        self._assert_parity_failure(
+            unlinked_question, reason="unlinked_question"
+        )
+
+        limited_ledger = build_evidence_ledger(
+            compile_snapshot(
+                snap(
+                    {},
+                    {"x.py": AFTER},
+                    overrides={
+                        ("base", "x.py"): {
+                            "state": "unavailable",
+                            "reason": "read_failed",
+                        }
+                    },
+                )
+            )
+        )
+        limited_index = plan_module.build_ledger_index(limited_ledger)
+        limited_unit = next(
+            unit
+            for unit in limited_ledger.units
+            if any(obligation.limitations for obligation in unit.obligations)
+        )
+        limited_result = authored_result(limited_unit)
+        explanation_index = next(
+            i
+            for i, item in enumerate(limited_result.explanations)
+            if item.limitations
+        )
+        omitted_limit = change_result(
+            limited_result, explanation_index, limitations=()
+        )
+        with self.assertRaisesRegex(
+            ValueError, "explicit_limitation_required"
+        ):
+            validate_detail_result(
+                omitted_limit,
+                limited_unit,
+                limited_ledger,
+                index=limited_index,
+            )
+        limited_results = tuple(
+            omitted_limit
+            if item.unit_key == limited_result.unit_key
+            else authored_result(unit)
+            for item, unit in zip(
+                (authored_result(unit) for unit in limited_ledger.units),
+                limited_ledger.units,
+                strict=True,
+            )
+        )
+        with self.assertRaisesRegex(
+            ValueError, "explicit_limitation_required"
+        ):
+            capture_indexed_detail_results(
+                limited_results, limited_ledger, index=limited_index
+            )
+
+    def test_cross_unit_and_cross_group_citations_are_rejected(self) -> None:
+        """Global source presence cannot substitute for unit and group ownership."""
+        ledger = build_evidence_ledger(two_group_report(), max_unit_spans=2)
+        index = plan_module.build_ledger_index(ledger)
+        unit = ledger.units[0]
+        result = authored_result(unit)
+        other_group = next(
+            candidate
+            for candidate in ledger.units
+            if candidate.group_key != unit.group_key
+        )
+        same_group = next(
+            candidate
+            for candidate in ledger.units
+            if candidate.group_key == unit.group_key
+            and candidate.id != unit.id
+        )
+        for foreign in (other_group, same_group):
+            bad_observation = result.observations[0].model_copy(
+                update={
+                    "citations": (span_reference(foreign.spans[0], foreign),)
+                }
+            )
+            bad_result = result.model_copy(
+                update={"observations": (bad_observation,)}
+            )
+            with self.assertRaises(ValueError) as strict:
+                validate_detail_result(bad_result, unit, ledger, index=index)
+            candidates = tuple(
+                bad_result if item.id == unit.id else authored_result(item)
+                for item in ledger.units
+            )
+            with self.assertRaises(type(strict.exception)) as indexed:
+                capture_indexed_detail_results(candidates, ledger, index=index)
+            self.assertEqual(str(indexed.exception), str(strict.exception))
+
+    def test_owned_stage_capture_isolated_from_models_dicts_and_accessors(
+        self,
+    ) -> None:
+        """Detach nested source values and return a fresh mapping on every read."""
+        source_models = list(self.results)
+        context = self.capture(tuple(source_models))
+        source_result = next(
+            item for item in source_models if item.explanations
+        )
+        source_ref = source_result.explanations[0].citations[0]
+        original_start = source_ref.byte_start
+        object.__setattr__(source_ref, "byte_start", True)
+        try:
+            current = context.detail_record(source_result.unit_key)
+            self.assertIs(
+                type(current["explanations"][0]["citations"][0]["byte_start"]),
+                int,
+            )
+            current["explanations"][0]["citations"][0]["byte_start"] = True
+            again = context.detail_record(source_result.unit_key)
+            self.assertEqual(
+                again["explanations"][0]["citations"][0]["byte_start"],
+                original_start,
+            )
+        finally:
+            object.__setattr__(source_ref, "byte_start", original_start)
+
+        payloads = [item.model_dump(mode="python") for item in self.results]
+        dict_context = self.capture(tuple(payloads))
+        expected = dict_context.detail_record(self.results[0].unit_key)
+        payloads[0]["unit_key"] = "f" * 64
+        self.assertEqual(
+            dict_context.detail_record(self.results[0].unit_key), expected
+        )
+
+    def test_capture_rejects_bypassed_numeric_booleans_without_serializing(
+        self,
+    ) -> None:
+        """Strict typed capture rejects bool offsets instead of accepting dump coercion."""
+        payloads = [item.model_dump(mode="python") for item in self.results]
+        payload = next(item for item in payloads if item["explanations"])
+        payload["explanations"][0]["citations"][0]["byte_start"] = True
+        with self.assertRaises(ValidationError):
+            self.capture(tuple(payloads))
+
+    def test_scope_memo_counts_real_resolutions_and_enforces_lifecycle(
+        self,
+    ) -> None:
+        """Reuse exact references locally and release all cached spans on close."""
+        scope = CitationResolutionScope(
+            self.ledger,
+            self.index,
+            revision_binding=("base-revision-1", "head-revision-1"),
+        )
+
+        def reference_key(ref: object) -> tuple[object, ...]:
+            return (
+                ref.span_id,
+                ref.unit_key,
+                ref.group_key,
+                ref.side,
+                ref.path,
+                ref.byte_start,
+                ref.byte_end,
+                ref.line_start,
+                ref.line_end,
+                ref.content_digest,
+            )
+
+        distinct = {
+            reference_key(ref)
+            for result in self.results
+            for refs in (
+                *(item.citations for item in result.explanations),
+                *(item.citations for item in result.observations),
+                *(item.citations for item in result.questions),
+            )
+            for ref in refs
+        }
+        with (
+            mock.patch.object(
+                plan_module,
+                "_validate_detail_result",
+                wraps=plan_module._validate_detail_result,  # noqa: SLF001 # Count the real contextual validator.
+            ) as details,
+            mock.patch.object(
+                plan_module,
+                "_resolve_span_ref",
+                wraps=plan_module._resolve_span_ref,  # noqa: SLF001 # Count actual source resolver calls.
+            ) as resolutions,
+            mock.patch.object(
+                plan_module,
+                "build_evidence_ledger",
+                side_effect=AssertionError(
+                    "indexed validation rebuilt the evidence ledger"
+                ),
+            ) as ledger_builds,
+            mock.patch.object(
+                plan_module,
+                "build_ledger_index",
+                side_effect=AssertionError(
+                    "indexed capture rebuilt the ledger index"
+                ),
+            ) as builds,
+        ):
+            context = self.capture(
+                scope=scope,
+                revision_binding=("base-revision-1", "head-revision-1"),
+            )
+            self.assertEqual(details.call_count, len(self.results))
+            self.assertEqual(resolutions.call_count, len(distinct))
+            for _ in range(3):
+                for unit_key in context.unit_keys:
+                    self.assertTrue(context.contains_unit(unit_key))
+                    context.detail_record(unit_key)
+            self.assertEqual(details.call_count, len(self.results))
+            self.assertEqual(resolutions.call_count, len(distinct))
+            self.assertEqual(ledger_builds.call_count, 0)
+            self.assertEqual(builds.call_count, 0)
+        self.assertEqual(scope.resolution_count, len(distinct))
+        self.assertEqual(scope.memoized_reference_count, len(distinct))
+        with self.assertRaises(AttributeError):
+            scope._index = self.index  # noqa: SLF001 # Rebinding must fail.
+        with self.assertRaises(AttributeError):
+            object.__setattr__(
+                scope,
+                "_revision_binding",
+                ("base-rebound", "head-rebound"),
+            )
+        self.assertEqual(
+            scope.revision_binding,
+            ("base-revision-1", "head-revision-1"),
+        )
+        with self.assertRaises(TypeError):
+            copy.copy(scope)
+        with self.assertRaises(TypeError):
+            copy.deepcopy(scope)
+        with self.assertRaises(TypeError):
+            pickle.dumps(scope)
+        with self.assertRaises(TypeError):
+            copy.copy(context)
+        with self.assertRaises(TypeError):
+            pickle.dumps(context)
+        with self.assertRaises(AttributeError):
+            context._index = self.index  # noqa: SLF001 # Rebinding must fail.
+        scope.close()
+        self.assertEqual(scope.memoized_reference_count, 0)
+        with self.assertRaises(AttributeError):
+            object.__setattr__(scope, "_closed", False)
+        self.assertTrue(scope.closed)
+        with self.assertRaisesRegex(ValueError, "unregistered_detail_context"):
+            _ = context.unit_keys
+        with self.assertRaisesRegex(ValueError, "citation_scope_closed"):
+            scope.resolve(
+                self.results[0].explanations[0].citations[0],
+                self.index.units[self.results[0].unit_key],
+                revision_binding=("base-revision-1", "head-revision-1"),
+            )
+
+    def test_scope_rejects_rebound_index_revision_and_mutated_sources(  # noqa: PLR0915 # Exercise current ledger and index mutations together.
+        self,
+    ) -> None:
+        """Content-stable references cannot reuse another binding or revision."""
+        revision = ("base-revision-1", "head-revision-1")
+        scope = CitationResolutionScope(
+            self.ledger, self.index, revision_binding=revision
+        )
+        result = next(item for item in self.results if item.explanations)
+        unit = self.index.units[result.unit_key]
+        reference = result.explanations[0].citations[0]
+        indexed_span = self.index.spans[reference.span_id]
+        original_line_start = indexed_span.line_start
+        object.__setattr__(indexed_span, "line_start", True)
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                CitationResolutionScope(
+                    self.ledger, self.index, revision_binding=revision
+                )
+        finally:
+            object.__setattr__(indexed_span, "line_start", original_line_start)
+
+        resolved = scope.resolve(reference, unit, revision_binding=revision)
+        original_span = self.index.spans[reference.span_id]
+        self.assertEqual(resolved.line_start, original_span.line_start)
+        object.__setattr__(resolved, "text", "changed detached result")
+        self.assertNotEqual(
+            scope.resolve(reference, unit, revision_binding=revision).text,
+            "changed detached result",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "citation_scope_revision_binding_required"
+        ):
+            scope.resolve(reference, unit)
+        with self.assertRaisesRegex(
+            ValueError, "citation_scope_revision_mismatch"
+        ):
+            scope.resolve(
+                reference,
+                unit,
+                revision_binding=("base-revision-2", "head-revision-1"),
+            )
+        with self.assertRaises(AttributeError):
+            object.__setattr__(
+                scope,
+                "_revision_binding",
+                ("base-revision-2", "head-revision-1"),
+            )
+        context = self.capture(scope=scope, revision_binding=revision)
+        context.assert_current(
+            self.ledger, self.index, revision_binding=revision
+        )
+        with self.assertRaisesRegex(
+            ValueError, "citation_scope_revision_mismatch"
+        ):
+            context.assert_current(
+                self.ledger,
+                self.index,
+                revision_binding=("base-revision-2", "head-revision-1"),
+            )
+
+        shifted_spans = tuple(
+            span.model_copy(
+                update={
+                    "line_start": span.line_start + 89,
+                    "line_end": span.line_end + 89,
+                }
+            )
+            for span in self.ledger.spans
+        )
+        shifted_by_id = {span.id: span for span in shifted_spans}
+        shifted_units = tuple(
+            unit.model_copy(
+                update={
+                    "spans": tuple(
+                        shifted_by_id[span.id] for span in unit.spans
+                    )
+                }
+            )
+            for unit in self.ledger.units
+        )
+        shifted_bindings = tuple(
+            binding.model_copy(update={"start_line": binding.start_line + 89})
+            for binding in self.ledger.bindings
+        )
+        shifted_ledger = self.ledger.model_copy(
+            update={
+                "spans": shifted_spans,
+                "units": shifted_units,
+                "bindings": shifted_bindings,
+            }
+        )
+        shifted_index = plan_module.build_ledger_index(shifted_ledger)
+        shifted_unit = shifted_index.units[result.unit_key]
+        shifted_ref = span_reference(
+            shifted_index.spans[reference.span_id], shifted_unit
+        )
+        self.assertEqual(reference, shifted_ref)
+        with self.assertRaisesRegex(
+            ValueError, "citation_scope_binding_mismatch"
+        ):
+            capture_indexed_detail_results(
+                tuple(authored_result(item) for item in shifted_ledger.units),
+                shifted_ledger,
+                index=shifted_index,
+                citation_scope=scope,
+                revision_binding=revision,
+            )
+        fresh_scope = CitationResolutionScope(
+            shifted_ledger, shifted_index, revision_binding=revision
+        )
+        shifted_span = fresh_scope.resolve(
+            shifted_ref,
+            shifted_unit,
+            revision_binding=revision,
+        )
+        self.assertNotEqual(shifted_span.line_start, original_span.line_start)
+        self.assertEqual(fresh_scope.resolution_count, 1)
+
+        current_span = self.index.spans[reference.span_id]
+        original_text = current_span.text
+        object.__setattr__(current_span, "text", "tampered source")
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                scope.resolve(reference, unit, revision_binding=revision)
+        finally:
+            object.__setattr__(current_span, "text", original_text)
+
+        original_line_start = current_span.line_start
+        object.__setattr__(current_span, "line_start", True)
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                scope.resolve(reference, unit, revision_binding=revision)
+        finally:
+            object.__setattr__(current_span, "line_start", original_line_start)
+
+        current_unit = self.index.units[unit.id]
+        original_group_key = current_unit.group_key
+        object.__setattr__(current_unit, "group_key", "f" * 64)
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                scope.resolve(reference, unit, revision_binding=revision)
+        finally:
+            object.__setattr__(current_unit, "group_key", original_group_key)
+
+        current_binding = self.index.bindings[current_span.buffer_key]
+        original_start_line = current_binding.start_line
+        object.__setattr__(current_binding, "start_line", True)
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                scope.resolve(reference, unit, revision_binding=revision)
+        finally:
+            object.__setattr__(
+                current_binding, "start_line", original_start_line
+            )
+
+        current_availability = self.ledger.availability[0]
+        original_counterpart = current_availability.counterpart_path
+        object.__setattr__(
+            current_availability, "counterpart_path", "mutated.py"
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                scope.resolve(reference, unit, revision_binding=revision)
+        finally:
+            object.__setattr__(
+                current_availability, "counterpart_path", original_counterpart
+            )
+        scope.close()
+        fresh_scope.close()
+
+        changed_revision = ("base-revision-2", "head-revision-1")
+        changed_revision_scope = CitationResolutionScope(
+            self.ledger, self.index, revision_binding=changed_revision
+        )
+        changed_revision_scope.resolve(
+            reference, unit, revision_binding=changed_revision
+        )
+        self.assertEqual(changed_revision_scope.resolution_count, 1)
+        changed_revision_scope.close()
+
+    def test_raw_boolean_span_coordinates_cannot_enter_or_reuse_a_scope(
+        self,
+    ) -> None:
+        """Reject bool coordinates before scope capture and after memo seeding."""
+        revision = ("base-raw-1", "head-raw-1")
+        result = next(item for item in self.results if item.explanations)
+        unit = self.index.units[result.unit_key]
+        reference = result.explanations[0].citations[0]
+        span = self.index.spans[reference.span_id]
+        original_line_start = span.line_start
+
+        object.__setattr__(span, "line_start", True)
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                CitationResolutionScope(
+                    self.ledger, self.index, revision_binding=revision
+                )
+        finally:
+            object.__setattr__(span, "line_start", original_line_start)
+
+        scope = CitationResolutionScope(
+            self.ledger, self.index, revision_binding=revision
+        )
+        resolved = scope.resolve(reference, unit, revision_binding=revision)
+        self.assertIs(type(resolved.line_start), int)
+        object.__setattr__(span, "line_start", True)
+        try:
+            with self.assertRaisesRegex(ValueError, "ledger_index_mutated"):
+                scope.resolve(reference, unit, revision_binding=revision)
+        finally:
+            object.__setattr__(span, "line_start", original_line_start)
+            scope.close()
+
+    def test_scope_owner_pins_revision_and_cannot_be_reopened(self) -> None:
+        """Context reuse stays on factory revisions and closed owner state."""
+        revision = ("base-owner-1", "head-owner-1")
+        changed = ("base-owner-2", "head-owner-1")
+        scope = CitationResolutionScope(
+            self.ledger, self.index, revision_binding=revision
+        )
+        result = next(item for item in self.results if item.explanations)
+        unit = self.index.units[result.unit_key]
+        reference = result.explanations[0].citations[0]
+        scope.resolve(reference, unit, revision_binding=revision)
+
+        with self.assertRaises(AttributeError):
+            object.__setattr__(scope, "_revision_binding", changed)
+        self.assertEqual(scope.revision_binding, revision)
+        context = self.capture(scope=scope, revision_binding=revision)
+        context.assert_current(
+            self.ledger, self.index, revision_binding=revision
+        )
+        with self.assertRaisesRegex(
+            ValueError, "citation_scope_revision_mismatch"
+        ):
+            context.assert_current(
+                self.ledger, self.index, revision_binding=changed
+            )
+        with self.assertRaisesRegex(
+            ValueError, "citation_scope_revision_mismatch"
+        ):
+            scope.resolve(reference, unit, revision_binding=changed)
+
+        scope.close()
+        with self.assertRaises(AttributeError):
+            object.__setattr__(scope, "_closed", False)
+        with self.assertRaisesRegex(ValueError, "citation_scope_closed"):
+            scope.resolve(reference, unit, revision_binding=revision)
+
+    def test_public_expanded_validator_does_not_consume_indexed_context(
+        self,
+    ) -> None:
+        """Public strict validation remains an independent boundary and oracle."""
+        result = next(item for item in self.results if item.explanations)
+        unit = self.index.units[result.unit_key]
+        context = self.capture()
+        with self.assertRaises(ValidationError):
+            validate_detail_result(
+                context, unit, self.ledger, index=self.index
+            )
+        expected_calls = sum(
+            len(refs)
+            for refs in (
+                *(item.citations for item in result.explanations),
+                *(item.citations for item in result.observations),
+                *(item.citations for item in result.questions),
+            )
+        )
+        with mock.patch.object(
+            plan_module,
+            "_resolve_span_ref",
+            wraps=plan_module._resolve_span_ref,  # noqa: SLF001 # Count strict expanded resolutions.
+        ) as strict_resolutions:
+            validate_detail_result(result, unit, self.ledger, index=self.index)
+        self.assertEqual(strict_resolutions.call_count, expected_calls)
+
+
+class IndexedGraphDetailTests(unittest.TestCase):
+    """Exercise the indexed adapter against a real accepted report graph."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Use one locally generated report graph for the graph adapter tests."""
+        from test_report_storage import ReportStorageTests
+
+        ReportStorageTests.setUpClass()
+        fixture = ReportStorageTests(
+            "test_expanded_and_compact_generation_inputs_have_exact_oracles"
+        )
+        cls.graph = fixture._typed_report_graph()  # noqa: SLF001 # Reuse the accepted synthetic graph fixture.
+        cls.ledger = build_evidence_ledger(ReportStorageTests.report)
+        cls.index = plan_module.build_ledger_index(cls.ledger)
+        cls.expanded_details = ReportStorageTests.expanded_report[
+            "generation"
+        ]["details"]
+
+    def test_graph_detail_validation_avoids_expansion_and_reuses_unique_work(
+        self,
+    ) -> None:
+        """Validate graph addresses directly and keep returned data detached."""
+        graph = self.graph
+        ledger = self.ledger
+        index = self.index
+        references = graph.generation_result_refs["details"]
+        expected_refs = {
+            canonical_bytes(reference)
+            for result_ref in references
+            for reference in (
+                item
+                for group in (graph.result_record(result_ref)["explanations"],)
+                for explanation in group
+                for item in explanation["citations"]
+            )
+        }
+        expected_refs.update(
+            canonical_bytes(reference)
+            for result_ref in references
+            for section in (
+                graph.result_record(result_ref).get("observations", []),
+                graph.result_record(result_ref).get("questions", []),
+            )
+            for item in section
+            for reference in item["citations"]
+        )
+        import diffstory.report_storage as storage_module
+
+        expected_details = {
+            detail["unit_key"]: detail for detail in self.expanded_details
+        }
+
+        with (
+            mock.patch.object(
+                plan_module,
+                "_validate_detail_result",
+                wraps=plan_module._validate_detail_result,  # noqa: SLF001 # Count the real contextual validator.
+            ) as details,
+            mock.patch.object(
+                plan_module,
+                "_resolve_span_ref",
+                wraps=plan_module._resolve_span_ref,  # noqa: SLF001 # Count actual source resolver calls.
+            ) as resolutions,
+            mock.patch.object(
+                plan_module,
+                "build_evidence_ledger",
+                side_effect=AssertionError(
+                    "indexed validation rebuilt the evidence ledger"
+                ),
+            ) as ledger_builds,
+            mock.patch.object(
+                plan_module,
+                "build_ledger_index",
+                side_effect=AssertionError(
+                    "indexed validation rebuilt the index"
+                ),
+            ) as builds,
+            mock.patch.object(
+                DetailResult,
+                "model_validate",
+                wraps=DetailResult.model_validate,
+            ) as structural,
+            mock.patch.object(
+                storage_module,
+                "expand_report_storage",
+                side_effect=AssertionError(
+                    "indexed validation expanded the report"
+                ),
+            ) as expand,
+            mock.patch.object(
+                storage_module,
+                "encode_report_storage",
+                side_effect=AssertionError(
+                    "indexed validation encoded the report"
+                ),
+            ) as encode,
+            mock.patch.object(
+                storage_module,
+                "parse_report_storage",
+                side_effect=AssertionError(
+                    "indexed validation parsed the report"
+                ),
+            ) as parse,
+            mock.patch.object(
+                storage_module.ReportStorageView,
+                "to_bytes",
+                side_effect=AssertionError(
+                    "indexed validation serialized the graph"
+                ),
+            ) as to_bytes,
+        ):
+            context = validate_indexed_detail_results(
+                tuple(reversed(references)), graph, ledger, index=index
+            )
+            self.assertEqual(
+                context.references,
+                tuple(reversed(references)),
+            )
+            self.assertEqual(details.call_count, len(references))
+            self.assertEqual(structural.call_count, len(references))
+            self.assertEqual(resolutions.call_count, len(expected_refs))
+            self.assertEqual(
+                context.citation_scope.resolution_count, len(expected_refs)
+            )
+            self.assertEqual(ledger_builds.call_count, 0)
+            self.assertEqual(builds.call_count, 0)
+            for operation in (expand, encode, parse, to_bytes):
+                self.assertEqual(operation.call_count, 0)
+
+        for unit_key in context.unit_keys:
+            self.assertEqual(
+                canonical_bytes(context.detail_record(unit_key)),
+                canonical_bytes(expected_details[unit_key]),
+            )
+
+        first_unit = context.unit_keys[0]
+        first_reference = context.references[0]
+        original_reference = next(reversed(references))
+        object.__setattr__(first_reference, "storage_id", "f" * 64)
+        self.assertEqual(context.references[0], original_reference)
+        first = context.detail_record(first_unit)
+        first["explanations"].clear()
+        self.assertTrue(context.detail_record(first_unit)["explanations"])
+        with self.assertRaisesRegex(
+            ValueError, "detail_set_coverage_mismatch"
+        ):
+            validate_indexed_detail_results(
+                references[:-1], graph, ledger, index=index
+            )
+        with self.assertRaisesRegex(
+            ValueError, "detail_set_coverage_mismatch"
+        ):
+            validate_indexed_detail_results(
+                (*references, references[0]), graph, ledger, index=index
+            )
+        context.citation_scope.close()
+
+    def test_graph_capture_rejects_mutated_addresses(self) -> None:
+        """A caller-mutated storage address cannot select another record."""
+        graph = self.graph
+        ledger = self.ledger
+        index = self.index
+        references = graph.generation_result_refs["details"]
+        reference = references[0]
+        old_id = reference.storage_id
+        object.__setattr__(reference, "storage_id", "f" * 64)
+        try:
+            with self.assertRaisesRegex(
+                ValueError, "detail_set_coverage_mismatch"
+            ):
+                validate_indexed_detail_results(
+                    references, graph, ledger, index=index
+                )
+        finally:
+            object.__setattr__(reference, "storage_id", old_id)
+
+    def test_context_owns_graph_view_when_caller_rebinds_tables(self) -> None:
+        """Rebinding the caller's graph tables cannot change captured details."""
+        import diffstory.report_storage as storage_module
+
+        graph = self.graph
+        references = graph.generation_result_refs["details"]
+        reference = next(
+            item
+            for item in references
+            if graph.result_record(item)["explanations"]
+        )
+        unit_key = reference.item_key
+        context = validate_indexed_detail_results(
+            references, graph, self.ledger, index=self.index
+        )
+        expected = context.detail_record(unit_key)
+        original_tables = graph._tables  # noqa: SLF001 # Preserve the fixture's immutable source view.
+        try:
+            changed_record = graph.record("results", reference.storage_id)
+            changed_record["explanations"][0]["before"] = (
+                "changed after context capture"
+            )
+            changed_tables = dict(original_tables)
+            changed_results = dict(original_tables["results"])
+            changed_entry = dict(changed_results[reference.storage_id])
+            changed_entry["record"] = storage_module._freeze(  # noqa: SLF001 # Rebuild a frozen synthetic caller view.
+                changed_record
+            )
+            changed_results[reference.storage_id] = MappingProxyType(
+                changed_entry
+            )
+            changed_tables["results"] = MappingProxyType(changed_results)
+            object.__setattr__(
+                graph, "_tables", MappingProxyType(changed_tables)
+            )
+
+            self.assertNotEqual(
+                graph.result_record(reference)["explanations"][0]["before"],
+                expected["explanations"][0]["before"],
+            )
+            self.assertIsNot(context._graph, graph)  # noqa: SLF001 # The context owns its top-level graph view.
+            self.assertEqual(context.detail_record(unit_key), expected)
+            context.assert_current(self.ledger, self.index)
+        finally:
+            object.__setattr__(graph, "_tables", original_tables)
+            context.citation_scope.close()
 
 
 class ProseInputFixture(Contract):

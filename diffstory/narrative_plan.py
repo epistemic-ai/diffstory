@@ -8,6 +8,7 @@ and adapter envelope. Packing is an estimate; adapters must recheck before send.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import heapq
 import json
@@ -16,6 +17,7 @@ import re
 from bisect import bisect_right
 from collections import Counter
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
 from difflib import SequenceMatcher
@@ -23,9 +25,12 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import TypeVar
 from weakref import WeakKeyDictionary
+from weakref import WeakSet
+from weakref import ref as weakref_ref
 
 from pydantic import BaseModel
 from pydantic import Field
+from typing_extensions import Self
 
 from diffstory.narrative_contracts import BatchSpec
 from diffstory.narrative_contracts import BatchStage
@@ -60,8 +65,10 @@ from diffstory.usage import estimate_input
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Mapping
     from collections.abc import Sequence
+
+    from diffstory.report_storage import ReportStorageView
+    from diffstory.report_storage import ResultRef
 
 
 def _json_default(value: object) -> object:
@@ -81,6 +88,51 @@ def canonical_bytes(value: object) -> bytes:
         allow_nan=False,
         default=_json_default,
     ).encode("utf-8")
+
+
+def _raw_integrity_value(value: object) -> object:
+    """Tag raw Python values before hashing mutable model integrity state.
+
+    Pydantic serializers can normalize ``True`` to ``1`` for integer fields.
+    Integrity checks must compare the exact current model value, including its
+    scalar type, so this adapter walks model fields without serializing models.
+    """
+    if isinstance(value, BaseModel):
+        return (
+            "model",
+            type(value).__module__,
+            type(value).__qualname__,
+            tuple(
+                (name, _raw_integrity_value(getattr(value, name)))
+                for name in type(value).model_fields
+            ),
+        )
+    if isinstance(value, Mapping):
+        entries = [
+            (_raw_integrity_value(key), _raw_integrity_value(item))
+            for key, item in value.items()
+        ]
+        entries.sort(key=lambda item: canonical_bytes(item[0]))
+        return "mapping", tuple(entries)
+    if type(value) in {tuple, list}:
+        return type(value).__name__, tuple(
+            _raw_integrity_value(item) for item in value
+        )
+    if type(value) in {set, frozenset}:
+        entries = [_raw_integrity_value(item) for item in value]
+        entries.sort(key=canonical_bytes)
+        return type(value).__name__, tuple(entries)
+    if value is None or type(value) in {str, bool, int, float}:
+        return "scalar", type(value).__name__, value
+    if type(value) is bytes:
+        return "bytes", value.hex()
+    msg = "Unsupported raw integrity value"
+    raise TypeError(msg)
+
+
+def _raw_integrity_bytes(value: object) -> bytes:
+    """Encode a type-preserving integrity witness for current model values."""
+    return canonical_bytes(_raw_integrity_value(value))
 
 
 def content_digest(value: bytes) -> str:
@@ -917,13 +969,13 @@ class LedgerIndex:
             object.__setattr__(self, name, MappingProxyType(values))
         _INDEX_AUTHORITY[self] = (
             ledger,
-            content_digest(canonical_bytes(ledger)),
+            content_digest(_raw_integrity_bytes(ledger)),
             content_digest(self._map_bytes()),
             tuple(getattr(self, name) for name in _INDEX_MAP_NAMES),
         )
 
     def _map_bytes(self) -> bytes:
-        return canonical_bytes(
+        return _raw_integrity_bytes(
             (
                 *tuple(
                     dict(getattr(self, name))
@@ -960,7 +1012,7 @@ class LedgerIndex:
                 old is getattr(self, name)
                 for name, old in zip(_INDEX_MAP_NAMES, bindings, strict=True)
             )
-            and content_digest(canonical_bytes(ledger)) == snapshot
+            and content_digest(_raw_integrity_bytes(ledger)) == snapshot
             and content_digest(self._map_bytes()) == maps,
             "ledger_index_mutated",
         )
@@ -1246,6 +1298,420 @@ def _resolve_span_ref(
     return span
 
 
+def _revision_pair(value: object) -> tuple[str, str]:
+    _require(
+        type(value) is tuple
+        and len(value) == _REVISION_PAIR_SIZE
+        and all(type(item) is str and item for item in value),
+        "invalid_citation_revision_binding",
+    )
+    return value
+
+
+def _ledger_side_revision(
+    ledger: EvidenceLedger, index: LedgerIndex, side: str
+) -> str:
+    """Derive a source revision key when Git revisions are not available.
+
+    The ledger format does not carry base/head commit IDs. This fallback binds
+    the citation scope to the current side's paths, bytes, fragments, and
+    absolute line starts. Callers that have report revisions should pass those
+    exact values to ``CitationResolutionScope`` instead.
+    """
+    availability = tuple(
+        sorted(
+            (
+                item.path,
+                item.counterpart_path,
+                item.state,
+                item.coverage,
+                item.reason,
+                item.full_source,
+                item.full_and_parsed,
+            )
+            for item in ledger.availability
+            if item.side == side
+        )
+    )
+    buffers = tuple(
+        sorted(
+            (
+                buffer.key,
+                buffer.path,
+                buffer.content_digest,
+                buffer.byte_length,
+                buffer.coverage,
+                buffer.parse_status,
+                index.bindings[buffer.key].fragment_key,
+                index.bindings[buffer.key].start_line,
+                index.bindings[buffer.key].region,
+            )
+            for buffer in index.buffers.values()
+            if buffer.side == side
+        )
+    )
+    return semantic_digest(
+        "citation-source-revision.v1", side, ledger.id, availability, buffers
+    )
+
+
+def _span_ref_key(ref: SpanRef) -> tuple[object, ...]:
+    return (
+        ref.span_id,
+        ref.unit_key,
+        ref.group_key,
+        ref.side,
+        ref.path,
+        ref.byte_start,
+        ref.byte_end,
+        ref.line_start,
+        ref.line_end,
+        ref.content_digest,
+    )
+
+
+def _citation_binding_key(
+    ref: SpanRef,
+    unit: EvidenceUnit,
+    index: LedgerIndex,
+    revisions: tuple[str, str],
+    availability_by_source: Mapping[tuple[str, str], tuple[object, ...]],
+) -> tuple[object, ...]:
+    """Bind one exact reference to its current physical source coordinates."""
+    span = index.spans.get(ref.span_id)
+    if span is None:
+        return (_span_ref_key(ref), revisions, "missing-span")
+    buffer = index.buffers.get(span.buffer_key)
+    binding = index.bindings.get(span.buffer_key)
+    availability = availability_by_source.get((span.side, span.path))
+    return (
+        _span_ref_key(ref),
+        unit.id,
+        unit.group_key,
+        revisions,
+        (
+            span.buffer_key,
+            span.side,
+            span.path,
+            span.byte_start,
+            span.byte_end,
+            span.line_start,
+            span.line_end,
+            span.content_digest,
+        ),
+        None
+        if buffer is None
+        else (
+            buffer.key,
+            buffer.side,
+            buffer.path,
+            buffer.content_digest,
+            buffer.byte_length,
+            buffer.coverage,
+            buffer.parse_status,
+        ),
+        None
+        if binding is None
+        else (
+            binding.buffer_key,
+            binding.fragment_key,
+            binding.start_line,
+            binding.region,
+        ),
+        availability,
+    )
+
+
+_REVISION_PAIR_SIZE = 2
+
+_CITATION_SCOPE_TOKEN = object()
+
+
+class _CitationScopeOwner:
+    """Factory-owned binding and memo state for one exact scope object."""
+
+    __slots__ = (
+        "availability_by_source",
+        "closed",
+        "detail_contexts",
+        "explicit_revision_binding",
+        "index",
+        "ledger",
+        "memo",
+        "resolution_count",
+        "revision_binding",
+        "scope_ref",
+    )
+
+    def __init__(  # noqa: PLR0913 # The owner captures the complete local binding.
+        self,
+        token: object,
+        scope: CitationResolutionScope,
+        ledger: EvidenceLedger,
+        index: LedgerIndex,
+        revision_binding: tuple[str, str],
+        explicit_revision_binding: bool,  # noqa: FBT001 # Preserve explicit Git revision binding semantics.
+        availability_by_source: Mapping[tuple[str, str], tuple[object, ...]],
+    ) -> None:
+        _require(
+            token is _CITATION_SCOPE_TOKEN, "invalid_citation_scope_owner"
+        )
+        self.scope_ref = weakref_ref(scope)
+        self.ledger: EvidenceLedger | None = ledger
+        self.index: LedgerIndex | None = index
+        self.revision_binding = revision_binding
+        self.explicit_revision_binding = explicit_revision_binding
+        self.availability_by_source = availability_by_source
+        self.memo: dict[tuple[object, ...], SourceSpan] = {}
+        self.closed = False
+        self.resolution_count = 0
+        self.detail_contexts: WeakSet = WeakSet()
+
+
+class CitationResolutionScope:
+    """Run-local citation memo bound to one live ledger and its physical source.
+
+    The scope stores resolved spans only while it is open. It is not proof
+    authority. Public resolution methods strictly capture caller models and
+    return detached spans. Indexed validators use the private checked path
+    after validating their owned detail records.
+    """
+
+    __slots__ = ("__weakref__", "_owner")
+
+    def __init__(
+        self,
+        ledger: EvidenceLedger,
+        index: LedgerIndex,
+        *,
+        revision_binding: tuple[str, str] | None = None,
+    ) -> None:
+        """Bind to the existing validated index; never build a replacement."""
+        _require(type(index) is LedgerIndex, "invalid_ledger_index")
+        _require(type(ledger) is EvidenceLedger, "invalid_evidence_ledger")
+        _require(index.validated_ledger() is ledger, "ledger_index_mismatch")
+        explicit = revision_binding is not None
+        revisions = (
+            _revision_pair(revision_binding)
+            if explicit
+            else (
+                _ledger_side_revision(ledger, index, "base"),
+                _ledger_side_revision(ledger, index, "head"),
+            )
+        )
+        availability_by_source = MappingProxyType(
+            {
+                (item.side, item.path): (
+                    item.side,
+                    item.path,
+                    item.counterpart_path,
+                    item.state,
+                    item.coverage,
+                    item.reason,
+                    item.full_source,
+                    item.full_and_parsed,
+                )
+                for item in ledger.availability
+            }
+        )
+        object.__setattr__(
+            self,
+            "_owner",
+            _CitationScopeOwner(
+                _CITATION_SCOPE_TOKEN,
+                self,
+                ledger,
+                index,
+                revisions,
+                explicit,
+                availability_by_source,
+            ),
+        )
+
+    def _owned_state(self) -> _CitationScopeOwner:
+        owner = self._owner
+        _require(
+            type(owner) is _CitationScopeOwner and owner.scope_ref() is self,
+            "invalid_citation_scope_owner",
+        )
+        return owner
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Keep ledger, index, and revision bindings fixed after capture."""
+        if hasattr(self, name):
+            msg = "citation_scope_binding_is_immutable"
+            raise AttributeError(msg)
+        object.__setattr__(self, name, value)
+
+    @property
+    def revision_binding(self) -> tuple[str, str]:
+        """Return the immutable base/head revision pair used by this scope."""
+        return self._owned_state().revision_binding
+
+    @property
+    def memoized_reference_count(self) -> int:
+        """Return the number of physical citation bindings cached locally."""
+        return len(self._owned_state().memo)
+
+    @property
+    def resolution_count(self) -> int:
+        """Count successful calls to the source span resolver in this scope."""
+        return self._owned_state().resolution_count
+
+    @property
+    def closed(self) -> bool:
+        """Report whether memoized resolution state has been released."""
+        return self._owned_state().closed
+
+    def _check_current(
+        self,
+        ledger: EvidenceLedger,
+        index: LedgerIndex,
+        revision_binding: tuple[str, str] | None,
+    ) -> None:
+        owner = self._owned_state()
+        _require(not owner.closed, "citation_scope_closed")
+        _require(
+            ledger is owner.ledger and index is owner.index,
+            "citation_scope_binding_mismatch",
+        )
+        _require(type(index) is LedgerIndex, "invalid_ledger_index")
+        _require(index.validated_ledger() is ledger, "ledger_index_mismatch")
+        if owner.explicit_revision_binding:
+            _require(
+                revision_binding is not None,
+                "citation_scope_revision_binding_required",
+            )
+        if revision_binding is not None:
+            _require(
+                _revision_pair(revision_binding) == owner.revision_binding,
+                "citation_scope_revision_mismatch",
+            )
+
+    def _resolve_validated(
+        self, ref: SpanRef, unit: EvidenceUnit
+    ) -> SourceSpan:
+        owner = self._owned_state()
+        _require(not owner.closed, "citation_scope_closed")
+        index = owner.index
+        _require(index is not None, "citation_scope_closed")
+        _require(
+            index.units.get(unit.id) is unit,
+            "citation_scope_unit_mismatch",
+        )
+        key = _citation_binding_key(
+            ref,
+            unit,
+            index,
+            owner.revision_binding,
+            owner.availability_by_source,
+        )
+        resolved = owner.memo.get(key)
+        if resolved is None:
+            resolved = _resolve_span_ref(ref, unit, index)
+            owner.memo[key] = resolved
+            owner.resolution_count += 1
+        return resolved
+
+    def _check_index(self, index: LedgerIndex) -> None:
+        """Require indexed detail checks to use the scope's original index."""
+        owner = self._owned_state()
+        _require(not owner.closed, "citation_scope_closed")
+        _require(owner.index is index, "citation_scope_binding_mismatch")
+
+    def _register_detail_context(self, context: IndexedDetailContext) -> None:
+        """Register one exact detail context within this source scope."""
+        owner = self._owned_state()
+        _require(not owner.closed, "citation_scope_closed")
+        _require(
+            context._citation_scope is self  # noqa: SLF001 # Context ownership is local to this scope.
+            and context._ledger is owner.ledger  # noqa: SLF001 # Compare exact bound objects.
+            and context._index is owner.index,  # noqa: SLF001 # Compare exact bound objects.
+            "detail_context_binding_mismatch",
+        )
+        owner.detail_contexts.add(context)
+
+    def _owns_detail_context(self, context: IndexedDetailContext) -> bool:
+        """Check identity registration without a process-global authority map."""
+        owner = self._owned_state()
+        return not owner.closed and context in owner.detail_contexts
+
+    def resolve_many(
+        self,
+        refs: Sequence[SpanRef],
+        unit: EvidenceUnit,
+        *,
+        revision_binding: tuple[str, str] | None = None,
+    ) -> tuple[SourceSpan, ...]:
+        """Strictly capture references and return detached current source spans.
+
+        Use this batch API for later indexed assembly. It checks current ledger
+        integrity once for the batch, then resolves each distinct physical
+        reference at most once in this scope.
+        """
+        owner = self._owned_state()
+        ledger = owner.ledger
+        index = owner.index
+        _require(
+            ledger is not None and index is not None, "citation_scope_closed"
+        )
+        self._check_current(ledger, index, revision_binding)
+        checked_unit = _indexed_unit(unit, index)
+        checked_refs = tuple(SpanRef.model_validate(ref) for ref in refs)
+        return tuple(
+            self._resolve_validated(ref, checked_unit).model_copy(deep=True)
+            for ref in checked_refs
+        )
+
+    def resolve(
+        self,
+        ref: SpanRef,
+        unit: EvidenceUnit,
+        *,
+        revision_binding: tuple[str, str] | None = None,
+    ) -> SourceSpan:
+        """Strictly resolve one caller reference and return a detached span."""
+        return self.resolve_many(
+            (ref,), unit, revision_binding=revision_binding
+        )[0]
+
+    def close(self) -> None:
+        """Release cached spans and the bound ledger/index references."""
+        owner = self._owned_state()
+        owner.memo.clear()
+        owner.detail_contexts.clear()
+        owner.ledger = None
+        owner.index = None
+        owner.availability_by_source = MappingProxyType({})
+        owner.closed = True
+
+    def __enter__(self) -> Self:
+        """Return this live scope for a managed block."""
+        _require(not self._owned_state().closed, "citation_scope_closed")
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        """Close the scope and release its memo on block exit."""
+        self.close()
+
+    def __copy__(self) -> CitationResolutionScope:
+        """Do not transfer memo state into a copied scope."""
+        msg = "citation_scope_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __deepcopy__(
+        self, _memo: dict[int, object]
+    ) -> CitationResolutionScope:
+        """Do not transfer memo state into a copied scope."""
+        msg = "citation_scope_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        """Prevent serialized scope state from becoming reusable."""
+        msg = "citation_scope_cannot_be_serialized"
+        raise TypeError(msg)
+
+
 def resolve_span_ref(
     ref: SpanRef,
     unit: EvidenceUnit,
@@ -1261,9 +1727,19 @@ def resolve_span_ref(
 
 
 def _validate_citations(
-    refs: tuple[SpanRef, ...], unit: EvidenceUnit, index: LedgerIndex
+    refs: tuple[SpanRef, ...],
+    unit: EvidenceUnit,
+    index: LedgerIndex,
+    *,
+    citation_scope: CitationResolutionScope | None = None,
 ) -> tuple[SourceSpan, ...]:
     _unique([ref.span_id for ref in refs], "duplicate_citation")
+    if citation_scope is not None:
+        citation_scope._check_index(index)  # noqa: SLF001 # Keep indexed use on this exact bound index.
+        return tuple(
+            citation_scope._resolve_validated(ref, unit)  # noqa: SLF001 # Owned detail records use the strict internal path.
+            for ref in refs
+        )
     return tuple(_resolve_span_ref(ref, unit, index) for ref in refs)
 
 
@@ -1299,7 +1775,11 @@ def validate_detail_result(
 
 
 def _validate_detail_result(
-    result: DetailResult, unit: EvidenceUnit, index: LedgerIndex
+    result: DetailResult,
+    unit: EvidenceUnit,
+    index: LedgerIndex,
+    *,
+    citation_scope: CitationResolutionScope | None = None,
 ) -> None:
     _require(result.unit_key == unit.id, "detail_unit_mismatch")
     obligations = {item.id: item for item in unit.obligations}
@@ -1314,7 +1794,12 @@ def _validate_detail_result(
         )
         cited = {
             span.id
-            for span in _validate_citations(explanation.citations, unit, index)
+            for span in _validate_citations(
+                explanation.citations,
+                unit,
+                index,
+                citation_scope=citation_scope,
+            )
         }
         required = {
             key
@@ -1341,9 +1826,19 @@ def _validate_detail_result(
     )
     _unique([o.id for o in result.observations], "duplicate_observation")
     for observation in result.observations:
-        _validate_citations(observation.citations, unit, index)
+        _validate_citations(
+            observation.citations,
+            unit,
+            index,
+            citation_scope=citation_scope,
+        )
     for question in result.questions:
-        _validate_citations(question.citations, unit, index)
+        _validate_citations(
+            question.citations,
+            unit,
+            index,
+            citation_scope=citation_scope,
+        )
         _unique(list(question.obligation_ids), "duplicate_question_obligation")
         _require(
             set(question.obligation_ids) <= obligations.keys(),
@@ -1366,6 +1861,387 @@ def _validate_detail_results(
     for result in results:
         _validate_detail_result(result, index.units[result.unit_key], index)
     return results
+
+
+_DETAIL_CONTEXT_TOKEN = object()
+
+
+def _tuple_detail_record(value: object) -> object:
+    """Adapt one owned JSON-shaped detail record to strict tuple contracts.
+
+    Storage records use JSON arrays, while the typed contracts use tuples.
+    This conversion changes only those enumerated array positions. It keeps
+    every scalar untouched, so bool/int and other type substitutions remain
+    visible to strict Pydantic validation.
+    """
+    if type(value) is not dict:
+        return value
+    record = dict(value)
+    for field_name in ("explanations", "observations", "questions"):
+        entries = record.get(field_name)
+        if type(entries) not in {list, tuple}:
+            continue
+        captured_entries = []
+        for entry in entries:
+            if type(entry) is not dict:
+                captured_entries.append(entry)
+                continue
+            captured = dict(entry)
+            for array_name in (
+                "obligation_ids",
+                "citations",
+                "limitations",
+            ):
+                nested = captured.get(array_name)
+                if type(nested) is list:
+                    captured[array_name] = tuple(nested)
+            captured_entries.append(captured)
+        record[field_name] = tuple(captured_entries)
+    return record
+
+
+class IndexedDetailContext:
+    """Owned, data-only detail records checked against one current ledger.
+
+    Graph-backed contexts keep immutable graph addresses and a private shallow
+    view over the graph's immutable primitive tables. Stage-backed contexts
+    keep detached typed detail models. Public accessors return fresh
+    dictionaries, so returned mutations cannot change context records.
+    Neither form is a generation or report capability.
+    """
+
+    __slots__ = (
+        "__weakref__",
+        "_citation_scope",
+        "_graph",
+        "_index",
+        "_ledger",
+        "_references",
+        "_references_by_unit",
+        "_typed_by_unit",
+        "_unit_keys",
+    )
+
+    def __init__(  # noqa: PLR0913 # The private constructor receives the complete owned state.
+        self,
+        *,
+        token: object,
+        ledger: EvidenceLedger,
+        index: LedgerIndex,
+        citation_scope: CitationResolutionScope,
+        unit_keys: tuple[str, ...],
+        graph: ReportStorageView | None = None,
+        references: tuple[ResultRef, ...] = (),
+        typed_by_unit: Mapping[str, DetailResult] | None = None,
+    ) -> None:
+        """Store one graph-backed or typed stage detail context."""
+        _require(token is _DETAIL_CONTEXT_TOKEN, "invalid_detail_context")
+        self._ledger = ledger
+        self._index = index
+        self._citation_scope = citation_scope
+        self._graph = graph
+        self._references = references
+        self._references_by_unit = MappingProxyType(
+            dict(zip(unit_keys, references, strict=True))
+            if graph is not None
+            else {}
+        )
+        self._typed_by_unit = MappingProxyType(dict(typed_by_unit or {}))
+        self._unit_keys = unit_keys
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Keep captured detail ownership and backing records fixed."""
+        if hasattr(self, name):
+            msg = "indexed_detail_context_is_immutable"
+            raise AttributeError(msg)
+        object.__setattr__(self, name, value)
+
+    def _check_registered(self) -> None:
+        _require(
+            self._citation_scope._owns_detail_context(self),  # noqa: SLF001 # Verify identity in the local owner.
+            "unregistered_detail_context",
+        )
+
+    @property
+    def citation_scope(self) -> CitationResolutionScope:
+        """Return the local memo used by indexed detail citation checks."""
+        self._check_registered()
+        return self._citation_scope
+
+    @property
+    def unit_keys(self) -> tuple[str, ...]:
+        """Return detail unit keys in the captured input order."""
+        self._check_registered()
+        return self._unit_keys
+
+    @property
+    def references(self) -> tuple[ResultRef, ...]:
+        """Return fresh typed graph addresses in the captured input order."""
+        self._check_registered()
+        return tuple(_copy_result_ref(ref) for ref in self._references)
+
+    def contains_unit(self, unit_key: str) -> bool:
+        """Check membership without revalidating or resolving the detail."""
+        self._check_registered()
+        return unit_key in self._unit_keys
+
+    def detail_record(self, unit_key: str) -> dict:
+        """Return a detached full detail mapping for one validated unit."""
+        self._check_registered()
+        if self._graph is not None:
+            reference = self._references_by_unit.get(unit_key)
+            _require(reference is not None, "unknown_detail_unit")
+            return self._graph.result_record(_copy_result_ref(reference))
+        result = self._typed_by_unit.get(unit_key)
+        _require(result is not None, "unknown_detail_unit")
+        return result.model_dump(mode="python")
+
+    def assert_current(
+        self,
+        ledger: EvidenceLedger,
+        index: LedgerIndex,
+        *,
+        revision_binding: tuple[str, str] | None = None,
+    ) -> None:
+        """Recheck current ledger/index binding before a later proof boundary."""
+        self._check_registered()
+        self._citation_scope._check_current(  # noqa: SLF001 # Context delegates integrity to its bound scope.
+            ledger, index, revision_binding
+        )
+        _require(
+            ledger is self._ledger and index is self._index,
+            "detail_context_binding_mismatch",
+        )
+
+    def __copy__(self) -> IndexedDetailContext:
+        """Keep ownership with the original validated context."""
+        msg = "indexed_detail_context_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __deepcopy__(self, _memo: dict[int, object]) -> IndexedDetailContext:
+        """Keep ownership with the original validated context."""
+        msg = "indexed_detail_context_cannot_be_copied"
+        raise TypeError(msg)
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        """Prevent serialized context data from being treated as verified."""
+        msg = "indexed_detail_context_cannot_be_serialized"
+        raise TypeError(msg)
+
+
+def _copy_result_ref(reference: ResultRef) -> ResultRef:
+    from diffstory.report_storage import ResultRef as StorageResultRef
+
+    return StorageResultRef(
+        reference.table,
+        reference.kind,
+        reference.storage_id,
+        reference.item_key,
+    )
+
+
+def _detail_scope(
+    ledger: EvidenceLedger,
+    index: LedgerIndex,
+    citation_scope: CitationResolutionScope | None,
+    revision_binding: tuple[str, str] | None,
+) -> tuple[CitationResolutionScope, bool]:
+    _require(type(ledger) is EvidenceLedger, "invalid_evidence_ledger")
+    _require(type(index) is LedgerIndex, "invalid_ledger_index")
+    if citation_scope is None:
+        return (
+            CitationResolutionScope(
+                ledger, index, revision_binding=revision_binding
+            ),
+            True,
+        )
+    _require(
+        type(citation_scope) is CitationResolutionScope,
+        "invalid_citation_scope",
+    )
+    citation_scope._check_current(  # noqa: SLF001 # Bind the supplied local scope once per validation batch.
+        ledger, index, revision_binding
+    )
+    return citation_scope, False
+
+
+def _validate_indexed_detail_models(
+    results: tuple[DetailResult, ...],
+    ledger: EvidenceLedger,
+    index: LedgerIndex,
+    citation_scope: CitationResolutionScope,
+) -> IndexedDetailContext:
+    _require(
+        Counter(result.unit_key for result in results)
+        == Counter(index.units.keys()),
+        "detail_set_coverage_mismatch",
+    )
+    for result in results:
+        _validate_detail_result(
+            result,
+            index.units[result.unit_key],
+            index,
+            citation_scope=citation_scope,
+        )
+    context = IndexedDetailContext(
+        token=_DETAIL_CONTEXT_TOKEN,
+        ledger=ledger,
+        index=index,
+        citation_scope=citation_scope,
+        unit_keys=tuple(result.unit_key for result in results),
+        typed_by_unit={result.unit_key: result for result in results},
+    )
+    citation_scope._register_detail_context(  # noqa: SLF001 # Keep registration in the owning scope.
+        context
+    )
+    return context
+
+
+def capture_indexed_detail_results(
+    results: Sequence[DetailResult | dict],
+    ledger: EvidenceLedger,
+    *,
+    index: LedgerIndex,
+    citation_scope: CitationResolutionScope | None = None,
+    revision_binding: tuple[str, str] | None = None,
+) -> IndexedDetailContext:
+    """Strictly own fresh typed stage details before a manifest is complete.
+
+    The capture validates every supplied detail model and nested citation,
+    checks full ledger-unit coverage, and returns a data-only context. It does
+    not issue a stage proof or generation/report capability.
+    """
+    scope, owned_scope = _detail_scope(
+        ledger, index, citation_scope, revision_binding
+    )
+    try:
+        captured = tuple(
+            DetailResult.model_validate(_tuple_detail_record(item))
+            for item in results
+        )
+        return _validate_indexed_detail_models(
+            captured,
+            ledger,
+            index,
+            scope,
+        )
+    except Exception:
+        if owned_scope:
+            scope.close()
+        raise
+
+
+def validate_indexed_detail_results(  # noqa: PLR0913 # Explicit current source/index bindings are required.
+    result_refs: Sequence[ResultRef],
+    graph: ReportStorageView,
+    ledger: EvidenceLedger,
+    *,
+    index: LedgerIndex,
+    citation_scope: CitationResolutionScope | None = None,
+    revision_binding: tuple[str, str] | None = None,
+) -> IndexedDetailContext:
+    """Validate ordered graph detail references without expanding the report.
+
+    ``result_refs`` must name unique detail results in ``graph`` and collectively
+    cover every unit in ``ledger``. The graph's addresses are only structural
+    indexes; each fetched record is strictly parsed and checked against the
+    current ledger. The returned context retains addresses, not duplicate
+    detail models or canonical detail snapshots.
+    """
+    from diffstory.report_storage import ReportRecordGraph
+    from diffstory.report_storage import ReportStorageView
+    from diffstory.report_storage import ResultRef as StorageResultRef
+
+    _require(
+        type(graph) in {ReportRecordGraph, ReportStorageView},
+        "invalid_indexed_detail_graph",
+    )
+    owned_graph = copy.copy(graph)
+    scope, owned_scope = _detail_scope(
+        ledger, index, citation_scope, revision_binding
+    )
+    try:
+        _require(
+            all(type(ref) is StorageResultRef for ref in result_refs),
+            "invalid_indexed_detail_reference",
+        )
+        references = tuple(_copy_result_ref(ref) for ref in result_refs)
+        _unique(
+            [reference.storage_id for reference in references],
+            "detail_set_coverage_mismatch",
+        )
+        _unique(
+            [reference.item_key for reference in references],
+            "detail_set_coverage_mismatch",
+        )
+        generation_refs = owned_graph.generation_result_refs["details"]
+        generation_ids = {
+            reference.storage_id for reference in generation_refs
+        }
+        results = []
+        unit_keys = []
+        for reference in references:
+            _require(
+                reference.table == "results" and reference.kind == "detail",
+                "invalid_indexed_detail_reference",
+            )
+            try:
+                canonical_ref = owned_graph.lookup_result(
+                    "detail", reference.item_key
+                )
+            except ValueError as error:
+                msg = "detail_set_coverage_mismatch"
+                raise ValueError(msg) from error
+            _require(
+                reference == canonical_ref
+                and reference.storage_id in generation_ids,
+                "detail_set_coverage_mismatch",
+            )
+            try:
+                raw_record = owned_graph._validated_record(  # noqa: SLF001 # Read the graph-owned structurally checked record.
+                    "results", canonical_ref.storage_id
+                )
+            except ValueError as error:
+                msg = "detail_set_coverage_mismatch"
+                raise ValueError(msg) from error
+            result = DetailResult.model_validate(
+                _tuple_detail_record(raw_record)
+            )
+            _require(
+                result.unit_key == canonical_ref.item_key,
+                "detail_result_reference_mismatch",
+            )
+            results.append(result)
+            unit_keys.append(result.unit_key)
+        _require(
+            Counter(unit_keys) == Counter(index.units.keys()),
+            "detail_set_coverage_mismatch",
+        )
+        for result in results:
+            _validate_detail_result(
+                result,
+                index.units[result.unit_key],
+                index,
+                citation_scope=scope,
+            )
+        context = IndexedDetailContext(
+            token=_DETAIL_CONTEXT_TOKEN,
+            ledger=ledger,
+            index=index,
+            citation_scope=scope,
+            unit_keys=tuple(unit_keys),
+            graph=owned_graph,
+            references=references,
+        )
+        scope._register_detail_context(  # noqa: SLF001 # Keep registration in the owning scope.
+            context
+        )
+    except Exception:
+        if owned_scope:
+            scope.close()
+        raise
+    else:
+        return context
 
 
 def validate_detail_results(
