@@ -983,6 +983,12 @@ class CliV2Tests(unittest.TestCase):
         path = self.root / "padded.report.json"
         report = compile_snapshot(self.snapshot)
         raw = json.dumps(report).encode()
+        compact_report = json.dumps(
+            report,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
         size = 109_957_391
         with path.open("wb") as stream:
             stream.write(raw)
@@ -997,6 +1003,13 @@ class CliV2Tests(unittest.TestCase):
             ["render", str(path), "--out", str(self.out)]
         )
         self.assertEqual(code, 0, errors)
+        self.assertEqual(
+            self.out.with_suffix(".report.json").read_bytes(), compact_report
+        )
+        self.assertEqual(
+            read_json(str(self.out.with_suffix(".report.json"))),
+            json.loads(compact_report),
+        )
         with self.assertRaisesRegex(ValueError, "byte limit"):
             read_json(str(path))
         code, _, errors = self.run_cli(
@@ -1014,7 +1027,7 @@ class CliV2Tests(unittest.TestCase):
         self.assertFalse((self.root / "reject.html").exists())
         small = self.root / "small.json"
         small.write_bytes(raw)
-        limit = len(raw) + 1
+        limit = len(raw)
         code, _, errors = self.run_cli(
             [
                 "render",
@@ -1025,9 +1038,24 @@ class CliV2Tests(unittest.TestCase):
                 str(limit),
             ]
         )
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(
+            (self.root / "too-small.report.json").read_bytes(), compact_report
+        )
+        below_input = self.root / "below-input.html"
+        code, _, errors = self.run_cli(
+            [
+                "render",
+                str(small),
+                "--out",
+                str(below_input),
+                "--max-report-bytes",
+                str(len(raw) - 1),
+            ]
+        )
         self.assertEqual(code, 2)
-        self.assertIn("Output JSON needs", errors)
-        self.assertFalse((self.root / "too-small.html").exists())
+        self.assertIn("byte limit", errors)
+        self.assertFalse(below_input.exists())
         code, _, errors = self.run_cli(
             [
                 "render",

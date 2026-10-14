@@ -16,6 +16,7 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import unquote
 
 from playwright.sync_api import sync_playwright
 from test_narrative import FakeProvider
@@ -540,7 +541,7 @@ def check_sources(  # noqa: C901, PLR0915 # One interaction sequence per immutab
     }
 
 
-def check_page(  # noqa: PLR0913 # Fixture data, browser and evidence destination stay explicit.
+def check_page(  # noqa: C901, PLR0913, PLR0915 # Keep one browser page's fidelity checks together.
     browser: Browser,
     report: dict,
     html: str,
@@ -548,10 +549,23 @@ def check_page(  # noqa: PLR0913 # Fixture data, browser and evidence destinatio
     check: Checks,
     *,
     sample_sources: bool = False,
+    capture_dom_signature: bool = False,
+    capture_embedded_summary: bool = False,
+    enable_test_metrics: bool = False,
 ) -> dict:
-    """Load an offline fixture and verify display, sources, errors and network."""
+    """Check one offline page's display, source interactions and boundaries.
+
+    Preconditions: ``report`` is the independently checked expanded oracle,
+        ``html`` is its trusted self-contained output, and ``browser`` is local.
+    Postconditions: Every typed field, link, source byte, order, error and
+        request event is checked before the page closes.
+    Essential behavior: Uses the page's own source-preview controls and keeps
+        optional prose signatures in memory only when the caller asks for them.
+    """
     page = browser.new_page(viewport={"width": 1280, "height": 900})
     page.set_default_timeout(6500)
+    if enable_test_metrics:
+        page.add_init_script("window.__DIFFSTORY_TEST_METRICS__ = true;")
     errors, console_errors, requests = [], [], []
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.on(
@@ -562,6 +576,13 @@ def check_page(  # noqa: PLR0913 # Fixture data, browser and evidence destinatio
     )
     page.on("request", lambda request: requests.append(request.url))
     page.set_content(html, wait_until="domcontentloaded")
+    if not enable_test_metrics:
+        check(
+            page.evaluate(
+                "typeof window.__DIFFSTORY_READER_METRICS__ === 'undefined'"
+            ),
+            "numeric test metrics stay hidden without the Playwright flag",
+        )
     config = report["generation"]["request_configuration"]
     notice = page.locator(".generation-notice").text_content()
     check(
@@ -574,6 +595,60 @@ def check_page(  # noqa: PLR0913 # Fixture data, browser and evidence destinatio
     )
     check_details(page, report, check)
     check_prose(page, report, check)
+    typed = report["narrative_v2"]
+    actual_sections = page.locator(".story-section").evaluate_all(
+        "nodes => nodes.map(node => node.id)"
+    )
+    check(
+        actual_sections
+        == [section["group_id"] for section in typed["sections"]],
+        "reader sections retain their stored order and anchors",
+    )
+    actual_context = page.locator(".v2-context .v2-detail").evaluate_all(
+        "nodes => nodes.map(node => node.dataset.detail)"
+    )
+    check(
+        actual_context
+        == [detail["unit_key"] for detail in typed["context_details"]],
+        "retained context details keep their stored order",
+    )
+    actual_catalog = page.locator(".v2-catalog .v2-source").evaluate_all(
+        "nodes => nodes.map(node => node.id.replace(/^source-/, ''))"
+    )
+    check(
+        actual_catalog == [citation["key"] for citation in typed["citations"]],
+        "source catalog keeps its stored order and citation anchors",
+    )
+    link_rows = page.locator("a[href]").evaluate_all(
+        "nodes => nodes.map(node => ({href: node.getAttribute('href'), target: node.getAttribute('target'), rel: node.getAttribute('rel')}))"
+    )
+    ids = set(
+        page.locator("[id]").evaluate_all(
+            "nodes => nodes.map(node => node.id)"
+        )
+    )
+    internal_links = [
+        row["href"] for row in link_rows if row["href"].startswith("#")
+    ]
+    external_links = [
+        row for row in link_rows if row["href"].startswith("http")
+    ]
+    check(internal_links, "reader includes internal navigation links")
+    for href in internal_links:
+        try:
+            target = unquote(href[1:])
+        except UnicodeDecodeError:
+            target = ""
+        check(target in ids, "internal link resolves to a rendered anchor")
+    check(external_links, "reader includes source links to external revisions")
+    for row in external_links:
+        check(
+            row["href"].startswith("https://github.com/")
+            and row["target"] == "_blank"
+            and "noopener" in (row["rel"] or "").split()
+            and "noreferrer" in (row["rel"] or "").split(),
+            "external links remain HTTPS GitHub links with safe target flags",
+        )
     text = page.locator("body").text_content()
     for mechanism in (
         STRIP_BEFORE,
@@ -625,14 +700,73 @@ def check_page(  # noqa: PLR0913 # Fixture data, browser and evidence destinatio
     check(not errors, f"no browser page errors: {errors}")
     check(not console_errors, f"no browser console errors: {console_errors}")
     check(not requests, f"no runtime network requests: {requests}")
+    dom_signature = None
+    if capture_dom_signature:
+        dom_signature = page.evaluate("""() => ({
+          text: document.body.textContent,
+          fields: [...document.querySelectorAll('[data-field]')].map(node => [node.dataset.field, node.textContent]),
+          links: [...document.querySelectorAll('a[href]')].map(node => [node.getAttribute('href'), node.textContent, node.dataset.citation || null, node.dataset.consumption || null]),
+          sections: [...document.querySelectorAll('.story-section')].map(node => node.id),
+          anchors: [...document.querySelectorAll('[id]')].map(node => node.id),
+          sourceBlocks: [...document.querySelectorAll('.v2-source')].map(node => [node.id, node.querySelector('summary')?.textContent || '', node.querySelector('.exact-code')?.dataset.fragment || '', node.querySelector('.exact-code')?.dataset.side || '', node.querySelector('.code-source-link')?.getAttribute('href') || ''])
+        })""")
+    graph_summary = None
+    if capture_embedded_summary:
+        graph_summary = page.evaluate("""() => {
+          const payload = JSON.parse(document.getElementById('report-data').textContent);
+          if (payload.storage_version !== 'diffstory.report-storage.v1') return {shared: false};
+          const tables = payload.tables;
+          const optionalFields = ['claims', 'citations', 'basis', 'effect', 'uncertainty', 'author_context_digest'];
+          let omittedStatementDefaults = 0;
+          let omittedTerminologyDefaults = 0;
+          for (const row of tables.results) {
+            if (row.kind === 'section' && !Object.prototype.hasOwnProperty.call(row.record, 'terminology')) omittedTerminologyDefaults += 1;
+            const record = row.record;
+            const statements = [];
+            for (const field of ['abstraction', 'orientation', 'synthesis', 'transition', 'preamble', 'lead', 'closing']) {
+              for (const statement of (record[field] || [])) statements.push(statement);
+            }
+            if (record.title) statements.push(record.title);
+            for (const term of (record.terminology || [])) if (term.definition) statements.push(term.definition);
+            for (const statement of statements) {
+              if (optionalFields.some(field => !Object.prototype.hasOwnProperty.call(statement, field))) omittedStatementDefaults += 1;
+            }
+          }
+          return {
+            shared: true,
+            storageVersion: payload.storage_version,
+            artifactKind: payload.artifact_kind,
+            tableNames: Object.keys(tables).sort(),
+            tableCounts: Object.fromEntries(Object.entries(tables).map(([name, rows]) => [name, rows.length])),
+            sourceFragmentCount: payload.root.base_report.source_evidence.fragments.length,
+            requestCount: tables.requests.length,
+            producerCount: tables.producers.length,
+            receiptCount: tables.receipts.length,
+            literalCompilerRef: payload.root.base_report.opaque_browser_probe?.$ref ?? null,
+            omittedTerminologyDefaults,
+            omittedStatementDefaults
+          };
+        }""")
+    reader_metrics = None
+    if enable_test_metrics:
+        reader_metrics = page.evaluate(
+            "window.__DIFFSTORY_READER_METRICS__ || null"
+        )
     page.close()
-    return {
+    result = {
         **sources,
         "page_errors": errors,
         "console_errors": console_errors,
         "network_requests": requests,
         "screenshots": [str(screenshot), str(mobile)],
     }
+    if capture_dom_signature:
+        result["_dom_signature"] = dom_signature
+    if capture_embedded_summary:
+        result["_embedded_summary"] = graph_summary
+    if enable_test_metrics:
+        result["_reader_metrics"] = reader_metrics
+    return result
 
 
 def check_legacy_notice(
@@ -672,8 +806,14 @@ def check_legacy_notice(
 
 def main() -> None:
     """Run generated, offline-roundtripped and shifted authored reader fixtures."""
+    output_parent = Path(
+        os.environ.get("DIFFSTORY_VERIFICATION_DIR", tempfile.gettempdir())
+    )
+    output_parent.mkdir(parents=True, exist_ok=True)
     directory = Path(
-        tempfile.mkdtemp(prefix="diffstory-browser-narrative-v2-")
+        tempfile.mkdtemp(
+            prefix="diffstory-browser-narrative-v2-", dir=output_parent
+        )
     )
     check = Checks()
     golden = offline_reader_report(
@@ -743,16 +883,18 @@ def main() -> None:
             ("shifted", shifted),
             ("chunked", chunked),
         ):
+            page_result = check_page(
+                browser,
+                report,
+                html,
+                directory / name,
+                check,
+                sample_sources=name == "chunked",
+            )
+            page_result.pop("_dom_signature", None)
             results[name] = {
                 "pipeline": evidence,
-                **check_page(
-                    browser,
-                    report,
-                    html,
-                    directory / name,
-                    check,
-                    sample_sources=name == "chunked",
-                ),
+                **page_result,
             }
         check_legacy_notice(browser, directory, check)
         browser.close()

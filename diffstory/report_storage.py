@@ -43,6 +43,7 @@ from .narrative_contracts import StoryPlan
 from .narrative_contracts import SupportedStatement
 from .narrative_contracts import result_key
 from .narrative_contracts import result_key_field
+from .narrative_manifest import GENERATION_STORAGE_VERSION
 from .narrative_manifest import CurrentUsage
 from .narrative_manifest import GenerationManifest
 from .narrative_manifest import InheritedProvenance
@@ -64,6 +65,7 @@ from .narrative_protocol import RequestConfiguration
 from .narrative_runtime import ArtifactInvocation
 from .narrative_runtime import PreparedMetadata
 from .narrative_runtime import RunIdentity
+from .narrative_storage import encode_invocation
 
 STORAGE_VERSION = "diffstory.report-storage.v1"
 _ID_PATTERN = re.compile(r"^[a-f0-9]{64}$")
@@ -1657,7 +1659,7 @@ def _strict_json_load(
     if (
         type(max_input_bytes) is not int
         or max_input_bytes < 0
-        or len(raw) > min(max_input_bytes, _MAX_INPUT_BYTES)
+        or len(raw) > max_input_bytes
     ):
         _fail("storage_input_too_large")
     _check_json_depth(raw)
@@ -5622,6 +5624,369 @@ def _validate_typed_table_record(  # noqa: C901, PLR0911, PLR0912 # Dispatch eac
     return None
 
 
+def _derive_report_graph(  # noqa: C901, PLR0915 # Derive one private report root over sealed rows.
+    source_graph: ReportRecordGraph,
+    records: GenerationRecordSet,
+    reader_projection: IndexedReaderProjection,
+    *,
+    base_report: object,
+) -> ReportRecordGraph:
+    """Derive a report root over sealed annotation rows without reopening them.
+
+    Preconditions:
+        ``source_graph`` is the exact closed annotations graph for ``records``;
+        ``reader_projection`` is the checked presentation selector; and
+        ``base_report`` is the session-owned immutable compiler report.
+    Postconditions:
+        Returns an exact-closure report graph with the same immutable result,
+        audit, plan, and evidence rows. Only the reader row and root change.
+    Essential behavior:
+        Reuses reader schema, record-reference, root, and closure predicates;
+        it does not mutate or unseal the source graph or rerun production proof.
+    """
+    if (
+        type(source_graph) is not ReportRecordGraph
+        or type(records) is not GenerationRecordSet
+        or type(reader_projection) is not IndexedReaderProjection
+        or type(base_report) is not _OwnedMapping
+        or source_graph._artifact_kind != "annotations"  # noqa: SLF001 # Inspect the exact imported graph family.
+        or source_graph._raw is not None  # noqa: SLF001 # A session-owned graph must not retain input bytes.
+        or source_graph._root.get("shape") != "annotations"  # noqa: SLF001 # Inspect its exact root shape.
+    ):
+        _fail("invalid_indexed_report_derivation")
+    if reader_projection.shape != "presentation" or any(
+        type(value) not in {tuple, list}
+        for value in (
+            reader_projection.sections,
+            reader_projection.context_details,
+            reader_projection.citations,
+            reader_projection.support_provenance,
+        )
+    ):
+        _fail("invalid_indexed_reader_projection")
+    if {"generation", "narrative_v2"} & set(base_report):
+        _fail("invalid_report_base")
+
+    def result_pointer(reference: object, kind: str) -> dict[str, str]:
+        """Resolve one selected result reference against sealed result rows."""
+        if type(reference) is not ResultRef or reference.kind != kind:
+            _fail("invalid_generation_record_reference")
+        actual = source_graph._result_by_id.get(reference.storage_id)  # noqa: SLF001 # Resolve the typed selector in the sealed result index.
+        entry = source_graph._tables["results"].get(reference.storage_id)  # noqa: SLF001 # Check the exact immutable result row.
+        if (
+            actual != reference
+            or entry is None
+            or entry.get("kind") != kind
+            or entry["record"].get(result_key_field(kind))
+            != reference.item_key
+        ):
+            _fail("foreign_storage_result_reference")
+        return _ref(reference.storage_id, kind)
+
+    def record_pointer(
+        reference: object, table: str, kind: str
+    ) -> dict[str, str]:
+        """Resolve one selected audit reference against sealed table rows."""
+        if (
+            type(reference) is not RecordRef
+            or reference.table != table
+            or reference.kind != kind
+        ):
+            _fail("invalid_generation_record_reference")
+        entry = source_graph._tables[table].get(reference.storage_id)  # noqa: SLF001 # Check the exact immutable audit row.
+        if entry is None or entry.get("kind") != kind:
+            _fail("foreign_storage_record_reference")
+        return _ref(reference.storage_id, kind)
+
+    record: dict[str, object] = {
+        "shape": "presentation",
+        "version": reader_projection.version or "diffstory.presentation.v2",
+        "provenance": reader_projection.provenance
+        or "model-generated · unverified",
+        "document": result_pointer(reader_projection.document, "document"),
+        "sections": [],
+        "context_details": [],
+        "citations": [],
+        "support_provenance": [],
+    }
+    sections = []
+    for section in reader_projection.sections:
+        if type(section) is not ReaderSectionRef or type(
+            section.details
+        ) not in {
+            tuple,
+            list,
+        }:
+            _fail("invalid_indexed_reader_section")
+        sections.append(
+            {
+                "group_id": section.group_id,
+                "group_key": section.group_key,
+                "number": section.number,
+                "next_id": section.next_id,
+                "prose": result_pointer(section.prose, "section"),
+                "details": [
+                    result_pointer(item, "detail") for item in section.details
+                ],
+            }
+        )
+    record["sections"] = sections
+    record["context_details"] = [
+        result_pointer(item, "detail")
+        for item in reader_projection.context_details
+    ]
+    record["citations"] = [
+        record_pointer(item, "resolved_citations", "resolved_citation")
+        for item in reader_projection.citations
+    ]
+    record["support_provenance"] = [
+        record_pointer(item, "inherited_provenance", "inherited_provenance")
+        for item in reader_projection.support_provenance
+    ]
+    _validate_reader_record(record)
+
+    source_root = source_graph._root  # noqa: SLF001 # Reuse the validated source generation selector.
+    old_reader_id, old_reader_kind = _check_reference_shape(
+        source_root["reader"]
+    )
+    old_reader = source_graph._tables["readers"].get(old_reader_id)  # noqa: SLF001 # Remove only the root-only annotation reader.
+    if (
+        old_reader_kind != "reader"
+        or old_reader is None
+        or old_reader.get("kind") != "reader"
+        or old_reader["record"].get("shape") != "annotations"
+    ):
+        _fail("invalid_indexed_report_derivation")
+
+    reader_id = _streamed_storage_address(
+        "reader",
+        _reader_logical_chunks(record, source_graph._tables),  # noqa: SLF001 # Resolve through the sealed shared rows.
+    )
+    reader_entry = _freeze(
+        {"id": reader_id, "kind": "reader", "record": record}
+    )
+    reader_table = dict(source_graph._tables["readers"])  # noqa: SLF001 # Copy only the reader address table.
+    reader_table.pop(old_reader_id)
+    existing = reader_table.get(reader_id)
+    if existing is not None and existing != reader_entry:
+        _fail("storage_address_collision")
+    reader_table[reader_id] = reader_entry
+    tables = dict(source_graph._tables)  # noqa: SLF001 # Reuse every non-reader table view.
+    tables["readers"] = MappingProxyType(reader_table)
+    frozen_tables = MappingProxyType(tables)
+
+    check_root = {
+        "shape": "report",
+        "base_report": base_report,
+        "generation": _thaw(source_root["generation"]),
+        "reader": _ref(reader_id, "reader"),
+    }
+    _RecordArena._check_arena_root(check_root, "report")  # noqa: SLF001 # Reuse the established private root predicate.
+    _check_graph_and_addresses(check_root, frozen_tables)
+    application_root = MappingProxyType(
+        {
+            "shape": "report",
+            "base_report": base_report,
+            "generation": source_root["generation"],
+            "reader": MappingProxyType(_ref(reader_id, "reader")),
+        }
+    )
+    return ReportRecordGraph(
+        _raw=None,
+        _artifact_kind="report",
+        _root=application_root,
+        _tables=frozen_tables,
+        _result_by_key=source_graph._result_by_key,  # noqa: SLF001 # Share the immutable result selector index.
+        _result_by_id=source_graph._result_by_id,  # noqa: SLF001 # Share the immutable reverse selector index.
+        _typed_validation_counts=source_graph._typed_validation_counts,  # noqa: SLF001 # Reuse structural validation evidence.
+    )
+
+
+def _annotation_reader_record(
+    source_graph: ReportRecordGraph,
+    reader_projection: IndexedReaderProjection,
+) -> dict[str, object]:
+    """Build an annotation reader's pointers from a checked source projection.
+
+    Preconditions:
+        ``source_graph`` is a session-owned report graph and
+        ``reader_projection`` is its checked annotation reader projection.
+    Postconditions:
+        Returns only the ordered reader skeleton with pointers to rows already
+        owned by the graph.
+    Essential behavior:
+        Reuses accepted references and performs no graph-wide closure or
+        address validation pass.
+    """
+    if (
+        type(source_graph) is not ReportRecordGraph
+        or source_graph._artifact_kind != "report"  # noqa: SLF001 # Require the exact parsed/applied report family.
+        or source_graph._raw is not None  # noqa: SLF001 # Only session-owned immutable graph views can be derived.
+        or source_graph._root.get("shape") != "report"  # noqa: SLF001 # Bind to the root selector checked by the session.
+        or type(reader_projection) is not IndexedReaderProjection
+        or reader_projection.shape != "annotations"
+    ):
+        _fail("invalid_indexed_annotation_derivation")
+
+    def result_pointer(reference: object, kind: str) -> dict[str, str]:
+        """Resolve one selected result reference against sealed result rows."""
+        if type(reference) is not ResultRef or reference.kind != kind:
+            _fail("invalid_generation_record_reference")
+        actual = source_graph._result_by_id.get(reference.storage_id)  # noqa: SLF001 # Resolve the typed selector in the sealed result index.
+        entry = source_graph._tables["results"].get(reference.storage_id)  # noqa: SLF001 # Check the exact immutable result row.
+        if (
+            actual != reference
+            or entry is None
+            or entry.get("kind") != kind
+            or entry["record"].get(result_key_field(kind))
+            != reference.item_key
+        ):
+            _fail("foreign_storage_result_reference")
+        return _ref(reference.storage_id, kind)
+
+    def record_pointer(
+        reference: object, table: str, kind: str
+    ) -> dict[str, str]:
+        """Resolve one selected audit reference against sealed table rows."""
+        if (
+            type(reference) is not RecordRef
+            or reference.table != table
+            or reference.kind != kind
+        ):
+            _fail("invalid_generation_record_reference")
+        entry = source_graph._tables[table].get(reference.storage_id)  # noqa: SLF001 # Check the exact immutable audit row.
+        if entry is None or entry.get("kind") != kind:
+            _fail("foreign_storage_record_reference")
+        return _ref(reference.storage_id, kind)
+
+    reader: dict[str, object] = {
+        "shape": "annotations",
+        "document": result_pointer(reader_projection.document, "document"),
+        "steps": [],
+        "context_details": [],
+        "citations": [],
+        "support_provenance": [],
+    }
+    steps = []
+    for section in reader_projection.sections:
+        if type(section) is not ReaderSectionRef:
+            _fail("invalid_indexed_reader_section")
+        steps.append(
+            {
+                "group_id": section.group_id,
+                "group_key": section.group_key,
+                "number": section.number,
+                "next_id": section.next_id,
+                "prose": result_pointer(section.prose, "section"),
+                "details": [
+                    result_pointer(item, "detail") for item in section.details
+                ],
+            }
+        )
+    reader["steps"] = steps
+    reader["context_details"] = [
+        result_pointer(item, "detail")
+        for item in reader_projection.context_details
+    ]
+    reader["citations"] = [
+        record_pointer(item, "resolved_citations", "resolved_citation")
+        for item in reader_projection.citations
+    ]
+    reader["support_provenance"] = [
+        record_pointer(item, "inherited_provenance", "inherited_provenance")
+        for item in reader_projection.support_provenance
+    ]
+    return reader
+
+
+def _derive_annotation_graph(
+    source_graph: ReportRecordGraph,
+    reader_projection: IndexedReaderProjection,
+    *,
+    metadata: Mapping[str, object],
+) -> ReportRecordGraph:
+    """Derive an annotations root over rows from a checked report graph.
+
+    Preconditions:
+        ``source_graph`` is a closed report graph, ``reader_projection`` is
+        the accepted annotation reader, and ``metadata`` contains the current
+        annotation schema and base/head revisions.
+    Postconditions:
+        Returns an annotation root that shares all accepted generation and
+        audit rows and replaces the presentation reader with one annotation
+        reader row.
+    Essential behavior:
+        Computes only the new reader address needed by shared storage; it does
+        not revalidate the already sealed graph's closure or addresses.
+    """
+    if (
+        type(source_graph) is not ReportRecordGraph
+        or source_graph._artifact_kind != "report"  # noqa: SLF001 # Require the exact parsed/applied report family.
+        or source_graph._raw is not None  # noqa: SLF001 # Only session-owned immutable graph views can be derived.
+        or source_graph._root.get("shape") != "report"  # noqa: SLF001 # Bind to the root selector checked by the session.
+        or type(reader_projection) is not IndexedReaderProjection
+        or reader_projection.shape != "annotations"
+        or set(metadata) != {"schema", "base_sha", "head_sha"}
+        or metadata.get("schema") != "diffstory.annotations.v2"
+        or any(
+            type(metadata.get(key)) is not str
+            for key in ("base_sha", "head_sha")
+        )
+    ):
+        _fail("invalid_indexed_annotation_derivation")
+
+    reader = _annotation_reader_record(source_graph, reader_projection)
+
+    source_root = source_graph._root  # noqa: SLF001 # Reuse the validated report generation selector.
+    old_reader_id, old_reader_kind = _check_reference_shape(
+        source_root["reader"]
+    )
+    old_reader = source_graph._tables["readers"].get(old_reader_id)  # noqa: SLF001 # Replace only the root-selected presentation reader.
+    if (
+        old_reader_kind != "reader"
+        or old_reader is None
+        or old_reader.get("kind") != "reader"
+        or old_reader["record"].get("shape") != "presentation"
+    ):
+        _fail("invalid_indexed_annotation_derivation")
+
+    reader_id = _streamed_storage_address(
+        "reader",
+        _reader_logical_chunks(reader, source_graph._tables),  # noqa: SLF001 # Address the logical annotation reader over shared rows.
+    )
+    reader_entry = _freeze(
+        {"id": reader_id, "kind": "reader", "record": reader}
+    )
+    reader_table = dict(source_graph._tables["readers"])  # noqa: SLF001 # Copy only the small root-reader index.
+    reader_table.pop(old_reader_id)
+    existing = reader_table.get(reader_id)
+    if existing is not None and existing != reader_entry:
+        _fail("storage_address_collision")
+    reader_table[reader_id] = reader_entry
+    tables = dict(source_graph._tables)  # noqa: SLF001 # Share every non-reader table index.
+    tables["readers"] = MappingProxyType(reader_table)
+    frozen_tables = MappingProxyType(tables)
+
+    frozen_metadata = _freeze(dict(metadata))
+    annotation_root = MappingProxyType(
+        {
+            "shape": "annotations",
+            "metadata": frozen_metadata,
+            "generation": source_root["generation"],
+            "reader": MappingProxyType(_ref(reader_id, "reader")),
+        }
+    )
+    return ReportRecordGraph(
+        _raw=None,
+        _artifact_kind="annotations",
+        _root=annotation_root,
+        _tables=frozen_tables,
+        _result_by_key=source_graph._result_by_key,  # noqa: SLF001 # Share the immutable result selector index.
+        _result_by_id=source_graph._result_by_id,  # noqa: SLF001 # Share the immutable reverse selector index.
+        _typed_validation_counts=source_graph._typed_validation_counts,  # noqa: SLF001 # Reuse structural validation evidence.
+    )
+
+
 def _validate_annotation_reader(reader: dict) -> None:
     if set(reader) != {
         "document",
@@ -6501,13 +6866,16 @@ def _iter_logical_record_json(  # noqa: C901, PLR0912, PLR0913 # Stream canonica
             yield from _iter_logical_record_json(logical)
         return
     if isinstance(value, Mapping):
+        keys = tuple(value)
+        if any(type(key) is not str for key in keys):
+            _fail("storage_non_string_key")
         yield b"{"
         first = True
-        for key in sorted(value):
+        for key in sorted(keys):
             if not first:
                 yield bytes((44,))
             first = False
-            yield canonical_bytes(key)
+            yield from _iter_canonical_string_json(key)
             yield b":"
             yield from _iter_logical_record_json(
                 value[key],
@@ -6519,7 +6887,7 @@ def _iter_logical_record_json(  # noqa: C901, PLR0912, PLR0913 # Stream canonica
             )
         yield b"}"
         return
-    if type(value) in {list, tuple}:
+    if type(value) in {list, tuple, _OwnedList, _OwnedTuple}:
         yield b"["
         for position, item in enumerate(value):
             if position:
@@ -6534,7 +6902,34 @@ def _iter_logical_record_json(  # noqa: C901, PLR0912, PLR0913 # Stream canonica
             )
         yield b"]"
         return
+    if type(value) is str:
+        yield from _iter_canonical_string_json(value)
+        return
     yield canonical_bytes(value)
+
+
+def _iter_canonical_string_json(value: str) -> Iterator[bytes]:
+    """Stream one canonical JSON string in bounded, UTF-8-safe pieces.
+
+    Preconditions:
+        ``value`` is a Python string accepted by the standard JSON encoder.
+    Postconditions:
+        Joined chunks equal ``canonical_bytes(value)`` without retaining one
+        escaped copy of a long compiler source or prose string.
+    Essential behavior:
+        Uses the same escaping rules as the existing canonical serializer and
+        splits only between Python string positions.
+    """
+    yield b'"'
+    for offset in range(0, len(value), 1024):
+        encoded = json.dumps(
+            value[offset : offset + 1024],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        yield encoded[1:-1].encode("utf-8")
+    yield b'"'
 
 
 def _normalized_statement_info(
@@ -6896,3 +7291,855 @@ def expand_report_storage(
     if len(canonical_bytes(expanded)) != projected:
         _fail("expansion_size_mismatch")
     return expanded
+
+
+_JSON_OUTPUT_CHUNK_BYTES = 16 * 1024
+_OVERLAY_GROUP_FIELDS = ("title", "number", "next_id", "narrative")
+
+
+def _iter_bounded_json_chunks(
+    chunks: Iterator[bytes], *, chunk_size: int = _JSON_OUTPUT_CHUNK_BYTES
+) -> Iterator[bytes]:
+    """Coalesce small JSON pieces into fixed-size output chunks.
+
+    Preconditions:
+        ``chunks`` yields UTF-8 JSON pieces and ``chunk_size`` is a positive
+        exact integer.
+    Postconditions:
+        Every yielded byte string is nonempty and no larger than
+        ``chunk_size``; concatenation preserves every input byte.
+    Essential behavior:
+        Keeps only one bounded staging buffer while avoiding one-byte writes
+        for JSON punctuation and short scalar values.
+    """
+    if type(chunk_size) is not int or chunk_size <= 0:
+        _fail("invalid_json_chunk_size")
+    buffer = bytearray()
+    for chunk in chunks:
+        if type(chunk) is not bytes:
+            _fail("invalid_json_chunk")
+        offset = 0
+        while offset < len(chunk):
+            available = chunk_size - len(buffer)
+            take = min(available, len(chunk) - offset)
+            buffer.extend(chunk[offset : offset + take])
+            offset += take
+            if len(buffer) == chunk_size:
+                yield bytes(buffer)
+                buffer.clear()
+    if buffer:
+        yield bytes(buffer)
+
+
+def _output_group_overlays(
+    overlay: Mapping[str, object],
+) -> dict[str, Mapping[str, object]]:
+    """Index validated output group overlays without copying their contents.
+
+    Preconditions:
+        ``overlay`` is the immutable, renderer-checked application overlay.
+    Postconditions:
+        Returns one unique group-ID index whose values are the owned overlay
+        rows; missing or duplicate rows are rejected.
+    Essential behavior:
+        Allocates only references for the bounded group projection.
+    """
+    values = overlay.get("groups")
+    if type(values) not in {_OwnedList, _OwnedTuple, list, tuple}:
+        _fail("invalid_indexed_applied_fields")
+    expected = {"group_id", *_OVERLAY_GROUP_FIELDS}
+    by_id: dict[str, Mapping[str, object]] = {}
+    for item in values:
+        if not isinstance(item, Mapping) or set(item) != expected:
+            _fail("invalid_indexed_applied_fields")
+        group_id = item.get("group_id")
+        if type(group_id) is not str or group_id in by_id:
+            _fail("invalid_indexed_applied_fields")
+        by_id[group_id] = item
+    return by_id
+
+
+def _iter_effective_group_json(
+    group: object, group_overlay: Mapping[str, object]
+) -> Iterator[bytes]:
+    """Stream one shallow group projection with proven applied fields.
+
+    Preconditions:
+        ``group`` and its overlay row are checked mappings for the same group.
+    Postconditions:
+        Emits their canonical merged JSON fields without retaining the group.
+    Essential behavior:
+        Creates one shallow group mapping at a time.
+    """
+    if not isinstance(group, Mapping):
+        _fail("invalid_indexed_applied_fields")
+    effective = dict(group.items())
+    for field in _OVERLAY_GROUP_FIELDS:
+        effective[field] = group_overlay[field]
+    yield from _iter_logical_record_json(effective)
+
+
+def _iter_effective_groups_json(
+    base_groups: object, overlay: Mapping[str, object]
+) -> Iterator[bytes]:
+    """Stream compiler groups with their deterministic generated fields.
+
+    Preconditions:
+        The report group sequence and exact overlay membership passed sealing.
+    Postconditions:
+        Emits groups in compiler order and rejects missing or unused overlays.
+    Essential behavior:
+        Merges and releases one group projection at a time.
+    """
+    if type(base_groups) not in {_OwnedList, _OwnedTuple, list, tuple}:
+        _fail("invalid_indexed_applied_fields")
+    by_id = _output_group_overlays(overlay)
+    seen: set[str] = set()
+    yield b"["
+    for position, group in enumerate(base_groups):
+        if not isinstance(group, Mapping):
+            _fail("invalid_indexed_applied_fields")
+        group_id = group.get("id")
+        group_overlay = by_id.get(group_id) if type(group_id) is str else None
+        if group_overlay is None:
+            _fail("invalid_indexed_applied_fields")
+        if position:
+            yield b","
+        seen.add(group_id)
+        yield from _iter_effective_group_json(group, group_overlay)
+    if seen != set(by_id):
+        _fail("invalid_indexed_applied_fields")
+    yield b"]"
+
+
+def _iter_effective_base_report_json(
+    base_report: object, overlay: Mapping[str, object]
+) -> Iterator[bytes]:
+    """Stream a report base with its applied document and group overlays.
+
+    Preconditions:
+        ``base_report`` and ``overlay`` are the exact checked session values.
+    Postconditions:
+        Emits the effective applied base in canonical key order.
+    Essential behavior:
+        Retains no complete compiler-base copy or effective group list.
+    """
+    if not isinstance(base_report, Mapping) or not isinstance(
+        overlay, Mapping
+    ):
+        _fail("invalid_indexed_applied_fields")
+    if {"generation", "narrative_v2"} & set(base_report):
+        _fail("invalid_report_base")
+    if set(overlay) != {"document", "groups"} or "groups" not in base_report:
+        _fail("invalid_indexed_applied_fields")
+    fields = set(base_report)
+    fields.add("document")
+    yield b"{"
+    for position, field in enumerate(sorted(fields)):
+        if position:
+            yield b","
+        yield from _iter_canonical_string_json(field)
+        yield b":"
+        if field == "document":
+            yield from _iter_logical_record_json(overlay["document"])
+        elif field == "groups":
+            yield from _iter_effective_groups_json(
+                base_report["groups"], overlay
+            )
+        else:
+            yield from _iter_logical_record_json(base_report[field])
+    yield b"}"
+
+
+def _iter_shared_storage_json(  # noqa: C901 # Keep canonical root and 13-table emission in one closed-format writer.
+    view: ReportStorageView, *, overlay: Mapping[str, object] | None = None
+) -> Iterator[bytes]:
+    """Stream the canonical closed report-storage envelope from owned indexes.
+
+    Preconditions:
+        ``view`` is a closed graph or parsed view. A report overlay, when
+        supplied, is the session-checked effective document/group projection.
+    Postconditions:
+        Chunks equal canonical storage JSON without a mutable envelope or a
+        complete serialized byte buffer.
+    Essential behavior:
+        Writes all 13 closed tables in canonical table and storage-ID order.
+    """
+    if not isinstance(view, ReportStorageView):
+        _fail("invalid_storage_view")
+    root = view._root  # noqa: SLF001 # Stream only the immutable root owned by this graph.
+    tables = view._tables  # noqa: SLF001 # Stream only the immutable indexes owned by this graph.
+    if (
+        view._artifact_kind not in {"report", "annotations"}  # noqa: SLF001
+        or set(tables) != set(_TABLES)
+        or (overlay is not None and view._artifact_kind != "report")  # noqa: SLF001
+    ):
+        _fail("invalid_storage_view")
+    expected_root = (
+        {"shape", "base_report", "generation", "reader"}
+        if view._artifact_kind == "report"  # noqa: SLF001
+        else {"shape", "metadata", "generation", "reader"}
+    )
+    if set(root) != expected_root:
+        _fail("invalid_storage_root")
+
+    yield b'{"artifact_kind":'
+    yield from _iter_canonical_string_json(view._artifact_kind)  # noqa: SLF001
+    yield b',"root":{'
+    for position, field in enumerate(sorted(root)):
+        if position:
+            yield b","
+        yield from _iter_canonical_string_json(field)
+        yield b":"
+        if field == "base_report" and overlay is not None:
+            yield from _iter_effective_base_report_json(root[field], overlay)
+        else:
+            yield from _iter_logical_record_json(root[field])
+    yield b'},"storage_version":'
+    yield from _iter_canonical_string_json(STORAGE_VERSION)
+    yield b',"tables":{'
+    for table_position, table in enumerate(sorted(_TABLES)):
+        if table_position:
+            yield b","
+        yield from _iter_canonical_string_json(table)
+        yield b":["
+        index = tables[table]
+        for row_position, identifier in enumerate(sorted(index)):
+            if row_position:
+                yield b","
+            yield from _iter_logical_record_json(index[identifier])
+        yield b"]"
+    yield b"}}"
+
+
+def _materialized_model(  # noqa: PLR0913 # Keep the selected table, kind, and codec contract explicit.
+    view: ReportStorageView,
+    pointer: object,
+    *,
+    table: str,
+    kind: str,
+    model_type: type[BaseModel],
+    compact_invocation: bool = False,
+) -> Iterator[bytes]:
+    """Normalize and stream one selected typed record at a time.
+
+    Preconditions:
+        ``pointer`` selects a record of ``kind`` in ``table`` and the graph
+        has already passed its independent structural and proof boundary.
+    Postconditions:
+        Emits the strict model's normal JSON representation; producer
+        invocations use the existing generation-storage.v1 codec when asked.
+    Essential behavior:
+        Retains at most one selected logical record/model during compatibility
+        default normalization.
+    """
+    identifier, pointer_kind = _check_reference_shape(pointer)
+    entry = view._tables.get(table, {}).get(identifier)  # noqa: SLF001 # Resolve one selected address in the checked graph.
+    if entry is None or pointer_kind != kind or entry.get("kind") != kind:
+        _fail("wrong_kind_storage_reference")
+    logical = view._materialize(table, identifier, {})  # noqa: SLF001 # Expand only this selected record for typed default normalization.
+    model = model_type.model_validate(_tuple_model_input(logical))
+    value = model.model_dump(mode="json")
+    if compact_invocation:
+        invocation = getattr(model, "invocation", None)
+        if invocation is None or "invocation" not in value:
+            _fail("invalid_generation_producer")
+        value["invocation"] = encode_invocation(invocation).model_dump(
+            mode="json"
+        )
+    yield from _iter_logical_record_json(value)
+
+
+def _tuple_model_input(value: object) -> object:
+    """Adapt JSON arrays to Python tuples for strict selected-model parsing.
+
+    Preconditions:
+        ``value`` is one already checked JSON header or selected table record.
+    Postconditions:
+        Mapping and scalar values are preserved while every array uses the
+        Python shape accepted by strict ``model_validate`` tuple fields.
+    Essential behavior:
+        Avoids JSON re-encoding and never coerces scalar types.
+    """
+    if isinstance(value, Mapping):
+        return {key: _tuple_model_input(item) for key, item in value.items()}
+    if type(value) in {list, tuple, _OwnedList, _OwnedTuple}:
+        return tuple(_tuple_model_input(item) for item in value)
+    return value
+
+
+def _iter_generation_record_array(  # noqa: PLR0913 # Keep the fixed reference adapter inputs explicit.
+    view: ReportStorageView,
+    generation: Mapping[str, object],
+    *,
+    field: str,
+    table: str,
+    kind: str,
+    model_type: type[BaseModel],
+    compact_invocation: bool = False,
+) -> Iterator[bytes]:
+    """Stream one ordered generation array through selected typed records.
+
+    Preconditions:
+        ``generation[field]`` is an ordered array of the exact record kind.
+    Postconditions:
+        Emits each selected normalized row in source order.
+    Essential behavior:
+        Retains only the current selected record and model.
+    """
+    values = generation.get(field)
+    if type(values) not in {_OwnedList, _OwnedTuple, list, tuple}:
+        _fail("invalid_generation_skeleton")
+    yield b"["
+    for position, pointer in enumerate(values):
+        if position:
+            yield b","
+        yield from _materialized_model(
+            view,
+            pointer,
+            table=table,
+            kind=kind,
+            model_type=model_type,
+            compact_invocation=compact_invocation,
+        )
+    yield b"]"
+
+
+def _iter_stored_generation_json(  # noqa: C901, PLR0912 # Dispatch the closed manifest fields to selected stream adapters.
+    view: ReportStorageView,
+) -> Iterator[bytes]:
+    """Stream generation-storage.v1 with legacy model-default semantics.
+
+    Preconditions:
+        ``view`` owns a generation skeleton whose complete proof was checked
+        by the current ReportSession.
+    Postconditions:
+        Emits the canonical JSON value produced by
+        ``stored_generation(persisted_manifest(expanded_generation))``.
+    Essential behavior:
+        Normalizes one header or selected typed row at a time and never builds
+        a whole ``GenerationManifest`` or manifest dump.
+    """
+    generation = view._root["generation"]  # noqa: SLF001 # Read the captured immutable generation selectors.
+    if not isinstance(generation, Mapping):
+        _fail("invalid_generation_skeleton")
+    fields = set(GenerationManifest.model_fields)
+    if set(generation) - fields:
+        _fail("invalid_generation_skeleton")
+    header_models: dict[str, type[BaseModel]] = {
+        "current_usage": CurrentUsage,
+        "ledger_parameters": LedgerParameters,
+        "request_configuration": RequestConfiguration,
+    }
+    fixed_records: dict[str, tuple[str, str, type[BaseModel]]] = {
+        "run": ("runs", "run", RunIdentity),
+        "plan": ("plans", "story_plan", StoryPlan),
+        "document": ("results", "document", DocumentResult),
+    }
+    array_records: dict[str, tuple[str, str, type[BaseModel], bool]] = {
+        "details": ("results", "detail", DetailResult, False),
+        "planning": ("results", "planning_card", PlanningCardResult, False),
+        "sections": ("results", "section", SectionResult, False),
+        "producers": ("producers", "producer", ProducerDescriptor, True),
+        "receipts": ("receipts", "receipt", ResultReceipt, False),
+    }
+    output_fields = sorted((*fields, "storage_version"))
+    yield b"{"
+    for position, field in enumerate(output_fields):
+        if position:
+            yield b","
+        yield from _iter_canonical_string_json(field)
+        yield b":"
+        if field == "storage_version":
+            yield from _iter_canonical_string_json(GENERATION_STORAGE_VERSION)
+        elif field in fixed_records:
+            table, kind, model_type = fixed_records[field]
+            yield from _materialized_model(
+                view,
+                generation.get(field),
+                table=table,
+                kind=kind,
+                model_type=model_type,
+            )
+        elif field in array_records:
+            table, kind, model_type, compact_invocation = array_records[field]
+            yield from _iter_generation_record_array(
+                view,
+                generation,
+                field=field,
+                table=table,
+                kind=kind,
+                model_type=model_type,
+                compact_invocation=compact_invocation,
+            )
+        elif field in header_models:
+            value = generation.get(field)
+            if value is None:
+                _fail("invalid_generation_skeleton")
+            model = header_models[field].model_validate(
+                _tuple_model_input(_thaw(value))
+            )
+            yield from _iter_logical_record_json(model.model_dump(mode="json"))
+        elif field == "version":
+            yield from _iter_canonical_string_json(
+                generation.get(field, "diffstory.generation.v2")
+            )
+        elif field == "provenance":
+            yield from _iter_canonical_string_json(
+                generation.get(field, "unverified")
+            )
+        elif field in {
+            "compiler_fact_signature",
+            "ledger_digest",
+            "unit_keys",
+        }:
+            if field not in generation:
+                _fail("invalid_generation_skeleton")
+            yield from _iter_logical_record_json(generation[field])
+        else:
+            _fail("unknown_generation_skeleton_field")
+    yield b"}"
+
+
+def _reader_entry(
+    view: ReportStorageView, root: Mapping[str, object]
+) -> Mapping[str, object]:
+    """Resolve the exact root-selected reader row without expanding it.
+
+    Preconditions:
+        ``root`` is a checked report or annotation root from ``view``.
+    Postconditions:
+        Returns only the typed reader record selected by the root.
+    Essential behavior:
+        Rejects missing and wrong-kind pointers without expanding the reader.
+    """
+    identifier, kind = _check_reference_shape(root["reader"])
+    entry = view._tables["readers"].get(identifier)  # noqa: SLF001 # Follow only the closed reader root pointer.
+    if kind != "reader" or entry is None or entry.get("kind") != "reader":
+        _fail("wrong_kind_storage_reference")
+    return entry["record"]
+
+
+def _iter_reader_field_json(
+    reader: Mapping[str, object],
+    field: str,
+    indexes: Mapping[str, object],
+    references: Mapping[tuple[object, ...], tuple[str, str]],
+) -> Iterator[bytes]:
+    """Stream one logical reader field while resolving only schema pointers.
+
+    Preconditions:
+        ``reader`` is a checked annotation/presentation reader and ``field``
+        is one of its declared member paths.
+    Postconditions:
+        Emits the logical field with only enumerated references resolved.
+    Essential behavior:
+        Leaves compiler maps and literal ``$ref``-shaped values untouched.
+    """
+    yield from _iter_logical_record_json(
+        reader[field],
+        references=references,
+        indexes=indexes,  # type: ignore[arg-type]
+        logical_lookup=lambda table, identifier: _record_logical_chunks(
+            table,
+            identifier,
+            indexes,  # type: ignore[arg-type]
+        ),
+        path=(field,),
+    )
+
+
+def _iter_reader_model_array_json(
+    view: ReportStorageView,
+    values: object,
+    *,
+    table: str,
+    kind: str,
+    model_type: type[BaseModel],
+) -> Iterator[bytes]:
+    """Stream selected reader records through their strict compatibility model.
+
+    Preconditions:
+        ``values`` is an ordered array of typed references in ``view``.
+    Postconditions:
+        Emits each selected row with the same model defaults as public typed
+        reader assembly, in the original reference order.
+    Essential behavior:
+        Materializes and validates only the current selected row.
+    """
+    if type(values) not in {_OwnedList, _OwnedTuple, list, tuple}:
+        _fail("invalid_reader_array")
+    yield b"["
+    for position, pointer in enumerate(values):
+        if position:
+            yield b","
+        yield from _materialized_model(
+            view,
+            pointer,
+            table=table,
+            kind=kind,
+            model_type=model_type,
+        )
+    yield b"]"
+
+
+def _iter_expanded_reader_section_json(
+    view: ReportStorageView, section: Mapping[str, object]
+) -> Iterator[bytes]:
+    """Stream one reader section while normalizing its selected result rows.
+
+    Preconditions:
+        ``section`` is the checked ordered reader header with prose and detail
+        references owned by ``view``.
+    Postconditions:
+        Emits that section with its original header fields and typed result
+        defaults, without retaining a complete reader tree.
+    Essential behavior:
+        Uses the real result references and keeps only one selected row live.
+    """
+    expected = {
+        "group_id",
+        "group_key",
+        "number",
+        "next_id",
+        "prose",
+        "details",
+    }
+    if set(section) != expected:
+        _fail("invalid_reader_section")
+    yield b"{"
+    for position, field in enumerate(sorted(expected)):
+        if position:
+            yield b","
+        yield from _iter_canonical_string_json(field)
+        yield b":"
+        if field == "prose":
+            yield from _materialized_model(
+                view,
+                section[field],
+                table="results",
+                kind="section",
+                model_type=SectionResult,
+            )
+        elif field == "details":
+            yield from _iter_reader_model_array_json(
+                view,
+                section[field],
+                table="results",
+                kind="detail",
+                model_type=DetailResult,
+            )
+        else:
+            yield from _iter_logical_record_json(section[field])
+    yield b"}"
+
+
+def _iter_expanded_reader_sections_json(
+    view: ReportStorageView, values: object
+) -> Iterator[bytes]:
+    """Stream the reader's ordered section headers and selected result rows.
+
+    Preconditions:
+        ``values`` is the checked ``sections`` or ``steps`` array.
+    Postconditions:
+        Emits the same ordered section values with typed reader defaults.
+    Essential behavior:
+        Retains at most the current section and one typed result row.
+    """
+    if type(values) not in {_OwnedList, _OwnedTuple, list, tuple}:
+        _fail("invalid_reader_array")
+    yield b"["
+    for position, section in enumerate(values):
+        if position:
+            yield b","
+        if not isinstance(section, Mapping):
+            _fail("invalid_reader_section")
+        yield from _iter_expanded_reader_section_json(view, section)
+    yield b"]"
+
+
+def _iter_expanded_reader_field_json(
+    view: ReportStorageView, reader: Mapping[str, object], field: str
+) -> Iterator[bytes]:
+    """Stream one selected reader field through its strict compatibility model.
+
+    Preconditions:
+        ``reader`` is a checked reader selected by ``view`` and ``field`` is
+        one of its public expanded members.
+    Postconditions:
+        Emits the selected logical value with all typed defaults applied.
+    Essential behavior:
+        Normalizes one selected row at a time and preserves all references.
+    """
+    shape = reader.get("shape")
+    if shape == "presentation":
+        section_field = "sections"
+        accepted_fields = {
+            "version",
+            "provenance",
+            "document",
+            "sections",
+            "context_details",
+            "citations",
+            "support_provenance",
+        }
+    elif shape == "annotations":
+        section_field = "steps"
+        accepted_fields = {
+            "document",
+            "steps",
+            "context_details",
+            "citations",
+            "support_provenance",
+        }
+    else:
+        _fail("invalid_reader_shape")
+    if field not in accepted_fields:
+        _fail("invalid_reader_fields")
+    if field == "document":
+        yield from _materialized_model(
+            view,
+            reader[field],
+            table="results",
+            kind="document",
+            model_type=DocumentResult,
+        )
+    elif field == section_field:
+        yield from _iter_expanded_reader_sections_json(view, reader[field])
+    elif field == "context_details":
+        yield from _iter_reader_model_array_json(
+            view,
+            reader[field],
+            table="results",
+            kind="detail",
+            model_type=DetailResult,
+        )
+    elif field == "citations":
+        yield from _iter_reader_model_array_json(
+            view,
+            reader[field],
+            table="resolved_citations",
+            kind="resolved_citation",
+            model_type=ResolvedCitation,
+        )
+    elif field == "support_provenance":
+        yield from _iter_reader_model_array_json(
+            view,
+            reader[field],
+            table="inherited_provenance",
+            kind="inherited_provenance",
+            model_type=InheritedProvenance,
+        )
+    else:
+        yield from _iter_logical_record_json(reader[field])
+
+
+def _iter_expanded_reader_json(
+    view: ReportStorageView, reader: Mapping[str, object]
+) -> Iterator[bytes]:
+    """Stream an expanded presentation or annotation reader with defaults.
+
+    Preconditions:
+        ``reader`` is the checked reader selected by the report or annotation
+        root of ``view``.
+    Postconditions:
+        Emits public typed assembly values while preserving order, content,
+        source links, provenance, and all selected references.
+    Essential behavior:
+        Applies strict model defaults per selected row, without building a
+        complete ``V2Presentation`` or annotation model.
+    """
+    shape = reader.get("shape")
+    if shape == "presentation":
+        expected = {
+            "shape",
+            "version",
+            "provenance",
+            "document",
+            "sections",
+            "context_details",
+            "citations",
+            "support_provenance",
+        }
+    elif shape == "annotations":
+        expected = {
+            "shape",
+            "document",
+            "steps",
+            "context_details",
+            "citations",
+            "support_provenance",
+        }
+    else:
+        _fail("invalid_reader_shape")
+    if set(reader) != expected:
+        _fail("invalid_reader_fields")
+    fields = sorted(expected - {"shape"})
+    yield b"{"
+    for position, field in enumerate(fields):
+        if position:
+            yield b","
+        yield from _iter_canonical_string_json(field)
+        yield b":"
+        yield from _iter_expanded_reader_field_json(view, reader, field)
+    yield b"}"
+
+
+def _iter_expanded_report_json(
+    view: ReportStorageView, overlay: Mapping[str, object]
+) -> Iterator[bytes]:
+    """Stream an applied expanded report through its indexed reader and rows.
+
+    Preconditions:
+        ``view`` and ``overlay`` belong to a sealed applied report handle.
+    Postconditions:
+        Emits the canonical logical report with generation-storage.v1 defaults.
+    Essential behavior:
+        Resolves indexed result rows directly and keeps no presentation tree.
+    """
+    root = view._root  # noqa: SLF001 # Read only the session-checked report graph.
+    if (
+        view._artifact_kind != "report"  # noqa: SLF001
+        or root.get("shape") != "report"
+        or set(root) != {"shape", "base_report", "generation", "reader"}
+        or not isinstance(root.get("base_report"), Mapping)
+    ):
+        _fail("invalid_storage_root")
+    base = root["base_report"]
+    if {"generation", "narrative_v2"} & set(base):
+        _fail("invalid_report_base")
+    reader = _reader_entry(view, root)
+    if reader.get("shape") != "presentation":
+        _fail("invalid_reader_shape")
+    fields = set(base) | {"document", "groups", "generation", "narrative_v2"}
+    yield b"{"
+    for position, field in enumerate(sorted(fields)):
+        if position:
+            yield b","
+        yield from _iter_canonical_string_json(field)
+        yield b":"
+        if field == "document":
+            yield from _iter_logical_record_json(overlay["document"])
+        elif field == "groups":
+            yield from _iter_effective_groups_json(base.get("groups"), overlay)
+        elif field == "generation":
+            yield from _iter_stored_generation_json(view)
+        elif field == "narrative_v2":
+            yield from _iter_expanded_reader_json(view, reader)
+        else:
+            yield from _iter_logical_record_json(base[field])
+    yield b"}"
+
+
+def _iter_expanded_annotations_json(  # noqa: C901 # Select one accepted reader root and stream its fields.
+    view: ReportStorageView,
+    *,
+    reader_record: Mapping[str, object] | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> Iterator[bytes]:
+    """Stream an annotation candidate over its exact reader and proof rows.
+
+    Preconditions:
+        ``view`` owns a checked annotations root, or is a checked report graph
+        paired with the annotation reader projection derived by its session.
+    Postconditions:
+        Emits the existing annotation logical fields and compatibility proof.
+    Essential behavior:
+        Resolves ordered reader pointers and selected audit rows as consumed;
+        it does not need a storage-addressed reader when output is expanded.
+    """
+    root = view._root  # noqa: SLF001 # Read only the session-checked indexed graph.
+    if view._artifact_kind == "annotations":  # noqa: SLF001 # Use the sealed annotation root when present.
+        if (
+            root.get("shape") != "annotations"
+            or set(root) != {"shape", "metadata", "generation", "reader"}
+            or not isinstance(root.get("metadata"), Mapping)
+            or reader_record is not None
+            or metadata is not None
+        ):
+            _fail("invalid_storage_root")
+        reader = _reader_entry(view, root)
+        metadata = root["metadata"]
+    elif view._artifact_kind == "report":  # noqa: SLF001 # Consume a projection proven by the same report session.
+        if (
+            root.get("shape") != "report"
+            or set(root) != {"shape", "base_report", "generation", "reader"}
+            or reader_record is None
+            or metadata is None
+            or reader_record.get("shape") != "annotations"
+        ):
+            _fail("invalid_storage_root")
+        reader = reader_record
+    else:
+        _fail("invalid_storage_root")
+    if reader.get("shape") != "annotations":
+        _fail("invalid_reader_shape")
+    if not isinstance(metadata, Mapping):
+        _fail("invalid_storage_root")
+    reader_fields = set(reader) - {"shape"}
+    fields = set(metadata) | reader_fields | {"generation"}
+    yield b"{"
+    for position, field in enumerate(sorted(fields)):
+        if position:
+            yield b","
+        yield from _iter_canonical_string_json(field)
+        yield b":"
+        if field == "generation":
+            yield from _iter_stored_generation_json(view)
+        elif field in metadata:
+            yield from _iter_logical_record_json(metadata[field])
+        else:
+            yield from _iter_expanded_reader_field_json(view, reader, field)
+    yield b"}"
+
+
+def _iter_report_output_json(
+    view: ReportStorageView,
+    overlay: Mapping[str, object],
+    *,
+    report_storage: str,
+) -> Iterator[bytes]:
+    """Select the expanded compatibility or normalized shared report stream.
+
+    Preconditions:
+        ``view`` and ``overlay`` passed the current session's report check.
+    Postconditions:
+        Emits exactly one selected report representation.
+    Essential behavior:
+        Does not change the compatibility default or construct an envelope.
+    """
+    if report_storage == "shared":
+        yield from _iter_shared_storage_json(view, overlay=overlay)
+    elif report_storage == "expanded":
+        yield from _iter_expanded_report_json(view, overlay)
+    else:
+        _fail("unknown_report_storage")
+
+
+def _iter_annotation_output_json(
+    view: ReportStorageView,
+    *,
+    report_storage: str,
+    reader_record: Mapping[str, object] | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> Iterator[bytes]:
+    """Select the expanded compatibility or normalized shared annotation stream.
+
+    Preconditions:
+        ``view`` and any reader projection belong to one registered generation
+        handle; shared output uses an annotation-root graph.
+    Postconditions:
+        Emits exactly one selected annotation representation.
+    Essential behavior:
+        Leaves all proof checks to the session and preserves expanded default.
+    """
+    if report_storage == "shared":
+        if reader_record is not None or metadata is not None:
+            _fail("invalid_indexed_annotation_derivation")
+        yield from _iter_shared_storage_json(view)
+    elif report_storage == "expanded":
+        yield from _iter_expanded_annotations_json(
+            view, reader_record=reader_record, metadata=metadata
+        )
+    else:
+        _fail("unknown_report_storage")

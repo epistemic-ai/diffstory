@@ -130,8 +130,8 @@ class IndexedStorageImportTests(unittest.TestCase):
           parity; application graph retains the exact captured compiler base.
         * Complete annotation bytes plus matching compiler report -> one
           independent proof; report handoff shares result and audit row objects.
-        * Either indexed generation passed to apply -> explicit M6 renderer
-          seal deferral, with no ``ValidatedReport`` issued.
+        * Either indexed generation passed to apply -> a checked
+          ``ValidatedReport`` and detached generation-storage.v1 oracle parity.
         """
         expansions = [
             expand_report_storage(
@@ -266,10 +266,17 @@ class IndexedStorageImportTests(unittest.TestCase):
                         )
                         with self.assertRaises(TypeError):
                             handoff.overlay["document"] = {}
-                    with self.assertRaisesRegex(
-                        ValueError, "indexed_report_renderer_seal_deferred"
+                    with patch(
+                        "diffstory.narrative_v2.validate_production",
+                        side_effect=AssertionError(
+                            "indexed apply rebuilt the complete proof"
+                        ),
                     ):
-                        session.apply(generation)
+                        report_handle = session.apply(generation)
+                    self.assertEqual(
+                        canonical_bytes(session.report_data(report_handle)),
+                        canonical_bytes(self.applied),
+                    )
                 finally:
                     session.close()
 
@@ -497,6 +504,11 @@ class IndexedStorageImportTests(unittest.TestCase):
                 self.report_bytes,
                 max_input_bytes=True,
             )
+        with self.assertRaisesRegex(ValueError, "invalid_input_limit"):
+            ReportSession.import_indexed(
+                self.report_bytes,
+                max_input_bytes=-1,
+            )
 
         session, generation = ReportSession.import_indexed(
             self.report_bytes,
@@ -507,6 +519,53 @@ class IndexedStorageImportTests(unittest.TestCase):
             self.assertIsNotNone(self._proof(session, generation))
         finally:
             session.close()
+
+    def test_explicit_import_cap_is_not_clamped_to_the_parser_default(
+        self,
+    ) -> None:
+        """Concern: explicit import caps remain authoritative above defaults.
+
+        Input/expected matrix:
+        * Exact canonical report bytes with a patched smaller module default
+          and an explicit exact-size cap -> accepted by indexed import.
+        * The same canonical bytes through the default parser path with a
+          patched one-byte-smaller default -> rejected as too large.
+        * Exact size minus one, a boolean, and a negative explicit cap ->
+          rejected without coercion.
+        """
+        from diffstory import report_storage
+
+        payload = self.report_bytes
+        with patch.object(
+            report_storage, "_MAX_INPUT_BYTES", len(payload) - 1
+        ):
+            session, generation = ReportSession.import_indexed(
+                payload,
+                max_input_bytes=len(payload),
+            )
+        try:
+            self.assertIsInstance(generation, ValidatedGeneration)
+        finally:
+            session.close()
+
+        strict_load = report_storage._strict_json_load  # noqa: SLF001 # Exercise the exact default parser boundary.
+        with (
+            patch.object(
+                strict_load,
+                "__kwdefaults__",
+                {"max_input_bytes": len(payload) - 1},
+            ),
+            self.assertRaisesRegex(ValueError, "storage_input_too_large"),
+        ):
+            report_storage.parse_report_storage(payload)
+        with self.assertRaisesRegex(ValueError, "storage_input_too_large"):
+            strict_load(payload, max_input_bytes=len(payload) - 1)
+        for invalid_limit in (True, -1):
+            with (
+                self.subTest(limit=invalid_limit),
+                self.assertRaisesRegex(ValueError, "storage_input_too_large"),
+            ):
+                strict_load(payload, max_input_bytes=invalid_limit)
 
     def test_omitted_defaults_remain_omitted_and_header_scalars_stay_strict(
         self,
@@ -1071,10 +1130,11 @@ class IndexedStorageImportTests(unittest.TestCase):
                 ValueError, "invalid_session_capability"
             ):
                 foreign.apply(generation)
-            with self.assertRaisesRegex(
-                ValueError, "indexed_report_renderer_seal_deferred"
-            ):
-                session.apply(generation)
+            report_handle = session.apply(generation)
+            self.assertEqual(
+                canonical_bytes(session.report_data(report_handle)),
+                canonical_bytes(self.applied),
+            )
         finally:
             foreign.close()
             session.close()

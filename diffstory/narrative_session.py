@@ -31,6 +31,7 @@ from .narrative_plan import content_digest
 from .narrative_plan import semantic_digest
 from .narrative_protocol import RequestConfiguration
 from .narrative_wire import strict_json
+from .render import _validate_indexed_report_surface
 from .render import _validate_report_collections
 from .render import _validate_report_schema
 from .render import _validate_v2_report_surface
@@ -39,6 +40,7 @@ _ISSUER_TOKEN = object()
 _VALIDATION_VERSION = "diffstory.session.import-proof.v1"
 _ASSEMBLY_VERSION = "diffstory.session.apply-v1"
 _RENDER_SURFACE_VERSION = "diffstory.session.render-surface.v1"
+_GRAPH_BINDING_SIZE = 8
 _StageWitness = tuple[str, tuple[str, ...], str]
 _StageWitnessCache = dict[
     int, tuple[object, object, object | None, _StageWitness]
@@ -234,7 +236,9 @@ class _IndexedGenerationProof:
         reader: Ordered reader references retained by that graph.
         overlay: Detached deterministic document/group fields for later apply.
         run_ref: Captured pre-annotation run row.
-        application_payload: Optional data-only graph/base/overlay handoff.
+        application_payload: Data-only graph/base/overlay handoff.
+        graph_binding: Identity pins for the source graph's immutable root and
+            table/index views; rows remain shared and recursively immutable.
         stage_proofs: Exact capabilities that completed this production.
         versions_digest: Captured validation and compatibility versions.
         witness: Type-preserving digest of all retained payload bindings.
@@ -249,7 +253,8 @@ class _IndexedGenerationProof:
     reader: object
     overlay: object
     run_ref: object
-    application_payload: _IndexedApplicationPayload | None
+    application_payload: _IndexedApplicationPayload
+    graph_binding: tuple[object, ...]
     stage_proofs: tuple[StageProof, ...]
     versions_digest: str
     witness: str
@@ -270,6 +275,8 @@ class _IndexedApplicationPayload:
         original_run_bytes: Canonical bytes for the embedded pre-annotation
             run identity, separate from the current captured report digest.
         versions_digest: Captured validation and compatibility version binding.
+        graph_binding: Identity pins for the derived report root, table views,
+            and indexes. The graph's recursively immutable rows are shared.
 
     M6 may consume this value only through the exact registered generation
     proof. Before ``apply`` registers ``ValidatedReport``, it must adapt the
@@ -285,6 +292,7 @@ class _IndexedApplicationPayload:
     overlay: object
     original_run_bytes: bytes
     versions_digest: str
+    graph_binding: tuple[object, ...]
 
 
 class _CapturedInput:
@@ -1129,6 +1137,28 @@ class ReportSession:
         )
 
     @classmethod
+    def _from_preview_capture(cls, captured_input: object) -> ReportSession:
+        """Attach one checked preview capture directly to a new session.
+
+        Preconditions:
+            ``captured_input`` is the current, unattached private capture from
+            an approved v2 narrator preview.
+        Postconditions:
+            Returns one session that owns that exact detached capture.
+        Essential behavior:
+            Does not snapshot the caller report or allocate a second report
+            tree. The capture's owner binding prevents another session from
+            adopting it.
+        """
+        if (
+            type(captured_input) is not _CapturedInput
+            or captured_input.owner_session is not None
+        ):
+            msg = "captured_input_session_mismatch"
+            raise ValueError(msg)
+        return cls(captured_input, issuer=_ISSUER_TOKEN)
+
+    @classmethod
     def import_indexed(
         cls,
         storage_bytes: bytes,
@@ -1465,6 +1495,7 @@ class ReportSession:
                 original_run.model_dump(mode="json")
             ),
             versions_digest=self._captured_input._versions_digest,  # noqa: SLF001 # Bind current validation and compatibility rules.
+            graph_binding=_capture_graph_binding(application_graph),
         )
         proof = _IndexedGenerationProof(
             scope_digest=self._scope_digest,
@@ -1477,6 +1508,7 @@ class ReportSession:
             overlay=overlay_value,
             run_ref=records.run_ref,
             application_payload=application_payload,
+            graph_binding=_capture_graph_binding(graph),
             stage_proofs=(),
             versions_digest=self._captured_input._versions_digest,  # noqa: SLF001 # Bind captured validation and compatibility rules.
             witness="",
@@ -1499,28 +1531,31 @@ class ReportSession:
         Postconditions:
             Returns a report capability only while the original capture is current.
         Essential behavior:
-            Checks full captured content before applying the proven candidate.
+            Checks full captured content once before applying the proven
+            candidate, then uses private current-scope registry helpers.
         """
         self._require_open()
         self._captured_input.assert_capture_current()
-        proof = self._registered_payload(
+        proof = self._registered_payload_current(
             generation, ValidatedGeneration, "generation"
         )
         if type(proof) is _IndexedGenerationProof:
-            if (
-                proof.scope_digest != self._scope_digest
-                or proof.report_digest != self._captured_input.report_digest
-                or proof.configuration_bytes
-                != self._captured_input.configuration_bytes
-                or proof.versions_digest
-                != self._captured_input._versions_digest  # noqa: SLF001 # Compare this import's captured validator versions.
-                or proof.witness != _indexed_generation_proof_witness(proof)
-                or proof.application_payload is None
-            ):
-                msg = "stale_session_capability"
-                raise ValueError(msg)
-            msg = "indexed_report_renderer_seal_deferred"
-            raise ValueError(msg)
+            application = self._check_indexed_generation_payload(proof)
+            for stage_proof in proof.stage_proofs:
+                evidence = self._registered_payload_current(
+                    stage_proof, StageProof, "stage"
+                )
+                _require_session(
+                    type(evidence) is _StageProofEvidence
+                    and evidence.witness == _stage_proof_witness(evidence),
+                    "stale_stage_proof",
+                )
+            _validate_indexed_report_surface(
+                application.base_report,
+                application.overlay,
+                application.reader,
+            )
+            return self._register_current(ValidatedReport, "report", proof)
         if type(proof) is not _GenerationProof:
             msg = "invalid_session_capability"
             raise ValueError(msg)
@@ -1561,11 +1596,423 @@ class ReportSession:
             assembly_version=_ASSEMBLY_VERSION,
             render_surface_version=_RENDER_SURFACE_VERSION,
         )
-        return self._register(ValidatedReport, "report", report_proof)
+        return self._register_current(ValidatedReport, "report", report_proof)
+
+    def _checked_report_data(
+        self, report: ValidatedReport
+    ) -> _IndexedApplicationPayload:
+        """Return the checked indexed payload for trusted output adapters.
+
+        Preconditions:
+            ``report`` is the exact live indexed report handle issued by this
+            session, and captured report/source/configuration bindings remain
+            current.
+        Postconditions:
+            Returns the registered ``_IndexedApplicationPayload`` with its
+            graph, record set, presentation reader, captured base, overlay,
+            original-run bytes, and version digest unchanged.
+        Essential behavior:
+            Rechecks capability identity, proof witness, graph root/table
+            pins, selectors, and current capture before trusted use. This is a
+            data accessor, not an authority source for caller dictionaries.
+        """
+        proof = self._registered_payload(report, ValidatedReport, "report")
+        if type(proof) is not _IndexedGenerationProof:
+            msg = "indexed_report_handle_required"
+            raise ValueError(msg)
+        return self._check_indexed_generation_payload(proof)
+
+    def iter_report_json(
+        self,
+        report: ValidatedReport,
+        *,
+        report_storage: str = "expanded",
+        max_output_bytes: int,
+    ) -> Iterator[bytes]:
+        """Return a bounded JSON stream for one registered applied report.
+
+        Preconditions:
+            ``report_storage`` is ``expanded`` or ``shared`` and
+            ``max_output_bytes`` is an exact nonnegative integer. Iteration
+            requires the exact live indexed ``ValidatedReport`` issued here.
+        Postconditions:
+            The complete stream is emitted only if it fits the byte cap and
+            the same capture and graph remain current at the end boundary.
+        Essential behavior:
+            Streams immutable indexed data directly, applies the private
+            overlay to expanded/shared report roots, and checks only registry
+            identity between output chunks.
+        """
+        if type(report_storage) is not str or report_storage not in {
+            "expanded",
+            "shared",
+        }:
+            msg = "unknown_report_storage"
+            raise ValueError(msg)
+        if type(max_output_bytes) is not int or max_output_bytes < 0:
+            msg = "invalid_output_limit"
+            raise ValueError(msg)
+        return self._iter_report_json(report, report_storage, max_output_bytes)
+
+    def _iter_report_json(
+        self,
+        report: ValidatedReport,
+        report_storage: str,
+        max_output_bytes: int,
+    ) -> Iterator[bytes]:
+        """Consume the exact checked application graph as bounded JSON chunks.
+
+        Preconditions:
+            The public method accepted the format and exact nonnegative cap.
+        Postconditions:
+            Returns only complete chunks within the cap and performs a final
+            full capture/graph check before iteration ends.
+        Essential behavior:
+            Checks identity/liveness between chunks without repeating the full
+            input, ledger, source, or proof traversal.
+        """
+        from .report_storage import _iter_bounded_json_chunks
+        from .report_storage import _iter_report_output_json
+
+        application = self._checked_report_data(report)
+        chunks = _iter_bounded_json_chunks(
+            _iter_report_output_json(
+                application.graph,
+                application.overlay,
+                report_storage=report_storage,
+            )
+        )
+        total_bytes = 0
+        for chunk in chunks:
+            self._registered_payload_current(report, ValidatedReport, "report")
+            if total_bytes + len(chunk) > max_output_bytes:
+                msg = "report_output_too_large"
+                raise ValueError(msg)
+            total_bytes += len(chunk)
+            yield chunk
+        if self._checked_report_data(report) is not application:
+            msg = "stale_session_capability"
+            raise ValueError(msg)
+
+    def iter_annotations_json(
+        self,
+        generation: ValidatedGeneration,
+        *,
+        report_storage: str = "expanded",
+        max_output_bytes: int,
+    ) -> Iterator[bytes]:
+        """Return a bounded annotation JSON stream for a registered generation.
+
+        Preconditions:
+            ``report_storage`` is ``expanded`` or ``shared`` and
+            ``max_output_bytes`` is an exact nonnegative integer. Iteration
+            requires this session's exact live indexed generation handle.
+        Postconditions:
+            Emits the compatibility annotation candidate or its closed shared
+            envelope only while the complete generation proof remains current.
+        Essential behavior:
+            Reuses the accepted proof graph and derives an annotation root over
+            its shared rows when the proof was imported from report storage.
+        """
+        if type(report_storage) is not str or report_storage not in {
+            "expanded",
+            "shared",
+        }:
+            msg = "unknown_report_storage"
+            raise ValueError(msg)
+        if type(max_output_bytes) is not int or max_output_bytes < 0:
+            msg = "invalid_output_limit"
+            raise ValueError(msg)
+        return self._iter_annotations_json(
+            generation, report_storage, max_output_bytes
+        )
+
+    def _iter_annotations_json(  # noqa: C901, PLR0912 # Keep root selection and output boundaries together.
+        self,
+        generation: ValidatedGeneration,
+        report_storage: str,
+        max_output_bytes: int,
+    ) -> Iterator[bytes]:
+        """Consume the exact checked generation graph as bounded JSON chunks.
+
+        Preconditions:
+            ``generation`` is this session's complete registered indexed
+            generation proof and the output options passed their public checks.
+        Postconditions:
+            Returns only complete chunks within the cap and rechecks the proof
+            and capture before iteration ends.
+        Essential behavior:
+            Derives a root-only annotation view over existing rows when the
+            source proof was a report, then streams without full expansion.
+        """
+        from .report_storage import IndexedReaderProjection
+        from .report_storage import ReportRecordGraph
+        from .report_storage import _annotation_reader_record
+        from .report_storage import _derive_annotation_graph
+        from .report_storage import _iter_annotation_output_json
+        from .report_storage import _iter_bounded_json_chunks
+
+        proof = self._checked_generation_data(generation)
+        graph = proof.graph
+        annotation_reader: Mapping[str, object] | None = None
+        annotation_metadata: Mapping[str, object] | None = None
+        if type(graph) is not ReportRecordGraph:
+            msg = "indexed_generation_handle_required"
+            raise ValueError(msg)
+        if graph.artifact_kind == "annotations":
+            annotation_graph = graph
+        elif graph.artifact_kind == "report":
+            reader = proof.reader
+            if type(reader) is not IndexedReaderProjection:
+                msg = "invalid_session_capability"
+                raise ValueError(msg)
+            if reader.shape == "presentation":
+                reader = IndexedReaderProjection(
+                    shape="annotations",
+                    document=reader.document,
+                    sections=reader.sections,
+                    context_details=reader.context_details,
+                    citations=reader.citations,
+                    support_provenance=reader.support_provenance,
+                )
+            if reader.shape != "annotations":
+                msg = "invalid_session_capability"
+                raise ValueError(msg)
+            meta = self._captured_input.report_view.get("meta")
+            if not isinstance(meta, Mapping):
+                msg = "invalid_report_metadata"
+                raise ValueError(msg)
+            annotation_metadata = {
+                "schema": "diffstory.annotations.v2",
+                "base_sha": meta["base_sha"],
+                "head_sha": meta["head_sha"],
+            }
+            if report_storage == "shared":
+                annotation_graph = _derive_annotation_graph(
+                    graph, reader, metadata=annotation_metadata
+                )
+            else:
+                annotation_reader = _annotation_reader_record(graph, reader)
+                annotation_graph = graph
+        else:
+            msg = "invalid_session_capability"
+            raise ValueError(msg)
+
+        chunks = _iter_bounded_json_chunks(
+            _iter_annotation_output_json(
+                annotation_graph,
+                report_storage=report_storage,
+                reader_record=annotation_reader,
+                metadata=(
+                    annotation_metadata
+                    if report_storage == "expanded"
+                    else None
+                ),
+            )
+        )
+        total_bytes = 0
+        for chunk in chunks:
+            self._registered_payload_current(
+                generation, ValidatedGeneration, "generation"
+            )
+            if total_bytes + len(chunk) > max_output_bytes:
+                msg = "annotations_output_too_large"
+                raise ValueError(msg)
+            total_bytes += len(chunk)
+            yield chunk
+        if self._checked_generation_data(generation) is not proof:
+            msg = "stale_session_capability"
+            raise ValueError(msg)
+
+    def _checked_generation_data(
+        self, generation: ValidatedGeneration
+    ) -> _IndexedGenerationProof:
+        """Return an exact current indexed generation proof for output adapters.
+
+        Preconditions:
+            ``generation`` is the exact live registered generation capability.
+        Postconditions:
+            Returns its original indexed proof only after capture, graph,
+            coverage, application pins, and every registered stage proof pass.
+        Essential behavior:
+            Reuses completed proof data without rebuilding a manifest, ledger,
+            request audit, source index, or candidate.
+        """
+        payload = self._registered_payload(
+            generation, ValidatedGeneration, "generation"
+        )
+        if type(payload) is not _IndexedGenerationProof:
+            msg = "indexed_generation_handle_required"
+            raise ValueError(msg)
+        self._check_indexed_generation_payload(payload)
+        for stage_proof in payload.stage_proofs:
+            evidence = self._registered_payload_current(
+                stage_proof, StageProof, "stage"
+            )
+            _require_session(
+                type(evidence) is _StageProofEvidence
+                and evidence.witness == _stage_proof_witness(evidence),
+                "stale_stage_proof",
+            )
+        return payload
+
+    def _check_indexed_generation_payload(
+        self, proof: _IndexedGenerationProof
+    ) -> _IndexedApplicationPayload:
+        """Recheck a registered indexed proof at its apply or output boundary.
+
+        Preconditions:
+            ``proof`` is the exact private generation payload already resolved
+            from this session's identity registry.
+        Postconditions:
+            Returns only its current application payload with exact graph,
+            generation, reader, original-run, capture, configuration, and
+            version bindings.
+        Essential behavior:
+            Reuses immutable completed proof evidence without constructing a
+            new manifest, presentation, ledger, or generation graph.
+        """
+        capture = self._captured_input
+        if (
+            type(proof) is not _IndexedGenerationProof
+            or type(proof.application_payload)
+            is not _IndexedApplicationPayload
+        ):
+            msg = "invalid_session_capability"
+            raise ValueError(msg)
+        application = proof.application_payload
+        try:
+            current_witness = _indexed_generation_proof_witness(proof)
+        except (AttributeError, TypeError, ValueError):
+            msg = "stale_session_capability"
+            raise ValueError(msg) from None
+        if (
+            proof.scope_digest != self._scope_digest
+            or proof.report_digest != capture.report_digest
+            or proof.configuration_bytes != capture.configuration_bytes
+            or proof.compiler_fact_signature != capture.compiler_signature
+            or proof.versions_digest != capture._versions_digest  # noqa: SLF001 # Compare the captured validation and compatibility versions.
+            or proof.witness != current_witness
+            or application.records is not proof.records
+            or application.base_report is not capture.report_view
+            or application.versions_digest != capture._versions_digest  # noqa: SLF001 # Compare the private application handoff version.
+            or proof.run_ref != proof.records.run_ref
+            or canonical_bytes(
+                proof.records.header.get("request_configuration")
+            )
+            != proof.configuration_bytes
+            or proof.records.header.get("compiler_fact_signature")
+            != proof.compiler_fact_signature
+            or not _graph_binding_is_current(proof.graph, proof.graph_binding)
+            or not _graph_binding_is_current(
+                application.graph, application.graph_binding
+            )
+        ):
+            msg = "stale_session_capability"
+            raise ValueError(msg)
+
+        from .report_storage import GenerationRecordSet
+        from .report_storage import IndexedReaderProjection
+        from .report_storage import ReportRecordGraph
+        from .report_storage import _check_reference_shape
+
+        if (
+            type(proof.graph) is not ReportRecordGraph
+            or type(application.graph) is not ReportRecordGraph
+            or type(proof.records) is not GenerationRecordSet
+            or type(application.reader) is not IndexedReaderProjection
+            or type(proof.reader) is not IndexedReaderProjection
+        ):
+            msg = "invalid_session_capability"
+            raise ValueError(msg)
+        report_root = application.graph._root  # noqa: SLF001 # Inspect only the application root selectors.
+        if (
+            report_root.get("shape") != "report"
+            or set(report_root)
+            != {"shape", "base_report", "generation", "reader"}
+            or report_root.get("base_report") is not application.base_report
+            or application.graph._artifact_kind != "report"  # noqa: SLF001 # Keep report-root kind exact.
+            or not _indexed_graph_matches_records(proof.graph, proof.records)
+            or not _indexed_graph_matches_records(
+                application.graph, proof.records
+            )
+            or _indexed_reader_facts(application.graph.reader_projection)
+            != _indexed_reader_facts(application.reader)
+            or _indexed_reader_facts(proof.graph.reader_projection)
+            != _indexed_reader_facts(
+                proof.reader
+                if proof.graph.artifact_kind == "annotations"
+                else application.reader
+            )
+        ):
+            msg = "indexed_graph_binding_changed"
+            raise ValueError(msg)
+        reader_id, reader_kind = _check_reference_shape(report_root["reader"])
+        reader_entry = application.graph._tables["readers"].get(  # noqa: SLF001 # Resolve only the root-selected reader row.
+            reader_id
+        )
+        run_reference = proof.records.run_ref
+        run_entry = application.graph._tables["runs"].get(  # noqa: SLF001 # Resolve only the captured original-run row.
+            run_reference.storage_id
+        )
+        if (
+            reader_kind != "reader"
+            or reader_entry is None
+            or reader_entry.get("kind") != "reader"
+            or reader_entry["record"].get("shape") != "presentation"
+            or run_entry is None
+            or run_entry.get("kind") != "run"
+            or type(application.original_run_bytes) is not bytes
+            or canonical_bytes(_thaw_owned(run_entry["record"]))
+            != application.original_run_bytes
+        ):
+            msg = "indexed_graph_binding_changed"
+            raise ValueError(msg)
+        return application
 
     def report_data(self, report: ValidatedReport) -> dict:
-        """Return a detached report only for a live registered report handle."""
+        """Return detached compatibility report data for a live report handle.
+
+        Preconditions:
+            ``report`` is the exact registered report capability for this open
+            session.
+        Postconditions:
+            Returns detached report data; caller mutation cannot change any
+            captured base, graph row, or report capability.
+        Essential behavior:
+            Expands indexed graphs only for this explicit compatibility API and
+            restores the existing generation-storage.v1 representation.
+        """
         proof = self._registered_payload(report, ValidatedReport, "report")
+        if type(proof) is _IndexedGenerationProof:
+            application = self._check_indexed_generation_payload(proof)
+            from .narrative_manifest import V2Presentation
+            from .narrative_manifest import stored_generation
+            from .report_storage import _tuple_model_input
+            from .report_storage import expand_report_storage
+
+            expanded = expand_report_storage(
+                application.graph,
+                max_output_bytes=(1 << 63) - 1,
+            )
+            expanded["generation"] = stored_generation(
+                persisted_manifest(expanded["generation"])
+            )
+            overlay = _thaw_owned(application.overlay)
+            expanded["document"] = overlay["document"]
+            groups_by_id = {group["id"]: group for group in expanded["groups"]}
+            for item in overlay["groups"]:
+                group = groups_by_id.get(item["group_id"])
+                if group is None:
+                    msg = "invalid_indexed_applied_fields"
+                    raise ValueError(msg)
+                for field in ("title", "number", "next_id", "narrative"):
+                    group[field] = item[field]
+            presentation = V2Presentation.model_validate(
+                _tuple_model_input(expanded["narrative_v2"])
+            )
+            expanded["narrative_v2"] = presentation.model_dump(mode="json")
+            return expanded
         if type(proof) is not _ReportProof:
             msg = "invalid_session_capability"
             raise ValueError(msg)
@@ -1670,6 +2117,28 @@ class ReportSession:
         """
         self._require_open()
         self._captured_input.assert_capture_current()
+        handle = cls(_ISSUER_TOKEN)
+        self._registrations[id(handle)] = (handle, kind, payload)
+        return handle
+
+    def _register_current(
+        self, cls: type, kind: str, payload: object
+    ) -> object:
+        """Issue a local handle after the enclosing operation checked capture.
+
+        Preconditions:
+            The synchronous enclosing operation just checked captured input,
+            and ``payload`` belongs to this live session scope.
+        Postconditions:
+            Returns a handle registered to this exact session and payload.
+        Essential behavior:
+            Preserves exact identity, kind, liveness, and scope checks without
+            starting another full capture traversal.
+        """
+        self._require_open()
+        if getattr(payload, "scope_digest", None) != self._scope_digest:
+            msg = "stale_session_capability"
+            raise ValueError(msg)
         handle = cls(_ISSUER_TOKEN)
         self._registrations[id(handle)] = (handle, kind, payload)
         return handle
@@ -2718,6 +3187,8 @@ class ReportSession:
         from .narrative_manifest import assemble_indexed_reader
         from .narrative_manifest import indexed_applied_fields
         from .report_storage import GenerationRecordSet
+        from .report_storage import IndexedReaderProjection
+        from .report_storage import _derive_report_graph
 
         self._require_open()
         expected = self._recordset_for_production(stage_proofs)
@@ -2820,6 +3291,26 @@ class ReportSession:
                 },
             },
         )
+        application_reader = IndexedReaderProjection(
+            shape="presentation",
+            document=reader.document,
+            sections=reader.sections,
+            context_details=reader.context_details,
+            citations=reader.citations,
+            support_provenance=reader.support_provenance,
+            version="diffstory.presentation.v2",
+            provenance="model-generated · unverified",
+        )
+        application_graph = _derive_report_graph(
+            graph,
+            records,
+            application_reader,
+            base_report=report,
+        )
+        overlay_value = _freeze_report(overlay)
+        original_run_bytes = canonical_bytes(
+            inputs.run.model_dump(mode="json")
+        )
         proof = _IndexedGenerationProof(
             scope_digest=self._scope_digest,
             report_digest=self._captured_input.report_digest,
@@ -2828,9 +3319,19 @@ class ReportSession:
             records=records,
             graph=graph,
             reader=reader,
-            overlay=_freeze_report(overlay),
+            overlay=overlay_value,
             run_ref=records.run_ref,
-            application_payload=None,
+            application_payload=_IndexedApplicationPayload(
+                graph=application_graph,
+                records=records,
+                reader=application_reader,
+                base_report=report,
+                overlay=overlay_value,
+                original_run_bytes=original_run_bytes,
+                versions_digest=self._captured_input._versions_digest,  # noqa: SLF001 # Bind the accepted validation and compatibility versions.
+                graph_binding=_capture_graph_binding(application_graph),
+            ),
+            graph_binding=_capture_graph_binding(graph),
             stage_proofs=stage_proofs,
             versions_digest=self._captured_input._versions_digest,  # noqa: SLF001 # Bind the accepted validator/compatibility versions.
             witness="",
@@ -3304,6 +3805,108 @@ def _generation_recordset_witness(records: object) -> str:
     )
 
 
+def _capture_graph_binding(graph: object) -> tuple[object, ...]:
+    """Pin graph roots, table maps, and indexes without hashing all rows.
+
+    Preconditions:
+        ``graph`` is the exact sealed ``ReportRecordGraph`` created by this
+        session or its bytes-only import parser.
+    Postconditions:
+        Returns strong identity pins for the root, immutable table views, and
+        indexes. Table rows are recursively immutable and remain shared.
+    Essential behavior:
+        Makes frozen-object field substitution visible at each consumer
+        boundary without a full graph digest scan.
+    """
+    from .report_storage import ReportRecordGraph
+
+    if type(graph) is not ReportRecordGraph:
+        msg = "invalid_report_graph"
+        raise ValueError(msg)
+    table_views = tuple(
+        (name, graph._tables[name])  # noqa: SLF001 # Retain only immutable table view identities.
+        for name in graph._tables  # noqa: SLF001 # Preserve the exact current table set.
+    )
+    return (
+        graph._root,  # noqa: SLF001 # The frozen root is identity-pinned.
+        graph._tables,  # noqa: SLF001 # The frozen outer table map is identity-pinned.
+        table_views,
+        graph._result_by_key,  # noqa: SLF001 # The result selector index is identity-pinned.
+        graph._result_by_id,  # noqa: SLF001 # The reverse result selector index is identity-pinned.
+        graph._typed_validation_counts,  # noqa: SLF001 # Structural evidence remains from this graph.
+        graph._artifact_kind,  # noqa: SLF001 # Root kind is a stable scalar binding.
+        graph._raw,  # noqa: SLF001 # Session-created graphs do not retain input bytes.
+    )
+
+
+def _graph_binding_is_current(graph: object, binding: object) -> bool:
+    """Check the exact immutable graph objects retained at issuance."""
+    if type(binding) is not tuple or len(binding) != _GRAPH_BINDING_SIZE:
+        return False
+    try:
+        root, tables, table_views, by_key, by_id, counts, kind, raw = binding
+        return (
+            graph._root is root  # noqa: SLF001 # Compare immutable root identity.
+            and graph._tables is tables  # noqa: SLF001 # Compare immutable table-map identity.
+            and type(table_views) is tuple
+            and all(
+                graph._tables.get(name) is view  # noqa: SLF001 # Compare each table view without scanning its records.
+                for name, view in table_views
+            )
+            and len(table_views) == len(graph._tables)  # noqa: SLF001 # Detect substituted table membership.
+            and graph._result_by_key is by_key  # noqa: SLF001 # Compare result index identity.
+            and graph._result_by_id is by_id  # noqa: SLF001 # Compare reverse index identity.
+            and graph._typed_validation_counts is counts  # noqa: SLF001 # Compare structural-count identity.
+            and graph._artifact_kind == kind  # noqa: SLF001 # Compare report/annotation family.
+            and graph._raw is raw  # noqa: SLF001 # Session graphs have no raw input alias.
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _graph_binding_witness(graph: object, binding: object) -> str:
+    """Witness expected and current graph identities at one trust boundary."""
+    if type(binding) is not tuple or len(binding) != _GRAPH_BINDING_SIZE:
+        return semantic_digest("diffstory.session.graph-binding.invalid.v1")
+    try:
+        expected_table_views = tuple(
+            (name, id(view)) for name, view in binding[2]
+        )
+        current_table_views = tuple(
+            (name, id(view))
+            for name, view in graph._tables.items()  # noqa: SLF001 # Read table-map identities only.
+        )
+        current = (
+            id(getattr(graph, "_root", None)),
+            id(getattr(graph, "_tables", None)),
+            current_table_views,
+            id(getattr(graph, "_result_by_key", None)),
+            id(getattr(graph, "_result_by_id", None)),
+            id(getattr(graph, "_typed_validation_counts", None)),
+            getattr(graph, "_artifact_kind", None),
+            id(getattr(graph, "_raw", None)),
+        )
+        expected = (
+            id(binding[0]),
+            id(binding[1]),
+            expected_table_views,
+            id(binding[3]),
+            id(binding[4]),
+            id(binding[5]),
+            binding[6],
+            id(binding[7]),
+        )
+        return semantic_digest(
+            "diffstory.session.graph-binding.v1",
+            id(graph),
+            id(binding),
+            expected,
+            current,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return semantic_digest("diffstory.session.graph-binding.invalid.v1")
+
+
 def _indexed_generation_proof_witness(
     proof: _IndexedGenerationProof,
 ) -> str:
@@ -3311,18 +3914,19 @@ def _indexed_generation_proof_witness(
     reader_facts = _indexed_reader_facts(proof.reader)
     application = proof.application_payload
     application_facts = (
-        None
-        if application is None
-        else (
-            id(application),
-            id(application.graph),
-            _generation_recordset_witness(application.records),
-            _indexed_reader_facts(application.reader),
-            id(application.base_report),
-            content_digest(_raw_integrity_bytes(application.overlay)),
-            content_digest(application.original_run_bytes),
-            application.versions_digest,
-        )
+        id(application),
+        id(application.graph),
+        id(application.records),
+        _generation_recordset_witness(application.records),
+        id(application.reader),
+        _indexed_reader_facts(application.reader),
+        id(application.base_report),
+        id(application.overlay),
+        content_digest(_raw_integrity_bytes(application.overlay)),
+        id(application.original_run_bytes),
+        content_digest(application.original_run_bytes),
+        application.versions_digest,
+        _graph_binding_witness(application.graph, application.graph_binding),
     )
     return semantic_digest(
         "diffstory.session.indexed-generation-proof.v1",
@@ -3330,12 +3934,19 @@ def _indexed_generation_proof_witness(
         proof.report_digest,
         content_digest(proof.configuration_bytes),
         proof.compiler_fact_signature,
+        id(proof.records),
         _generation_recordset_witness(proof.records),
         id(proof.graph),
+        id(proof.graph_binding),
+        _graph_binding_witness(proof.graph, proof.graph_binding),
+        id(proof.reader),
         reader_facts,
+        id(proof.overlay),
         content_digest(_raw_integrity_bytes(proof.overlay)),
+        id(proof.run_ref),
         _record_reference_facts(proof.run_ref),
         application_facts,
+        id(proof.stage_proofs),
         tuple(id(item) for item in proof.stage_proofs),
         proof.versions_digest,
     )
@@ -3378,6 +3989,64 @@ def _indexed_reader_facts(reader: object) -> tuple[object, ...]:
         getattr(reader, "version", None),
         getattr(reader, "provenance", None),
     )
+
+
+def _indexed_graph_matches_records(graph: object, records: object) -> bool:
+    """Compare root generation selectors with the exact registered record set.
+
+    Preconditions:
+        ``graph`` and ``records`` are immutable session-owned graph and
+        ``GenerationRecordSet`` values whose table rows passed structural
+        validation at issue or import time.
+    Postconditions:
+        Returns true only when header fields and every ordered generation
+        address select the same records and coverage.
+    Essential behavior:
+        Checks compact selectors without expanding result, audit, or prose rows.
+    """
+    from .report_storage import GenerationRecordSet
+    from .report_storage import ReportRecordGraph
+
+    if (
+        type(graph) is not ReportRecordGraph
+        or type(records) is not GenerationRecordSet
+    ):
+        return False
+    generation = graph._root.get("generation")  # noqa: SLF001 # Inspect the exact root generation selector.
+    if not isinstance(generation, Mapping):
+        return False
+    reference_fields = {
+        "run",
+        "details",
+        "plan",
+        "planning",
+        "sections",
+        "document",
+        "producers",
+        "receipts",
+    }
+    header = {
+        key: value
+        for key, value in generation.items()
+        if key not in reference_fields
+    }
+    try:
+        if canonical_bytes(header) != canonical_bytes(records.header):
+            return False
+        bindings = graph.generation_record_refs
+        results = bindings["results"]
+        return (
+            bindings["run"] == records.run_ref
+            and bindings["plan"] == records.plan_ref
+            and bindings["producers"] == records.producers
+            and bindings["receipts"] == records.receipts
+            and results["details"] == records.details
+            and results["planning"] == records.planning
+            and results["sections"] == records.sections
+            and results["document"] == (records.document,)
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _transport_witness(transport: object) -> tuple[object, ...]:

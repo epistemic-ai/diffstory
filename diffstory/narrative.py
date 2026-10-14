@@ -3954,6 +3954,91 @@ class Narrator:
         )
         return results[0], self._assemble_steps(context, results[1:])
 
+    def generate_validated(self, report: dict, *, session: object) -> object:
+        """Run v2 narration and return its session-owned generation handle.
+
+        Preconditions:
+            This narrator uses ``architecture="v2"``; it has not started a
+            generation job; ``report`` matches its preview; and ``session`` is
+            an open ``ReportSession`` captured with the same request descriptor.
+        Postconditions:
+            Returns the exact ``ValidatedGeneration`` issued by the supplied
+            session. The caller retains responsibility for keeping that
+            session open through apply and any later trusted output operations.
+        Essential behavior:
+            Delegates to the existing batched traversal, adopts its exact
+            preview capture when present, and preserves facade provider,
+            runtime, usage, and one-generation bookkeeping checks.
+
+        Raises:
+            ValueError: If this is the legacy architecture or generation has
+                already started.
+            ArtifactRuntimeError: If the provider changed after preview.
+        """
+        if self._v2 is None:
+            msg = "validated_generation_requires_v2"
+            raise ValueError(msg)
+        if self._generation_started:
+            msg = "A narrator instance can run only one generation job"
+            raise ValueError(msg)
+        if self.provider is not self._v2.provider:
+            msg = "dependencies_changed"
+            raise ArtifactRuntimeError(msg)
+        try:
+            return self._v2.generate_validated(report, session=session)
+        finally:
+            self.runtime = self._v2.runtime
+            self._generation_started = self._v2.started
+
+    def capture_session(self, report: dict) -> object:
+        """Create a session that directly owns this narrator's preview capture.
+
+        Preconditions:
+            This narrator uses ``architecture="v2"``, has not started
+            generation, and ``report`` matches the current approval preview.
+        Postconditions:
+            Returns one open ``ReportSession`` bound to the exact private
+            capture and request descriptor already checked by v2 preview.
+        Essential behavior:
+            Runs preview only when needed and transfers its detached capture
+            without taking another report snapshot.
+
+        Raises:
+            ValueError: If legacy mode, generation state, or capture ownership
+                prevents creating a session.
+            ArtifactRuntimeError: If provider identity, options, run, or report
+                approval changed after preview.
+        """
+        if self._v2 is None:
+            msg = "session_capture_requires_v2"
+            raise ValueError(msg)
+        if self._generation_started or self._v2.started:
+            msg = "A narrator instance can run only one generation job"
+            raise ValueError(msg)
+        if self.provider is not self._v2.provider:
+            msg = "dependencies_changed"
+            raise ArtifactRuntimeError(msg)
+
+        if self._v2.inputs is None:
+            self.preview(report)
+        else:
+            self._v2.check_approval(report)
+
+        if self._generation_started or self._v2.started:
+            msg = "A narrator instance can run only one generation job"
+            raise ValueError(msg)
+        if self.provider is not self._v2.provider:
+            msg = "dependencies_changed"
+            raise ArtifactRuntimeError(msg)
+        if self._v2.inputs is None:
+            msg = "preview_capture_missing"
+            raise ValueError(msg)
+
+        from .narrative_session import ReportSession
+
+        captured_input = self._v2.inputs._captured_input  # noqa: SLF001 # Transfer only the approved, exact preview capture.
+        return ReportSession._from_preview_capture(captured_input)  # noqa: SLF001 # The private factory binds that existing capture to one session.
+
     def generate(self, report: dict) -> dict:
         """
         Generate complete revision-bound candidate annotations or fail closed.

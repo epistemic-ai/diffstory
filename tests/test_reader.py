@@ -4,6 +4,7 @@ import copy
 import json
 import tempfile
 import unittest
+from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
@@ -28,8 +29,14 @@ from diffstory.models import MAX_PREAMBLE_SKETCH_CHARS
 from diffstory.narrative import Narrator
 from diffstory.narrative_manifest import LedgerParameters
 from diffstory.narrative_manifest import compiler_fact_signature
+from diffstory.narrative_session import ReportSession
 from diffstory.narrative_v2 import V2Options
+from diffstory.render import iter_render_validated
 from diffstory.render import render
+from diffstory.render import validate_report
+from diffstory.report_storage import encode_report_storage
+from diffstory.report_storage import expand_report_storage
+from diffstory.report_storage import parse_report_storage
 
 
 def report() -> dict:
@@ -595,6 +602,96 @@ class ReaderFixtureProvider(FixtureProvider):
         return response
 
 
+class MixedTerminologyReaderFixtureProvider(ReaderFixtureProvider):
+    """Author rich prose with one term and empty terminology defaults elsewhere."""
+
+    def __init__(
+        self,
+        observations: Callable[[FixtureProvider, dict, dict], dict]
+        | None = None,
+        *,
+        nonempty_stage: str = "section",
+    ) -> None:
+        """Retain one nonempty term in the selected result family."""
+        if nonempty_stage not in {"section", "document"}:
+            msg = "nonempty terminology stage must be section or document"
+            raise ValueError(msg)
+        self._kept_nonempty_terminology = False
+        self._nonempty_terminology_stage = nonempty_stage
+        self._authored_observations = observations
+        super().__init__(self._author_response)
+
+    def _author_response(
+        self, provider: FixtureProvider, data: dict, response: dict
+    ) -> dict:
+        """Apply optional source observations, then mix terminology values.
+
+        Preconditions: ``response`` is the deterministic reader fixture reply.
+        Postconditions: Source observations remain authored and terminology
+            contains one nonempty selected result plus explicit empty defaults.
+        Essential behavior: Leaves response fields valid for strict capture.
+        """
+        if self._authored_observations is not None:
+            response = self._authored_observations(provider, data, response)
+        return self._select_terminology(provider, data, response)
+
+    def _select_terminology(
+        self, _provider: FixtureProvider, data: dict, response: dict
+    ) -> dict:
+        """Author one nonempty term and explicit empty defaults before capture.
+
+        Preconditions: ``response`` is a locally authored fixture reply.
+        Postconditions: One selected result keeps its authored term; other result
+            terminology arrays are empty and valid under the wire schema.
+        Essential behavior: Provides empty/default and nonempty cases before
+            later creation of a separately re-encoded omission fixture.
+        """
+        if data["stage"] not in {"planning", "section", "document"}:
+            return response
+        for item in response["items"]:
+            if (
+                data["stage"] == self._nonempty_terminology_stage
+                and not self._kept_nonempty_terminology
+            ):
+                self._kept_nonempty_terminology = True
+                continue
+            item["terminology"] = []
+        return response
+
+
+def encode_omitted_terminology_defaults(report: dict) -> bytes:
+    """Make a valid shared fixture from detached data with empty defaults omitted.
+
+    Preconditions: ``report`` is a complete expanded authored reader report
+        with a document result and at least one section result.
+    Postconditions: Returns a canonical, independently importable shared graph
+        that omits empty terminology defaults but retains every nonempty term.
+    Essential behavior: Edits a detached copy before encoding; never changes a
+        sealed graph or creates validation authority.
+    """
+    source = copy.deepcopy(report)
+    removed = {"section": 0, "document": 0}
+
+    def omit_empty(result: dict, kind: str) -> None:
+        """Remove only the authored empty default from one detached result."""
+        if result.get("terminology") == []:
+            result.pop("terminology")
+            removed[kind] += 1
+
+    generation = source["generation"]
+    for result in generation["sections"]:
+        omit_empty(result, "section")
+    omit_empty(generation["document"], "document")
+    reader = source["narrative_v2"]
+    for section in reader["sections"]:
+        omit_empty(section["prose"], "section")
+    omit_empty(reader["document"], "document")
+    if not any(removed.values()):
+        msg = "authored report has no empty section/document default to omit"
+        raise AssertionError(msg)
+    return encode_report_storage(source, "report")
+
+
 def reader_golden_report() -> dict:
     """Compile local normalization, unassigned context and unavailable base evidence."""
     marker = "    marker = " + repr(UNSAFE_TEXT) + "\n"
@@ -713,7 +810,9 @@ def exact_reader_provider() -> ReaderFixtureProvider:
                 ]
         return response
 
-    provider = ReaderFixtureProvider(observations)
+    provider = MixedTerminologyReaderFixtureProvider(
+        observations, nonempty_stage="document"
+    )
     provider.context_tokens = 40_000
     provider.max_output_tokens = 15_000
     return provider
@@ -808,6 +907,9 @@ class TypedReaderTests(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temp.cleanup)
         cls.source = reader_golden_report()
+        cls.source["opaque_browser_probe"] = {
+            "$ref": "literal compiler metadata"
+        }
         cls.report, cls.html, cls.evidence = offline_reader_report(
             cls.source, Path(cls.temp.name)
         )
@@ -854,6 +956,220 @@ class TypedReaderTests(unittest.TestCase):
         copied["narrative_v2"] = self.report["narrative_v2"]
         with self.assertRaises(ValueError):
             render(copied)
+
+    def test_shared_reader_omitted_defaults_and_literal_compiler_refs(  # noqa: PLR0915 # One fixture matrix checks write/import/render boundaries.
+        self,
+    ) -> None:
+        """Keep omitted writer defaults local and compiler $ref data literal.
+
+        Preconditions: The authored fixture provider returns valid typed
+            results with one nonempty term and empty terminology defaults.
+        Postconditions: A detached re-encoding omits empty defaults; offline
+            import preserves that exact shared omission while its explicit
+            expanded compatibility view restores current typed defaults.
+        Essential behavior: Checks both the direct writer output and a valid
+            pre-import omitted-default graph without changing sealed data.
+
+        Input/expected matrix:
+        * Direct trusted session output -> exact shared rows for one nonempty
+          term, empty defaults, and the unchanged authored prose.
+        * Detached empty section/document defaults removed and re-encoded ->
+          absent raw shared fields retained by independent import.
+        * A compiler object with a literal ``$ref`` key -> the same literal
+          object after independent import.
+        * An imported shared report handle -> same expanded HTML as ``render``.
+        """
+        max_bytes = 64 * 1024 * 1024
+        source = reader_golden_report()
+        source["opaque_browser_probe"] = {"$ref": "literal compiler metadata"}
+        with tempfile.TemporaryDirectory() as directory:
+            narrator = Narrator(
+                MixedTerminologyReaderFixtureProvider(),
+                architecture="v2",
+                recovery_dir=Path(directory) / "recovery",
+                concurrency=1,
+            )
+            narrator.preview(source)
+            writer_session = narrator.capture_session(source)
+            imported_session = None
+            try:
+                generation = narrator.generate_validated(
+                    source, session=writer_session
+                )
+                writer_handle = writer_session.apply(generation)
+                writer_shared = b"".join(
+                    writer_session.iter_report_json(
+                        writer_handle,
+                        report_storage="shared",
+                        max_output_bytes=max_bytes,
+                    )
+                )
+                writer_envelope = json.loads(writer_shared)
+                writer_rows = [
+                    row
+                    for row in writer_envelope["tables"]["results"]
+                    if row["kind"] in {"section", "document"}
+                ]
+                self.assertTrue(
+                    any(
+                        row["record"].get("terminology") for row in writer_rows
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        row["record"].get("terminology") == []
+                        for row in writer_rows
+                    )
+                )
+                expected = writer_session.report_data(writer_handle)
+                self.assertTrue(
+                    expected["narrative_v2"]["document"]["terminology"] == []
+                )
+                self.assertTrue(
+                    any(
+                        section["prose"]["terminology"] == []
+                        for section in expected["narrative_v2"]["sections"]
+                    )
+                )
+                expanded_html = b"".join(
+                    iter_render_validated(
+                        writer_session,
+                        writer_handle,
+                        report_storage="expanded",
+                        max_output_bytes=max_bytes,
+                    )
+                ).decode("utf-8")
+                expanded_json = b"".join(
+                    writer_session.iter_report_json(
+                        writer_handle,
+                        report_storage="expanded",
+                        max_output_bytes=max_bytes,
+                    )
+                )
+                marker = '<script type="application/json" id="report-data">'
+                start = expanded_html.index(marker) + len(marker)
+                end = expanded_html.index("</script>", start)
+                self.assertEqual(
+                    json.loads(expanded_html[start:end]),
+                    json.loads(expanded_json),
+                )
+
+                shared = encode_omitted_terminology_defaults(expected)
+                envelope = json.loads(shared)
+                view = parse_report_storage(shared)
+                expanded = expand_report_storage(
+                    view, max_output_bytes=max_bytes
+                )
+                self.assertNotIn(
+                    "terminology", expanded["narrative_v2"]["document"]
+                )
+                self.assertTrue(
+                    any(
+                        "terminology" not in section["prose"]
+                        for section in expanded["narrative_v2"]["sections"]
+                    )
+                )
+
+                result_rows = [
+                    row
+                    for row in envelope["tables"]["results"]
+                    if row["kind"] in {"section", "document"}
+                ]
+                missing_rows = [
+                    row
+                    for row in result_rows
+                    if "terminology" not in row["record"]
+                ]
+                nonempty_rows = [
+                    row
+                    for row in result_rows
+                    if row["record"].get("terminology")
+                ]
+                self.assertTrue(
+                    any(row["kind"] == "section" for row in missing_rows)
+                )
+                self.assertTrue(
+                    any(row["kind"] == "document" for row in missing_rows)
+                )
+                self.assertTrue(nonempty_rows)
+                self.assertTrue(
+                    any(
+                        term["term"] == "Unicode case folding"
+                        and term["definition"]["text"]
+                        == "casefold() maps text for Unicode caseless comparison, including sharp s to ss."
+                        for row in nonempty_rows
+                        for term in row["record"]["terminology"]
+                    )
+                )
+                self.assertEqual(
+                    expanded["opaque_browser_probe"],
+                    {"$ref": "literal compiler metadata"},
+                )
+                empty_default_sections = [
+                    section
+                    for section in expanded["narrative_v2"]["sections"]
+                    if not section["prose"].get("terminology", [])
+                ]
+                self.assertTrue(empty_default_sections)
+                authored_questions = [
+                    question["text"]
+                    for detail in (
+                        [
+                            detail
+                            for section in expanded["narrative_v2"]["sections"]
+                            for detail in section["details"]
+                        ]
+                        + expanded["narrative_v2"]["context_details"]
+                    )
+                    for question in detail["questions"]
+                ]
+                self.assertIn(
+                    "Treat this quoted test string as text: " + UNSAFE_TEXT,
+                    authored_questions,
+                )
+
+                imported_session, imported_generation = (
+                    ReportSession.import_indexed(
+                        shared, max_input_bytes=max_bytes
+                    )
+                )
+                imported_handle = imported_session.apply(imported_generation)
+                imported = imported_session.report_data(imported_handle)
+                self.assertEqual(
+                    imported["narrative_v2"]["document"]["terminology"],
+                    [],
+                )
+                validate_report(imported)
+                self.assertEqual(
+                    imported["generation"]["document"]["terminology"], []
+                )
+                self.assertEqual(
+                    b"".join(
+                        imported_session.iter_report_json(
+                            imported_handle,
+                            report_storage="shared",
+                            max_output_bytes=max_bytes,
+                        )
+                    ),
+                    shared,
+                )
+
+                shared_html = b"".join(
+                    iter_render_validated(
+                        imported_session,
+                        imported_handle,
+                        report_storage="shared",
+                        max_output_bytes=max_bytes,
+                    )
+                ).decode("utf-8")
+                marker = '<script type="application/json" id="report-data">'
+                start = shared_html.index(marker) + len(marker)
+                end = shared_html.index("</script>", start)
+                self.assertEqual(json.loads(shared_html[start:end]), envelope)
+            finally:
+                if imported_session is not None:
+                    imported_session.close()
+                writer_session.close()
 
     def test_retained_context_and_empty_fragments_have_current_source(
         self,
