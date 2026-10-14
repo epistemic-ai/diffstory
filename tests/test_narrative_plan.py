@@ -6,7 +6,9 @@ import copy
 import json
 import pickle
 import unittest
+from collections import Counter
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 from unittest import mock
 
 from pydantic import ValidationError
@@ -27,6 +29,7 @@ from diffstory.narrative_contracts import FactualObservation
 from diffstory.narrative_contracts import GroupSpec
 from diffstory.narrative_contracts import PlanningGroup
 from diffstory.narrative_contracts import SourceSpan
+from diffstory.narrative_contracts import SpanRef
 from diffstory.narrative_contracts import SupportedStatement
 from diffstory.narrative_contracts import Terminology
 from diffstory.narrative_plan import CitationResolutionScope
@@ -57,6 +60,36 @@ from diffstory.narrative_plan import validate_story_order
 from diffstory.narrative_plan import validate_story_plan
 from diffstory.narrative_plan import validate_story_requests
 from diffstory.usage import ModelCapacity
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import FrameType
+
+
+def _span_validator_profiler(
+    counts: Counter[str],
+) -> Callable[[FrameType, str, object], None]:
+    """Build a profiler that counts actual nested span-validator calls.
+
+    Preconditions:
+        ``counts`` is the mutable counter for one measured operation.
+    Postconditions:
+        Returns a call profiler that increments ``span_ref_ranges`` only for
+        actual ``SpanRef.ranges`` Python executions.
+    Essential behavior:
+        Exposes nested structural work that top-level parser mocks omit.
+    """
+
+    def profile(frame: FrameType, event: str, _arg: object) -> None:
+        if (
+            event == "call"
+            and frame.f_code.co_name == "ranges"
+            and isinstance(frame.f_locals.get("self"), SpanRef)
+        ):
+            counts["span_ref_ranges"] += 1
+
+    return profile
+
 
 BEFORE = 'def normalize(value):\n    value = value.strip()\n    marker = "request"\n    return value.lower()\n'
 AFTER = 'def normalize(value):\n    value = value.rstrip()\n    marker = "request"\n    return value.casefold()\n'
@@ -2320,6 +2353,211 @@ class IndexedGraphDetailTests(unittest.TestCase):
         finally:
             object.__setattr__(graph, "_tables", original_tables)
             context.citation_scope.close()
+
+    def test_arena_detail_binding_reuses_structure_and_keeps_owned_rows(
+        self,
+    ) -> None:
+        """Reject structural reparsing after early arena detail capture."""
+        import copy
+        import sys
+
+        from diffstory.narrative_plan import (
+            _capture_indexed_arena_detail_results,
+        )
+        from diffstory.report_storage import ResultRef
+        from diffstory.report_storage import _RecordArena
+
+        caller_details = copy.deepcopy(self.expanded_details)
+        arena = _RecordArena()
+        validator_calls = Counter()
+        trace_span_validator = _span_validator_profiler(validator_calls)
+        previous_profile = sys.getprofile()
+        sys.setprofile(trace_span_validator)
+        capture_validator_calls = 0
+        with (
+            mock.patch.object(
+                DetailResult,
+                "model_validate_json",
+                wraps=DetailResult.model_validate_json,
+            ) as detail_parses,
+            mock.patch.object(
+                DetailResult,
+                "model_validate",
+                side_effect=AssertionError("arena adapter reparsed a detail"),
+            ),
+            mock.patch.object(
+                SpanRef,
+                "model_validate",
+                side_effect=AssertionError(
+                    "arena adapter reparsed a span ref"
+                ),
+            ),
+            mock.patch.object(
+                plan_module,
+                "_validate_detail_result",
+                wraps=plan_module._validate_detail_result,  # noqa: SLF001 # Count full contextual checks.
+            ) as contextual_checks,
+            mock.patch.object(
+                plan_module,
+                "_resolve_span_ref",
+                wraps=plan_module._resolve_span_ref,  # noqa: SLF001 # Count actual source reads.
+            ) as source_resolutions,
+        ):
+            try:
+                references = tuple(
+                    arena.put_result(item) for item in caller_details
+                )
+                capture_validator_calls = validator_calls["span_ref_ranges"]
+                context = _capture_indexed_arena_detail_results(
+                    references, arena, self.ledger, index=self.index
+                )
+            finally:
+                sys.setprofile(previous_profile)
+
+        self.assertEqual(detail_parses.call_count, len(references))
+        self.assertEqual(contextual_checks.call_count, len(references))
+        self.assertGreater(capture_validator_calls, 0)
+        self.assertEqual(
+            validator_calls["span_ref_ranges"], capture_validator_calls
+        )
+        self.assertGreaterEqual(
+            arena.typed_validation_counts.get("evidence_refs:span_ref", 0), 1
+        )
+        self.assertEqual(
+            source_resolutions.call_count,
+            context.citation_scope.resolution_count,
+        )
+        self.assertGreater(source_resolutions.call_count, 0)
+        self.assertEqual(tuple(context.references), references)
+        self.assertEqual(context._graph, None)  # noqa: SLF001 # Arena ownership has no complete graph input.
+        self.assertEqual(dict(context._typed_by_unit), {})  # noqa: SLF001 # The context stores no detail model map.
+        self.assertEqual(arena._builder.typed_results, {})  # noqa: SLF001 # Capture releases parsed detail models.
+        self.assertTrue(
+            all(
+                row["kind"] == "detail"
+                for row in context._arena_reader._tables["results"].values()  # noqa: SLF001 # Verify the early shallow reader contains details only.
+            )
+        )
+        for original in self.expanded_details:
+            self.assertEqual(
+                canonical_bytes(context.detail_record(original["unit_key"])),
+                canonical_bytes(original),
+            )
+        caller_details[0]["unit_key"] = "0" * 64
+        selected_unit = self.expanded_details[0]["unit_key"]
+        detached = context.detail_record(selected_unit)
+        detached["explanations"].clear()
+        self.assertTrue(context.detail_record(selected_unit)["explanations"])
+
+        altered_references = (
+            (
+                "storage address changed",
+                ResultRef(
+                    references[0].table,
+                    references[0].kind,
+                    "f" * 64,
+                    references[0].item_key,
+                ),
+            ),
+            (
+                "item binding changed",
+                ResultRef(
+                    references[0].table,
+                    references[0].kind,
+                    references[0].storage_id,
+                    "f" * 64,
+                ),
+            ),
+        )
+        for concern, altered_reference in altered_references:
+            with (
+                self.subTest(concern=concern),
+                self.assertRaisesRegex(
+                    ValueError, "foreign_storage_result_reference"
+                ),
+            ):
+                _capture_indexed_arena_detail_results(
+                    (altered_reference, *references[1:]),
+                    arena,
+                    self.ledger,
+                    index=self.index,
+                )
+        context.citation_scope.close()
+        with self.assertRaisesRegex(ValueError, "unregistered_detail_context"):
+            _ = context.unit_keys
+
+    def test_arena_detail_context_rejects_private_backing_rebinds(
+        self,
+    ) -> None:
+        """Reject selectors or reader indexes rebound after scope registration."""
+        import copy
+
+        from diffstory.narrative_plan import (
+            _capture_indexed_arena_detail_results,
+        )
+        from diffstory.report_storage import _RecordArena
+
+        arena = _RecordArena()
+        references = tuple(
+            arena.put_result(copy.deepcopy(item))
+            for item in self.expanded_details
+        )
+        context = _capture_indexed_arena_detail_results(
+            references, arena, self.ledger, index=self.index
+        )
+        reader = context._arena_reader  # noqa: SLF001 # Exercise registered private backing identities.
+        cases = (
+            ("unit-to-result selectors", context, "_references_by_unit"),
+            ("arena table index", reader, "_tables"),
+            ("arena item-key index", reader, "_result_ids"),
+        )
+        for concern, owner, attribute in cases:
+            with self.subTest(concern=concern):
+                original = getattr(owner, attribute)
+                object.__setattr__(owner, attribute, MappingProxyType({}))
+                with self.assertRaisesRegex(
+                    ValueError, "unregistered_detail_context"
+                ):
+                    _ = context.unit_keys
+                object.__setattr__(owner, attribute, original)
+                self.assertEqual(
+                    context.unit_keys,
+                    tuple(item["unit_key"] for item in self.expanded_details),
+                )
+        context.citation_scope.close()
+
+    def test_arena_rejects_raw_bool_reference_before_ownership(self) -> None:
+        """Reject bool values where a source citation requires a natural number."""
+        import copy
+
+        from diffstory.report_storage import _RecordArena
+
+        candidate = copy.deepcopy(
+            next(
+                item
+                for item in self.expanded_details
+                if any(
+                    entry.get("citations", ())
+                    for family in (
+                        "explanations",
+                        "observations",
+                        "questions",
+                    )
+                    for entry in item[family]
+                )
+            )
+        )
+        reference = next(
+            citation
+            for family in ("explanations", "observations", "questions")
+            for entry in candidate[family]
+            for citation in entry.get("citations", ())
+        )
+        reference["byte_start"] = True
+        arena = _RecordArena()
+        with self.assertRaises(ValidationError):
+            arena.put_result(candidate)
+        self.assertEqual(sum(arena.retained_record_counts.values()), 0)
 
 
 class ProseInputFixture(Contract):

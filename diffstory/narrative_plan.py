@@ -23,9 +23,9 @@ from dataclasses import field
 from difflib import SequenceMatcher
 from types import MappingProxyType
 from typing import TYPE_CHECKING
+from typing import Protocol
 from typing import TypeVar
 from weakref import WeakKeyDictionary
-from weakref import WeakSet
 from weakref import ref as weakref_ref
 
 from pydantic import BaseModel
@@ -1427,6 +1427,31 @@ _REVISION_PAIR_SIZE = 2
 _CITATION_SCOPE_TOKEN = object()
 
 
+@dataclass(frozen=True, slots=True)
+class _DetailContextBinding:
+    """Scope-local identity witness for one owned data-only detail context.
+
+    Attributes:
+        graph: Exact shallow graph view, or ``None`` for stage/arena contexts.
+        arena_reader: Exact private arena projection, or ``None`` otherwise.
+        references: Primitive address fields in the original detail order.
+        unit_keys: Detail unit keys in the original order.
+        reference_map: Exact immutable unit-to-reference map.
+        typed_mapping: Exact immutable typed-stage map, if present.
+        backing_tables: Exact immutable graph or arena table index.
+        backing_result_ids: Exact arena result identity index, if present.
+    """
+
+    graph: object | None
+    arena_reader: object | None
+    references: tuple[tuple[str, str, str, str], ...]
+    unit_keys: tuple[str, ...]
+    reference_map: object
+    typed_mapping: object
+    backing_tables: object | None
+    backing_result_ids: object | None
+
+
 class _CitationScopeOwner:
     """Factory-owned binding and memo state for one exact scope object."""
 
@@ -1465,7 +1490,7 @@ class _CitationScopeOwner:
         self.memo: dict[tuple[object, ...], SourceSpan] = {}
         self.closed = False
         self.resolution_count = 0
-        self.detail_contexts: WeakSet = WeakSet()
+        self.detail_contexts: WeakKeyDictionary = WeakKeyDictionary()
 
 
 class CitationResolutionScope:
@@ -1620,7 +1645,16 @@ class CitationResolutionScope:
         _require(owner.index is index, "citation_scope_binding_mismatch")
 
     def _register_detail_context(self, context: IndexedDetailContext) -> None:
-        """Register one exact detail context within this source scope."""
+        """Register one exact detail context within this source scope.
+
+        Preconditions:
+            The context points to this scope's original ledger and index.
+        Postconditions:
+            The local owner pins graph/reader identity, ordered references, and
+            unit order for subsequent liveness checks.
+        Essential behavior:
+            Stores identity and primitive witnesses without a global registry.
+        """
         owner = self._owned_state()
         _require(not owner.closed, "citation_scope_closed")
         _require(
@@ -1629,12 +1663,87 @@ class CitationResolutionScope:
             and context._index is owner.index,  # noqa: SLF001 # Compare exact bound objects.
             "detail_context_binding_mismatch",
         )
-        owner.detail_contexts.add(context)
+        backing_tables = None
+        backing_result_ids = None
+        if context._graph is not None:  # noqa: SLF001 # Pin the exact graph table view.
+            backing_tables = getattr(context._graph, "_tables", None)  # noqa: SLF001 # Retain only the immutable index object.
+        elif context._arena_reader is not None:  # noqa: SLF001 # Pin the exact arena table view.
+            backing_tables = getattr(context._arena_reader, "_tables", None)  # noqa: SLF001 # Retain only the immutable index object.
+            backing_result_ids = getattr(
+                context._arena_reader,  # noqa: SLF001 # Pin item-key bindings.
+                "_result_ids",
+                None,
+            )
+        owner.detail_contexts[context] = _DetailContextBinding(
+            graph=context._graph,  # noqa: SLF001 # Pin the original shallow view.
+            arena_reader=context._arena_reader,  # noqa: SLF001 # Pin the original arena projection.
+            references=tuple(
+                (
+                    item.table,
+                    item.kind,
+                    item.storage_id,
+                    item.item_key,
+                )
+                for item in context._references  # noqa: SLF001 # Store scalar witnesses only.
+            ),
+            unit_keys=context._unit_keys,  # noqa: SLF001 # Preserve original order.
+            reference_map=context._references_by_unit,  # noqa: SLF001 # Pin the immutable unit-to-address map.
+            typed_mapping=context._typed_by_unit,  # noqa: SLF001 # Pin the immutable typed-stage map.
+            backing_tables=backing_tables,
+            backing_result_ids=backing_result_ids,
+        )
 
     def _owns_detail_context(self, context: IndexedDetailContext) -> bool:
-        """Check identity registration without a process-global authority map."""
+        """Check identity registration without a process-global authority map.
+
+        Preconditions:
+            ``context`` is an indexed detail context presented to its scope.
+        Postconditions:
+            Returns true only while every pinned identity and scalar witness
+            still matches the registered binding.
+        Essential behavior:
+            Rejects closure, object rebinding, reference mutation, and order
+            changes before the context is used.
+        """
         owner = self._owned_state()
-        return not owner.closed and context in owner.detail_contexts
+        binding = owner.detail_contexts.get(context)
+        backing_tables = None
+        backing_result_ids = None
+        if context._graph is not None:  # noqa: SLF001 # Read the registered graph view.
+            backing_tables = getattr(context._graph, "_tables", None)  # noqa: SLF001 # Compare its immutable index identity.
+        elif context._arena_reader is not None:  # noqa: SLF001 # Read the registered arena view.
+            backing_tables = getattr(context._arena_reader, "_tables", None)  # noqa: SLF001 # Compare its immutable index identity.
+            backing_result_ids = getattr(
+                context._arena_reader,  # noqa: SLF001 # Compare exact result bindings.
+                "_result_ids",
+                None,
+            )
+        return bool(
+            not owner.closed
+            and binding is not None
+            and context._citation_scope is self  # noqa: SLF001 # Verify the original local scope.
+            and context._ledger is owner.ledger  # noqa: SLF001 # Verify the original ledger.
+            and context._index is owner.index  # noqa: SLF001 # Verify the original checked index.
+            and context._graph is binding.graph  # noqa: SLF001 # Reject graph rebinding.
+            and context._arena_reader is binding.arena_reader  # noqa: SLF001 # Reject arena reader rebinding.
+            and context._unit_keys == binding.unit_keys  # noqa: SLF001 # Reject order changes.
+            and context._references_by_unit is binding.reference_map  # noqa: SLF001 # Reject map rebinding.
+            and context._typed_by_unit is binding.typed_mapping  # noqa: SLF001 # Reject typed map rebinding.
+            and tuple(
+                (
+                    item.table,
+                    item.kind,
+                    item.storage_id,
+                    item.item_key,
+                )
+                for item in context._references  # noqa: SLF001 # Compare type-preserving scalar addresses.
+            )
+            == binding.references
+            and context._references_by_unit is binding.reference_map  # noqa: SLF001 # Reject unit-to-reference map rebinding.
+            and context._typed_by_unit is binding.typed_mapping  # noqa: SLF001 # Reject typed-stage map rebinding.
+            and backing_tables is binding.backing_tables
+            and backing_result_ids is binding.backing_result_ids
+        )
 
     def resolve_many(
         self,
@@ -1866,6 +1975,50 @@ def _validate_detail_results(
 _DETAIL_CONTEXT_TOKEN = object()
 
 
+class _DetailRecordReader(Protocol):
+    """Narrow immutable result reader for arena-backed detail contexts.
+
+    Implementations expose owned primitive records and detached selected
+    results. They do not reconstruct a manifest or retain typed results.
+    """
+
+    def _result_view(self, reference: ResultRef) -> Mapping[str, object]:
+        """Return one arena-owned normalized result row.
+
+        Preconditions:
+            ``reference`` is an exact detail address owned by the reader.
+        Postconditions:
+            The row and nested values are immutable primitives.
+        Essential behavior:
+            Selects one captured row without model parsing or reconstruction.
+        """
+
+    def _evidence_view(
+        self, pointer: Mapping[str, object], *, kind: str
+    ) -> Mapping[str, object]:
+        """Return one arena-owned evidence-reference row.
+
+        Preconditions:
+            ``pointer`` has the exact strict address shape and requested kind.
+        Postconditions:
+            The selected evidence mapping is immutable.
+        Essential behavior:
+            Resolves the captured nested reference without revalidating its
+            structural model.
+        """
+
+    def result_record(self, reference: ResultRef) -> dict:
+        """Return a detached logical result selected by its address.
+
+        Preconditions:
+            ``reference`` is an exact address owned by the reader.
+        Postconditions:
+            The returned mapping is detached and may be changed by its caller.
+        Essential behavior:
+            Materializes only the explicitly selected result for access.
+        """
+
+
 def _tuple_detail_record(value: object) -> object:
     """Adapt one owned JSON-shaped detail record to strict tuple contracts.
 
@@ -1900,18 +2053,170 @@ def _tuple_detail_record(value: object) -> object:
     return record
 
 
+@dataclass(frozen=True, slots=True)
+class _DetailExplanationView:
+    """Ephemeral primitive explanation fields for ledger contextual checks.
+
+    Attributes:
+        obligation_ids: Ordered obligation digests from one owned detail.
+        citations: Strictly prevalidated source-span models for this check only.
+        limitations: Ordered explicit limitation values from the result.
+    """
+
+    obligation_ids: tuple[str, ...]
+    citations: tuple[SpanRef, ...]
+    limitations: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DetailObservationView:
+    """Ephemeral observation identity and citation fields for one check.
+
+    Attributes:
+        id: Observation digest owned by the complete result record.
+        citations: Strictly prevalidated source-span models for this check.
+    """
+
+    id: str
+    citations: tuple[SpanRef, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DetailQuestionView:
+    """Ephemeral question citation and obligation fields for one check.
+
+    Attributes:
+        citations: Strictly prevalidated source-span models for this check.
+        obligation_ids: Ordered obligation digests from the question.
+    """
+
+    citations: tuple[SpanRef, ...]
+    obligation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _DetailResultView:
+    """Duck-typed detail projection used only by existing contextual checks.
+
+    Attributes:
+        unit_key: Ledger unit digest bound to the selected result address.
+        explanations: Ordered obligation explanations for the unit.
+        observations: Ordered factual observations for the unit.
+        questions: Ordered unresolved questions for the unit.
+    """
+
+    unit_key: str
+    explanations: tuple[_DetailExplanationView, ...]
+    observations: tuple[_DetailObservationView, ...]
+    questions: tuple[_DetailQuestionView, ...]
+
+
+def _detail_result_check_view(
+    record: Mapping[str, object], reader: _DetailRecordReader
+) -> _DetailResultView:
+    """Build one ephemeral contextual projection without model revalidation.
+
+    Preconditions:
+        ``record`` is an immutable normalized detail row already structurally
+        validated by its owning arena. ``reader`` resolves its typed span refs.
+    Postconditions:
+        The returned plain dataclasses contain only values needed by the full
+        ledger-unit, obligation, citation, and context checks.
+    Essential behavior:
+        No complete ``DetailResult`` or second detail snapshot is retained.
+    """
+    _require(
+        type(record.get("unit_key")) is str,
+        "detail_result_reference_mismatch",
+    )
+
+    def array(value: object) -> tuple:
+        """Read one already checked ordered result array.
+
+        Preconditions:
+            ``value`` is a JSON list or immutable tuple from an owned row.
+        Postconditions:
+            Returns the same items in an ephemeral tuple.
+        Essential behavior:
+            Preserves item order and scalar types for contextual validation.
+        """
+        _require(type(value) in {tuple, list}, "invalid_typed_storage_record")
+        return tuple(value)
+
+    def spans(value: object) -> tuple[SpanRef, ...]:
+        """Project validated span rows into temporary lightweight models.
+
+        Preconditions:
+            Each item in ``value`` is a strict span address resolved by reader.
+        Postconditions:
+            Returns temporary ``SpanRef`` values for existing contextual checks.
+        Essential behavior:
+            Uses model construction only after the arena's structural parse.
+        """
+        output = []
+        for pointer in array(value):
+            raw = reader._evidence_view(pointer, kind="span_ref")  # noqa: SLF001 # Resolve the arena-owned strict reference.
+            output.append(SpanRef.model_construct(**dict(raw)))
+        return tuple(output)
+
+    explanations = []
+    for item in array(record.get("explanations", ())):
+        _require(isinstance(item, Mapping), "invalid_typed_storage_record")
+        explanations.append(
+            _DetailExplanationView(
+                obligation_ids=array(item.get("obligation_ids", ())),
+                citations=spans(item.get("citations", ())),
+                limitations=array(item.get("limitations", ())),
+            )
+        )
+    observations = []
+    for item in array(record.get("observations", ())):
+        _require(
+            isinstance(item, Mapping) and type(item.get("id")) is str,
+            "invalid_typed_storage_record",
+        )
+        observations.append(
+            _DetailObservationView(
+                id=item["id"], citations=spans(item.get("citations", ()))
+            )
+        )
+    questions = []
+    for item in array(record.get("questions", ())):
+        _require(isinstance(item, Mapping), "invalid_typed_storage_record")
+        questions.append(
+            _DetailQuestionView(
+                citations=spans(item.get("citations", ())),
+                obligation_ids=array(item.get("obligation_ids", ())),
+            )
+        )
+    return _DetailResultView(
+        unit_key=record["unit_key"],
+        explanations=tuple(explanations),
+        observations=tuple(observations),
+        questions=tuple(questions),
+    )
+
+
 class IndexedDetailContext:
     """Owned, data-only detail records checked against one current ledger.
 
     Graph-backed contexts keep immutable graph addresses and a private shallow
-    view over the graph's immutable primitive tables. Stage-backed contexts
-    keep detached typed detail models. Public accessors return fresh
-    dictionaries, so returned mutations cannot change context records.
-    Neither form is a generation or report capability.
+    view over the graph's immutable primitive tables. Arena-backed contexts
+    keep ordered result addresses and a private reader projection over owned
+    primitive records. Stage-backed contexts keep detached typed details.
+    Public accessors return fresh dictionaries, so returned mutations cannot
+    change context records. No form is a generation or report capability.
+
+    Attributes:
+        unit_keys: Exact detail-unit membership in captured input order.
+        references: Result addresses for graph/arena contexts; empty for stage
+            model contexts. Access returns fresh typed reference objects.
+        detail_record: Explicit detached access to one selected logical detail.
     """
 
     __slots__ = (
         "__weakref__",
+        "_arena_reader",
         "_citation_scope",
         "_graph",
         "_index",
@@ -1931,19 +2236,32 @@ class IndexedDetailContext:
         citation_scope: CitationResolutionScope,
         unit_keys: tuple[str, ...],
         graph: ReportStorageView | None = None,
+        arena_reader: _DetailRecordReader | None = None,
         references: tuple[ResultRef, ...] = (),
         typed_by_unit: Mapping[str, DetailResult] | None = None,
     ) -> None:
-        """Store one graph-backed or typed stage detail context."""
+        """Store one graph-backed, arena-backed, or typed stage context.
+
+        Preconditions:
+            ``token`` is module-private and the selected backing matches the
+            supplied references or typed-detail mapping.
+        Postconditions:
+            Ordered unit keys, references, and backing selectors are detached
+            and immutable to ordinary callers.
+        Essential behavior:
+            Arena-backed contexts keep a reader and addresses, not complete
+            detail models or duplicate logical snapshots.
+        """
         _require(token is _DETAIL_CONTEXT_TOKEN, "invalid_detail_context")
         self._ledger = ledger
         self._index = index
         self._citation_scope = citation_scope
         self._graph = graph
+        self._arena_reader = arena_reader
         self._references = references
         self._references_by_unit = MappingProxyType(
             dict(zip(unit_keys, references, strict=True))
-            if graph is not None
+            if graph is not None or arena_reader is not None
             else {}
         )
         self._typed_by_unit = MappingProxyType(dict(typed_by_unit or {}))
@@ -1986,8 +2304,23 @@ class IndexedDetailContext:
         return unit_key in self._unit_keys
 
     def detail_record(self, unit_key: str) -> dict:
-        """Return a detached full detail mapping for one validated unit."""
+        """Return one detached full detail mapping for a validated unit.
+
+        Preconditions:
+            The context is registered and live, and ``unit_key`` was captured.
+        Postconditions:
+            The returned logical detail is mutable and cannot change context
+            records or future access results.
+        Essential behavior:
+            Materializes only the selected result from its owned backing.
+        """
         self._check_registered()
+        if self._arena_reader is not None:
+            reference = self._references_by_unit.get(unit_key)
+            _require(reference is not None, "unknown_detail_unit")
+            return self._arena_reader.result_record(
+                _copy_result_ref(reference)
+            )
         if self._graph is not None:
             reference = self._references_by_unit.get(unit_key)
             _require(reference is not None, "unknown_detail_unit")
@@ -2030,8 +2363,21 @@ class IndexedDetailContext:
 
 
 def _copy_result_ref(reference: ResultRef) -> ResultRef:
+    """Copy one exact typed result reference without accepting subclasses.
+
+    Preconditions:
+        ``reference`` is an exact storage ``ResultRef``.
+    Postconditions:
+        The returned value is a fresh immutable reference with strict scalar
+        types checked by its constructor.
+    Essential behavior:
+        Caller object identity is not retained as a context binding.
+    """
     from diffstory.report_storage import ResultRef as StorageResultRef
 
+    _require(
+        type(reference) is StorageResultRef, "invalid_storage_result_reference"
+    )
     return StorageResultRef(
         reference.table,
         reference.kind,
@@ -2242,6 +2588,93 @@ def validate_indexed_detail_results(  # noqa: PLR0913 # Explicit current source/
         raise
     else:
         return context
+
+
+def _capture_indexed_arena_detail_results(  # noqa: PLR0913 # Current ledger and source bindings remain explicit.
+    result_refs: Sequence[ResultRef],
+    arena: object,
+    ledger: EvidenceLedger,
+    *,
+    index: LedgerIndex,
+    citation_scope: CitationResolutionScope | None = None,
+    revision_binding: tuple[str, str] | None = None,
+) -> IndexedDetailContext:
+    """Bind early arena details to the current ledger without reparsing models.
+
+    Preconditions:
+        ``arena`` is the exact private ``_RecordArena`` type; every reference
+        names an arena-owned detail; and ``ledger``/``index`` pass the existing
+        scope and current-source integrity checks.
+    Postconditions:
+        Full ledger, obligation, context, and citation validation has run for
+        every ordered detail. The context stores only copied addresses and a
+        shallow immutable arena reader.
+    Essential behavior:
+        Reuses the arena's strict structural parsing and resolves current source
+        citations through the same scope-local memo as existing detail adapters.
+    """
+    from diffstory.report_storage import ResultRef as StorageResultRef
+    from diffstory.report_storage import _RecordArena
+
+    _require(type(arena) is _RecordArena, "invalid_indexed_detail_arena")
+    scope, owned_scope = _detail_scope(
+        ledger, index, citation_scope, revision_binding
+    )
+    try:
+        _require(
+            type(result_refs) in {tuple, list}
+            and all(type(ref) is StorageResultRef for ref in result_refs),
+            "invalid_indexed_detail_reference",
+        )
+        references = tuple(_copy_result_ref(ref) for ref in result_refs)
+        _unique(
+            [reference.storage_id for reference in references],
+            "detail_set_coverage_mismatch",
+        )
+        _unique(
+            [reference.item_key for reference in references],
+            "detail_set_coverage_mismatch",
+        )
+        reader = arena._detail_reader(references)  # noqa: SLF001 # Private owned-record path.
+        detail_views = []
+        unit_keys = []
+        for reference in references:
+            raw = reader._result_view(reference)  # noqa: SLF001 # Read the strict normalized result.
+            detail = _detail_result_check_view(raw, reader)
+            _require(
+                detail.unit_key == reference.item_key,
+                "detail_result_reference_mismatch",
+            )
+            detail_views.append(detail)
+            unit_keys.append(detail.unit_key)
+        _require(
+            Counter(unit_keys) == Counter(index.units.keys()),
+            "detail_set_coverage_mismatch",
+        )
+        for result in detail_views:
+            _validate_detail_result(
+                result,
+                index.units[result.unit_key],
+                index,
+                citation_scope=scope,
+            )
+        context = IndexedDetailContext(
+            token=_DETAIL_CONTEXT_TOKEN,
+            ledger=ledger,
+            index=index,
+            citation_scope=scope,
+            unit_keys=tuple(unit_keys),
+            arena_reader=reader,
+            references=references,
+        )
+        scope._register_detail_context(  # noqa: SLF001 # Keep registration in the owning scope.
+            context
+        )
+    except Exception:
+        if owned_scope:
+            scope.close()
+        raise
+    return context
 
 
 def validate_detail_results(

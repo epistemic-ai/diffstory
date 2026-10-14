@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 import tempfile
 import unittest
 from collections import Counter
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import FrameType
+
     from pydantic import BaseModel
 
 from test_narrative_runtime import changed_record
@@ -23,6 +28,7 @@ from diffstory.narrative import Narrator
 from diffstory.narrative_contracts import ClaimRef
 from diffstory.narrative_contracts import DetailResult
 from diffstory.narrative_contracts import DocumentResult
+from diffstory.narrative_contracts import SpanRef
 from diffstory.narrative_manifest import GenerationManifest
 from diffstory.narrative_manifest import InheritedProvenance
 from diffstory.narrative_manifest import PresentationSection
@@ -59,6 +65,31 @@ def _entry(envelope: dict, table: str, kind: str | None = None) -> dict:
         for item in envelope["tables"][table]
         if kind is None or item["kind"] == kind
     )
+
+
+def _span_validator_profiler(
+    counts: Counter[str],
+) -> Callable[[FrameType, str, object], None]:
+    """Build a profiler that counts executed nested span validators.
+
+    Preconditions:
+        ``counts`` is the mutable counter for one measured operation.
+    Postconditions:
+        Returns a call profiler that increments ``span_ref_ranges`` only for
+        actual ``SpanRef.ranges`` Python executions.
+    Essential behavior:
+        Measures nested Pydantic validation that dispatcher mocks cannot see.
+    """
+
+    def profile(frame: FrameType, event: str, _arg: object) -> None:
+        if (
+            event == "call"
+            and frame.f_code.co_name == "ranges"
+            and isinstance(frame.f_locals.get("self"), SpanRef)
+        ):
+            counts["span_ref_ranges"] += 1
+
+    return profile
 
 
 def _repoint(
@@ -165,6 +196,798 @@ class ReportStorageTests(unittest.TestCase):
             parse_report_storage(encoded).byte_length, len(encoded)
         )
         return encoded, expanded
+
+    def _incremental_arena_graph(  # noqa: PLR0913, PLR0915 # Build a complete synthetic incremental fixture.
+        self,
+        artifact_kind: str,
+        ledger: object,
+        index: object,
+        *,
+        tamper_receipt: bool = False,
+        reverse_sections: bool = False,
+        model_dispatch: object | None = None,
+        omit_generation_run_default: bool = False,
+        omit_producer_original_run_default: bool = False,
+    ) -> tuple[
+        ReportRecordGraph,
+        object,
+        object,
+        tuple[Counter[str], Counter[str]] | None,
+    ]:
+        """Capture results, bind details early, then seal one synthetic graph.
+
+        Preconditions:
+            ``ledger`` and ``index`` are the current synthetic evidence pair;
+            ``artifact_kind`` is ``report`` or ``annotations``.
+        Postconditions:
+            The graph contains the same records supplied by the fixture. The
+            context was bound after details but before later-stage records.
+        Essential behavior:
+            Reads only authored synthetic fixture values, uses no complete
+            manifest or reader model, and can alter one seal relationship for
+            a negative test or omit the current or producer original run's
+            default runtime contract field for a field-presence test.
+        """
+        from diffstory.narrative_plan import (
+            _capture_indexed_arena_detail_results,
+        )
+        from diffstory.report_storage import GenerationRecordSet
+        from diffstory.report_storage import IndexedReaderProjection
+        from diffstory.report_storage import ReaderSectionRef
+        from diffstory.report_storage import _RecordArena
+        from diffstory.report_storage import _thaw
+
+        if artifact_kind == "report":
+            source = self.expanded_report
+            reader_data = self.applied["narrative_v2"]
+        elif artifact_kind == "annotations":
+            source = self.expanded_annotations
+            reader_data = self.annotations
+        else:
+            msg = "invalid_artifact_kind"
+            raise ValueError(msg)
+        source = copy.deepcopy(source)
+        generation = source["generation"]
+        if omit_generation_run_default:
+            generation["run"].pop("runtime_contract_version")
+        if omit_producer_original_run_default:
+            for producer in generation["producers"]:
+                producer["original_run"].pop("runtime_contract_version")
+        arena = _RecordArena()
+        caller_details = copy.deepcopy(generation["details"])
+        detail_refs = tuple(arena.put_result(item) for item in caller_details)
+
+        context = _capture_indexed_arena_detail_results(
+            detail_refs, arena, ledger, index=index
+        )
+        original_first = copy.deepcopy(caller_details[0])
+        caller_details[0]["unit_key"] = "0" * 64
+        self.assertEqual(
+            _thaw(arena.result_view(detail_refs[0])), original_first
+        )
+
+        plan_ref = arena.put_record("story_plan", generation["plan"])
+        planning_refs = tuple(
+            arena.put_result(item) for item in generation["planning"]
+        )
+        section_refs = tuple(
+            arena.put_result(item) for item in generation["sections"]
+        )
+        document_ref = arena.put_result(generation["document"])
+        run_ref = arena.put_record("run", generation["run"])
+        producer_refs = tuple(
+            arena.put_record("producer", item)
+            for item in generation["producers"]
+        )
+        receipts = copy.deepcopy(generation["receipts"])
+        if tamper_receipt:
+            receipts[0]["result_digest"] = "f" * 64
+        receipt_refs = tuple(
+            arena.put_record("receipt", item) for item in receipts
+        )
+
+        detail_by_unit = {
+            reference.item_key: reference for reference in detail_refs
+        }
+        section_by_subject = {
+            item["binding"]["subject_key"]: reference
+            for item, reference in zip(
+                generation["sections"], section_refs, strict=True
+            )
+        }
+        reader_section_field = (
+            "sections" if artifact_kind == "report" else "steps"
+        )
+        reader_sections = []
+        for section in reader_data[reader_section_field]:
+            member_refs = tuple(
+                detail_by_unit[item["unit_key"]] for item in section["details"]
+            )
+            reader_sections.append(
+                ReaderSectionRef(
+                    group_id=section["group_id"],
+                    group_key=section["group_key"],
+                    number=section["number"],
+                    next_id=section["next_id"],
+                    prose=section_by_subject[section["group_key"]],
+                    details=member_refs,
+                )
+            )
+        if reverse_sections:
+            reader_sections.reverse()
+        citation_refs = tuple(
+            arena.put_record("resolved_citation", item)
+            for item in reader_data["citations"]
+        )
+        provenance_refs = tuple(
+            arena.put_record("inherited_provenance", item)
+            for item in reader_data["support_provenance"]
+        )
+        projection = IndexedReaderProjection(
+            shape=(
+                "presentation" if artifact_kind == "report" else "annotations"
+            ),
+            document=document_ref,
+            sections=tuple(reader_sections),
+            context_details=tuple(
+                detail_by_unit[item["unit_key"]]
+                for item in reader_data["context_details"]
+            ),
+            citations=citation_refs,
+            support_provenance=provenance_refs,
+            version=reader_data.get("version"),
+            provenance=reader_data.get("provenance"),
+        )
+        header_fields = {
+            "version",
+            "provenance",
+            "compiler_fact_signature",
+            "current_usage",
+            "ledger_digest",
+            "ledger_parameters",
+            "request_configuration",
+            "unit_keys",
+        }
+        header = copy.deepcopy(
+            {
+                key: value
+                for key, value in generation.items()
+                if key in header_fields
+            }
+        )
+        expected_header = copy.deepcopy(header)
+        mutable_detail_refs = list(detail_refs)
+        generation_refs = GenerationRecordSet(
+            header,
+            run_ref=run_ref,
+            details=mutable_detail_refs,
+            plan_ref=plan_ref,
+            planning=planning_refs,
+            sections=section_refs,
+            document=document_ref,
+            producers=producer_refs,
+            receipts=receipt_refs,
+        )
+        mutable_detail_refs.clear()
+        header["current_usage"]["calls"] = True
+        self.assertEqual(generation_refs.details, detail_refs)
+        self.assertEqual(_thaw(generation_refs.header), expected_header)
+        if artifact_kind == "report":
+            root = {
+                "shape": "report",
+                "base_report": {
+                    key: value
+                    for key, value in self.applied.items()
+                    if key not in {"generation", "narrative_v2"}
+                },
+            }
+        else:
+            root = {
+                "shape": "annotations",
+                "metadata": {
+                    key: self.annotations[key]
+                    for key in ("schema", "base_sha", "head_sha")
+                },
+            }
+        before_seal = (
+            Counter(
+                call.args[0].__name__ for call in model_dispatch.call_args_list
+            )
+            if model_dispatch is not None
+            else None
+        )
+        graph = arena.seal(generation_refs, projection, root)
+        after_seal = (
+            Counter(
+                call.args[0].__name__ for call in model_dispatch.call_args_list
+            )
+            if model_dispatch is not None
+            else None
+        )
+        seal_dispatches = (
+            (before_seal, after_seal)
+            if before_seal is not None and after_seal is not None
+            else None
+        )
+        return graph, arena, context, seal_dispatches
+
+    def test_shared_run_binding_preserves_runtime_default_presence(
+        self,
+    ) -> None:
+        """Preserve default field presence through shared parsing and sealing.
+
+        Input/expected case matrix:
+            unchanged: both current and producer runs retain the default.
+            generation-only omission: only the current run omits the default.
+            producer-only omission: only producer original runs omit it.
+            both omitted: current and producer original runs omit the default.
+
+        Args:
+            self: Test case with an authored synthetic report fixture.
+        Preconditions:
+            The fixture's generation has a current run and producer records.
+        Postconditions:
+            Both independent parsing and incremental sealing expand to the
+            exact input in every matrix case.
+        Essential behavior:
+            Shared run identity follows validated model content while expansion
+            preserves whether the default field was present in the input.
+        """
+        from diffstory.narrative_plan import build_evidence_ledger
+        from diffstory.narrative_plan import build_ledger_index
+
+        cases = (
+            ("unchanged", False, False),
+            ("generation-only omission", True, False),
+            ("producer-only omission", False, True),
+            ("both omitted", True, True),
+        )
+        ledger = build_evidence_ledger(self.report)
+        index = build_ledger_index(ledger)
+        for case_name, omit_generation, omit_producer in cases:
+            with self.subTest(case=case_name):
+                expected_input = copy.deepcopy(self.expanded_report)
+                if omit_generation:
+                    expected_input["generation"]["run"].pop(
+                        "runtime_contract_version"
+                    )
+                if omit_producer:
+                    for producer in expected_input["generation"]["producers"]:
+                        producer["original_run"].pop(
+                            "runtime_contract_version"
+                        )
+
+                parsed_expansion = expand_report_storage(
+                    parse_report_storage(
+                        encode_report_storage(expected_input, "report")
+                    ),
+                    max_output_bytes=128 * 1024 * 1024,
+                )
+                self.assertEqual(
+                    canonical_bytes(parsed_expansion),
+                    canonical_bytes(expected_input),
+                )
+
+                graph, _arena, _context, _dispatches = (
+                    self._incremental_arena_graph(
+                        "report",
+                        ledger,
+                        index,
+                        omit_generation_run_default=omit_generation,
+                        omit_producer_original_run_default=omit_producer,
+                    )
+                )
+                sealed_expansion = expand_report_storage(
+                    parse_report_storage(graph.to_bytes()),
+                    max_output_bytes=128 * 1024 * 1024,
+                )
+                self.assertEqual(
+                    canonical_bytes(sealed_expansion),
+                    canonical_bytes(expected_input),
+                )
+
+    def test_incremental_arena_seals_both_artifacts_without_expansion(  # noqa: C901, PLR0915 # Exercise one end-to-end normal path.
+        self,
+    ) -> None:
+        """Reject hidden full-tree reconstruction during incremental sealing."""
+        from pydantic import BaseModel
+
+        from diffstory import narrative_plan as plan_module
+        from diffstory.narrative_plan import build_evidence_ledger
+
+        self.applied = copy.deepcopy(self.applied)
+        self.annotations = copy.deepcopy(self.annotations)
+        self.expanded_report = copy.deepcopy(self.expanded_report)
+        self.expanded_annotations = copy.deepcopy(self.expanded_annotations)
+        citation_sets = (
+            self.applied["narrative_v2"]["citations"],
+            self.annotations["citations"],
+            self.expanded_report["narrative_v2"]["citations"],
+            self.expanded_annotations["citations"],
+        )
+        for citations in citation_sets:
+            citations[0]["url"] = None
+            citations[1]["url"] = "https://exämple.invalid/λ"
+
+        ledger = build_evidence_ledger(self.report)
+        index = plan_module.build_ledger_index(ledger)
+        report_oracle = self._typed_report_graph()
+        annotation_reader = self._typed_annotation_reader(self.annotations)
+        annotation_oracle = ReportRecordGraph.from_typed(
+            self._typed_model(
+                GenerationManifest,
+                self.expanded_annotations["generation"],
+            ),
+            annotation_reader,
+            artifact_kind="annotations",
+            metadata={
+                key: self.annotations[key]
+                for key in ("schema", "base_sha", "head_sha")
+            },
+        )
+
+        for artifact_kind, oracle in (
+            ("report", report_oracle),
+            ("annotations", annotation_oracle),
+        ):
+            with self.subTest(artifact_kind=artifact_kind):
+                capture_validator_calls = Counter()
+                trace_capture_validator = _span_validator_profiler(
+                    capture_validator_calls
+                )
+                original_model = report_storage._model  # noqa: SLF001 # Count actual unique structural dispatches.
+                previous_profile = sys.getprofile()
+                sys.setprofile(trace_capture_validator)
+                try:
+                    with (
+                        patch.object(
+                            report_storage,
+                            "_model",
+                            wraps=original_model,
+                        ) as model_dispatch,
+                        patch.object(
+                            plan_module,
+                            "_validate_detail_result",
+                            wraps=plan_module._validate_detail_result,  # noqa: SLF001 # Count current-ledger checks.
+                        ) as detail_checks,
+                        patch.object(
+                            plan_module,
+                            "_resolve_span_ref",
+                            wraps=plan_module._resolve_span_ref,  # noqa: SLF001 # Count actual source resolutions.
+                        ) as source_resolutions,
+                        patch.object(
+                            DetailResult,
+                            "model_validate_json",
+                            wraps=DetailResult.model_validate_json,
+                        ) as detail_parses,
+                        patch.object(
+                            report_storage,
+                            "expand_report_storage",
+                            side_effect=AssertionError(
+                                "normal path expanded a graph"
+                            ),
+                        ),
+                        patch.object(
+                            report_storage,
+                            "encode_report_storage",
+                            side_effect=AssertionError(
+                                "normal path encoded a tree"
+                            ),
+                        ),
+                        patch.object(
+                            report_storage,
+                            "parse_report_storage",
+                            side_effect=AssertionError(
+                                "normal path parsed a graph"
+                            ),
+                        ),
+                        patch.object(
+                            ReportRecordGraph,
+                            "from_typed",
+                            side_effect=AssertionError(
+                                "normal path rebuilt typed records"
+                            ),
+                        ),
+                        patch.object(
+                            GenerationManifest,
+                            "model_validate",
+                            side_effect=AssertionError(
+                                "normal path built a manifest"
+                            ),
+                        ),
+                        patch.object(
+                            GenerationManifest,
+                            "model_validate_json",
+                            side_effect=AssertionError(
+                                "normal path parsed a manifest"
+                            ),
+                        ),
+                        patch.object(
+                            V2Presentation,
+                            "model_validate",
+                            side_effect=AssertionError(
+                                "normal path built a presentation"
+                            ),
+                        ),
+                        patch.object(
+                            V2Presentation,
+                            "model_validate_json",
+                            side_effect=AssertionError(
+                                "normal path parsed a presentation"
+                            ),
+                        ),
+                        patch.object(
+                            PresentationSection,
+                            "model_validate_json",
+                            side_effect=AssertionError(
+                                "normal path parsed reader sections"
+                            ),
+                        ),
+                    ):
+                        graph, arena, context, seal_dispatches = (
+                            self._incremental_arena_graph(
+                                artifact_kind,
+                                ledger,
+                                index,
+                                model_dispatch=model_dispatch,
+                            )
+                        )
+                finally:
+                    sys.setprofile(previous_profile)
+
+                self.assertEqual(graph.to_bytes(), oracle.to_bytes())
+                expected_expanded = (
+                    self.expanded_report
+                    if artifact_kind == "report"
+                    else self.expanded_annotations
+                )
+                self.assertEqual(
+                    canonical_bytes(
+                        expand_report_storage(
+                            graph, max_output_bytes=128 * 1024 * 1024
+                        )
+                    ),
+                    canonical_bytes(expected_expanded),
+                )
+                self.assertEqual(
+                    seal_dispatches[1] - seal_dispatches[0],
+                    Counter(
+                        {
+                            "CurrentUsage": 1,
+                            "LedgerParameters": 1,
+                            "RequestConfiguration": 1,
+                        }
+                    ),
+                )
+                model_counts = Counter(
+                    call.args[0].__name__
+                    for call in model_dispatch.call_args_list
+                )
+                self.assertGreaterEqual(model_counts["CurrentUsage"], 1)
+                self.assertGreaterEqual(model_counts["LedgerParameters"], 1)
+                self.assertGreaterEqual(
+                    model_counts["RequestConfiguration"], 1
+                )
+                self.assertEqual(
+                    model_counts["DetailResult"],
+                    len(self.expanded_report["generation"]["details"]),
+                )
+                self.assertEqual(
+                    detail_parses.call_count,
+                    len(self.expanded_report["generation"]["details"]),
+                )
+                self.assertEqual(
+                    detail_checks.call_count,
+                    len(self.expanded_report["generation"]["details"]),
+                )
+                span_rows = arena.typed_validation_counts.get(
+                    "evidence_refs:span_ref", 0
+                )
+                self.assertGreater(span_rows, 0)
+                self.assertGreater(
+                    capture_validator_calls["span_ref_ranges"], span_rows
+                )
+                self.assertEqual(model_counts["SpanRef"], 0)
+                self.assertGreater(source_resolutions.call_count, 0)
+                self.assertEqual(
+                    context.citation_scope.resolution_count,
+                    source_resolutions.call_count,
+                )
+                self.assertEqual(
+                    arena.typed_validation_counts["results:detail"],
+                    len(context.references),
+                )
+                self.assertEqual(arena._builder.typed_results, {})  # noqa: SLF001 # No complete results survive.
+                self.assertEqual(arena._builder.address_contents, {})  # noqa: SLF001 # No duplicate canonical buffers survive.
+                self.assertEqual(arena._builder.logical_records, {})  # noqa: SLF001 # No duplicate logical snapshots survive.
+                self.assertEqual(dict(context._typed_by_unit), {})  # noqa: SLF001 # Arena contexts retain addresses only.
+                self.assertIsNone(context._graph)  # noqa: SLF001 # No expanded graph backing is retained.
+                reader_rows = context._arena_reader._tables  # noqa: SLF001 # Inspect the shallow early snapshot.
+                self.assertTrue(
+                    all(
+                        row["kind"] == "detail"
+                        for row in reader_rows["results"].values()
+                    )
+                )
+                for table, rows in reader_rows.items():
+                    for identifier, row in rows.items():
+                        self.assertIs(
+                            row,
+                            arena._builder.records[table][identifier],  # noqa: SLF001 # Reader maps share each immutable row.
+                        )
+                self.assertEqual(
+                    arena.relationship_counters["receipt_index_builds"], 1
+                )
+                self.assertEqual(
+                    arena.relationship_counters[
+                        "receipt_index_records_scanned"
+                    ],
+                    len(self.expanded_report["generation"]["receipts"]),
+                )
+                expected_inherited = len(
+                    self.annotations["support_provenance"]
+                )
+                self.assertGreaterEqual(expected_inherited, 2)
+                self.assertEqual(
+                    arena.relationship_counters["receipt_lookups"],
+                    expected_inherited,
+                )
+                self.assertFalse(hasattr(report_storage, "_DUMMY_SPAN_REF"))
+                self.assertNotIn(
+                    "arena-placeholder.py",
+                    repr(arena._builder.records),  # noqa: SLF001 # Verify the stored primitive graph has no substitute evidence.
+                )
+                parser_validator_calls = Counter()
+                trace_parser_validator = _span_validator_profiler(
+                    parser_validator_calls
+                )
+                previous_profile = sys.getprofile()
+                sys.setprofile(trace_parser_validator)
+                try:
+                    parsed = parse_report_storage(graph.to_bytes())
+                finally:
+                    sys.setprofile(previous_profile)
+                self.assertEqual(parsed.artifact_kind, artifact_kind)
+                self.assertGreater(
+                    parser_validator_calls["span_ref_ranges"], span_rows
+                )
+                with self.assertRaisesRegex(ValueError, "record_arena_sealed"):
+                    arena.put_record(
+                        "story_plan",
+                        self.expanded_report["generation"]["plan"],
+                    )
+
+                def no_models(value: object) -> None:
+                    self.assertNotIsInstance(value, BaseModel)
+                    if isinstance(value, Mapping):
+                        for nested in value.values():
+                            no_models(nested)
+                    elif type(value) in {tuple, list}:
+                        for nested in value:
+                            no_models(nested)
+
+                for rows in arena._builder.records.values():  # noqa: SLF001 # Inspect arena-owned primitive values.
+                    for row in rows.values():
+                        no_models(row["record"])
+
+        envelope = _envelope(
+            encode_report_storage(self.annotations, "annotations")
+        )
+        _artifact_kind, root, indexes = (
+            report_storage._validate_envelope_shape(  # noqa: SLF001 # Exercise the parser's independent receipt relationship index.
+                envelope
+            )
+        )
+        parser_counters: dict[str, int] = {}
+        report_storage._check_graph_and_addresses(  # noqa: SLF001 # Reproduce the independent parser's full graph precondition.
+            root, indexes
+        )
+        report_storage._validate_table_records(  # noqa: SLF001 # Measure the shared parser relationship checks.
+            root, indexes, counters=parser_counters
+        )
+        self.assertEqual(parser_counters["receipt_index_builds"], 1)
+        self.assertEqual(
+            parser_counters["receipt_index_records_scanned"],
+            len(self.expanded_annotations["generation"]["receipts"]),
+        )
+        self.assertEqual(
+            parser_counters["receipt_lookups"],
+            len(self.annotations["support_provenance"]),
+        )
+
+    def test_incremental_seal_rechecks_reader_order_and_receipt_binding(
+        self,
+    ) -> None:
+        """Reject structurally stored records with invalid generation links at seal."""
+        from diffstory import narrative_plan as plan_module
+        from diffstory.narrative_plan import build_evidence_ledger
+
+        ledger = build_evidence_ledger(self.report)
+        index = plan_module.build_ledger_index(ledger)
+        cases = (
+            (
+                "wrong reader section order",
+                {"reverse_sections": True},
+                "reader_section_mismatch",
+            ),
+            (
+                "receipt result digest mismatch",
+                {"tamper_receipt": True},
+                "receipt_result_mismatch",
+            ),
+        )
+        for concern, options, error in cases:
+            with (
+                self.subTest(concern=concern),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                self._incremental_arena_graph(
+                    "report", ledger, index, **options
+                )
+
+    def test_shared_relationship_failures_match_parser_and_seal(self) -> None:
+        """Reject the same invalid reader and receipt links at both boundaries."""
+        from diffstory.narrative_plan import build_evidence_ledger
+        from diffstory.narrative_plan import build_ledger_index
+
+        cases = (
+            (
+                "reader section order",
+                {"reverse_sections": True},
+                "reader_section_mismatch",
+            ),
+            (
+                "receipt result digest",
+                {"tamper_receipt": True},
+                "receipt_result_mismatch",
+            ),
+        )
+        for concern, seal_options, error in cases:
+            with self.subTest(concern=concern):
+                with self.assertRaisesRegex(ValueError, error):
+                    ledger = build_evidence_ledger(self.report)
+                    index = build_ledger_index(ledger)
+                    self._incremental_arena_graph(
+                        "report", ledger, index, **seal_options
+                    )
+
+                envelope = _envelope(
+                    encode_report_storage(self.expanded_report, "report")
+                )
+                if concern == "reader section order":
+                    reader_id = envelope["root"]["reader"]["$ref"]
+                    reader = next(
+                        row
+                        for row in envelope["tables"]["readers"]
+                        if row["id"] == reader_id
+                    )
+                    reader_sections = reader["record"]["sections"]
+                    reader_sections.reverse()
+                else:
+                    receipt_id = envelope["root"]["generation"]["receipts"][0][
+                        "$ref"
+                    ]
+                    receipt = next(
+                        row
+                        for row in envelope["tables"]["receipts"]
+                        if row["id"] == receipt_id
+                    )
+                    receipt["record"]["result_digest"] = "f" * 64
+                with self.assertRaisesRegex(ValueError, error):
+                    parse_report_storage(_raw(envelope))
+
+    def test_arena_snapshots_models_defaults_and_collision_content(
+        self,
+    ) -> None:
+        """Preserve caller values and compare full content on address reuse."""
+        from diffstory.narrative_contracts import PlanningCardResult
+        from diffstory.narrative_plan import semantic_digest
+        from diffstory.report_storage import _RecordArena
+        from diffstory.report_storage import _thaw
+
+        raw_detail = copy.deepcopy(
+            self.expanded_report["generation"]["details"][0]
+        )
+        expected_detail = copy.deepcopy(raw_detail)
+        typed_detail = self._typed_model(DetailResult, raw_detail)
+        arena = _RecordArena()
+        detail_ref = arena.put_result(typed_detail)
+        if typed_detail.explanations:
+            object.__setattr__(
+                typed_detail.explanations[0], "before", "changed after capture"
+            )
+        self.assertEqual(_thaw(arena.result_view(detail_ref)), expected_detail)
+
+        planning_input = copy.deepcopy(
+            self.expanded_report["generation"]["planning"][0]
+        )
+        planning_input.pop("terminology", None)
+        typed_planning = self._typed_model(PlanningCardResult, planning_input)
+        planning_arena = _RecordArena()
+        planning_ref = planning_arena.put_result(planning_input)
+        selected = _thaw(planning_arena.result_view(planning_ref))
+        self.assertNotIn("terminology", selected)
+        self.assertEqual(
+            planning_arena._result_digests[planning_ref.storage_id],  # noqa: SLF001 # Compare the small typed-default witness.
+            semantic_digest("diffstory.receipt-result.v2", typed_planning),
+        )
+
+        collision_arena = _RecordArena()
+        changed_detail = copy.deepcopy(raw_detail)
+        changed_detail["unit_key"] = "f" * 64
+        original_address = report_storage.storage_address
+
+        def collide_results(kind: str, record: dict) -> str:
+            if kind == "detail":
+                return "0" * 64
+            return original_address(kind, record)
+
+        with patch.object(
+            report_storage,
+            "storage_address",
+            side_effect=collide_results,
+        ):
+            collision_arena.put_result(raw_detail)
+            with self.assertRaisesRegex(
+                ValueError, "storage_address_collision"
+            ):
+                collision_arena.put_result(changed_detail)
+
+    def test_arena_selected_views_are_immutable_and_logically_exact(
+        self,
+    ) -> None:
+        """Keep selected access exact without retaining a complete result copy."""
+        from diffstory.report_storage import _RecordArena
+        from diffstory.report_storage import _thaw
+
+        expected = copy.deepcopy(
+            self.expanded_report["generation"]["planning"][0]
+        )
+        arena = _RecordArena()
+        reference = arena.put_result(expected)
+
+        selected = arena.result_view(reference)
+        self.assertEqual(
+            canonical_bytes(_thaw(selected)), canonical_bytes(expected)
+        )
+        with self.assertRaises(TypeError):
+            selected["unit_key"] = "0" * 64
+        self.assertEqual(
+            b"".join(arena.logical_chunks(reference)),
+            canonical_bytes(expected),
+        )
+
+        path = {"field": "abstraction", "index": 0}
+        statement = arena.statement_view(reference, path)
+        self.assertEqual(
+            canonical_bytes(_thaw(statement)),
+            canonical_bytes(expected["abstraction"][0]),
+        )
+        self.assertEqual(arena.retained_record_counts["results"], 1)
+
+    def test_arena_rolls_back_nested_rows_when_parent_validation_fails(
+        self,
+    ) -> None:
+        """Do not retain evidence rows from an invalid parent result."""
+        from pydantic import ValidationError
+
+        from diffstory.report_storage import _RecordArena
+
+        invalid = copy.deepcopy(
+            self.expanded_report["generation"]["details"][0]
+        )
+        invalid["explanations"][0].pop("after")
+        arena = _RecordArena()
+        with self.assertRaises(ValidationError):
+            arena.put_result(invalid)
+        self.assertEqual(sum(arena.retained_record_counts.values()), 0)
+        self.assertEqual(arena.typed_validation_counts, {})
+        self.assertEqual(
+            arena.put_result(
+                self.expanded_report["generation"]["details"][0]
+            ).kind,
+            "detail",
+        )
 
     def _coherent_reader_record_change(  # noqa: PLR0913 # Keep mutation schema inputs explicit.
         self,
