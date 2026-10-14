@@ -17,8 +17,10 @@ import re
 from bisect import bisect_right
 from collections import Counter
 from collections import defaultdict
+from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import MutableMapping
+from collections.abc import Sequence as AbstractSequence
 from dataclasses import dataclass
 from dataclasses import field
 from difflib import SequenceMatcher
@@ -75,15 +77,180 @@ if TYPE_CHECKING:
     from diffstory.report_storage import ResultRef
 
 
+@dataclass(frozen=True, slots=True)
+class _OwnedMapping(Mapping[str, object]):
+    """Read-only mapping for one session-owned JSON object.
+
+    Attributes:
+        entries: Ordered string keys and detached immutable JSON values.
+
+    The mapping preserves source iteration order while canonical serialization
+    sorts keys. It is an internal traversal view, not a public report adapter.
+    """
+
+    entries: tuple[tuple[str, object], ...]
+
+    def __getitem__(self, key: str) -> object:
+        """Return the value for an existing key.
+
+        Preconditions:
+            ``key`` is a string.
+        Postconditions:
+            Returns the exact immutable child owned by this mapping.
+        Essential behavior:
+            Does not copy or thaw the report tree.
+        """
+        for name, value in self.entries:
+            if name == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate original keys without creating a mutable mapping."""
+        return (key for key, _value in self.entries)
+
+    def __len__(self) -> int:
+        """Return the number of owned keys."""
+        return len(self.entries)
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedList(AbstractSequence[object]):
+    """Read-only view that preserves an input JSON list's Python shape."""
+
+    items: tuple[object, ...]
+
+    def __getitem__(self, index: int | slice) -> object:
+        """Read one owned element or slice.
+
+        Preconditions:
+            ``index`` is a valid sequence index or slice.
+        Postconditions:
+            Returns an immutable owned element or tuple of owned elements.
+        Essential behavior:
+            Preserves list identity in the session's raw-shape witness.
+        """
+        return self.items[index]
+
+    def __len__(self) -> int:
+        """Return the number of owned list elements."""
+        return len(self.items)
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedTuple(AbstractSequence[object]):
+    """Read-only view that preserves an input Python tuple's shape."""
+
+    items: tuple[object, ...]
+
+    def __getitem__(self, index: int | slice) -> object:
+        """Read one owned element or slice without exposing the backing tuple."""
+        return self.items[index]
+
+    def __len__(self) -> int:
+        """Return the number of owned tuple elements."""
+        return len(self.items)
+
+
+def _canonical_chunks(value: object) -> Iterator[bytes]:
+    """Yield canonical JSON bytes for native or owned JSON primitives.
+
+    Preconditions:
+        Values contain JSON primitives, mappings with string keys, sequences,
+        or Pydantic models with JSON serializers.
+    Postconditions:
+        Joined chunks equal the previous ``json.dumps`` canonical wire bytes.
+    Essential behavior:
+        Traverses owned report views directly so hashing need not build a full
+        temporary report dictionary or retain its encoded byte buffer.
+    """
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    if isinstance(value, Mapping):
+        keys = tuple(value)
+        if not all(type(key) is str for key in keys):
+            # Keep json's original error behavior for non-JSON object keys.
+            fallback = json.dumps(
+                dict(value),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+                default=_json_default,
+            )
+            yield fallback.encode("utf-8")
+            return
+        yield b"{"
+        for position, key in enumerate(sorted(keys)):
+            if position:
+                yield b","
+            yield json.dumps(key, ensure_ascii=False).encode("utf-8")
+            yield b":"
+            yield from _canonical_chunks(value[key])
+        yield b"}"
+        return
+    if type(value) in {list, tuple, _OwnedList, _OwnedTuple}:
+        yield b"["
+        for position, item in enumerate(value):
+            if position:
+                yield b","
+            yield from _canonical_chunks(item)
+        yield b"]"
+        return
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+        default=_json_default,
+    )
+    yield encoded.encode("utf-8")
+
+
+def _thaw_owned(value: object) -> object:
+    """Build a detached mutable compatibility value from an owned view."""
+    if type(value) is _OwnedMapping:
+        return {key: _thaw_owned(item) for key, item in value.entries}
+    if type(value) is _OwnedList:
+        return [_thaw_owned(item) for item in value.items]
+    if type(value) is _OwnedTuple:
+        return tuple(_thaw_owned(item) for item in value.items)
+    return value
+
+
 def _json_default(value: object) -> object:
+    """Adapt typed models and owned views for the standard JSON encoder.
+
+    Preconditions:
+        ``value`` is a Pydantic model, mapping, or owned sequence view.
+    Postconditions:
+        Returns a shallow JSON-compatible container or model value.
+    Essential behavior:
+        Keeps ordinary trees on the standard encoder's optimized path while
+        avoiding a recursive thaw of the session-owned report tree.
+    """
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
+    if isinstance(value, Mapping):
+        return dict(value.items())
+    if type(value) in {_OwnedList, _OwnedTuple}:
+        return list(value.items)
     msg = "Unsupported canonical value"
     raise TypeError(msg)
 
 
 def canonical_bytes(value: object) -> bytes:
-    """Encode identity material without whitespace or dictionary order effects."""
+    """Encode identity material without whitespace or dictionary order effects.
+
+    Preconditions:
+        ``value`` is JSON data, a typed model, a mapping, or an owned view.
+    Postconditions:
+        Returns the exact compact UTF-8 bytes used by the canonical identity.
+    Essential behavior:
+        Uses the standard encoder for native and typed values; owned views use
+        shallow per-container adapters and are not deep-thawed.
+    """
     return json.dumps(
         value,
         sort_keys=True,
@@ -92,6 +259,22 @@ def canonical_bytes(value: object) -> bytes:
         allow_nan=False,
         default=_json_default,
     ).encode("utf-8")
+
+
+def canonical_digest(value: object) -> str:
+    """Hash canonical JSON by chunks without retaining its complete bytes.
+
+    Preconditions:
+        ``value`` is accepted by :func:`canonical_bytes`.
+    Postconditions:
+        Returns the SHA256 digest of exactly the canonical wire bytes.
+    Essential behavior:
+        Keeps only the active JSON path and hash state for owned report views.
+    """
+    digest = hashlib.sha256()
+    for chunk in _canonical_chunks(value):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _raw_integrity_value(value: object) -> object:
@@ -118,10 +301,9 @@ def _raw_integrity_value(value: object) -> object:
         ]
         entries.sort(key=lambda item: canonical_bytes(item[0]))
         return "mapping", tuple(entries)
-    if type(value) in {tuple, list}:
-        return type(value).__name__, tuple(
-            _raw_integrity_value(item) for item in value
-        )
+    if type(value) in {tuple, list, _OwnedList, _OwnedTuple}:
+        kind = "list" if type(value) in {list, _OwnedList} else "tuple"
+        return kind, tuple(_raw_integrity_value(item) for item in value)
     if type(value) in {set, frozenset}:
         entries = [_raw_integrity_value(item) for item in value]
         entries.sort(key=canonical_bytes)
@@ -146,7 +328,7 @@ def content_digest(value: bytes) -> str:
 
 def semantic_digest(*parts: object) -> str:
     """Hash versioned canonical content; callers exclude current bindings."""
-    return content_digest(canonical_bytes(parts))
+    return canonical_digest(parts)
 
 
 def _require(condition: bool, reason: str) -> None:  # noqa: FBT001 # Assertion predicate, not an option.
@@ -202,11 +384,11 @@ class _Change:
 
 
 def _projection(
-    report: dict,
+    report: dict | _OwnedMapping,
 ) -> tuple[list[_Fragment], tuple[FileAvailability, ...]]:
     evidence = report.get("source_evidence")
     _require(
-        isinstance(evidence, dict)
+        type(evidence) in {dict, _OwnedMapping}
         and evidence.get("schema") == "diffstory.source-evidence.v1",
         "original_source_projection_required",
     )
@@ -741,7 +923,10 @@ def _global_changed_spans(
 
 
 def build_evidence_ledger(
-    report: dict, *, max_span_bytes: int = 4096, max_unit_spans: int = 16
+    report: dict | _OwnedMapping,
+    *,
+    max_span_bytes: int = 4096,
+    max_unit_spans: int = 16,
 ) -> EvidenceLedger:
     """Account for every original buffer and derive bounded local obligations.
 

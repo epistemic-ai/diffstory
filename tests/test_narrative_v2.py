@@ -356,6 +356,37 @@ class BatchedNarratorTests(unittest.TestCase):
         with self.assertRaisesRegex(ArtifactRuntimeError, "busy"):
             narrator.generate(report)
 
+    def test_public_dict_validation_rebuilds_its_own_production_index(
+        self,
+    ) -> None:
+        """A public annotation dictionary must not inherit coordinator authority."""
+        cases = [(golden_report(1), "diffstory.annotations.v2")]
+        for report, expected_schema in cases:
+            with self.subTest(schema=expected_schema):
+                provider = FixtureProvider()
+                narrator = self.narrator(provider)
+                candidate = narrator.generate(report)
+                self.assertIs(type(candidate), dict)
+                self.assertEqual(candidate["schema"], expected_schema)
+                manifest = GenerationManifest.model_validate_json(
+                    canonical_bytes(candidate["generation"])
+                )
+                from diffstory.narrative_v2 import build_ledger_index
+
+                with (
+                    patch(
+                        "diffstory.narrative_v2.build_evidence_ledger",
+                        wraps=build_evidence_ledger,
+                    ) as ledgers,
+                    patch(
+                        "diffstory.narrative_v2.build_ledger_index",
+                        wraps=build_ledger_index,
+                    ) as indexes,
+                ):
+                    validate_generation(report, manifest, candidate=candidate)
+                self.assertEqual(ledgers.call_count, 1)
+                self.assertEqual(indexes.call_count, 1)
+
     def test_many_fitting_groups_do_not_create_an_evidence_or_section_floor(
         self,
     ) -> None:

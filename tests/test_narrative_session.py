@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import pickle
 import tempfile
@@ -19,7 +20,9 @@ from diffstory.narrative_manifest import GenerationManifest
 from diffstory.narrative_manifest import compiler_fact_signature
 from diffstory.narrative_manifest import result_digest
 from diffstory.narrative_plan import canonical_bytes
+from diffstory.narrative_plan import canonical_digest
 from diffstory.narrative_protocol import RequestConfiguration
+from diffstory.narrative_protocol import V2Options
 from diffstory.narrative_runtime import ArtifactRuntimeError
 from diffstory.narrative_session import ReportSession
 from diffstory.narrative_session import ValidatedGeneration
@@ -177,6 +180,193 @@ class ReportSessionTests(unittest.TestCase):
             self.assertEqual(
                 session.request_configuration_data(), self.configuration
             )
+
+    def test_canonical_bytes_keeps_the_standard_encoder_for_native_and_models(
+        self,
+    ) -> None:
+        """Per-leaf Python serialization could slow ordinary identity values."""
+        native = {
+            "unicode": "café 🧭",
+            "values": [True, 1, None, -0.0],
+            "nested": {"z": 2, "a": 1},
+        }
+        defaulted_options = V2Options()
+        typed = RequestConfiguration.model_validate_json(
+            canonical_bytes(self.configuration)
+        )
+        cases = [
+            (
+                "native",
+                native,
+                json.dumps(
+                    native,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8"),
+            ),
+            (
+                "defaulted-model",
+                defaulted_options,
+                json.dumps(
+                    defaulted_options.model_dump(mode="json"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8"),
+            ),
+            (
+                "typed-model",
+                typed,
+                json.dumps(
+                    typed.model_dump(mode="json"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8"),
+            ),
+        ]
+        with patch(
+            "diffstory.narrative_plan._canonical_chunks",
+            side_effect=AssertionError(
+                "ordinary values entered Python chunk loop"
+            ),
+        ):
+            for name, value, expected in cases:
+                with self.subTest(name=name):
+                    self.assertEqual(canonical_bytes(value), expected)
+        for name, value, expected in cases:
+            with self.subTest(name=f"digest-{name}"):
+                self.assertEqual(
+                    canonical_digest(value),
+                    hashlib.sha256(expected).hexdigest(),
+                )
+
+    def test_owned_report_digest_matches_standard_json_for_raw_python_shapes(
+        self,
+    ) -> None:
+        """Streaming capture could change Unicode or Python-shape identity."""
+        cases = [
+            (
+                "unicode-scalars-and-arrays",
+                {
+                    "meta": {"title": "café 🧭", "revision": None},
+                    "values": [True, 1, False, 0, None, "e\u0301"],
+                    "tuple_value": (True, 1),
+                    "list_value": [True, 1],
+                    "empty_mapping": {},
+                    "empty_array": [],
+                },
+            )
+        ]
+        for name, report in cases:
+            with (
+                self.subTest(name=name),
+                ReportSession.capture(report, self.configuration) as session,
+            ):
+                expected = json.dumps(
+                    report,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+                capture = session._captured_input  # noqa: SLF001 # Verify the internal owned stream without using the public expansion as its oracle.
+                self.assertEqual(
+                    capture.report_digest,
+                    hashlib.sha256(expected).hexdigest(),
+                )
+                self.assertEqual(
+                    canonical_bytes(capture.report_view), expected
+                )
+                self.assertEqual(
+                    canonical_digest(capture.report_view),
+                    hashlib.sha256(expected).hexdigest(),
+                )
+                self.assertEqual(session.captured_report(), report)
+
+    def test_changed_owned_group_title_cannot_reuse_completed_import(
+        self,
+    ) -> None:
+        """A changed captured title could be hidden by the derived overlay."""
+        cases = [
+            (
+                "group-title",
+                "changed captured title",
+                "captured_input_changed",
+            )
+        ]
+        for name, changed_title, expected_error in cases:
+            with (
+                self.subTest(name=name),
+                ReportSession.capture(
+                    self.report, self.configuration
+                ) as session,
+            ):
+                generation = session.validate_import(
+                    self.annotations["generation"],
+                    candidate=self.annotations,
+                )
+                capture = session._captured_input  # noqa: SLF001 # Reproduce the frozen-owned-view bypass.
+                root = capture.report_view
+                group = root["groups"][0]
+                original_entries = group.entries
+                old_signature = compiler_fact_signature(root)
+                object.__setattr__(
+                    group,
+                    "entries",
+                    tuple(
+                        (
+                            key,
+                            changed_title if key == "title" else value,
+                        )
+                        for key, value in original_entries
+                    ),
+                )
+                self.assertEqual(compiler_fact_signature(root), old_signature)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    session.apply(generation)
+                self.assertFalse(
+                    any(
+                        kind == "report"
+                        for _handle, kind, _data in session._registrations.values()  # noqa: SLF001 # Confirm failed apply issued no report handle.
+                    )
+                )
+                object.__setattr__(group, "entries", original_entries)
+
+    def test_changed_session_version_cannot_issue_import_capability(
+        self,
+    ) -> None:
+        """A changed proof version could issue a capability under a stale scope."""
+        cases = [
+            (
+                "validation-version",
+                "diffstory.session.import-proof.changed",
+                "captured_input_changed",
+            )
+        ]
+        for name, changed_version, expected_error in cases:
+            with (
+                self.subTest(name=name),
+                ReportSession.capture(
+                    self.report, self.configuration
+                ) as session,
+            ):
+                with (
+                    patch(
+                        "diffstory.narrative_session._VALIDATION_VERSION",
+                        changed_version,
+                    ),
+                    self.assertRaisesRegex(ValueError, expected_error),
+                ):
+                    session.validate_import(
+                        self.annotations["generation"],
+                        candidate=self.annotations,
+                    )
+                self.assertEqual(session._registrations, {})  # noqa: SLF001 # Confirm stale versions issued no session capability.
 
     def test_capture_accepts_configuration_models_and_serialized_snapshots(
         self,

@@ -38,6 +38,9 @@ from .narrative_contracts import StoryPlan
 from .narrative_contracts import SupportedStatement
 from .narrative_contracts import result_key
 from .narrative_contracts import result_kind
+from .narrative_plan import _OwnedList
+from .narrative_plan import _OwnedMapping
+from .narrative_plan import _thaw_owned
 from .narrative_plan import canonical_bytes
 from .narrative_plan import content_digest
 from .narrative_plan import semantic_digest
@@ -78,22 +81,33 @@ def _require(condition: bool, reason: str) -> None:  # noqa: FBT001 # Assertion 
         raise ValueError(reason)
 
 
-def compiler_fact_signature(report: dict) -> str:
+def compiler_fact_signature(report: dict | _OwnedMapping) -> str:
     """Hash compiler facts after removing only declared generated presentation.
 
     Exclude root document/generation/narrative_v2 and group presentation.
     Canonicalize group order by compiler ID. Retain every other field, including
     metadata, revisions, source, classification, prerequisites and test status.
     Never compare an annotated report's full hash to its pre-annotation hash.
+
+    Preconditions:
+        ``report`` is a strict public dictionary or the private read-only
+        primitive view owned by a ReportSession capture.
+    Postconditions:
+        Returns the existing compiler-fact signature with unchanged field and
+        scalar semantics.
+    Essential behavior:
+        Hashes selected mapping views by stream, without thawing an owned report.
     """
     _require(
-        type(report) is dict and type(report.get("groups")) is list,
+        type(report) in {dict, _OwnedMapping}
+        and type(report.get("groups")) in {list, _OwnedList},
         "invalid_report_shape",
     )
     groups = report["groups"]
     _require(
         all(
-            type(group) is dict and type(group.get("id")) is str
+            type(group) in {dict, _OwnedMapping}
+            and type(group.get("id")) is str
             for group in groups
         ),
         "invalid_group_shape",
@@ -102,19 +116,39 @@ def compiler_fact_signature(report: dict) -> str:
         len({group["id"] for group in groups}) == len(groups),
         "duplicate_group",
     )
-    projection = {
-        key: value
-        for key, value in report.items()
-        if key not in {"document", "generation", "groups", "narrative_v2"}
-    }
-    projection["groups"] = [
-        {
-            key: value
-            for key, value in group.items()
-            if key not in {"narrative", "title", "number", "next_id"}
-        }
-        for group in sorted(groups, key=lambda group: group["id"])
-    ]
+    excluded = {"document", "generation", "groups", "narrative_v2"}
+    projection = _OwnedMapping(
+        (
+            *tuple(
+                (key, value)
+                for key, value in report.items()
+                if key not in excluded
+            ),
+            (
+                "groups",
+                _OwnedList(
+                    tuple(
+                        _OwnedMapping(
+                            tuple(
+                                (key, value)
+                                for key, value in group.items()
+                                if key
+                                not in {
+                                    "narrative",
+                                    "title",
+                                    "number",
+                                    "next_id",
+                                }
+                            )
+                        )
+                        for group in sorted(
+                            groups, key=lambda group: group["id"]
+                        )
+                    )
+                ),
+            ),
+        )
+    )
     return semantic_digest("diffstory.compiler-facts.v2", projection)
 
 
@@ -577,7 +611,7 @@ def build_receipts(
 
 
 def assemble_candidate(  # noqa: C901, PLR0912, PLR0915 # Assemble all typed families, slice coordinates and immediate provenance.
-    report: dict,
+    report: dict | _OwnedMapping,
     manifest: GenerationManifest,
     *,
     ledger: EvidenceLedger | None = None,
@@ -1332,22 +1366,41 @@ def assemble_indexed_candidate(
 
 
 def validate_generation(
-    report: dict,
+    report: dict | _OwnedMapping,
     manifest: GenerationManifest,
     *,
     provider: object | None = None,
     options: V2Options | None = None,
     candidate: dict | None = None,
+    _captured_input: object | None = None,
 ) -> dict:
-    """Rebuild trusted production support, hierarchy, requests and exact assembly."""
+    """Rebuild trusted production support, hierarchy, requests and exact assembly.
+
+    Preconditions:
+        Public calls supply an expanded dictionary. The private captured-input
+        path supplies only the exact immutable view registered by its session.
+    Postconditions:
+        Returns a data candidate after the complete independent proof succeeds.
+    Essential behavior:
+        Does not let a report dictionary or partial session binding skip proof.
+    """
     from .narrative_v2 import validate_production
 
+    if _captured_input is None:
+        _require(type(report) is dict, "invalid_report_shape")
+    else:
+        owns_report = getattr(_captured_input, "owns_report_view", None)
+        _require(
+            callable(owns_report) and owns_report(report),
+            "invalid_report_shape",
+        )
     return validate_production(
         report,
         manifest,
         provider=provider,
         options=options,
         candidate=candidate,
+        _captured_input=_captured_input,
     )
 
 
@@ -1821,7 +1874,9 @@ def indexed_applied_fields(  # noqa: PLR0915 # Select document and group fields 
 
 
 def _apply_v2_candidate(
-    report: dict, manifest: GenerationManifest, candidate: dict
+    report: dict | _OwnedMapping,
+    manifest: GenerationManifest,
+    candidate: dict,
 ) -> dict:
     """Apply already validated deterministic v2 data to an owned report copy.
 
@@ -1831,7 +1886,11 @@ def _apply_v2_candidate(
     from copy import deepcopy
 
     presentation = presentation_from_candidate(candidate)
-    result = deepcopy(report)
+    result = (
+        _thaw_owned(report)
+        if type(report) is _OwnedMapping
+        else deepcopy(report)
+    )
     groups = {g["id"]: g for g in result["groups"]}
     result["groups"] = [groups[s.group_id] for s in presentation.sections]
     for section, group in zip(

@@ -53,6 +53,7 @@ from .narrative_manifest import compiler_fact_signature
 from .narrative_manifest import validate_prose_support
 from .narrative_plan import PackingError
 from .narrative_plan import RequestPackingLimits
+from .narrative_plan import _raw_integrity_bytes
 from .narrative_plan import build_evidence_ledger
 from .narrative_plan import build_ledger_index
 from .narrative_plan import canonical_bytes
@@ -460,19 +461,58 @@ class ProductionInputs:
     """Reconstruct trusted source, support, fixed hierarchy and request bytes."""
 
     def __init__(
-        self, report: dict, transport: Transport | OfflineTransport
+        self,
+        report: dict,
+        transport: Transport | OfflineTransport,
+        *,
+        captured_input: object | None = None,
     ) -> None:
-        """Freeze report bytes and build one indexed evidence ledger."""
-        self.report_bytes = canonical_bytes(report)
-        self.report = strict_json(self.report_bytes)
+        """Share one immutable capture and build its ledger/index only once.
+
+        Preconditions:
+            Public construction receives a report dictionary and an approved
+            transport. The private capture hook is used only by ReportSession.
+        Postconditions:
+            ``report`` is the capture's immutable view and its ledger/index/run
+            identities are shared with that capture.
+        Essential behavior:
+            Avoids canonicalizing, parsing, and retaining a second report tree.
+        """
+        from .narrative_session import _CapturedInput
+
+        require(type(report) is dict or captured_input is not None)
+        if captured_input is None:
+            captured_input = _CapturedInput(report, transport.descriptor)
+        require(type(captured_input) is _CapturedInput)
+        captured_input.check_report(report)
+        descriptor_bytes = canonical_bytes(
+            transport.descriptor.model_dump(mode="json")
+        )
+        require(
+            descriptor_bytes == captured_input.configuration_bytes,
+            "dependencies_changed",
+        )
+        self._captured_input = captured_input
+        self.report = captured_input.report_view
+        self.report_digest = captured_input.report_digest
         self.transport = transport
         self.options = transport.options
-        self.ledger = build_evidence_ledger(
-            self.report, **self.options.ledger.model_dump()
-        )
-        self.index = build_ledger_index(self.ledger)
+        if captured_input.ledger is None:
+            ledger = build_evidence_ledger(
+                self.report, **self.options.ledger.model_dump()
+            )
+            index = build_ledger_index(ledger)
+            self.ledger, self.index = captured_input.bind_ledger_index(
+                ledger, index, self.options.ledger
+            )
+        else:
+            self.ledger, self.index = captured_input.bind_ledger_index(
+                captured_input.ledger,
+                captured_input.index,
+                self.options.ledger,
+            )
         self.wire = WireAdapter(self.index)
-        self.author = AuthorContext(
+        author = AuthorContext(
             **{
                 key: str(self.report["meta"].get(field) or "")
                 for key, field in (
@@ -482,21 +522,26 @@ class ProductionInputs:
                 )
             }
         )
-        self.author_digest = semantic_digest(
-            "diffstory.author-context.v2", self.author
+        author_digest = semantic_digest("diffstory.author-context.v2", author)
+        self.author, self.author_digest = captured_input.bind_author(
+            author, author_digest
         )
         self.run = RunIdentity(
             base_revision=self.report["meta"]["base_sha"],
             head_revision=self.report["meta"]["head_sha"],
-            report_signature=content_digest(self.report_bytes),
+            report_signature=self.report_digest,
             provider_destination=transport.descriptor.destination,
             model=transport.descriptor.model,
         )
+        self.run = captured_input.bind_run(self.run)
         self.details: dict[str, DetailResult] = {}
         self.observations = {}
         self.plan: StoryPlan | None = None
         self.group_roots: dict[str, str] = {}
         self.card_groups: dict[str, tuple[str, ...]] = {}
+        self.sources = None
+        self._source_binding = None
+        captured_input.bind_production_inputs(self)
 
     def detail_items(self) -> tuple[InputItem, ...]:
         """Use normalized source-only inputs without report or author identity."""
@@ -522,6 +567,7 @@ class ProductionInputs:
         self.sources = derive_planning_sources(
             self.index, details, author_context=self.author
         )
+        self._source_binding = self.sources
         self.details = {d.unit_key: d for d in self.sources.details}
         self.observations = {
             ClaimRef(unit_key=d.unit_key, observation_id=o.id): o
@@ -531,6 +577,66 @@ class ProductionInputs:
         for claim in self.observations:
             self.wire.claim_alias(claim)
         return self.sources.groups
+
+    def assert_capture_current(self) -> None:
+        """Reject changed captured content or derived production bindings.
+
+        Preconditions:
+            This is the live ProductionInputs value made for an open capture.
+        Postconditions:
+            Returns only when report content, options, run, author, ledger,
+            index, source, and transport bindings remain current.
+        Essential behavior:
+            Reuses the capture's ledger index and source-scope witnesses.
+        """
+        require(
+            self._captured_input is not None, "captured_input_binding_changed"
+        )
+        captured_input = self._captured_input
+        require(
+            self.report is captured_input.report_view,
+            "captured_input_binding_changed",
+        )
+        captured_input.assert_capture_current(self)
+        check_transport = getattr(self.transport, "check", None)
+        if callable(check_transport):
+            check_transport()
+
+    def check_approved_report(self, report: object) -> None:
+        """Compare the current caller report with this private immutable capture."""
+        self._captured_input.check_report(report)
+
+    def _release_capture_data(self) -> None:
+        """Clear production aliases and selected-source data when closed.
+
+        Preconditions:
+            The production inputs may still refer to an open or closed capture.
+        Postconditions:
+            Report, transport, model, source, detail, and plan aliases are empty.
+        Essential behavior:
+            Clears existing source caches and releases the shared capture link.
+        """
+        from .narrative_session import _close_source_caches
+
+        _close_source_caches(getattr(self, "_source_binding", None))
+        self._captured_input = None
+        self.report = None
+        self.report_digest = ""
+        self.transport = None
+        self.options = None
+        self.ledger = None
+        self.index = None
+        self.run = None
+        self.author = None
+        self.author_digest = ""
+        self.wire = None
+        self.sources = None
+        self._source_binding = None
+        self.details.clear()
+        self.observations.clear()
+        self.plan = None
+        self.group_roots.clear()
+        self.card_groups.clear()
 
     def support_payload(self, support: SupportSet) -> dict:
         """Serialize only immediate consumed support, never source ancestry."""
@@ -1636,17 +1742,49 @@ class BatchedNarrator:
         self.stages: list[StageInputs] = []
         self.reused: set[str] = set()
         self.approved_report: dict | None = None
+        self.session = None
+        self._approved_options_integrity_digest: str | None = None
 
-    def preview(self, report: dict) -> dict:
-        """Freeze approved inputs locally; never send source or check credentials."""
+    def preview(self, report: dict, *, session: object | None = None) -> dict:
+        """Freeze approved inputs locally; never send source or check credentials.
+
+        Preconditions:
+            ``report`` is the caller's report mapping. An optional session must
+            own a matching immutable report and request configuration.
+        Postconditions:
+            Preview and production preparation share the exact capture and
+            ledger/index when a session is supplied.
+        Essential behavior:
+            Retains the caller reference only for approval checks; captured
+            report identity uses streaming digests rather than duplicate bytes.
+        """
         require(not self.started, "busy")
         if self.inputs is None:
-            self.inputs = ProductionInputs(
-                report, Transport(self.provider, self.options)
+            transport = Transport(self.provider, self.options)
+            self._approved_options_integrity_digest = content_digest(
+                _raw_integrity_bytes(self.options)
             )
+            captured_input = None
+            if session is not None:
+                from .narrative_session import ReportSession
+
+                require(type(session) is ReportSession)
+                try:
+                    captured_input = session._coordinator_capture(  # noqa: SLF001 # Purpose-specific session capture hook; no authority is returned.
+                        report, transport.descriptor
+                    )
+                except ValueError:
+                    require(False, "dependencies_changed")  # noqa: FBT003 # Fail closed on a changed immutable session binding.
+            self.inputs = ProductionInputs(
+                report, transport, captured_input=captured_input
+            )
+            self.inputs._captured_input.bind_coordinator(self)  # noqa: SLF001 # Close expires the local coordinator's approval aliases.
             self.approved_report = report
+            self.session = session
         else:
+            require(session is self.session, "dependencies_changed")
             self.check_approval(report)
+        self.inputs.assert_capture_current()
         stage = StageInputs(self.inputs, "detail", self.inputs.detail_items())
         batches = stage.pack(tuple(stage.items))
         return {
@@ -1660,21 +1798,53 @@ class BatchedNarrator:
             "later_batches": "depend_on_validated_prose",
             "calls": len(batches),
             "conditional_calls": None,
-            "approval_digest": content_digest(self.inputs.report_bytes),
+            "approval_digest": self.inputs.report_digest,
         }
 
     def check_approval(self, report: dict) -> None:
-        """A changed report or provider cannot silently replace preview approval."""
-        require(
-            canonical_bytes(report) == self.inputs.report_bytes,
-            "dependencies_changed",
-        )
+        """Reject report or provider changes before the next operation.
+
+        Preconditions:
+            A live preview exists and ``report`` is the caller's report mapping.
+        Postconditions:
+            Returns only when report, options, models, transport, and versions
+            still match the preview binding.
+        Essential behavior:
+            Rechecks current caller content and all captured production witnesses.
+        """
+        try:
+            self.inputs.check_approved_report(report)
+            self.inputs.assert_capture_current()
+        except (AttributeError, ValueError):
+            require(False, "dependencies_changed")  # noqa: FBT003 # Preserve the existing safe dependency failure.
         require(
             self.options == self.inputs.options
-            and self.provider is self.inputs.transport.provider,
+            and self.provider is self.inputs.transport.provider
+            and self._approved_options_integrity_digest is not None
+            and content_digest(_raw_integrity_bytes(self.options))
+            == self._approved_options_integrity_digest,
             "dependencies_changed",
         )
-        self.inputs.transport.check()
+
+    def _release_capture_bindings(self) -> None:
+        """Expire approval aliases and in-memory production state on close.
+
+        Preconditions:
+            The coordinator may be retained after its owning session closes.
+        Postconditions:
+            Caller report, session, provider, options, stages, and runtime aliases
+            are cleared; future generation cannot reuse this preview.
+        Essential behavior:
+            Leaves no captured authority reachable through this coordinator.
+        """
+        self.approved_report = None
+        self.session = None
+        self.stages.clear()
+        self.reused.clear()
+        self.runtime = None
+        self.provider = None
+        self.options = None
+        self._approved_options_integrity_digest = None
 
     def save_run(self) -> None:
         """Atomically retain full run identity for historical producer receipts."""
@@ -1725,11 +1895,15 @@ class BatchedNarrator:
             raise ArtifactRuntimeError(msg) from None
         return run
 
-    def execute(self, stage: StageInputs) -> tuple[StoredArtifact, ...]:  # noqa: C901 # Preserve one logical ownership pass across original views.
+    def execute(self, stage: StageInputs) -> tuple[StoredArtifact, ...]:  # noqa: C901, PLR0912, PLR0915 # Preserve one logical ownership pass across original views.
         """Discover and audit every compatible original before packing new work."""
         self.stages.append(stage)
         replay = CodecReplay(stage)
         stage.replay = replay
+        captured_input = self.inputs._captured_input  # noqa: SLF001 # Coordinator binds the capture's private session to its actual stage.
+        session = captured_input.owner_session
+        if session is not None:
+            session._bind_stage(stage)  # noqa: SLF001 # Register incomplete stage data, not a proof.
         states = {}
         originals = {}
         for view in replay.views:
@@ -1802,6 +1976,8 @@ class BatchedNarrator:
             def approved_send(
                 prepared: PreparedArtifactRequest,
             ) -> ProviderReply:
+                if session is not None:
+                    session._check_stage_binding(stage)  # noqa: SLF001 # Verify the exact registered stage before dispatch.
                 self.check_approval(self.approved_report)
                 return send(prepared)
 
@@ -1889,6 +2065,8 @@ class BatchedNarrator:
             for a in outcome.artifacts
         )
         require(set(artifacts) == set(stage.items), "coverage")
+        if session is not None:
+            session._check_stage_binding(stage)  # noqa: SLF001 # Reject post-execution stage rebinding.
         return tuple(artifacts[k] for k in stage.items)
 
     def generate(self, report: dict) -> dict:
@@ -1899,7 +2077,6 @@ class BatchedNarrator:
         self.check_approval(report)
         self.started = True
         self.provider.require_credentials()
-        self.inputs.transport.check()
         self.runtime = ArtifactRuntime(
             self.inputs.run,
             recovery_dir=self.recovery_dir,
@@ -1959,9 +2136,8 @@ class BatchedNarrator:
         )
         manifest = GenerationManifest(
             run=self.inputs.run,
-            compiler_fact_signature=compiler_fact_signature(
-                self.inputs.report
-            ),
+            compiler_fact_signature=self.inputs._captured_input.compiler_signature  # noqa: SLF001 # Reuse the immutable capture's exact compiler-fact digest.
+            or compiler_fact_signature(self.inputs.report),
             current_usage=CurrentUsage(**self.usage.report()),
             ledger_digest=self.inputs.ledger.id,
             ledger_parameters=self.options.ledger,
@@ -2011,13 +2187,14 @@ class BatchedNarrator:
             stages[key].validate(stages[key].lookups[key], result)
 
 
-def validate_production(
+def validate_production(  # noqa: C901, PLR0915 # Preserve one full ordered offline proof path.
     report: dict,
     manifest: GenerationManifest,
     *,
     provider: object | None = None,
     options: V2Options | None = None,
     candidate: dict | None = None,
+    _captured_input: object | None = None,
 ) -> dict:
     """Rebuild all current proofs; default to the pure persisted codec.
 
@@ -2034,9 +2211,22 @@ def validate_production(
     if provider is not None:
         live = Transport(provider, descriptor.options)
         require(live.descriptor == descriptor, "dependencies_changed")
-    inputs = ProductionInputs(report, transport)
+    if _captured_input is None:
+        require(type(report) is dict, "invalid_report_shape")
+    else:
+        owns_report = getattr(_captured_input, "owns_report_view", None)
+        require(
+            callable(owns_report) and owns_report(report),
+            "invalid_report_shape",
+        )
+    inputs = ProductionInputs(
+        report, transport, captured_input=_captured_input
+    )
+    captured_facts = inputs._captured_input.compiler_signature  # noqa: SLF001 # The digest is bound to this exact immutable input capture.
+    if captured_facts is None:
+        captured_facts = compiler_fact_signature(report)
     require(
-        compiler_fact_signature(report) == manifest.compiler_fact_signature,
+        captured_facts == manifest.compiler_fact_signature,
         "dependencies_changed",
     )
     require(
@@ -2068,6 +2258,10 @@ def validate_production(
             {result_key(r) for r in results} == set(stage.items), "coverage"
         )
         replay = CodecReplay(stage)
+        stage.replay = replay
+        session = inputs._captured_input.owner_session  # noqa: SLF001 # The imported proof binds its actual stage to the matching capture.
+        if session is not None:
+            session._bind_stage(stage)  # noqa: SLF001 # Register incomplete stage data, not a proof.
         for key in dict.fromkeys(
             receipts[result_key(r)].producer_key for r in results
         ):
