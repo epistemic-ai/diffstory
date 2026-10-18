@@ -31,6 +31,7 @@ from diffstory.analysis import (  # noqa: E402, I001
     compile_snapshot,
 )
 from diffstory.render import render  # noqa: E402
+from test_analysis import snap  # noqa: E402
 
 
 def check_story_sections(
@@ -118,6 +119,12 @@ def file_evidence_report() -> dict:
     Returns:
         A compiled report with unsafe path text and an unrelated source warning.
     """
+    partial_before = (
+        "def compare():\n"
+        + "".join(f"    value_{index} = {index}\n" for index in range(30))
+        + "    return 1\n"
+    )
+    partial_after = partial_before.replace("return 1", "return 2")
     rows = [
         (
             "config.py",
@@ -151,6 +158,25 @@ def file_evidence_report() -> dict:
             None,
         ),
         ("README.md", None, "Notes stay separate from limits.\n", None),
+        ("partial.py", partial_before, partial_after, None),
+        (
+            "unparsed.py",
+            "def broken(:\n    return 1\n",
+            "def broken(:\n    return 2\n",
+            None,
+        ),
+        (
+            "candidate_old.py",
+            "def candidate(x):\n    return x + 1\n",
+            None,
+            None,
+        ),
+        (
+            "candidate_new.py",
+            None,
+            "def candidate(x):\n    return x + 2\n",
+            None,
+        ),
     ]
     fragments, evidence = [], []
     for path, base_text, head_text, unavailable_reason in rows:
@@ -160,14 +186,22 @@ def file_evidence_report() -> dict:
                 pair[side] = {
                     "path": path,
                     "state": "supplied",
-                    "coverage": "full",
+                    "coverage": (
+                        "partial"
+                        if path == "partial.py" and side == "base"
+                        else "full"
+                    ),
                 }
                 fragments.append(
                     {
                         "path": path,
                         "side": side,
                         "start_line": 1,
-                        "scope": "full",
+                        "scope": (
+                            "excerpt"
+                            if path == "partial.py" and side == "base"
+                            else "full"
+                        ),
                         "text": source,
                     }
                 )
@@ -180,7 +214,7 @@ def file_evidence_report() -> dict:
             else:
                 pair[side] = {"path": path, "state": "absent"}
         evidence.append(pair)
-    return compile_snapshot(
+    report = compile_snapshot(
         {
             "schema": "diffstory.snapshot.v1",
             "meta": {
@@ -193,15 +227,30 @@ def file_evidence_report() -> dict:
             },
             "fragments": fragments,
             "file_evidence": evidence,
+            "patches": [
+                {
+                    "path": pair["head"]["path"],
+                    "origin": "github",
+                    "patch": None,
+                }
+                for pair in evidence
+            ],
             "warnings": ["A counterpart file could not be read."],
         }
     )
+    for change in report["changes"]:
+        if (change.get("after") or {}).get("name") == "maybe_new":
+            change["basis"] = (
+                "Compare `maybe_new` in `unresolved_head.py`. "
+                "<img src=x onerror=window.pwned=1>"
+            )
+    return report
 
 
-def check_file_evidence(
+def check_file_evidence(  # noqa: PLR0915 # One public fixture matrix binds rendering to source evidence.
     browser: Browser, check: Callable, smoke_report: dict
 ) -> None:
-    """Check that classification and basis survive rendering and source expansion.
+    """Check that status caveats survive rendering and source expansion.
 
     Args:
         browser: Open Chromium instance.
@@ -220,6 +269,8 @@ def check_file_evidence(
         "maybe_old": ("observed_base", "Removal unresolved"),
         "test_new_contract": ("added", "Added to file"),
         "escaped_basis": ("added", "Added to file"),
+        "compare": ("modified", "Edited"),
+        "candidate": ("moved_modified", "Moved + edited"),
     }
     check(
         all(
@@ -230,6 +281,11 @@ def check_file_evidence(
     )
     proof_page = browser.new_page(viewport={"width": 1280, "height": 900})
     proof_page.set_content(render(smoke_report), wait_until="domcontentloaded")
+    embedded = json.loads(proof_page.locator("#report-data").text_content())
+    check(
+        embedded["changes"] == smoke_report["changes"],
+        "basis metadata stays in the embedded report",
+    )
     for name, (kind, label) in expected_labels.items():
         change_record = smoke_changes[name]
         figure = proof_page.locator(
@@ -239,10 +295,9 @@ def check_file_evidence(
             figure.locator(".classification").inner_text() == label,
             f"reader label for {name} ({kind})",
         )
-        expected_basis = change_record["basis"]
         check(
-            figure.locator(".code-basis").inner_text() == expected_basis,
-            f"basis appears below caption for {name}",
+            figure.locator(".code-basis, .code-bases").count() == 0,
+            f"routine basis note is absent for {name}",
         )
         if name == "alpha":
             figure.evaluate(
@@ -257,16 +312,156 @@ def check_file_evidence(
                 "added source row appears in the default passage",
             )
             check(
-                figure.locator(".code-basis").inner_text() == expected_basis,
-                "basis remains visible after lazy code loading",
+                figure.locator(".code-basis, .code-bases").count() == 0,
+                "routine basis remains absent after lazy code loading",
             )
+    for name in (
+        "alpha",
+        "beta",
+        "removed",
+        "test_new_contract",
+        "escaped_basis",
+    ):
+        figure = proof_page.locator(
+            f'[data-changes~="{smoke_changes[name]["id"]}"]'
+        ).first
+        check(
+            figure.locator(".code-caveat").count() == 0,
+            f"confirmed source status for {name} needs no caveat",
+        )
+    text_only = [
+        change
+        for change in smoke_report["changes"]
+        if (change.get("after") or change.get("before") or {}).get("path")
+        == "README.md"
+    ]
+    check(bool(text_only), "text-only source remains represented")
+    for change in text_only:
+        figure = proof_page.locator(f'[data-changes~="{change["id"]}"]').first
+        check(
+            figure.locator(".code-caveat").count() == 0,
+            "text-only content does not get a routine parsing caveat",
+        )
+    maybe_new = proof_page.locator(
+        f'[data-changes~="{smoke_changes["maybe_new"]["id"]}"]'
+    ).first
+    main_caveats = [
+        text.casefold()
+        for text in maybe_new.locator(".code-caveat > p").all_inner_texts()
+    ]
+    check(
+        any(
+            "cannot confirm whether maybe_new was added to this file" in text
+            for text in main_caveats
+        ),
+        "unresolved addition has a clear caveat",
+    )
+    check(
+        any(
+            "earlier version" in text
+            and "not available for comparison" in text
+            and "this does not mean the file was absent" in text
+            for text in main_caveats
+        ),
+        "unavailable earlier source is not described as an absent file",
+    )
+    main_code = maybe_new.locator(".code-caveat > p code").all_inner_texts()
+    check(
+        "maybe_new" in main_code and "unresolved_head.py" in main_code,
+        "main caveat keeps its declaration name and source path formatted as code",
+    )
+    details = maybe_new.locator(".code-caveat-detail")
+    check(
+        details.locator("summary").inner_text() == "Why this is uncertain",
+        "detailed basis stays behind an uncertainty disclosure",
+    )
+    details.locator("summary").click()
+    detail_code = details.locator("code").all_inner_texts()
+    check(
+        "maybe_new" in detail_code and "unresolved_head.py" in detail_code,
+        f"material source detail keeps formatted identifiers and paths: {detail_code!r}",
+    )
+    check(
+        details.locator("img, script, svg").count() == 0
+        and proof_page.evaluate("window.pwned") is None,
+        "hostile material detail remains inert",
+    )
+    for name in ("maybe_old", "compare", "candidate"):
+        figure = proof_page.locator(
+            f'[data-changes~="{smoke_changes[name]["id"]}"]'
+        ).first
+        check(
+            figure.locator(".code-caveat").count() > 0,
+            f"material {name} status has a visible caveat",
+        )
+    candidate = proof_page.locator(
+        f'[data-changes~="{smoke_changes["candidate"]["id"]}"]'
+    ).first
+    check(
+        any(
+            "candidate may have moved and changed" in text.casefold()
+            for text in candidate.locator(".code-caveat > p").all_inner_texts()
+        ),
+        "edited move warns that the declaration may have moved and changed",
+    )
+    failed_parse = [
+        change
+        for change in smoke_report["changes"]
+        if (change.get("after") or change.get("before") or {}).get("path")
+        == "unparsed.py"
+    ]
+    check(
+        bool(failed_parse), "unparsed source remains represented as a change"
+    )
+    if failed_parse:
+        figure = proof_page.locator(
+            f'[data-changes~="{failed_parse[0]["id"]}"]'
+        ).first
+        check(
+            any(
+                "could not read" in text.casefold()
+                and "as python" in text.casefold()
+                and "function comparison may be unreliable" in text.casefold()
+                for text in figure.locator(
+                    ".code-caveat > p"
+                ).all_inner_texts()
+            ),
+            "Python read failure warns that function comparison may be unreliable",
+        )
+    partial = proof_page.locator(
+        f'[data-changes~="{smoke_changes["compare"]["id"]}"]'
+    ).first
+    before_caveat = partial.locator(".code-caveat > p").inner_text()
+    check(
+        "only part of the earlier version of partial.py is available"
+        in before_caveat.casefold()
+        and "code outside the excerpt was not checked"
+        in before_caveat.casefold(),
+        "partial source states the limit in plain language",
+    )
+    partial.evaluate(
+        "(el) => el.querySelector('[data-load-preview]')?.click()"
+    )
+    expect(partial).to_have_attribute("data-loaded", "true")
+    while partial.locator(".load-bar").count():
+        partial.locator(".load-bar").first.click(no_wait_after=True)
+    check(
+        partial.locator(".code-caveat > p").inner_text() == before_caveat,
+        "partial-source caveat survives full source loading",
+    )
+    check(
+        "value_29 = 29" in partial.locator(".code-lines").inner_text(),
+        "full source remains available after the caveat",
+    )
     escaped_figure = proof_page.locator(
         f'[data-changes~="{smoke_changes["escaped_basis"]["id"]}"]'
     )
     check(
-        escaped_figure.locator(".code-basis script, .code-basis svg").count()
+        escaped_figure.locator(
+            ".code-caveat img, .code-caveat script, .code-caveat svg"
+        ).count()
         == 0,
-        "script-like basis text stays escaped",
+        "routine script-like basis is not rendered",
     )
     proof_page.locator("#evidence summary").click(no_wait_after=True)
     expect(proof_page.locator("#evidence")).to_contain_text("Analysis notes")
@@ -278,7 +473,7 @@ def check_file_evidence(
         proof_page.evaluate(
             "document.documentElement.scrollWidth <= innerWidth"
         ),
-        "long basis fits a narrow viewport",
+        "source caveat fits a narrow viewport",
     )
 
     proof_page.close()
@@ -400,9 +595,8 @@ def check_authored_preamble(
         f'[data-changes~="{smoke_changes["alpha"]["id"]}"]'
     )
     check(
-        alpha_figure.locator(".code-basis").inner_text()
-        == smoke_changes["alpha"]["basis"],
-        "basis appears beside an authored passage",
+        alpha_figure.locator(".code-basis, .code-bases").count() == 0,
+        "routine basis is absent beside an authored passage",
     )
     beta = smoke_changes["beta"]
     support = authored_section.locator("[data-extra]")
@@ -411,16 +605,16 @@ def check_authored_preamble(
     expect(support).to_have_attribute("data-ready", "true")
     beta_figure = support.locator(f'[data-changes~="{beta["id"]}"]')
     check(
-        beta_figure.locator(".code-basis").inner_text() == beta["basis"],
-        "basis appears for a supporting change",
+        beta_figure.locator(".code-basis, .code-bases").count() == 0,
+        "routine supporting basis is absent",
     )
     beta_figure.evaluate(
         "(el) => el.querySelector('[data-load-preview]')?.click()"
     )
     expect(beta_figure).to_have_attribute("data-loaded", "true")
     check(
-        beta_figure.locator(".code-basis").inner_text() == beta["basis"],
-        "supporting basis survives lazy loading",
+        beta_figure.locator(".code-basis, .code-bases").count() == 0,
+        "routine supporting basis stays absent after lazy loading",
     )
     authored_page.close()
 
@@ -910,45 +1104,16 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
             + "    return value_799\n"
         )
         new = source.replace("value_799 = 799", "value_799 = 800")
-        snapshot = {
-            "schema": "diffstory.snapshot.v1",
-            "meta": {
-                "base_sha": "a" * 40,
-                "head_sha": "b" * 40,
-                "changed_files": 1,
-                "scope": "complete",
+        snapshot = snap(
+            {"large.py": source},
+            {"large.py": new},
+            fragment_options={
+                (side, "large.py"): {"start_line": 1, "scope": "complete"}
+                for side in ("base", "head")
             },
-            "file_evidence": [
-                {
-                    "base": {
-                        "path": "large.py",
-                        "state": "supplied",
-                        "coverage": "full",
-                    },
-                    "head": {
-                        "path": "large.py",
-                        "state": "supplied",
-                        "coverage": "full",
-                    },
-                },
-            ],
-            "fragments": [
-                {
-                    "side": "base",
-                    "path": "large.py",
-                    "text": source,
-                    "start_line": 1,
-                    "scope": "complete",
-                },
-                {
-                    "side": "head",
-                    "path": "large.py",
-                    "text": new,
-                    "start_line": 1,
-                    "scope": "complete",
-                },
-            ],
-        }
+            changed_files=1,
+            scope="complete",
+        )
         stress = browser.new_page(viewport={"width": 1280, "height": 950})
         stress.set_content(
             render(compile_snapshot(snapshot)), wait_until="domcontentloaded"
@@ -993,6 +1158,10 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
         snapshot["fragments"][1]["text"] = re.sub(
             r"= (\d+)", lambda m: "= " + str(int(m.group(1)) + 1000), source
         )
+        snapshot["patches"] = snap(
+            {"large.py": source},
+            {"large.py": snapshot["fragments"][1]["text"]},
+        )["patches"]
         big_report = compile_snapshot(snapshot)
         stress = browser.new_page(viewport={"width": 1280, "height": 950})
         stress.set_content(render(big_report), wait_until="domcontentloaded")

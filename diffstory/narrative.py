@@ -12,6 +12,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from http.client import HTTPException
 from pathlib import Path
@@ -48,6 +49,7 @@ from .source_lines import split_source_lines
 from .usage import ModelCapacity
 from .usage import RunUsage
 from .usage import estimate_input
+from .writing import ASD_STYLE_INSTRUCTION
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -101,17 +103,6 @@ SUMMARY_OUTPUT_RESERVE = 1_200
 STEP_OUTPUT_RESERVE = 1_400
 DOCUMENT_OUTPUT_RESERVE = 3_200
 ORDER_OUTPUT_RESERVE = 1_200
-
-ASD_STYLE_INSTRUCTION = (
-    "Use ASD-STE100 principles as a strong guide, with roughly 80 to 90 "
-    "percent adherence across the prose. Do not claim formal compliance. "
-    "Prefer clear, simple words, active constructions, and one main idea per "
-    "sentence. Keep terms consistent and technical names exact. Vary sentence "
-    "length and structure so the prose has a natural rhythm and does not "
-    "sound like a repeated template. Make only claims supported by the "
-    "evidence. Apply this guidance to every prose field."
-)
-
 
 _LEAF_SYSTEM = (
     "Write concise code-review narration using only the supplied evidence. "
@@ -1025,8 +1016,9 @@ class CodexCLIProvider:
         timeout: float | None,
         *,
         response_byte_limit: int = MAX_RESPONSE_BYTES,
+        isolate_process: bool = True,
     ) -> ProviderReply:
-        """Send one isolated request and measure the complete physical JSONL."""
+        """Send once, optionally inheriting an outer supervisor's process group."""
         self.require_credentials()
         try:
             request = json.loads(body.decode("utf-8"))
@@ -1109,6 +1101,7 @@ class CodexCLIProvider:
                         else PROVIDER_CALL_TIMEOUT_SECONDS
                     ),
                     output_limit=response_byte_limit,
+                    isolate_process=isolate_process,
                 ),
             )
 
@@ -1325,12 +1318,17 @@ class ProviderResponseError(RuntimeCallError, ValueError):
         self.response_bytes = detail.response_bytes
 
 
-def _terminate_process_tree(process: subprocess.Popen) -> None:
+def _terminate_process_tree(
+    process: subprocess.Popen,
+    *,
+    timeout: float = PROCESS_CLEANUP_TIMEOUT_SECONDS,
+) -> None:
     """
     Terminate a Codex process and its descendants.
 
     Args:
         process: Process started in its own POSIX session or Windows group.
+        timeout: Remaining allowance for the Windows process-tree utility.
 
     Side Effects:
         Sends a forceful termination signal to the process group or tree, then
@@ -1346,7 +1344,7 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS,
+                    timeout=timeout,
                     check=False,
                 )
     else:
@@ -1366,6 +1364,8 @@ class _ProcessRequest:
     environment: Mapping[str, str]
     timeout: float | None
     output_limit: int
+    isolate_process: bool = True
+    cleanup_deadline: float | None = None
 
 
 class _BoundedProcess:
@@ -1392,11 +1392,11 @@ class _BoundedProcess:
             "env": request.environment,
             "bufsize": 0,
         }
-        if os.name == "nt":
+        if os.name == "nt" and request.isolate_process:
             process_options["creationflags"] = (
                 subprocess.CREATE_NEW_PROCESS_GROUP
             )
-        else:
+        elif request.isolate_process:
             process_options["start_new_session"] = True
         try:
             self.process = subprocess.Popen(  # noqa: S603  # Internal argv; shell disabled.
@@ -1421,7 +1421,25 @@ class _BoundedProcess:
         Side Effects:
             Sends termination signals to the process group/tree and child.
         """
-        _terminate_process_tree(self.process)
+        if self.request.isolate_process:
+            _terminate_process_tree(
+                self.process, timeout=self._cleanup_timeout()
+            )
+        else:
+            with contextlib.suppress(OSError):
+                self.process.kill()
+
+    def _cleanup_timeout(self) -> float:
+        """Share one remaining cleanup allowance under an outer wall deadline."""
+        if self.request.cleanup_deadline is None:
+            return PROCESS_CLEANUP_TIMEOUT_SECONDS
+        return max(
+            0.0,
+            min(
+                PROCESS_CLEANUP_TIMEOUT_SECONDS,
+                self.request.cleanup_deadline - time.monotonic(),
+            ),
+        )
 
     def _capture_stdout(self) -> None:
         """Read stdout while retaining at most one byte over the limit.
@@ -1508,12 +1526,12 @@ class _BoundedProcess:
             Waits briefly, then force-kills the child if it remains active.
         """
         try:
-            self.process.wait(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+            self.process.wait(timeout=self._cleanup_timeout())
         except subprocess.TimeoutExpired:
             with contextlib.suppress(OSError):
                 self.process.kill()
             try:
-                self.process.wait(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+                self.process.wait(timeout=self._cleanup_timeout())
             except subprocess.TimeoutExpired:
                 return False
         return True
@@ -1537,14 +1555,14 @@ class _BoundedProcess:
         Side Effects:
             Joins worker threads, terminates a stuck process, and closes stdout.
         """
-        writer.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
-        reader.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
-        stderr_reader.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+        writer.join(timeout=self._cleanup_timeout())
+        reader.join(timeout=self._cleanup_timeout())
+        stderr_reader.join(timeout=self._cleanup_timeout())
         if writer.is_alive() or reader.is_alive() or stderr_reader.is_alive():
             self._stop()
-            writer.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
-            reader.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
-            stderr_reader.join(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
+            writer.join(timeout=self._cleanup_timeout())
+            reader.join(timeout=self._cleanup_timeout())
+            stderr_reader.join(timeout=self._cleanup_timeout())
         if self.process.stdout and not reader.is_alive():
             self.process.stdout.close()
         if self.process.stderr and not stderr_reader.is_alive():
@@ -1579,7 +1597,13 @@ class _BoundedProcess:
         reader.start()
         writer.start()
         stderr_reader.start()
-        timed_out, cleanup_failed = self._wait_for_exit()
+        try:
+            timed_out, cleanup_failed = self._wait_for_exit()
+        except BaseException:
+            self._stop()
+            self._wait_after_stop()
+            self._join_io(reader, writer, stderr_reader)
+            raise
         io_stopped = self._join_io(reader, writer, stderr_reader)
         if cleanup_failed or not io_stopped:
             msg = "Codex CLI process cleanup did not finish"

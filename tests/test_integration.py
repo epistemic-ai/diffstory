@@ -109,6 +109,69 @@ class GitIntegrationTests(unittest.TestCase):
         self.assertEqual(evidence["old.py"]["head"]["state"], "absent")
         self.assertEqual(evidence["caller.py"]["base"]["coverage"], "full")
 
+    def test_original_git_patch_is_retained(self) -> None:
+        """Read Git's patch for pinned commits, even when the worktree is dirty."""
+        (self.root / "new.py").write_text("uncommitted content\n")
+        snapshot = from_git(str(self.root), self.base, self.head)
+        report = compile_snapshot(snapshot)
+        for raw in report["raw_files"]:
+            expected = self.git(
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                self.base,
+                self.head,
+                "--",
+                raw["path"],
+            )
+            self.assertEqual(raw["original_patch"], expected)
+            self.assertEqual(raw["diff_origin"], "git")
+            self.assertNotIn("uncommitted content", raw["original_patch"])
+
+    def test_git_patch_capture_enforces_the_aggregate_byte_limit(self) -> None:
+        """Reject combined Git patches that exceed the cap after source capture."""
+        for name, source in (("a.txt", "x = 1\n"), ("b.txt", "y = 1\n")):
+            (self.root / name).write_text(source)
+        self.git("add", ".")
+        self.git("commit", "-qm", "add bounded patch fixtures")
+        base = self.git("rev-parse", "HEAD").strip()
+        for name, source in (("a.txt", "x = 2\n"), ("b.txt", "y = 2\n")):
+            (self.root / name).write_text(source)
+        self.git("add", ".")
+        self.git("commit", "-qm", "change both bounded patch fixtures")
+        head = self.git("rev-parse", "HEAD").strip()
+        patch_sizes = [
+            len(
+                self.git(
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    base,
+                    head,
+                    "--",
+                    name,
+                ).encode("utf-8")
+            )
+            for name in ("a.txt", "b.txt")
+        ]
+        limit = max(patch_sizes)
+        self.assertGreater(sum(patch_sizes), limit)
+
+        with (
+            patch("diffstory.ingest.MAX_SNAPSHOT_SOURCE_BYTES", limit),
+            self.assertRaisesRegex(ValueError, "aggregate byte limit"),
+        ):
+            from_git(
+                str(self.root),
+                base,
+                head,
+                max_source_bytes=limit,
+            )
+
     def test_cli_roundtrip(self) -> None:
         """Write HTML and snapshot outputs, then export revision-bound evidence."""
         out = self.root / "reader.html"
@@ -633,6 +696,30 @@ class GitHubTransportTests(unittest.TestCase):
             from_github("org/repo#1", max_source_bytes=7)
         content_requests = [path for path in paths if "/contents/" in path]
         self.assertEqual(len(content_requests), 2)
+
+    def test_github_patch_capture_enforces_the_aggregate_byte_limit(
+        self,
+    ) -> None:
+        """Reject combined captured API patches after the bounded source read."""
+        patch_texts = (
+            "@@ -0,0 +1 @@\n+x=1\n",
+            "@@ -0,0 +1 @@\n+y=1\n",
+        )
+        rows = [
+            {"filename": "a.py", "status": "added", "patch": patch_texts[0]},
+            {"filename": "b.py", "status": "added", "patch": patch_texts[1]},
+        ]
+        limit = len(patch_texts[0].encode("utf-8"))
+        self.assertGreater(
+            sum(len(value.encode("utf-8")) for value in patch_texts), limit
+        )
+        fake, _ = self.fake(file_records=rows)
+        with (
+            patch("diffstory.ingest.MAX_SNAPSHOT_SOURCE_BYTES", limit),
+            patch("diffstory.ingest.GitHubClient.get", new=fake),
+            self.assertRaisesRegex(ValueError, "aggregate byte limit"),
+        ):
+            from_github("org/repo#1", max_source_bytes=limit)
 
     def test_source_limit_cannot_raise_hard_cap_before_api_access(
         self,

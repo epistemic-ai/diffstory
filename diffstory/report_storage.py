@@ -7382,33 +7382,40 @@ def _iter_effective_group_json(
 def _iter_effective_groups_json(
     base_groups: object, overlay: Mapping[str, object]
 ) -> Iterator[bytes]:
-    """Stream compiler groups with their deterministic generated fields.
+    """Stream groups in validated presentation order with generated fields.
 
     Preconditions:
         The report group sequence and exact overlay membership passed sealing.
     Postconditions:
-        Emits groups in compiler order and rejects missing or unused overlays.
+        Emits groups in overlay order and rejects duplicate, missing, or
+        unused compiler and overlay selectors.
     Essential behavior:
         Merges and releases one group projection at a time.
     """
     if type(base_groups) not in {_OwnedList, _OwnedTuple, list, tuple}:
         _fail("invalid_indexed_applied_fields")
     by_id = _output_group_overlays(overlay)
-    seen: set[str] = set()
-    yield b"["
-    for position, group in enumerate(base_groups):
+    overlay_groups = overlay["groups"]
+    base_by_id: dict[str, Mapping[str, object]] = {}
+    for group in base_groups:
         if not isinstance(group, Mapping):
             _fail("invalid_indexed_applied_fields")
         group_id = group.get("id")
-        group_overlay = by_id.get(group_id) if type(group_id) is str else None
-        if group_overlay is None:
+        if type(group_id) is not str or group_id in base_by_id:
+            _fail("invalid_indexed_applied_fields")
+        base_by_id[group_id] = group
+    if set(base_by_id) != set(by_id):
+        _fail("invalid_indexed_applied_fields")
+
+    yield b"["
+    for position, group_overlay in enumerate(overlay_groups):
+        group_id = group_overlay["group_id"]
+        group = base_by_id.get(group_id)
+        if group is None:
             _fail("invalid_indexed_applied_fields")
         if position:
             yield b","
-        seen.add(group_id)
         yield from _iter_effective_group_json(group, group_overlay)
-    if seen != set(by_id):
-        _fail("invalid_indexed_applied_fields")
     yield b"]"
 
 

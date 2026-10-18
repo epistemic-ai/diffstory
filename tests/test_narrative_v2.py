@@ -459,6 +459,69 @@ class BatchedNarratorTests(unittest.TestCase):
                     narrator.generate(report)
                 self.assertEqual(provider.calls, [])
 
+    def test_unrelated_credential_value_errors_remain_visible(self) -> None:
+        """Concern: a credentials ValueError can be mislabeled as changed input.
+
+        Preconditions:
+            Each case has a valid local report and an approved preview.
+        Postconditions:
+            The exact provider ``ValueError`` remains visible with no calls.
+        Essential behavior:
+            Covers public generation and explicit session-owned generation.
+
+        Input/expected matrix:
+        * Public ``generate`` -> original ``ValueError`` and zero calls.
+        * ``capture_session`` plus ``generate_validated`` -> original
+          ``ValueError`` and zero calls.
+        """
+        cases = (
+            ("generate", ValueError, "fixture credentials are unavailable"),
+            (
+                "generate_validated",
+                ValueError,
+                "fixture credentials are unavailable",
+            ),
+        )
+        for entrypoint, expected_error, expected_message in cases:
+            with (
+                self.subTest(entrypoint=entrypoint),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                report = golden_report(1)
+                provider = FixtureProvider()
+                narrator = Narrator(
+                    provider,
+                    architecture="v2",
+                    recovery_dir=Path(directory) / "state",
+                    concurrency=1,
+                )
+                narrator.preview(report)
+                session = None
+                try:
+                    if entrypoint == "generate_validated":
+                        session = narrator.capture_session(report)
+                    with (
+                        patch.object(
+                            provider,
+                            "require_credentials",
+                            side_effect=ValueError(expected_message),
+                        ),
+                        self.assertRaisesRegex(
+                            expected_error, expected_message
+                        ) as raised,
+                    ):
+                        if entrypoint == "generate":
+                            narrator.generate(report)
+                        else:
+                            narrator.generate_validated(
+                                report, session=session
+                            )
+                    self.assertIs(type(raised.exception), expected_error)
+                    self.assertEqual(provider.calls, [])
+                finally:
+                    if session is not None:
+                        session.close()
+
     def test_author_edit_reuses_source_only_details_and_invalidates_prose(
         self,
     ) -> None:

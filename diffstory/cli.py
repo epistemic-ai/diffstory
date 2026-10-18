@@ -485,7 +485,7 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--architecture",
-        choices=["legacy", "v2"],
+        choices=["legacy", "v2", "walkthrough"],
         default="v2",
         help="Narration architecture (default: v2; legacy remains supported)",
     )
@@ -575,6 +575,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Compile a saved diffstory.snapshot.v1 JSON document",
     )
     snapshot_parser.add_argument("input")
+    _add_narration_arguments(snapshot_parser)
 
     render_parser = subparsers.add_parser(
         "render",
@@ -1018,6 +1019,52 @@ def _confirm_source_transfer(
         raise CliError(msg)
 
 
+def _generate_walkthrough(
+    args: argparse.Namespace, report: dict
+) -> tuple[dict, dict]:
+    """Preview the complete bounded source plan, confirm it, and write the story.
+
+    Args:
+        args: Parsed source, provider, consent, and output options.
+        report: Compiled pinned source to narrate.
+
+    Returns:
+        Flat annotations and the complete flat saved report.
+
+    Raises:
+        ValueError: If consent, capacity, or output validation fails.
+        TimeoutError: If narration exceeds its four-minute deadline.
+    """
+    from .walkthrough import WalkthroughNarrator
+    from .walkthrough import walkthrough_annotations
+
+    provider = _create_provider(args)
+    state = _recovery_directory(args)
+    if args.fresh_state is not None and state.exists():
+        msg = "--fresh-state requires a new directory; existing budgets are retained"
+        raise CliError(msg)
+    narrator = WalkthroughNarrator(
+        provider,
+        concurrency=args.concurrency,
+        state_dir=state,
+        cache_dir=_checkpoint_directory(args),
+    )
+    plan = narrator.prepare(report)
+    print(f"Provider: {provider.name} · model: {provider.model}")
+    print(f"Destination: {provider.destination}")
+    print(
+        f"Walkthrough: {len(plan.writers)} writing + {int(not plan.single)} editorial requests · {len(plan.packet['regions'])} changed regions · {sum(len(writer.body) for writer in plan.writers):,} prepared writing bytes"
+    )
+    print(
+        "Limits: 12 total attempts · 4 concurrent calls · 240 seconds · 1 MiB model annotations"
+    )
+    _confirm_source_transfer(assume_yes=args.yes, provider=provider)
+    generated = narrator.generate_prepared()
+    _print_token_usage(narrator.usage.report())
+    print(f"Cached results reused: {narrator.cache_hits}")
+    return walkthrough_annotations(generated), generated
+
+
 def _generate_narration(
     args: argparse.Namespace,
     report: dict,
@@ -1395,14 +1442,29 @@ def _write_outputs(  # noqa: C901, PLR0912 # Keep one concrete staging and promo
     print(f"HTML: {output_path}\nData: {report_path}")
     if candidate_path is not None:
         print(f"Candidate annotations: {candidate_path}")
-    stats = report_view["stats"]
+    _print_report_summary(report_view)
+
+
+def _print_report_summary(report: dict) -> None:
+    """Print counts and warning totals from a validated saved report."""
+    if report.get("schema") == "diffstory.report.v2":
+        packet = report["packet"]
+        print(
+            f"{len(report['story']['sections'])} reading sections · {len(packet['changes'])} change units · {len(packet['regions'])} changed regions"
+        )
+        if packet["warnings"]:
+            print(
+                f"{len(packet['warnings'])} scope/parse warning(s); see report evidence panel"
+            )
+        return
+    stats = report["stats"]
     print(
         f"{stats['groups']} reading steps · {stats['units']} change units · "
         f"{stats['identical_ast_moves']} identical-AST moves"
     )
-    if report_view.get("warnings"):
+    if report.get("warnings"):
         print(
-            f"{len(report_view['warnings'])} scope/parse warning(s); "
+            f"{len(report['warnings'])} scope/parse warning(s); "
             "see report evidence panel"
         )
 
@@ -1739,18 +1801,18 @@ def _validate_command_options(args: argparse.Namespace) -> None:
         ValueError: If repository narration and authored annotations are both
             requested for the same command.
     """
-    uses_repository_source = args.command in {"git", "github"}
+    uses_repository_source = args.command in {"git", "github", "snapshot"}
     if uses_repository_source and args.narrate and args.annotations:
         msg = "Use --narrate or --annotations, not both"
         raise CliError(msg)
     if (
         uses_repository_source
         and (args.state_dir is not None or args.fresh_state is not None)
-        and (not args.narrate or args.architecture != "v2")
-    ):
-        msg = (
-            "--state-dir and --fresh-state require --narrate --architecture v2"
+        and (
+            not args.narrate or args.architecture not in {"v2", "walkthrough"}
         )
+    ):
+        msg = "--state-dir and --fresh-state require --narrate --architecture v2 or walkthrough"
         raise CliError(msg)
     if (
         uses_repository_source
@@ -1767,6 +1829,11 @@ def _validate_command_options(args: argparse.Namespace) -> None:
 
 def _safe_error_message(error: Exception) -> str:  # noqa: C901, PLR0911 # Closed error mapping at the CLI boundary.
     """Translate failures using fixed reasons; never format arbitrary exceptions."""
+    from .walkthrough import WalkthroughError
+    from .walkthrough_runtime import RunLimitError
+
+    if isinstance(error, (WalkthroughError, RunLimitError)):
+        return str(error)
     if isinstance(error, CliError):
         return str(error)
     if isinstance(error, ArtifactRuntimeError):
@@ -1949,6 +2016,21 @@ def _apply_cli_annotations(
         return None, session, generation, session.apply(generation)
 
     annotations = _decode_json_object(annotation_bytes)
+    if annotations.get("schema") == "diffstory.annotations.walkthrough.v1":
+        from .walkthrough import apply_walkthrough_annotations
+
+        if (
+            args.report_storage != "expanded"
+            or type(compiler_report) is not dict
+        ):
+            msg = "Walkthrough annotations require a compiler report and flat/expanded output"
+            raise CliError(msg)
+        return (
+            apply_walkthrough_annotations(compiler_report, annotations),
+            None,
+            None,
+            None,
+        )
     if args.report_storage == "shared":
         if not _has_v2_annotations(annotations):
             msg = (
@@ -2056,8 +2138,10 @@ def _run_output_command(
         lifetime,
     )
     annotations_output = None
-    if args.command in {"git", "github"} and args.narrate:
-        if args.architecture == "v2":
+    if args.command in {"git", "github", "snapshot"} and args.narrate:
+        if args.architecture == "walkthrough":
+            annotations_output, report = _generate_walkthrough(args, report)
+        elif args.architecture == "v2":
             session, generation, report_handle = _generate_narration_v2(
                 args, report, lifetime
             )

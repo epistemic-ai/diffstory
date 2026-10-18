@@ -39,8 +39,10 @@ from diffstory.narrative import Narrator
 from diffstory.narrative_manifest import expanded_generation
 from diffstory.narrative_plan import canonical_bytes
 from diffstory.narrative_runtime import ArtifactCallError
+from diffstory.narrative_session import ReportSession
 from diffstory.narrative_v2 import Transport
 from diffstory.narrative_v2 import V2Options
+from diffstory.render import iter_render_validated
 from diffstory.render import render
 from scripts import benchmark_narration as benchmark
 
@@ -82,6 +84,225 @@ class BenchmarkTests(unittest.TestCase):
             "--state",
             str(self.state),
         ]
+
+    def mocked_synthetic_metrics(
+        self,
+        scenario: str,
+        count: int,
+        cache_state: str,
+        *,
+        profile_callbacks: bool,
+    ) -> dict:
+        """Build one complete source-free child row for controller tests.
+
+        Preconditions:
+            Scenario and cache labels are values from the synthetic CLI enums.
+        Postconditions:
+            Returns a complete result shape with matching public output digests.
+        Essential behavior:
+            Exercises parent aggregation without starting provider or runtime work.
+        """
+
+        def phase_value() -> dict:
+            """Return one complete deterministic phase fixture.
+
+            Preconditions:
+                None.
+            Postconditions:
+                Returns finite nonnegative counts and times for one phase.
+            Essential behavior:
+                Supplies complete values so parent tests do not mask omissions.
+            """
+            return {
+                "calls": 1,
+                "failures": 0,
+                "records": 1,
+                "bytes": 8,
+                "characters": 8,
+                "wall_inclusive_seconds": 0.1,
+                "wall_exclusive_seconds": 0.08,
+                "thread_cpu_inclusive_seconds": 0.05,
+                "thread_cpu_exclusive_seconds": 0.04,
+            }
+
+        def phase_map(names: tuple[str, ...]) -> dict:
+            """Build observations for selected fixed phase labels.
+
+            Preconditions:
+                Each name is a benchmark phase label.
+            Postconditions:
+                Returns one complete phase value per input name.
+            Essential behavior:
+                Keeps path-phase fixtures deterministic and source-free.
+            """
+            return {name: phase_value() for name in names}
+
+        request_identity = {
+            "request_count": count,
+            "request_identity_sha256": f"{count:064x}",
+            "request_stage_counts": {"detail": count},
+        }
+        annotations = {
+            "bytes": 10,
+            "sha256": "a" * 64,
+            "logical_sha256": "b" * 64,
+        }
+        report = {
+            "bytes": 20,
+            "sha256": "c" * 64,
+            "logical_sha256": "d" * 64,
+        }
+        html = {
+            "bytes": 30,
+            "sha256": "e" * 64,
+            "embedded_report_sha256": "d" * 64,
+        }
+        if scenario == "handle-paired":
+            outputs = {
+                "trusted_expanded": {
+                    "annotations": annotations,
+                    "report": report,
+                    "html": {"bytes": 30, "sha256": "e" * 64},
+                },
+                "trusted_shared": {
+                    "annotations": {"bytes": 10, "sha256": "a" * 64},
+                    "report": {"bytes": 18, "sha256": "f" * 64},
+                    "html": {"bytes": 28, "sha256": "1" * 64},
+                },
+                "independent_shared_import": {
+                    "annotations": {
+                        "bytes": 10,
+                        "sha256": "a" * 64,
+                    },
+                    "report": {
+                        "bytes": 18,
+                        "sha256": "f" * 64,
+                    },
+                    "html": {
+                        "bytes": 28,
+                        "sha256": "1" * 64,
+                    },
+                    "logical_report": {"bytes": 20, "sha256": "d" * 64},
+                },
+                "expanded_public": {
+                    "report": report,
+                    "html": html,
+                },
+                "source_resolution": {
+                    "resolver_calls": 1,
+                    "distinct_current_physical_bindings": 1,
+                },
+            }
+            gates = {
+                "fresh_capture_initializations": 1,
+                "generation_complete_proofs": 1,
+                "apply_added_complete_proofs": 0,
+                "trusted_output_added_complete_proofs": 0,
+                "apply_added_ledger_index_builds": 0,
+                "trusted_output_added_ledger_index_builds": 0,
+                "shared_import_independent_import_complete_proofs": 1,
+                "shared_import_independent_import_session_proofs": 1,
+                "shared_import_apply_added_complete_proofs": 0,
+                "shared_import_output_added_complete_proofs": 0,
+                "shared_import_apply_added_ledger_index_builds": 0,
+                "shared_import_output_added_ledger_index_builds": 0,
+                "expanded_public_public_expanded_complete_proofs": 2,
+                "expanded_public_render_added_complete_proofs": 1,
+                "expanded_public_logical_report_matches_trusted_expanded_stream": True,
+                "expanded_public_public_html_payload_matches_logical_report": True,
+                "shared_import_logical_report_matches_expanded_public": True,
+                "shared_import_request_identity_matches_generation": True,
+                "expanded_shared_outputs_used_same_generation_handle": True,
+            }
+            path_phases = {
+                "capture_session": phase_map(("session.capture.facade",)),
+                "generate_validated": phase_map(
+                    ("session.generate_validated",)
+                ),
+                "trusted_apply": phase_map(("session.apply",)),
+                "trusted_expanded_output": phase_map(
+                    (
+                        "output.annotations.serialize",
+                        "output.report.serialize",
+                        "output.render.validated",
+                    )
+                ),
+                "trusted_shared_output": phase_map(
+                    (
+                        "output.annotations.serialize",
+                        "output.report.serialize",
+                        "output.render.validated",
+                    )
+                ),
+                "independent_import_proof": phase_map(
+                    ("session.shared_import", "proof.indexed_production")
+                ),
+                "independent_import_apply_and_output": phase_map(
+                    ("session.apply", "output.report.serialize")
+                ),
+                "independent_import_expansion": phase_map(
+                    ("benchmark.compatibility_expand",)
+                ),
+                "expanded_public_conversion": phase_map(
+                    ("benchmark.compatibility_expand",)
+                ),
+                "expanded_public_validation": phase_map(
+                    ("compat.public_validate",)
+                ),
+                "expanded_public_render": phase_map(("compat.render",)),
+            }
+        else:
+            outputs = {
+                "annotations": annotations,
+                "report": report,
+                "html": html,
+                "source_resolution": {
+                    "resolver_calls": 1,
+                    "distinct_current_physical_bindings": 1,
+                },
+                "request_identity": request_identity,
+            }
+            gates = {}
+            path_phases = {
+                "compatibility_generate": phase_map(("compat.generate",)),
+                "compatibility_generation_serialization": phase_map(
+                    ("compat.serialize",)
+                ),
+                "compatibility_apply": phase_map(("compat.apply",)),
+                "compatibility_apply_serialization": phase_map(
+                    ("compat.serialize",)
+                ),
+                "compatibility_render": phase_map(("compat.render",)),
+            }
+        return {
+            "status": "PASS",
+            "scenario": scenario,
+            "count": count,
+            "cache_state": cache_state,
+            "profiled_callbacks": profile_callbacks,
+            "fixture_sha256": f"{count:064x}",
+            "revision_binding_sha256": "b" * 64,
+            "request_configuration_sha256": "c" * 64,
+            "request_identity": request_identity,
+            "provider_calls": 1 if cache_state == "cold" else 0,
+            "elapsed_seconds": 1.0 + count / 10,
+            "process_cpu_seconds": 0.5,
+            "peak_rss_bytes": 1024 + count,
+            "peak_rss_scope": "fresh_process_high_water_mark",
+            "process_resource_scope": "whole_selected_scenario_child_process",
+            "outputs": outputs,
+            "deterministic_gates": gates,
+            "provider_call_gate": True,
+            "phase_measurements": {
+                name: phase_value() for name in benchmark.PHASE_LABELS
+            },
+            "path_phase_measurements": path_phases,
+            "pydantic_python_callbacks": (
+                {"field.fixture": 1, "model.fixture": 1}
+                if profile_callbacks
+                else {}
+            ),
+        }
 
     def test_nested_measurements_use_deterministic_self_time(self) -> None:
         """Subtract nested wall and thread CPU time without changing totals."""
@@ -339,7 +560,9 @@ class BenchmarkTests(unittest.TestCase):
             "result.stage_validation",
             "cache.lookup",
             "proof.production",
-            "proof.generated_manifest_audit",
+            "compat.generate",
+            "session.finish_production",
+            "proof.stage.audit",
             "proof.producer_request_audit",
             "proof.request_plan_audit",
             "proof.support.prose",
@@ -773,6 +996,420 @@ class BenchmarkTests(unittest.TestCase):
         tampered["generation"]["details"].pop()
         with self.assertRaises(ValueError):
             apply_annotations(report, tampered)
+
+    def test_synthetic_count_matrix_rejects_invalid_sizes_before_runs(
+        self,
+    ) -> None:
+        """Concern: the local matrix must reject malformed or unbounded sizes.
+
+        Input/expected matrix:
+            ``"2,4,8"`` -> ``(2, 4, 8)``; empty, duplicate, undersized,
+            nonnumeric, zero, and over-limit values -> ``BenchmarkError``.
+        """
+        matrix = (
+            ("2,4,8", (2, 4, 8)),
+            ("", None),
+            ("2,2,8", None),
+            ("2,4", None),
+            ("2,x,8", None),
+            ("0,4,8", None),
+            ("2,4,33", None),
+        )
+        for value, expected in matrix:
+            with self.subTest(value=value):
+                if expected is None:
+                    with self.assertRaises(benchmark.BenchmarkError):
+                        benchmark.parse_synthetic_counts(value)
+                else:
+                    self.assertEqual(
+                        benchmark.parse_synthetic_counts(value), expected
+                    )
+
+    def test_00_failed_controller_preserves_rows_without_incomplete_medians(
+        self,
+    ) -> None:
+        """Concern: child validation failures must not erase rows or fake medians.
+
+        Input/expected matrix:
+            each cold child returns only BLOCKED and presentation_order_changed
+            with exit 2 -> every planned coordinate remains, warm/profile work
+            is skipped, failure reasons persist, and no group has a median.
+        """
+        output = self.root / "synthetic-failure-results"
+
+        def fail_child(*_args: object, **_kwargs: object) -> tuple[dict, int]:
+            """Model an order-gate child with no completed measurements.
+
+            Preconditions:
+                The controller requests one cold, warm, or callback child.
+            Postconditions:
+                Returns the fixed failure reason and exact nonzero status.
+            Essential behavior:
+                Omits outputs, counters, and deterministic gates intentionally.
+            """
+            return {
+                "status": "BLOCKED",
+                "reason": "presentation_order_changed",
+            }, 2
+
+        with (
+            patch.object(
+                benchmark, "_run_synthetic_child", side_effect=fail_child
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            exit_code = benchmark.main(
+                [
+                    "--synthetic",
+                    "--counts",
+                    "1,2,3",
+                    "--repeats",
+                    "3",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+        result = json.loads((output / "measurements.json").read_text())
+        expected = (
+            ("timing_sample_count", 36),
+            ("callback_sample_count", 6),
+            ("timing_attempted_child_count", 18),
+            ("callback_attempted_child_count", 0),
+            ("status", "BLOCKED"),
+            ("parent_exit_code", 2),
+        )
+        self.assertEqual(exit_code, 2)
+        for name, value in expected:
+            with self.subTest(field=name):
+                self.assertEqual(result[name], value)
+        failed_cold = next(
+            row
+            for row in result["timing_samples"]
+            if row["count"] == 1
+            and row["repeat"] == 1
+            and row["scenario"] == "handle-paired"
+            and row["cache_state"] == "cold"
+        )
+        self.assertEqual(failed_cold["exit_code"], 2)
+        self.assertEqual(
+            failed_cold["metrics"]["reason"],
+            "presentation_order_changed",
+        )
+        skipped_warm = next(
+            row
+            for row in result["timing_samples"]
+            if row["count"] == 1
+            and row["repeat"] == 1
+            and row["scenario"] == "handle-paired"
+            and row["cache_state"] == "warm"
+        )
+        self.assertFalse(skipped_warm["attempted"])
+        self.assertIsNone(skipped_warm["exit_code"])
+        self.assertEqual(
+            skipped_warm["metrics"]["reason"], "cold_sample_failed"
+        )
+        self.assertIn(
+            {
+                "count": 1,
+                "repeat": 1,
+                "scenario": "handle-paired",
+                "cache_state": "cold",
+                "profile_kind": "timing",
+                "attempted": True,
+                "exit_code": 2,
+                "status": "BLOCKED",
+                "reason": "presentation_order_changed",
+            },
+            result["failed_samples"],
+        )
+        self.assertTrue(
+            all(
+                group["valid_sample_count"] == 0
+                and "process_wall_seconds" not in group
+                and "provider_calls" not in group
+                for group in result["aggregates"]["groups"].values()
+            )
+        )
+        report = (output / "result.md").read_text()
+        self.assertIn("presentation_order_changed", report)
+        self.assertNotIn("KeyError", report)
+
+    def test_01_successful_controller_preserves_all_complete_gates(
+        self,
+    ) -> None:
+        """Concern: complete mocked rows must retain every pairing and output gate.
+
+        Input/expected matrix:
+            three counts by three repeats, both scenarios and cache states, plus
+            six callback rows -> PASS, complete medians, matching semantics,
+            and every controller gate true in a caller-selected directory.
+        """
+        output = self.root / "caller-selected-synthetic-results"
+
+        def successful_child(
+            scenario: str,
+            count: int,
+            cache_state: str,
+            _cache_dir: Path,
+            *,
+            profile_callbacks: bool,
+        ) -> tuple[dict, int]:
+            """Return complete matched rows without starting child processes.
+
+            Preconditions:
+                The controller provides one allowed scenario and cache state.
+            Postconditions:
+                Returns a complete mocked metric map and exact zero status.
+            Essential behavior:
+                Lets the public parent path run without provider or runtime work.
+            """
+            return (
+                self.mocked_synthetic_metrics(
+                    scenario,
+                    count,
+                    cache_state,
+                    profile_callbacks=profile_callbacks,
+                ),
+                0,
+            )
+
+        with (
+            patch.object(
+                benchmark,
+                "_run_synthetic_child",
+                side_effect=successful_child,
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            exit_code = benchmark.main(
+                [
+                    "--synthetic",
+                    "--counts",
+                    "1,2,3",
+                    "--repeats",
+                    "3",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+        result = json.loads((output / "measurements.json").read_text())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["matrix_failures"], [])
+        self.assertTrue(all(result["pairing_gates"].values()))
+        self.assertTrue(
+            all(
+                group["status"] == "PASS"
+                and group["valid_sample_count"] == 3
+                and "process_wall_seconds" in group
+                for group in result["aggregates"]["groups"].values()
+            )
+        )
+        self.assertEqual(result["shared_fixture_analysis"], None)
+        self.assertEqual(
+            result["aggregates"]["groups"]["2/compat-public/cold"][
+                "matched_boundary_paths"
+            ]["public_compatibility"]["boundary_phases"],
+            [
+                "compat.generate",
+                "compat.serialize",
+                "compat.apply",
+                "compat.serialize",
+                "compat.render",
+            ],
+        )
+
+    def test_handle_output_modes_preserve_exact_logical_report_and_annotations(
+        self,
+    ) -> None:
+        """Concern: both formats must preserve one proof's full ordered JSON.
+
+        Input/expected matrix:
+            expanded report / expanded annotations -> the current JSON values;
+            shared report / shared annotations after fresh import -> the same
+            dictionaries, field sets, and array order.
+        """
+        with tempfile.TemporaryDirectory(
+            prefix="synthetic-parity-", dir=self.root
+        ) as temporary:
+            state = Path(temporary)
+            report = golden_report(2)
+            provider = FixtureProvider()
+            narrator = Narrator(
+                provider,
+                architecture="v2",
+                recovery_dir=state / "recovery",
+                checkpoint_dir=state / "cache",
+                concurrency=1,
+            )
+            with ExitStack() as stack:
+                benchmark.offline_guard(stack)
+                session = narrator.capture_session(report)
+                with session:
+                    generation = narrator.generate_validated(
+                        report, session=session
+                    )
+                    report_handle = session.apply(generation)
+                    outputs = {}
+                    for storage, _expected in (
+                        ("expanded", "current logical values"),
+                        ("shared", "same logical values after import"),
+                    ):
+                        annotations = b"".join(
+                            session.iter_annotations_json(
+                                generation,
+                                report_storage=storage,
+                                max_output_bytes=benchmark.SYNTHETIC_MAX_OUTPUT_BYTES,
+                            )
+                        )
+                        report_bytes = b"".join(
+                            session.iter_report_json(
+                                report_handle,
+                                report_storage=storage,
+                                max_output_bytes=benchmark.SYNTHETIC_MAX_OUTPUT_BYTES,
+                            )
+                        )
+                        html_bytes = b"".join(
+                            iter_render_validated(
+                                session,
+                                report_handle,
+                                report_storage=storage,
+                                max_output_bytes=benchmark.SYNTHETIC_MAX_OUTPUT_BYTES,
+                            )
+                        )
+                        outputs[storage] = {
+                            "annotations": annotations,
+                            "report": report_bytes,
+                            "html": html_bytes,
+                        }
+
+                    expanded_annotations = json.loads(
+                        outputs["expanded"]["annotations"]
+                    )
+                    expanded_report = json.loads(outputs["expanded"]["report"])
+                    shared_annotation_session, shared_generation = (
+                        ReportSession.import_indexed(
+                            outputs["shared"]["annotations"],
+                            compiler_report=report,
+                            max_input_bytes=len(
+                                outputs["shared"]["annotations"]
+                            ),
+                        )
+                    )
+                    with shared_annotation_session:
+                        shared_annotations = json.loads(
+                            b"".join(
+                                shared_annotation_session.iter_annotations_json(
+                                    shared_generation,
+                                    report_storage="expanded",
+                                    max_output_bytes=benchmark.SYNTHETIC_MAX_OUTPUT_BYTES,
+                                )
+                            )
+                        )
+                    shared_report_session, shared_report_generation = (
+                        ReportSession.import_indexed(
+                            outputs["shared"]["report"],
+                            max_input_bytes=len(outputs["shared"]["report"]),
+                        )
+                    )
+                    with shared_report_session:
+                        shared_report_handle = shared_report_session.apply(
+                            shared_report_generation
+                        )
+                        shared_report = shared_report_session.report_data(
+                            shared_report_handle
+                        )
+                    self.assertEqual(shared_annotations, expanded_annotations)
+                    self.assertEqual(shared_report, expanded_report)
+                    self.assertEqual(
+                        benchmark.rendered_report_digest(
+                            outputs["expanded"]["html"]
+                        ),
+                        benchmark.digest_json(expanded_report),
+                    )
+                    self.assertEqual(
+                        benchmark.rendered_report_digest(
+                            outputs["shared"]["html"]
+                        ),
+                        benchmark.digest_json(
+                            json.loads(outputs["shared"]["report"])
+                        ),
+                    )
+
+    def test_handle_flow_reuses_production_proof_and_import_proves_once(
+        self,
+    ) -> None:
+        """Concern: trusted reuse and independent import must have exact proof counts.
+
+        Input/expected matrix:
+            one cold ``handle-paired`` run -> capture=1, fresh proof=1,
+            apply/output extra proof=0, trusted ledger/index rebuilds=0,
+            independent indexed/session import proofs=1 each, and imported
+            apply/output extra proof or ledger/index rebuilds=0.
+        """
+        with tempfile.TemporaryDirectory(
+            prefix="synthetic-gates-", dir=self.root
+        ) as temporary:
+            cache_dir = Path(temporary) / "state"
+            cache_dir.mkdir(mode=0o700)
+            metrics = benchmark.run_synthetic_sample(
+                argparse.Namespace(
+                    synthetic_sample="handle-paired",
+                    count=2,
+                    cache_state="cold",
+                    cache_dir=cache_dir,
+                    profile_callbacks=False,
+                )
+            )
+        self.assertEqual(metrics["status"], "PASS")
+        gates = metrics["deterministic_gates"]
+        expected = (
+            ("fresh_capture_initializations", 1),
+            ("generation_complete_proofs", 1),
+            ("apply_added_complete_proofs", 0),
+            ("trusted_output_added_complete_proofs", 0),
+            ("apply_added_ledger_index_builds", 0),
+            ("trusted_output_added_ledger_index_builds", 0),
+            ("shared_import_independent_import_complete_proofs", 1),
+            ("shared_import_independent_import_session_proofs", 1),
+            ("shared_import_apply_added_complete_proofs", 0),
+            ("shared_import_output_added_complete_proofs", 0),
+            ("shared_import_apply_added_ledger_index_builds", 0),
+            ("shared_import_output_added_ledger_index_builds", 0),
+        )
+        for name, count in expected:
+            with self.subTest(gate=name):
+                self.assertEqual(gates[name], count)
+
+    def test_python_pydantic_profile_counts_nested_callbacks(self) -> None:
+        """Concern: profiling must observe Python field and model validators.
+
+        Input/expected matrix:
+            one typed fixture request-configuration capture -> at least one
+            field-validator callback and one model-validator callback.
+        """
+        report = golden_report(1)
+        provider = FixtureProvider()
+        descriptor = Transport(provider, V2Options()).descriptor
+        measurements = benchmark.PhaseMeasurements()
+        with benchmark.profile_python_pydantic_validators(measurements):
+            session = ReportSession.capture(report, descriptor)
+            session.close()
+        callbacks = measurements.callback_snapshot()
+        expected = (
+            ("field validator", "field."),
+            ("model validator", "model."),
+        )
+        for label, prefix in expected:
+            with self.subTest(callback=label):
+                self.assertGreater(
+                    sum(
+                        count
+                        for name, count in callbacks.items()
+                        if name.startswith(prefix)
+                    ),
+                    0,
+                )
 
 
 if __name__ == "__main__":

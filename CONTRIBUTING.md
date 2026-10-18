@@ -4,18 +4,31 @@ Keep the reading experience simple and the evidence explicit.
 
 ## Local setup
 
-Use Python 3.10+ and Git. From a checkout:
+Use Git and [uv](https://docs.astral.sh/uv/). Development uses Python 3.13,
+as pinned in `.python-version`; the package supports Python 3.10 and newer.
+From a checkout:
 
 ```bash
-python -m venv .venv
-# Activate .venv for your shell, then:
-python -m pip install -e '.[dev]'
-python -m unittest discover -s tests -v
-python examples/make_demo.py
-python scripts/check_release.py
+uv sync --locked
+uv run --locked python -m unittest discover -s tests -v
+uv run --locked python examples/make_demo.py
+uv run --locked python scripts/check_release.py
 ```
 
-For reader changes, also install Chromium with `python -m playwright install chromium` and run `python tests/browser_smoke.py`. A system browser can be selected through `DIFFSTORY_CHROMIUM`. Screenshots are written under `docs/reader/` and must show only the synthetic demo.
+`uv sync` creates `.venv`; `uv run` uses it without manual activation. The
+`--locked` flag checks that the committed lockfile matches the project
+metadata. To change dependencies, use `uv add` or edit `pyproject.toml` and run
+`uv lock`, then commit both metadata and `uv.lock`.
+
+For reader changes, install Chromium and run the browser check:
+
+```bash
+uv run --locked python -m playwright install chromium
+uv run --locked python tests/browser_smoke.py
+```
+
+A system browser can be selected through `DIFFSTORY_CHROMIUM`. Screenshots are
+written under `docs/reader/` and must show only the synthetic demo.
 
 ## Pull requests
 

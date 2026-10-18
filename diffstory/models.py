@@ -225,6 +225,17 @@ class SourceFragment(FileSide):
         return value
 
 
+class FilePatch(FileSide):
+    """Keep a file's original Git or GitHub patch, without rebuilding it.
+
+    ``patch=None`` means the original patch was unavailable. It must not be
+    replaced with a generated diff and presented as the original.
+    """
+
+    origin: Literal["git", "github"]
+    patch: str | None
+
+
 class SnapshotInput(StrictModel):
     """Validate the snapshot envelope before parsing or indexing source.
 
@@ -234,6 +245,7 @@ class SnapshotInput(StrictModel):
         fragments: Source records in their original order.
         warnings: Producer warnings; their text never controls classification.
         file_evidence: Required file pairs with explicit source states for both revisions.
+        patches: One Git/GitHub patch record per file; null text means unavailable.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -243,6 +255,27 @@ class SnapshotInput(StrictModel):
     fragments: list[SourceFragment] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     file_evidence: list[FileEvidence]
+    patches: list[FilePatch]
+
+    @field_validator("patches")
+    @classmethod
+    def bounded_patches(cls, records: list[FilePatch]) -> list[FilePatch]:
+        """Reject repeated paths and bound retained original patch text."""
+        paths = [record.path for record in records]
+        if len(paths) != len(set(paths)):
+            msg = "Original patch paths must be unique"
+            raise ValueError(msg)
+        try:
+            size = sum(
+                len((item.patch or "").encode("utf-8")) for item in records
+            )
+        except UnicodeEncodeError as error:
+            msg = "Original patch text must be valid UTF-8"
+            raise ValueError(msg) from error
+        if size > MAX_SNAPSHOT_SOURCE_BYTES:
+            msg = "Original patches exceed the aggregate byte limit"
+            raise ValueError(msg)
+        return records
 
     @field_validator("file_evidence")
     @classmethod

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from collections import Counter
+from difflib import unified_diff
 from itertools import permutations
 from itertools import product
 from pathlib import Path
@@ -20,6 +21,7 @@ from diffstory.analysis import make_hunks
 from diffstory.analysis import ordered_components
 from diffstory.ingest import parse_pr
 from diffstory.render import render
+from diffstory.source_lines import split_source_lines
 
 
 def snap(
@@ -76,6 +78,29 @@ def snap(
         },
         "fragments": fragments,
         "file_evidence": records,
+        # Synthetic test input only. Production must capture the supplied patch.
+        "patches": [
+            {
+                "path": path,
+                "origin": "github",
+                "patch": "\n".join(
+                    row.rstrip("\r\n")
+                    for row in unified_diff(
+                        split_source_lines(
+                            before.get(path, ""), keepends=True
+                        ),
+                        split_source_lines(after.get(path, ""), keepends=True),
+                        lineterm="",
+                    )
+                )
+                if all(
+                    side["state"] == "absent" or side.get("coverage") == "full"
+                    for side in record.values()
+                )
+                else None,
+            }
+            for path, record in zip(paths, records, strict=True)
+        ],
         "warnings": warnings or [],
     }
 
@@ -806,6 +831,7 @@ class CompilerTests(unittest.TestCase):
     def test_partial_parse_failure_keeps_valid_symbols(self) -> None:
         """One failed excerpt must not discard symbols from another excerpt."""
         snapshot = {
+            "patches": [{"path": "x.py", "origin": "github", "patch": None}],
             "schema": "diffstory.snapshot.v1",
             "meta": {"scope": "selected excerpts", "changed_files": 1},
             "fragments": [
@@ -1005,6 +1031,9 @@ class CompilerTests(unittest.TestCase):
                 },
             },
         )
+        accepted["patches"].append(
+            {"path": "not-read.py", "origin": "github", "patch": None}
+        )
         rejected = copy.deepcopy(snapshot)
         rejected["file_evidence"].append(
             {
@@ -1027,6 +1056,7 @@ class CompilerTests(unittest.TestCase):
     def test_empty_snapshot_rule_is_preserved(self) -> None:
         """Evidence records alone must not replace the declared empty comparison rule."""
         empty = {
+            "patches": [],
             "schema": "diffstory.snapshot.v1",
             "meta": {"changed_files": 0},
             "fragments": [],
@@ -1133,6 +1163,9 @@ class CompilerTests(unittest.TestCase):
         for name, second_start, accepted in rows:
             with self.subTest(case=name):
                 snapshot = {
+                    "patches": [
+                        {"path": "x.py", "origin": "github", "patch": None}
+                    ],
                     "schema": "diffstory.snapshot.v1",
                     "meta": {"changed_files": 1},
                     "fragments": [
@@ -1289,9 +1322,12 @@ class CompilerTests(unittest.TestCase):
         tags = {row["tag"] for hunk in raw["hunks"] for row in hunk["rows"]}
         self.assertEqual(tags, {"add", "delete"})
 
-    def test_partial_regions_keep_all_rows(self) -> None:
-        """Distinct partial regions must preserve every supplied source row."""
+    def test_partial_regions_keep_source_without_inventing_a_patch(
+        self,
+    ) -> None:
+        """Partial source stays available even when no original patch was supplied."""
         snapshot = {
+            "patches": [{"path": "x.py", "origin": "github", "patch": None}],
             "schema": "diffstory.snapshot.v1",
             "meta": {"changed_files": 1, "scope": "selected excerpts"},
             "fragments": [
@@ -1351,12 +1387,20 @@ class CompilerTests(unittest.TestCase):
                 for hunk in file["hunks"]
                 for row in hunk["rows"]
             ),
-            4,
+            0,
+        )
+        self.assertEqual(
+            [
+                fragment["text"]
+                for fragment in report["source_evidence"]["fragments"]
+            ],
+            [fragment["text"] for fragment in snapshot["fragments"]],
         )
 
     def test_basis_reasons_are_deterministic(self) -> None:
         """Basis text must list base then head blockers and both linked paths."""
         snapshot = {
+            "patches": [{"path": "new.py", "origin": "github", "patch": None}],
             "schema": "diffstory.snapshot.v1",
             "meta": {"changed_files": 1},
             "fragments": [
@@ -1552,31 +1596,6 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(e["schema"], "diffstory.narrative-request.v1")
         self.assertIn("untrusted", e["instructions"])
 
-    def test_evidence_packet_describes_a_flexible_conceptual_preamble(
-        self,
-    ) -> None:
-        """Describe the evidence-scaled overview and sketch rules in the packet instructions."""
-        packet = evidence_packet(compile_snapshot(snap({}, {"a.py": "x=1"})))
-        instructions = packet["instructions"]
-        self.assertIn("Preamble remains a string", instructions)
-        self.assertIn("about 200 to 450 words", instructions)
-        self.assertIn("under 4,000 characters", instructions)
-        self.assertIn("do not pad", instructions)
-        self.assertIn("fenced plain-text block", instructions)
-        self.assertIn("do not use Mermaid", instructions)
-        self.assertIn("blank line", instructions)
-
-    def test_evidence_packet_calls_for_natural_asd_style_guidance(
-        self,
-    ) -> None:
-        """Ask packet writers to follow ASD principles with natural prose rhythm."""
-        packet = evidence_packet(compile_snapshot(snap({}, {"a.py": "x=1"})))
-        instructions = packet["instructions"]
-        self.assertIn("ASD-STE100 principles as a strong guide", instructions)
-        self.assertIn("roughly 80 to 90 percent", instructions)
-        self.assertIn("Do not claim formal compliance", instructions)
-        self.assertIn("natural rhythm", instructions)
-
 
 class SourceEvidenceTests(unittest.TestCase):
     """Check original source bindings, validated states, and raw text ownership."""
@@ -1760,6 +1779,9 @@ class SourceEvidenceTests(unittest.TestCase):
                 for side in ("base", "head")
             }
         )
+        snapshot["patches"].append(
+            {"path": "unread.py", "origin": "github", "patch": None}
+        )
         projection = compile_snapshot(snapshot)["source_evidence"]
         pairs = {
             item["base"]["path"]: item for item in projection["file_evidence"]
@@ -1808,6 +1830,7 @@ class SourceEvidenceTests(unittest.TestCase):
     def test_projection_keeps_separate_regions_and_renamed_paths(self) -> None:
         """Keep fragment order, partial offsets, and cross-path file pairing."""
         snapshot = {
+            "patches": [{"path": "new.py", "origin": "github", "patch": None}],
             "schema": "diffstory.snapshot.v1",
             "fragments": [
                 {
@@ -1959,6 +1982,12 @@ class SourceEvidenceTests(unittest.TestCase):
         changed.pop("source_evidence")
         self.assertEqual(original["meta"].pop("source_bytes"), 44)
         self.assertEqual(changed["meta"].pop("source_bytes"), 45)
+        for field in ("supplied_additions", "supplied_deletions"):
+            self.assertEqual(original["stats"].pop(field), 1)
+            self.assertEqual(changed["stats"].pop(field), 2)
+        self.assertNotEqual(
+            original.pop("raw_files"), changed.pop("raw_files")
+        )
         self.assertEqual(original, changed)
 
     def test_blank_changes_outside_edited_symbols_remain_owned(self) -> None:

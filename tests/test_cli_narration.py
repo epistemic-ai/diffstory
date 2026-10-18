@@ -14,6 +14,7 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from test_narrative import FakeProvider
+from test_narrative import snapshot
 
 from diffstory.analysis import compile_snapshot
 from diffstory.cli import _build_parser
@@ -45,47 +46,7 @@ def sample_snapshot() -> dict:
     Returns:
         A valid two-revision snapshot for one changed Python function.
     """
-    return {
-        "schema": "diffstory.snapshot.v1",
-        "meta": {
-            "base_sha": "a" * 40,
-            "head_sha": "b" * 40,
-            "scope": "changed files",
-            "changed_files": 1,
-            "title": "A sample change",
-        },
-        "fragments": [
-            {
-                "path": "module.py",
-                "side": "base",
-                "text": "def calculate(value):\n    return value\n",
-                "start_line": 1,
-                "scope": "full",
-            },
-            {
-                "path": "module.py",
-                "side": "head",
-                "text": "def calculate(value):\n    return value + 1\n",
-                "start_line": 1,
-                "scope": "full",
-            },
-        ],
-        "file_evidence": [
-            {
-                "base": {
-                    "path": "module.py",
-                    "state": "supplied",
-                    "coverage": "full",
-                },
-                "head": {
-                    "path": "module.py",
-                    "state": "supplied",
-                    "coverage": "full",
-                },
-            },
-        ],
-        "warnings": [],
-    }
+    return snapshot()
 
 
 def narration_args(out: Path, *options: str) -> Namespace:

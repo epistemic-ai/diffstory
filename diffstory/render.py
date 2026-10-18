@@ -369,7 +369,7 @@ def _indexed_effective_group(
     return group_value
 
 
-def _indexed_effective_report(
+def _indexed_effective_report(  # noqa: C901
     base_report: object, overlay: object, reader: object
 ) -> dict:
     """Project a small effective renderer view from owned base and overlay.
@@ -380,7 +380,8 @@ def _indexed_effective_report(
         projection. Public callers must use ``validate_report``.
     Postconditions:
         Returns a shallow report map and shallow group rows with applied fields
-        taking precedence over compiler values.
+        taking precedence over compiler values, ordered by the validated
+        presentation overlay.
     Essential behavior:
         Leaves result, source, and audit values shared with their owners.
     """
@@ -418,17 +419,26 @@ def _indexed_effective_report(
     if type(group_values) not in {_OwnedList, _OwnedTuple}:
         msg = "invalid_indexed_applied_fields"
         raise ValueError(msg)
-    effective_groups = []
+    base_by_group: dict[str, _OwnedMapping] = {}
     for group in group_values:
+        if type(group) is not _OwnedMapping:
+            msg = "invalid_indexed_applied_fields"
+            raise ValueError(msg)
         group_id = group.get("id")
-        group_overlay = by_group.get(group_id)
-        if group_overlay is None:
+        if type(group_id) is not str or group_id in base_by_group:
+            msg = "invalid_indexed_applied_fields"
+            raise ValueError(msg)
+        base_by_group[group_id] = group
+    if set(by_group) != set(base_by_group):
+        msg = "invalid_indexed_applied_fields"
+        raise ValueError(msg)
+    effective_groups = []
+    for group_overlay in overlay["groups"]:
+        group = base_by_group.get(group_overlay["group_id"])
+        if group is None:
             msg = "invalid_indexed_applied_fields"
             raise ValueError(msg)
         effective_groups.append(_indexed_effective_group(group, group_overlay))
-    if set(by_group) != {group.get("id") for group in group_values}:
-        msg = "invalid_indexed_applied_fields"
-        raise ValueError(msg)
     document = overlay["document"]
     if type(document) is not _OwnedMapping:
         msg = "invalid_indexed_applied_fields"
@@ -475,6 +485,11 @@ def validate_report(report: dict) -> None:
         TypeError: If a value has an unsupported container or scalar type.
 
     """
+    if type(report) is dict and report.get("schema") == "diffstory.report.v2":
+        from .walkthrough import validate_walkthrough
+
+        validate_walkthrough(report)
+        return
     _validate_report_schema(report)
     _validate_report_collections(report)
     generation = report.get("generation")

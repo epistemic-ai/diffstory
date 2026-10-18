@@ -25,6 +25,9 @@ from diffstory.narrative_plan import content_digest
 from diffstory.narrative_runtime import ArtifactRuntimeError
 from diffstory.narrative_session import ReportSession
 from diffstory.narrative_session import ValidatedGeneration
+from diffstory.render import iter_render_validated
+from diffstory.render import render
+from diffstory.render import validate_report
 from diffstory.report_storage import _logical_record_for_validation
 from diffstory.report_storage import _reader_logical_chunks
 from diffstory.report_storage import _streamed_storage_address
@@ -279,6 +282,255 @@ class IndexedStorageImportTests(unittest.TestCase):
                     )
                 finally:
                     session.close()
+
+    def test_applied_group_order_matches_validated_presentation_outputs(  # noqa: PLR0915
+        self,
+    ) -> None:
+        """Concern: output adapters must preserve validated section order.
+
+        Input/expected matrix:
+        * Eight source groups with a changed validated order -> report data,
+          streamed expanded JSON, and a fresh shared import match the
+          established public application result and render boundaries.
+        * One source group with unchanged order -> the same outputs retain it.
+        * Trusted apply and normal streams -> no complete proof or ledger
+          rebuild; normal streams -> no full graph expansion.
+        * A canonical shared report with compiler order restored -> parsing
+          succeeds, but independent import rejects the stored order.
+        """
+        cases = (
+            ("changed", 8, True),
+            ("unchanged", 1, False),
+        )
+        for case_name, group_count, order_changes in cases:
+            with self.subTest(case=case_name):
+                compiler_report = golden_report(group_count)
+                compiler_order = [
+                    group["id"] for group in compiler_report["groups"]
+                ]
+                with tempfile.TemporaryDirectory() as directory:
+                    narrator = Narrator(
+                        FixtureProvider(),
+                        architecture="v2",
+                        recovery_dir=directory,
+                        concurrency=1,
+                    )
+                    narrator.preview(compiler_report)
+                    session = narrator.capture_session(compiler_report)
+                    imported_session = None
+                    try:
+                        generation = narrator.generate_validated(
+                            compiler_report, session=session
+                        )
+                        annotations = json.loads(
+                            b"".join(
+                                session.iter_annotations_json(
+                                    generation,
+                                    report_storage="expanded",
+                                    max_output_bytes=128 * 1024 * 1024,
+                                )
+                            )
+                        )
+                        public_report = apply_annotations(
+                            compiler_report, annotations
+                        )
+                        expected_order = [
+                            group["id"] for group in public_report["groups"]
+                        ]
+                        self.assertEqual(
+                            expected_order != compiler_order, order_changes
+                        )
+
+                        with (
+                            patch(
+                                "diffstory.narrative_v2.validate_production",
+                                side_effect=AssertionError(
+                                    "trusted apply rebuilt complete proof"
+                                ),
+                            ) as complete_proof,
+                            patch(
+                                "diffstory.narrative_v2.validate_indexed_production",
+                                side_effect=AssertionError(
+                                    "trusted apply rebuilt indexed proof"
+                                ),
+                            ) as indexed_proof,
+                            patch(
+                                "diffstory.narrative_v2.build_ledger_index",
+                                side_effect=AssertionError(
+                                    "trusted apply rebuilt ledger index"
+                                ),
+                            ) as ledger_index,
+                        ):
+                            report_handle = session.apply(generation)
+                        self.assertEqual(complete_proof.call_count, 0)
+                        self.assertEqual(indexed_proof.call_count, 0)
+                        self.assertEqual(ledger_index.call_count, 0)
+
+                        captured_before = canonical_bytes(
+                            session.captured_report()
+                        )
+                        report_data = session.report_data(report_handle)
+                        with (
+                            patch(
+                                "diffstory.narrative_v2.validate_production",
+                                side_effect=AssertionError(
+                                    "normal output rebuilt complete proof"
+                                ),
+                            ) as complete_proof,
+                            patch(
+                                "diffstory.narrative_v2.validate_indexed_production",
+                                side_effect=AssertionError(
+                                    "normal output rebuilt indexed proof"
+                                ),
+                            ) as indexed_proof,
+                            patch(
+                                "diffstory.narrative_v2.build_ledger_index",
+                                side_effect=AssertionError(
+                                    "normal output rebuilt ledger index"
+                                ),
+                            ) as ledger_index,
+                            patch(
+                                "diffstory.report_storage.expand_report_storage",
+                                side_effect=AssertionError(
+                                    "normal output expanded the graph"
+                                ),
+                            ) as graph_expansion,
+                        ):
+                            expanded_stream = json.loads(
+                                b"".join(
+                                    session.iter_report_json(
+                                        report_handle,
+                                        report_storage="expanded",
+                                        max_output_bytes=128 * 1024 * 1024,
+                                    )
+                                )
+                            )
+                            streamed_html = b"".join(
+                                iter_render_validated(
+                                    session,
+                                    report_handle,
+                                    report_storage="expanded",
+                                    max_output_bytes=128 * 1024 * 1024,
+                                )
+                            ).decode("utf-8")
+                            shared_bytes = b"".join(
+                                session.iter_report_json(
+                                    report_handle,
+                                    report_storage="shared",
+                                    max_output_bytes=128 * 1024 * 1024,
+                                )
+                            )
+                        self.assertEqual(complete_proof.call_count, 0)
+                        self.assertEqual(indexed_proof.call_count, 0)
+                        self.assertEqual(ledger_index.call_count, 0)
+                        self.assertEqual(graph_expansion.call_count, 0)
+
+                        for name, candidate in (
+                            ("report_data", report_data),
+                            ("expanded_stream", expanded_stream),
+                        ):
+                            with self.subTest(
+                                case=case_name, public_boundary=name
+                            ):
+                                self.assertEqual(
+                                    canonical_bytes(candidate),
+                                    canonical_bytes(public_report),
+                                )
+                                self.assertEqual(
+                                    [
+                                        group["id"]
+                                        for group in candidate["groups"]
+                                    ],
+                                    expected_order,
+                                )
+                                validate_report(candidate)
+                                html = render(candidate)
+                                marker = (
+                                    '<script type="application/json" '
+                                    'id="report-data">'
+                                )
+                                start = html.index(marker) + len(marker)
+                                end = html.index("</script>", start)
+                                self.assertEqual(
+                                    canonical_bytes(
+                                        json.loads(html[start:end])
+                                    ),
+                                    canonical_bytes(public_report),
+                                )
+
+                        marker = (
+                            '<script type="application/json" id="report-data">'
+                        )
+                        start = streamed_html.index(marker) + len(marker)
+                        end = streamed_html.index("</script>", start)
+                        self.assertEqual(
+                            canonical_bytes(
+                                json.loads(streamed_html[start:end])
+                            ),
+                            canonical_bytes(public_report),
+                        )
+                        self.assertEqual(
+                            canonical_bytes(session.captured_report()),
+                            captured_before,
+                        )
+
+                        if order_changes:
+                            wrong_order = json.loads(shared_bytes)
+                            stored_by_id = {
+                                group["id"]: group
+                                for group in wrong_order["root"][
+                                    "base_report"
+                                ]["groups"]
+                            }
+                            wrong_order["root"]["base_report"]["groups"] = [
+                                stored_by_id[group_id]
+                                for group_id in compiler_order
+                            ]
+                            wrong_bytes = canonical_bytes(wrong_order)
+                            self.assertEqual(
+                                parse_report_storage(
+                                    wrong_bytes
+                                ).artifact_kind,
+                                "report",
+                            )
+                            with self.assertRaisesRegex(
+                                (ValueError, ArtifactRuntimeError),
+                                "presentation_order_changed",
+                            ):
+                                ReportSession.import_indexed(
+                                    wrong_bytes,
+                                    max_input_bytes=len(wrong_bytes),
+                                )
+
+                        imported_session, imported_generation = (
+                            ReportSession.import_indexed(
+                                shared_bytes,
+                                max_input_bytes=len(shared_bytes),
+                            )
+                        )
+                        imported_handle = imported_session.apply(
+                            imported_generation
+                        )
+                        imported_report = imported_session.report_data(
+                            imported_handle
+                        )
+                        self.assertEqual(
+                            canonical_bytes(imported_report),
+                            canonical_bytes(public_report),
+                        )
+                        self.assertEqual(
+                            [
+                                group["id"]
+                                for group in imported_report["groups"]
+                            ],
+                            expected_order,
+                        )
+                        validate_report(imported_report)
+                        render(imported_report)
+                    finally:
+                        if imported_session is not None:
+                            imported_session.close()
+                        session.close()
 
     def test_report_import_captures_compiler_base_once_without_thawing(
         self,

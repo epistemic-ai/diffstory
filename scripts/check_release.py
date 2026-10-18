@@ -32,6 +32,8 @@ TOP_FILES = {
     "CODE_OF_CONDUCT.md",
     "CHANGELOG.md",
     "pyproject.toml",
+    ".python-version",
+    "uv.lock",
     "MANIFEST.in",
     ".gitignore",
     ".gitattributes",

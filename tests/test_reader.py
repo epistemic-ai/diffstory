@@ -49,6 +49,10 @@ def report() -> dict:
     """
     return compile_snapshot(
         {
+            "patches": [
+                {"path": "query.py", "origin": "github", "patch": None},
+                {"path": "parse.py", "origin": "github", "patch": None},
+            ],
             "schema": "diffstory.snapshot.v1",
             "meta": {
                 "base_sha": "a" * 40,
@@ -387,6 +391,10 @@ class LiterateReaderTests(unittest.TestCase):
         """Notes and warnings must be present as lists of strings."""
         compiled = compile_snapshot(
             {
+                "patches": [
+                    {"path": path, "origin": "github", "patch": None}
+                    for path in ("README.md", "broken.py")
+                ],
                 "schema": "diffstory.snapshot.v1",
                 "meta": {"changed_files": 2},
                 "fragments": [
@@ -448,6 +456,9 @@ class LiterateReaderTests(unittest.TestCase):
         source = "def f():\n    return 1\n"
         unresolved_report = compile_snapshot(
             {
+                "patches": [
+                    {"path": "x.py", "origin": "github", "patch": None}
+                ],
                 "schema": "diffstory.snapshot.v1",
                 "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40},
                 "file_evidence": [
@@ -477,6 +488,9 @@ class LiterateReaderTests(unittest.TestCase):
         )
         new_report = compile_snapshot(
             {
+                "patches": [
+                    {"path": "x.py", "origin": "github", "patch": None}
+                ],
                 "schema": "diffstory.snapshot.v1",
                 "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40},
                 "fragments": [

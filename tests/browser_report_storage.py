@@ -8,18 +8,23 @@ loads them offline, and writes all generated artifacts beneath
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
+import math
 import os
 import signal
+import statistics
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from browser_narrative_v2 import Checks
 from browser_narrative_v2 import check_page
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+from test_narrative_v2 import golden_report
 from test_reader import UNSAFE_TEXT
 from test_reader import MixedTerminologyReaderFixtureProvider
 from test_reader import encode_omitted_terminology_defaults
@@ -30,6 +35,7 @@ from test_reader import reader_golden_report
 
 from diffstory.analysis import compile_snapshot
 from diffstory.narrative import Narrator
+from diffstory.narrative_manifest import GENERATION_STORAGE_VERSION
 from diffstory.narrative_session import ReportSession
 from diffstory.render import iter_render_validated
 from diffstory.report_storage import STORAGE_VERSION
@@ -59,6 +65,7 @@ TABLES = sorted(
     )
 )
 REPORT_DATA_OPEN = '<script type="application/json" id="report-data">'
+REPORT_DATA_OPEN_BYTES = REPORT_DATA_OPEN.encode("ascii")
 
 
 def collect(chunks: object) -> bytes:
@@ -84,14 +91,33 @@ def embedded_json(html: bytes) -> dict:
     Postconditions: Returns the parsed embedded JSON object.
     Essential behavior: Confirms HTML escaping preserves a complete JSON value.
     """
-    text = html.decode("utf-8")
-    start = text.index(REPORT_DATA_OPEN) + len(REPORT_DATA_OPEN)
-    end = text.index("</script>", start)
-    value = json.loads(text[start:end])
+    value = json.loads(_embedded_script_payload_bytes(html).decode("utf-8"))
     if type(value) is not dict:
         msg = "embedded report data is not an object"
         raise AssertionError(msg)
     return value
+
+
+def _embedded_script_payload_bytes(html: bytes) -> bytes:
+    """Extract the exact UTF-8 payload consumed by the report-data script.
+
+    Preconditions: ``html`` is one trusted self-contained writer output.
+    Postconditions: Returns bytes between its unique report-data opening tag
+        and the following closing script tag, without JSON re-serialization.
+    Essential behavior: Measures HTML-escaped script text at the same boundary
+        as the browser's ``TextEncoder(script.textContent)`` call.
+    """
+    if html.count(REPORT_DATA_OPEN_BYTES) != 1:
+        msg = "trusted reader output has no unique report-data script"
+        raise AssertionError(msg)
+    start = html.index(REPORT_DATA_OPEN_BYTES) + len(REPORT_DATA_OPEN_BYTES)
+    end = html.find(b"</script>", start)
+    if end < start:
+        msg = "trusted reader output has no closing report-data script tag"
+        raise AssertionError(msg)
+    payload = html[start:end]
+    payload.decode("utf-8")
+    return payload
 
 
 def trusted_reader_outputs(  # noqa: C901, PLR0915 # One source-free trusted writer/import lifecycle.
@@ -100,6 +126,7 @@ def trusted_reader_outputs(  # noqa: C901, PLR0915 # One source-free trusted wri
     *,
     provider: object | None = None,
     options: object | None = None,
+    include_html_escape_probe: bool = False,
 ) -> tuple[dict, bytes, bytes, bytes, dict]:
     """Create a validated report and both HTML modes through session writers.
 
@@ -112,10 +139,13 @@ def trusted_reader_outputs(  # noqa: C901, PLR0915 # One source-free trusted wri
     """
     directory.mkdir(parents=True, exist_ok=True)
     source = copy.deepcopy(source_report)
-    source["opaque_browser_probe"] = {
+    browser_probe = {
         "$ref": "literal compiler metadata",
         "large_text": "",
     }
+    if include_html_escape_probe:
+        browser_probe["html_escape_probe"] = "<&> café \u2028\u2029"
+    source["opaque_browser_probe"] = browser_probe
     recovery = directory / "recovery"
     narrator = Narrator(
         provider or MixedTerminologyReaderFixtureProvider(),
@@ -256,6 +286,15 @@ def trusted_reader_outputs(  # noqa: C901, PLR0915 # One source-free trusted wri
             "shared_bytes": len(shared_json),
             "trusted_shared_bytes": len(writer_shared_json),
             "expanded_json_bytes": len(expanded_json),
+            "expanded_embedded_script_bytes": len(
+                _embedded_script_payload_bytes(expanded_html)
+            ),
+            "shared_embedded_script_bytes": len(
+                _embedded_script_payload_bytes(shared_html)
+            ),
+            "expanded_generation_storage_version": expanded_oracle[
+                "generation"
+            ].get("storage_version"),
             "storage_counts": parsed.storage_counts,
             "source_fragment_count": len(
                 envelope["root"]["base_report"]["source_evidence"]["fragments"]
@@ -377,6 +416,15 @@ def imported_reader_outputs(
         summary = {
             "shared_bytes": len(shared_json),
             "expanded_json_bytes": len(expanded_json),
+            "expanded_embedded_script_bytes": len(
+                _embedded_script_payload_bytes(expanded_html)
+            ),
+            "shared_embedded_script_bytes": len(
+                _embedded_script_payload_bytes(shared_html)
+            ),
+            "expanded_generation_storage_version": json.loads(expanded_json)[
+                "generation"
+            ].get("storage_version"),
             "storage_counts": parse_report_storage(shared_json).storage_counts,
             "source_fragment_count": len(
                 envelope["root"]["base_report"]["source_evidence"]["fragments"]
@@ -466,6 +514,198 @@ def visible_dom_text(browser: Browser, html: bytes) -> str:
         page.close()
 
 
+def _retained_heap(page: Page) -> tuple[int | None, int | None]:
+    """Collect supported retained JavaScript heap values after source expansion.
+
+    Preconditions: ``page`` is a live local Chromium page after its measured
+        source interaction.
+    Postconditions: Returns retained V8 heap and backing-storage bytes, with
+        null values when Chromium does not support the CDP fields.
+    Essential behavior: Forces CDP garbage collection before reading usage; it
+        does not treat the result as a peak or include native DOM memory.
+    """
+    client = None
+    try:
+        client = page.context.new_cdp_session(page)
+        client.send("HeapProfiler.enable")
+        client.send("HeapProfiler.collectGarbage")
+        usage = client.send("Runtime.getHeapUsage")
+    except PlaywrightError:
+        return None, None
+    finally:
+        if client is not None:
+            with contextlib.suppress(PlaywrightError):
+                client.detach()
+    values = []
+    for field in (
+        "usedSize",
+        "backingStorageSize",
+    ):
+        value = usage.get(field)
+        if type(value) not in {int, float} or not math.isfinite(value):
+            values.append(None)
+        else:
+            values.append(round(value))
+    return values[0], values[1]
+
+
+def _median_range(values: list[object]) -> dict:
+    """Summarize numeric repeated samples without inventing unavailable values.
+
+    Preconditions: ``values`` contains finite numbers or explicit ``None``.
+    Postconditions: Returns median, minimum, maximum, and count for numeric
+        observations; all three statistics are null when none are available.
+    Essential behavior: Keeps each raw sample in the artifact and summarizes
+        only matching fixture, format, and metric rows.
+    """
+    samples = [
+        value
+        for value in values
+        if type(value) in {int, float} and math.isfinite(value)
+    ]
+    if not samples:
+        return {"median": None, "min": None, "max": None, "sample_count": 0}
+    return {
+        "median": statistics.median(samples),
+        "min": min(samples),
+        "max": max(samples),
+        "sample_count": len(samples),
+    }
+
+
+def _summarize_measurement_group(
+    rows: list[dict], expected_repeats: int
+) -> dict:
+    """Summarize one complete fixture/storage repeat group.
+
+    Preconditions: ``rows`` contains only one fixture/storage pair and the
+        expected repeat count is from 1 through 5.
+    Postconditions: Returns numeric median/range/count summaries, with null
+        statistics only when every observation for a metric is unavailable.
+    Essential behavior: Rejects missing, extra, malformed, or partly null
+        observations before any median can imply a complete sample group.
+    """
+    if not 1 <= expected_repeats <= 5 or len(rows) != expected_repeats:
+        msg = (
+            "a fixture/storage summary requires exactly its expected repeat "
+            f"count ({len(rows)} observed, {expected_repeats} expected)"
+        )
+        raise AssertionError(msg)
+    row_metadata = {
+        "fixture",
+        "repeat",
+        "format_position",
+        "format_order",
+        "storage",
+        "retained_heap_supported",
+    }
+    metric_keys = set(rows[0]) - row_metadata
+    if any(set(row) - row_metadata != metric_keys for row in rows):
+        msg = "a fixture/storage repeat group has inconsistent metric fields"
+        raise AssertionError(msg)
+    support_values = [row.get("retained_heap_supported") for row in rows]
+    if any(type(value) is not bool for value in support_values):
+        msg = "a fixture/storage repeat group has invalid retained-heap flags"
+        raise AssertionError(msg)
+
+    metrics = {}
+    for key in sorted(metric_keys):
+        values = [row[key] for row in rows]
+        if any(
+            value is not None
+            and (type(value) not in {int, float} or not math.isfinite(value))
+            for value in values
+        ):
+            msg = (
+                f"measurement {key} contains a non-finite or nonnumeric value"
+            )
+            raise AssertionError(msg)
+        available_count = sum(value is not None for value in values)
+        if available_count not in {0, expected_repeats}:
+            msg = f"measurement {key} has only a partial set of observations"
+            raise AssertionError(msg)
+        metrics[key] = _median_range(values)
+    return {
+        "metrics": metrics,
+        "retained_heap_supported_samples": sum(support_values),
+        "repeat_count": len(rows),
+    }
+
+
+def _smoke_measurement_grouping() -> int:
+    """Check the closed summary cases before starting the browser matrix.
+
+    Preconditions: The local Python runtime is available; no browser is needed.
+    Postconditions: Three explicit input/expected cases pass or raise early.
+    Essential behavior: Prevents row-level grouping, unavailable-metric
+        coercion, and incomplete repeat groups from yielding plausible output.
+    """
+    cases = [
+        {
+            "concern": (
+                "three numeric observations retain their median, range, and count"
+            ),
+            "rows": [
+                {"value": 10, "retained_heap_supported": True},
+                {"value": 30, "retained_heap_supported": True},
+                {"value": 20, "retained_heap_supported": False},
+            ],
+            "expected": {
+                "metrics": {
+                    "value": {
+                        "median": 20,
+                        "min": 10,
+                        "max": 30,
+                        "sample_count": 3,
+                    }
+                },
+                "retained_heap_supported_samples": 2,
+                "repeat_count": 3,
+            },
+        },
+        {
+            "concern": (
+                "an unavailable metric stays null with zero numeric samples"
+            ),
+            "rows": [
+                {"value": None, "retained_heap_supported": False},
+                {"value": None, "retained_heap_supported": False},
+                {"value": None, "retained_heap_supported": False},
+            ],
+            "expected": {
+                "metrics": {
+                    "value": {
+                        "median": None,
+                        "min": None,
+                        "max": None,
+                        "sample_count": 0,
+                    }
+                },
+                "retained_heap_supported_samples": 0,
+                "repeat_count": 3,
+            },
+        },
+    ]
+    for case in cases:
+        actual = _summarize_measurement_group(case["rows"], 3)
+        if actual != case["expected"]:
+            msg = f"measurement grouping smoke failed: {case['concern']}"
+            raise AssertionError(msg)
+
+    missing_observation_rows = [
+        {"value": 10, "retained_heap_supported": True},
+        {"value": 20, "retained_heap_supported": True},
+    ]
+    try:
+        _summarize_measurement_group(missing_observation_rows, 3)
+    except AssertionError:
+        return len(cases) + 1
+    msg = (
+        "a missing observation must fail instead of producing a partial median"
+    )
+    raise AssertionError(msg)
+
+
 def _metric_page(  # noqa: C901, PLR0912, PLR0915 # One measured page has one serial load/click/capture lifecycle.
     browser: Browser,
     report: dict,
@@ -478,7 +718,8 @@ def _metric_page(  # noqa: C901, PLR0912, PLR0915 # One measured page has one se
     Preconditions: ``html`` is trusted writer output for ``report`` and
         ``browser`` is a local Playwright Chromium instance.
     Postconditions: Returns numeric test-hook values and an in-memory DOM
-        signature that the caller compares but does not serialize.
+        signature that the caller compares but does not serialize. Each call
+        creates a new page and isolated browser context.
     Essential behavior: Records attempted requests and rejects page or console
         errors while preserving the exact cited preview and full source.
     """
@@ -552,6 +793,7 @@ def _metric_page(  # noqa: C901, PLR0912, PLR0915 # One measured page has one se
       anchors: [...document.querySelectorAll('[id]')].map(node => node.id),
       sources: [...document.querySelectorAll('.v2-source')].map(node => [node.id, node.querySelector('summary')?.textContent || '', node.querySelector('.exact-code')?.dataset.fragment || '', node.querySelector('.exact-code')?.dataset.side || '', node.querySelector('.code-source-link')?.getAttribute('href') || ''])
     })""")
+    retained_js_heap, retained_backing_storage = _retained_heap(page)
     if requests or page_errors or console_errors:
         page.close()
         msg = f"browser requests/errors: {len(requests)}/{len(page_errors)}/{len(console_errors)}"
@@ -601,12 +843,24 @@ def _metric_page(  # noqa: C901, PLR0912, PLR0915 # One measured page has one se
         page.close()
         msg = "browser did not measure cited source loading"
         raise AssertionError(msg)
+    if (
+        metrics["readerReferenceCount"] <= 0
+        or metrics["readerResultCount"] <= 0
+    ):
+        page.close()
+        msg = (
+            "browser did not count the reader result and reference projections"
+        )
+        raise AssertionError(msg)
     page.close()
     numeric = {
         **metrics,
         "request_count": len(requests),
         "page_error_count": len(page_errors),
         "console_error_count": len(console_errors),
+        "retained_js_heap_used_bytes": retained_js_heap,
+        "retained_backing_storage_bytes": retained_backing_storage,
+        "retained_heap_supported": retained_js_heap is not None,
     }
     return numeric, signature
 
@@ -634,6 +888,59 @@ def _run() -> None:  # noqa: C901, PLR0912, PLR0915 # One capped serial browser 
         tempfile.mkdtemp(prefix="diffstory-m6u3-browser-", dir=parent)
     )
     check = Checks()
+    check(
+        _smoke_measurement_grouping() == 3,
+        "closed measurement grouping cases pass before browser startup",
+    )
+
+    (
+        escape_smoke_report,
+        escape_smoke_shared_json,
+        escape_smoke_expanded_html,
+        escape_smoke_shared_html,
+        escape_smoke_summary,
+    ) = trusted_reader_outputs(
+        reader_golden_report(),
+        output / "html-escape-smoke",
+        include_html_escape_probe=True,
+    )
+    escape_probe = escape_smoke_report["opaque_browser_probe"].get(
+        "html_escape_probe"
+    )
+    check(
+        escape_probe == "<&> café \u2028\u2029",
+        "the authored byte smoke includes HTML-significant and Unicode text",
+    )
+    escape_smoke_facts = {}
+    for storage, raw_bytes, html, expected_value in (
+        (
+            "expanded",
+            escape_smoke_summary["expanded_json_bytes"],
+            escape_smoke_expanded_html,
+            escape_smoke_report,
+        ),
+        (
+            "shared",
+            escape_smoke_summary["shared_bytes"],
+            escape_smoke_shared_html,
+            json.loads(escape_smoke_shared_json),
+        ),
+    ):
+        embedded_bytes = len(_embedded_script_payload_bytes(html))
+        check(
+            raw_bytes != embedded_bytes,
+            f"{storage} HTML-significant Unicode fixture separates raw JSON and embedded script byte counts",
+        )
+        check(
+            embedded_json(html) == expected_value,
+            f"{storage} HTML escaping preserves the exact logical JSON value",
+        )
+        escape_smoke_facts[storage] = {
+            "raw_compact_json_bytes": raw_bytes,
+            "embedded_script_utf8_bytes": embedded_bytes,
+            "escape_overhead_bytes": embedded_bytes - raw_bytes,
+            "logical_values_match": True,
+        }
 
     fixture_root = os.environ.get("DIFFSTORY_AUTHORED_FIXTURE_ROOT")
     if fixture_root:
@@ -660,6 +967,103 @@ def _run() -> None:  # noqa: C901, PLR0912, PLR0915 # One capped serial browser 
         ("golden", golden),
         ("exact", exact),
     ]
+    check(
+        fixture_cases[1][1][4]["expanded_json_bytes"]
+        > fixture_cases[0][1][4]["expanded_json_bytes"],
+        "the authored exact fixture is larger than the golden fixture",
+    )
+    repeat_value = os.environ.get("DIFFSTORY_BROWSER_REPEATS")
+    try:
+        repeat_count = int(repeat_value or "1")
+    except ValueError as error:
+        msg = "DIFFSTORY_BROWSER_REPEATS must be an integer from 1 through 5"
+        raise ValueError(msg) from error
+    repeated_matrix = repeat_value is not None
+    if not 1 <= repeat_count <= 5:
+        msg = "DIFFSTORY_BROWSER_REPEATS must be an integer from 1 through 5"
+        raise ValueError(msg)
+    scale_matrix = (
+        {"count": 2, "expected_sections": 2},
+        {"count": 4, "expected_sections": 4},
+        {"count": 8, "expected_sections": 8},
+    )
+    measurement_fixtures = fixture_cases
+    if repeated_matrix:
+        measurement_fixtures = []
+        for scale in scale_matrix:
+            count = scale["count"]
+            pair = trusted_reader_outputs(
+                golden_report(count),
+                output / f"golden-count-{count}",
+                provider=MixedTerminologyReaderFixtureProvider(),
+            )
+            report = pair[0]
+            fixture_name = f"golden_count_{count}"
+            check(
+                len(report["narrative_v2"]["sections"])
+                == scale["expected_sections"],
+                f"golden_report count {count} yields {scale['expected_sections']} compiler-backed scale sections",
+            )
+            measurement_fixtures.append((fixture_name, pair))
+        measurement_fixtures.append(("exact", exact))
+
+    fixture_facts = {}
+    for fixture_name, pair in measurement_fixtures:
+        report, shared_json, _expanded_html, _shared_html, source_summary = (
+            pair
+        )
+        storage_counts = source_summary["storage_counts"]
+        check(
+            source_summary["expanded_generation_storage_version"]
+            == GENERATION_STORAGE_VERSION,
+            f"{fixture_name} expanded bytes use compact generation-storage.v1",
+        )
+        check(
+            source_summary["expanded_json_bytes"] > 0
+            and source_summary["shared_bytes"] == len(shared_json)
+            and source_summary["source_fragment_count"]
+            == len(report["source_evidence"]["fragments"])
+            and source_summary["source_fragment_count"] > 0,
+            f"{fixture_name} has matching byte counts and complete source closure",
+        )
+        proof_tables = (
+            "runs",
+            "invocations",
+            "requests",
+            "producers",
+            "receipts",
+        )
+        check(
+            all(storage_counts.get(table, 0) > 0 for table in proof_tables),
+            f"{fixture_name} independently imported report keeps all proof table families",
+        )
+        expanded_bytes = source_summary["expanded_json_bytes"]
+        shared_bytes = len(shared_json)
+        fixture_facts[fixture_name] = {
+            "source_fragment_count": source_summary["source_fragment_count"],
+            "expanded_generation_storage_version": GENERATION_STORAGE_VERSION,
+            "expanded_json_bytes": expanded_bytes,
+            "shared_report_bytes": shared_bytes,
+            "raw_compact_json_bytes": {
+                "expanded": expanded_bytes,
+                "shared": shared_bytes,
+            },
+            "embedded_script_utf8_bytes": {
+                "expanded": source_summary["expanded_embedded_script_bytes"],
+                "shared": source_summary["shared_embedded_script_bytes"],
+            },
+            "html_escape_overhead_bytes": {
+                "expanded": source_summary["expanded_embedded_script_bytes"]
+                - expanded_bytes,
+                "shared": source_summary["shared_embedded_script_bytes"]
+                - shared_bytes,
+            },
+            "shared_minus_expanded_bytes": shared_bytes - expanded_bytes,
+            "shared_delta_percent": round(
+                (shared_bytes - expanded_bytes) * 100 / expanded_bytes, 2
+            ),
+            "storage_counts": storage_counts,
+        }
     fidelity: dict[str, dict] = {}
     measurements: list[dict] = []
 
@@ -759,76 +1163,104 @@ def _run() -> None:  # noqa: C901, PLR0912, PLR0915 # One capped serial browser 
                             f"{storage} keeps distinct same-line source slices",
                         )
 
-            for fixture_name, pair in fixture_cases:
+            for fixture_index, (fixture_name, pair) in enumerate(
+                measurement_fixtures
+            ):
                 report, shared_json, expanded_html, shared_html, _summary = (
                     pair
                 )
-                paired_metrics = {}
-                paired_signatures = {}
-                for storage, html in (
-                    ("expanded", expanded_html),
-                    ("shared", shared_html),
-                ):
-                    metric_values, signature = _metric_page(
-                        browser,
-                        report,
-                        html,
-                        expected_shared=storage == "shared",
-                    )
-                    paired_metrics[storage] = metric_values
-                    paired_signatures[storage] = signature
-                check(
-                    paired_signatures["expanded"]
-                    == paired_signatures["shared"],
-                    f"{fixture_name} browser DOM remains equal across storage modes",
-                )
-                for storage in ("expanded", "shared"):
-                    values = paired_metrics[storage]
+                html_by_storage = {
+                    "expanded": expanded_html,
+                    "shared": shared_html,
+                }
+                for repeat_index in range(repeat_count):
+                    format_order = ["expanded", "shared"]
+                    if (fixture_index + repeat_index) % 2:
+                        format_order.reverse()
+                    paired_signatures = {}
+                    for format_position, storage in enumerate(format_order, 1):
+                        metric_values, signature = _metric_page(
+                            browser,
+                            report,
+                            html_by_storage[storage],
+                            expected_shared=storage == "shared",
+                        )
+                        paired_signatures[storage] = signature
+                        expected_bytes = fixture_facts[fixture_name][
+                            "embedded_script_utf8_bytes"
+                        ][storage]
+                        check(
+                            metric_values["embeddedJSONBytes"]
+                            == expected_bytes,
+                            f"{fixture_name} repeat {repeat_index + 1} {storage} browser bytes equal the exact trusted HTML script payload",
+                        )
+                        measurements.append(
+                            {
+                                "fixture": fixture_name,
+                                "repeat": repeat_index + 1,
+                                "format_position": format_position,
+                                "format_order": format_order,
+                                "storage": storage,
+                                **metric_values,
+                            }
+                        )
                     check(
-                        values["request_count"] == 0,
-                        f"{fixture_name} {storage} made no network attempts",
-                    )
-                    check(
-                        values["page_error_count"] == 0,
-                        f"{fixture_name} {storage} had no page errors",
-                    )
-                    check(
-                        values["console_error_count"] == 0,
-                        f"{fixture_name} {storage} had no console errors",
-                    )
-                    check(
-                        values["readerReferenceCount"] > 0,
-                        f"{fixture_name} {storage} counted reader selectors",
-                    )
-                    check(
-                        values["readerResultCount"] > 0,
-                        f"{fixture_name} {storage} counted reader results",
-                    )
-                    measurements.append(
-                        {
-                            "fixture": fixture_name,
-                            "sharedReportBytes": len(shared_json),
-                            "storage": storage,
-                            **values,
-                        }
+                        paired_signatures["expanded"]
+                        == paired_signatures["shared"],
+                        f"{fixture_name} repeat {repeat_index + 1} DOM text, fields, labels, links, context, catalog, anchors, and exact source match",
                     )
         finally:
             browser.close()
 
-    json_sizes = [
-        row["embeddedJSONBytes"]
-        for row in measurements
-        if row["storage"] == "expanded"
-    ]
+    expected_measurement_rows = len(measurement_fixtures) * 2 * repeat_count
     check(
-        json_sizes == sorted(json_sizes),
-        "the authored exact fixture is larger than the golden fixture",
+        len(measurements) == expected_measurement_rows,
+        "the repeated matrix contains every fixture, format, and observation",
     )
+    measurement_summary = {}
+    for fixture_name, _pair in measurement_fixtures:
+        format_summaries = {}
+        for storage in ("expanded", "shared"):
+            rows = [
+                row
+                for row in measurements
+                if row["fixture"] == fixture_name and row["storage"] == storage
+            ]
+            check(
+                len(rows) == repeat_count,
+                f"{fixture_name} {storage} has exactly {repeat_count} measured observations",
+            )
+            format_summaries[storage] = _summarize_measurement_group(
+                rows, repeat_count
+            )
+        measurement_summary[fixture_name] = format_summaries
     measurement_artifact = {
         "source_free": True,
         "reused_authored_fixtures": bool(fixture_root),
-        "fixtures": [fixture_name for fixture_name, _pair in fixture_cases],
+        "measurement_mode": (
+            "opt-in-repeat-matrix"
+            if repeated_matrix
+            else "default-single-pass"
+        ),
+        "repeat_count": repeat_count,
+        "scale_input_matrix": list(scale_matrix) if repeated_matrix else [],
+        "fixtures": [
+            fixture_name for fixture_name, _pair in measurement_fixtures
+        ],
+        "fixture_facts": fixture_facts,
+        "html_escape_byte_smoke": escape_smoke_facts,
         "measurements": measurements,
+        "summary_by_fixture_and_format": measurement_summary,
+        "retained_heap_method": (
+            "Chrome CDP HeapProfiler.collectGarbage then Runtime.getHeapUsage "
+            "after source expansion; retained heap is not peak or allocation "
+            "memory, and does not include native DOM memory. Backing storage "
+            "is reported only when Chromium provides that counter."
+        ),
+        "performance_memory_scope": (
+            "Existing performance.memory fields are coarse current snapshots "
+            "after parse, index, and render; they are not peak measurements."
+        ),
     }
     (output / "measurements.json").write_text(
         json.dumps(measurement_artifact, sort_keys=True, indent=2) + "\n",
@@ -842,6 +1274,8 @@ def _run() -> None:  # noqa: C901, PLR0912, PLR0915 # One capped serial browser 
         "network_attempts": 0,
         "fixture_pages": len(fidelity),
         "measurement_rows": len(measurements),
+        "measurement_mode": measurement_artifact["measurement_mode"],
+        "repeat_count": repeat_count,
         "fidelity": fidelity,
     }
     (output / "result.json").write_text(

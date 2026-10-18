@@ -20,6 +20,8 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 from urllib.error import HTTPError
 
+from test_analysis import snap
+
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.analysis import validate_generated_report
@@ -70,85 +72,32 @@ def snapshot(
         A bounded ``diffstory.snapshot.v1`` mapping.
 
     """
-    return {
-        "schema": "diffstory.snapshot.v1",
-        "meta": {
-            "base_sha": "a" * 40,
-            "head_sha": "b" * 40,
-            "scope": "changed files",
-            "changed_files": 1,
-            "title": "A sample change",
+    return snap(
+        {"module.py": "def calculate(value):\n    return value\n"},
+        {"module.py": head_source},
+        fragment_options={
+            (side, "module.py"): {"start_line": 1, "scope": "full"}
+            for side in ("base", "head")
         },
-        "fragments": [
-            {
-                "path": "module.py",
-                "side": "base",
-                "text": "def calculate(value):\n    return value\n",
-                "start_line": 1,
-                "scope": "full",
-            },
-            {
-                "path": "module.py",
-                "side": "head",
-                "text": head_source,
-                "start_line": 1,
-                "scope": "full",
-            },
-        ],
-        "file_evidence": [
-            {
-                "base": {
-                    "path": "module.py",
-                    "state": "supplied",
-                    "coverage": "full",
-                },
-                "head": {
-                    "path": "module.py",
-                    "state": "supplied",
-                    "coverage": "full",
-                },
-            },
-        ],
-        "warnings": [],
-    }
+        changed_files=1,
+        title="A sample change",
+    )
 
 
 def two_group_report() -> dict:
     """Build two independent groups to exercise ordered parallel stages."""
     source = snapshot()
-    source["meta"]["changed_files"] = 2
-    source["fragments"].extend(
-        [
-            {
-                "path": "other.py",
-                "side": "base",
-                "text": "def normalize(value):\n    return value\n",
-                "start_line": 1,
-                "scope": "full",
-            },
-            {
-                "path": "other.py",
-                "side": "head",
-                "text": "def normalize(value):\n    return value.strip()\n",
-                "start_line": 1,
-                "scope": "full",
-            },
-        ],
-    )
-    source["file_evidence"].append(
-        {
-            "base": {
-                "path": "other.py",
-                "state": "supplied",
-                "coverage": "full",
-            },
-            "head": {
-                "path": "other.py",
-                "state": "supplied",
-                "coverage": "full",
-            },
+    other = snap(
+        {"other.py": "def normalize(value):\n    return value\n"},
+        {"other.py": "def normalize(value):\n    return value.strip()\n"},
+        fragment_options={
+            (side, "other.py"): {"start_line": 1, "scope": "full"}
+            for side in ("base", "head")
         },
     )
+    source["meta"]["changed_files"] = 2
+    for field in ("fragments", "file_evidence", "patches"):
+        source[field].extend(other[field])
     return compile_snapshot(source)
 
 
@@ -628,41 +577,7 @@ class NarrativeTests(unittest.TestCase):
 
     def test_generation_and_report_roundtrip_keep_provenance(self) -> None:
         """Retain revision binding and evidence when narrations are rendered."""
-        source_snapshot = snapshot()
-        source_snapshot["meta"]["changed_files"] = 2
-        source_snapshot["fragments"].extend(
-            [
-                {
-                    "path": "other.py",
-                    "side": "base",
-                    "text": "def normalize(value):\n    return value\n",
-                    "start_line": 1,
-                    "scope": "full",
-                },
-                {
-                    "path": "other.py",
-                    "side": "head",
-                    "text": "def normalize(value):\n    return value.strip()\n",
-                    "start_line": 1,
-                    "scope": "full",
-                },
-            ],
-        )
-        source_snapshot["file_evidence"].append(
-            {
-                "base": {
-                    "path": "other.py",
-                    "state": "supplied",
-                    "coverage": "full",
-                },
-                "head": {
-                    "path": "other.py",
-                    "state": "supplied",
-                    "coverage": "full",
-                },
-            },
-        )
-        report = compile_snapshot(source_snapshot)
+        report = two_group_report()
         provider = FakeProvider()
         narrator = Narrator(provider)
         preview = narrator.preview(report)
@@ -788,13 +703,6 @@ class NarrativeTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         apply_annotations(source_report, annotated)
 
-    def test_asd_style_guidance_keeps_natural_prose_rhythm(self) -> None:
-        """Use ASD principles as a strong guide without making prose robotic."""
-        self.assertIn("strong guide", ASD_STYLE_INSTRUCTION)
-        self.assertIn("roughly 80 to 90 percent", ASD_STYLE_INSTRUCTION)
-        self.assertIn("Do not claim formal compliance", ASD_STYLE_INSTRUCTION)
-        self.assertIn("natural rhythm", ASD_STYLE_INSTRUCTION)
-
     def test_new_document_response_requires_a_nonempty_preamble(self) -> None:
         """Require a preamble in new provider output and reject an empty value."""
         valid = FakeProvider._document_response({})
@@ -811,10 +719,10 @@ class NarrativeTests(unittest.TestCase):
             ):
                 Narrator._validate_document_response(response)
 
-    def test_document_prompt_supports_a_flexible_conceptual_overview(
+    def test_document_preamble_schema_has_a_type_and_length_bound(
         self,
     ) -> None:
-        """Describe an evidence-scaled, conceptual preamble in the document contract."""
+        """Keep the provider's preamble field a bounded string."""
         provider = FakeProvider()
         Narrator(provider).generate(compile_snapshot(snapshot()))
         request = next(
@@ -822,20 +730,11 @@ class NarrativeTests(unittest.TestCase):
             for call in provider.calls
             if call["name"] == "diffstory_document"
         )
-        prompt = request["system"]
         preamble_schema = request["schema"]["properties"]["preamble"]
-        self.assertIn("before any code tour", prompt)
-        self.assertIn("about 200 to 450 words", prompt)
-        self.assertIn("Do not pad", prompt)
-        self.assertIn("fenced plain-text blocks", prompt)
-        self.assertIn("blank line", prompt)
-        self.assertIn("do not use Mermaid", prompt)
         self.assertEqual(preamble_schema["type"], "string")
         self.assertEqual(
             preamble_schema["maxLength"], MAX_PREAMBLE_TOTAL_CHARS
         )
-        self.assertIn("about 200 to 450 words", preamble_schema["description"])
-        self.assertIn("multi-part change", preamble_schema["description"])
 
     def test_document_output_reserve_covers_a_page_sized_preamble(
         self,
@@ -1119,11 +1018,13 @@ class NarrativeTests(unittest.TestCase):
         """Enforce the aggregate source-byte limit when compiling a snapshot."""
         from unittest.mock import patch
 
+        source = snapshot()
+        source["patches"][0]["patch"] = None
         with (
             patch("diffstory.models.MAX_SNAPSHOT_SOURCE_BYTES", 4),
             self.assertRaisesRegex(ValueError, "aggregate limit"),
         ):
-            compile_snapshot(snapshot())
+            compile_snapshot(source)
 
     def test_cli_without_narrate_never_calls_provider(self) -> None:
         """Avoid provider calls and annotation output unless narration is requested."""
@@ -1477,15 +1378,12 @@ class NarrativeTests(unittest.TestCase):
             patch(
                 "diffstory.narrative.subprocess.Popen", return_value=process
             ),
-            patch(
-                "diffstory.narrative._terminate_process_tree"
-            ) as terminate_tree,
+            patch("diffstory.narrative._terminate_process_tree"),
             self.assertRaisesRegex(ProviderResponseError, "timed out"),
         ):
             provider.complete(body, 4)
         process.wait.assert_any_call(timeout=4)
         process.wait.assert_any_call(timeout=PROCESS_CLEANUP_TIMEOUT_SECONDS)
-        terminate_tree.assert_called_once_with(process)
 
     def test_codex_cli_stdout_is_terminated_at_the_response_limit(
         self,

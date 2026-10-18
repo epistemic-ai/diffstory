@@ -54,7 +54,8 @@
     readerMetrics.heapAfterParseBytes = heapBytes();
   }
   const indexBuildStarted = metricNow();
-  const sharedMode = parsedEnvelope?.storage_version === 'diffstory.report-storage.v1';
+  const storageVersion = parsedEnvelope?.storage_version;
+  const sharedMode = storageVersion === 'diffstory.report-storage.v1';
 
   function indexSharedEnvelope(envelope) {
     if (
@@ -92,11 +93,100 @@
     return {root: envelope.root, indexes};
   }
 
-  if (parsedEnvelope?.storage_version && !sharedMode) {
+  if (
+    typeof storageVersion === 'string'
+    && storageVersion.startsWith('diffstory.report-storage.')
+    && !sharedMode
+  ) {
     throw new Error('Unsupported embedded report storage version');
   }
   const sharedGraph = sharedMode ? indexSharedEnvelope(parsedEnvelope) : null;
-  const R = sharedMode ? sharedGraph.root.base_report : parsedEnvelope;
+  const flatMode = parsedEnvelope?.schema === 'diffstory.report.v2';
+  // Adapt flat saved data to the existing reader at display time. Source text
+  // stays in one store; definitions and original diff rows resolve lazily.
+  function projectWalkthrough(report) {
+    const packet = report.packet;
+    const sources = new Map(packet.sources.map(source => [source.id, source]));
+    const lineCache = new Map();
+    function lines(id) {
+      if (!lineCache.has(id)) {
+        const text = sources.get(id).text;
+        const value = text ? text.split(/\r\n|\r|\n/) : [];
+        if (value.length && /[\r\n]$/.test(text)) value.pop();
+        lineCache.set(id, value);
+      }
+      return lineCache.get(id);
+    }
+    function storedRowText(row, baseSourceId, headSourceId) {
+      const sourceId = row.tag === 'add' ? headSourceId : baseSourceId;
+      const number = row.tag === 'add' ? row.new : row.old;
+      return lines(sourceId)[number - sources.get(sourceId).start_line];
+    }
+    function sourceURL(source, ref) {
+      const repository = (source.side === 'head' && packet.meta.head_repository) || packet.meta.repository;
+      if (!/^[\w.-]+\/[\w.-]+$/.test(repository || '') || !/^[0-9a-f]{7,64}$/.test(source.revision)) return null;
+      return `https://github.com/${repository}/blob/${source.revision}/${source.path.split('/').map(encodeURIComponent).join('/')}#L${ref.start}-L${ref.end}`;
+    }
+    function definition(ref) {
+      if (!ref) return null;
+      const source = sources.get(ref.source_id);
+      return {source_id: source.id, path: source.path, side: source.side, start: ref.start, end: ref.end,
+        name: ref.name || 'Cited source', url: ref.url || sourceURL(source, ref),
+        get source() { return lines(source.id).slice(ref.start - source.start_line, ref.end - source.start_line + 1).join('\n'); }};
+    }
+    const rawFiles = packet.diffs.map(diff => ({...diff, hunks: diff.hunks.map(hunk => ({...hunk,
+      rows: hunk.rows.map(row => ({...row, get text() {
+        return storedRowText(row, diff.base_source, diff.head_source);
+      }}))
+    }))}));
+    const changes = packet.changes.map(change => ({...change,
+      before: definition(change.before), after: definition(change.after),
+      get fileDiffs() {
+        return rawFiles.filter(diff => (change.before && diff.base_source === change.before.source_id)
+          || (change.after && diff.head_source === change.after.source_id));
+      },
+      get functionHunks() {
+        return (change.comparison_hunks || []).map(hunk => ({...hunk,
+          rows: hunk.rows.map(row => ({...row, get text() {
+            return storedRowText(row, change.before?.source_id, change.after?.source_id);
+          }}))
+        }));
+      },
+      get hunks() {
+        return rawFiles.flatMap(diff => diff.hunks.map(hunk => {
+          const rows = hunk.rows.filter(row => (change.before && diff.base_source === change.before.source_id && row.old >= change.before.start && row.old <= change.before.end)
+            || (change.after && diff.head_source === change.after.source_id && row.new >= change.after.start && row.new <= change.after.end));
+          const old = rows.filter(row => row.old !== null), head = rows.filter(row => row.new !== null);
+          return {...hunk, old_start: old[0]?.old || hunk.old_start, new_start: head[0]?.new || hunk.new_start,
+            old_count: old.length, new_count: head.length, rows};
+        }).filter(hunk => hunk.rows.length));
+      }
+    }));
+    const groups = report.story.sections.map((section, index) => ({
+      id: `walkthrough-${index + 1}`, title: section.title, number: index + 1,
+      path: '', theme: 'walkthrough', prerequisites: [], test_links: [],
+      next_id: index + 1 < report.story.sections.length ? `walkthrough-${index + 2}` : null,
+      change_ids: [...new Set(section.passages.flatMap(passage => passage.change_ids))],
+      narrative: {intent: section.summary, why_now: '', transition: '', passages: section.passages}
+    }));
+    const byKind = {};
+    for (const change of changes) byKind[change.kind] = (byKind[change.kind] || 0) + 1;
+    const rows = packet.diffs.flatMap(diff => diff.hunks.flatMap(hunk => hunk.rows));
+    const tests = (packet.analysis?.tests || []).map(test => ({...definition(test.source), id: test.id}));
+    return {schema: 'diffstory.report.v1', meta: packet.meta, changes, groups, raw_files: rawFiles,
+      generation: report.generation, document: {preamble: report.story.preamble, lead: report.story.introduction, closing: report.story.closing},
+      stats: {groups: groups.length, units: changes.length, by_kind: byKind,
+        identical_ast_moves: byKind.moved || 0, supplied_paths: new Set(packet.sources.map(source => source.path)).size,
+        supplied_additions: rows.filter(row => row.tag === 'add').length,
+        supplied_deletions: rows.filter(row => row.tag === 'delete').length, test_definitions: tests.length, test_runs: 0},
+      tests, edges: [], symbol_edges: packet.analysis?.symbol_edges || [], cycles: [], unresolved: packet.analysis?.unresolved || [],
+      source_evidence: {file_evidence: packet.file_evidence || [], fragments: packet.sources.map(source => ({key: source.id, side: source.side, path: source.path, scope: source.scope, parse_status: source.parse_status}))},
+      warnings: packet.warnings, notes: packet.notes,
+      method: {matching: 'Compiler symbol matching and original coordinates are retained.',
+        narration: 'Source-linked model prose is unverified. Structural validation checks references and coverage.'},
+      flatDefinition: definition};
+  }
+  const R = sharedMode ? sharedGraph.root.base_report : flatMode ? projectWalkthrough(parsedEnvelope) : parsedEnvelope;
   const generation = sharedMode ? sharedGraph.root.generation : R.generation;
   const $ = (selector, parent = document) => parent.querySelector(selector);
   const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
@@ -173,7 +263,7 @@
         return `<code>${esc(part.slice(1, -1))}</code>`;
       }
       if (part.startsWith('**') && part.endsWith('**')) {
-        return `<strong>${inlineText(part.slice(2, -2))}</strong>`;
+        return `<strong>${inline(part.slice(2, -2))}</strong>`;
       }
       return inlineText(part);
     }).join('');
@@ -184,6 +274,23 @@
     .map(p => `<p>${inline(p)}</p>`).join('');
   const G = new Map(R.groups.map(g => [g.id, g]));
   const C = new Map(R.changes.map(c => [c.id, c]));
+  const flatStory = flatMode ? parsedEnvelope.story : null;
+  const flatPassages = new Map();
+  if (flatMode) {
+    for (const group of R.groups) {
+      for (const passage of group.narrative.passages || []) {
+        if (typeof passage.id === 'string') flatPassages.set(passage.id, {passage, group});
+      }
+    }
+  }
+  function passageAnchor(id) {
+    const value = String(id ?? '');
+    let encoded = '';
+    for (let index = 0; index < value.length; index += 1) {
+      encoded += value.charCodeAt(index).toString(16).padStart(4, '0');
+    }
+    return `passage-${encoded}`;
+  }
   const safeURL = value => {
     try { const u = new URL(value); return u.protocol === 'https:' && u.hostname === 'github.com' ? u.href : null; }
     catch (_) { return null; }
@@ -192,6 +299,7 @@
     ? `<a href="${esc(safeURL(url))}" class="${cls}" target="_blank" rel="noopener noreferrer">${esc(label)} ↗</a>` : '';
   let activeSection = null;
   let blockCounter = 0;
+  let flatCitationCount = 0;
   const blocks = new Map();
   const anchors = new Set();
   const PREVIEW_LIMIT = 34;
@@ -838,6 +946,109 @@
     }
     return rows;
   }
+  function focusRanges(spec, side) {
+    const focus = spec.focus;
+    if (!focus) return [];
+    const selected = focus[side];
+    if (Array.isArray(selected)) return selected;
+    return Number.isInteger(focus.start) && Number.isInteger(focus.end)
+      ? [focus] : [];
+  }
+  function lineInRanges(line, ranges, margin = 0) {
+    return Number.isInteger(line) && ranges.some(range =>
+      line >= range.start - margin && line <= range.end + margin
+    );
+  }
+  function citedDiffRows(rows, spec) {
+    const before = focusRanges(spec, 'before');
+    const after = focusRanges(spec, 'after');
+    if (!before.length && !after.length) return null;
+    const included = new Set();
+    const targets = [];
+    let hunkStart = 0;
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      if (row.type === 'hunk') { hunkStart = index + 1; continue; }
+      if (row.type !== 'line') continue;
+      const cited = row.tag === 'delete' ? lineInRanges(row.old, before)
+        : row.tag === 'add' ? lineInRanges(row.new, after)
+          : lineInRanges(row.old, before) || lineInRanges(row.new, after);
+      if (!cited || row.tag === 'context') continue;
+      targets.push(index);
+      const start = Math.max(hunkStart, index - 2);
+      const end = Math.min(rows.length - 1, index + 2);
+      for (let current = start; current <= end; current += 1) {
+        if (rows[current]?.type === 'line') included.add(current);
+      }
+    }
+    if (!targets.length) return null;
+    for (const index of targets) included.add(index);
+    const byHunk = [];
+    let heading = null, lineIndexes = [], groupStart = 0;
+    const flush = end => {
+      if (!lineIndexes.length) return;
+      byHunk.push({heading, lineIndexes, start: groupStart, end});
+      lineIndexes = [];
+    };
+    rows.forEach((row, index) => {
+      if (row.type === 'hunk') { flush(index); heading = row; groupStart = index + 1; }
+      else if (included.has(index)) lineIndexes.push(index);
+    });
+    flush(rows.length);
+    const output = [];
+    let priorEnd = 0;
+    for (const hunk of byHunk) {
+      if (hunk.start > priorEnd) {
+        const omitted = countLines(rows.slice(priorEnd, hunk.start));
+        if (omitted) output.push({type: 'gap', text: `… ${omitted} diff lines outside the cited ranges omitted`});
+      }
+      if (hunk.heading) output.push(hunk.heading);
+      if (hunk.lineIndexes[0] > hunk.start) {
+        const omitted = countLines(rows.slice(hunk.start, hunk.lineIndexes[0]));
+        if (omitted) output.push({type: 'gap', text: `… ${omitted} diff lines before cited edits omitted`});
+      }
+      let previous = null;
+      for (const index of hunk.lineIndexes) {
+        if (previous !== null && index > previous + 1) {
+          const omitted = countLines(rows.slice(previous + 1, index));
+          if (omitted) output.push({type: 'gap', text: `… ${omitted} diff lines between cited edits omitted`});
+        }
+        output.push(rows[index]);
+        previous = index;
+      }
+      const last = hunk.lineIndexes.at(-1);
+      const end = hunk.end;
+      const after = countLines(rows.slice(last + 1, end));
+      if (after) output.push({type: 'gap', text: `… ${after} diff lines after cited edits omitted`});
+      priorEnd = end;
+    }
+    const finalOmitted = countLines(rows.slice(priorEnd));
+    if (finalOmitted) output.push({type: 'gap', text: `… ${finalOmitted} additional diff lines omitted`});
+    return output;
+  }
+  function definitionPreview(rows, ranges) {
+    const selected = [];
+    rows.forEach((row, index) => {
+      if (row.type === 'line' && lineInRanges(row.new, ranges, 2)) selected.push(index);
+    });
+    if (!selected.length) return null;
+    const output = [];
+    const first = selected[0], last = selected.at(-1);
+    const before = countLines(rows.slice(0, first));
+    if (before) output.push({type: 'gap', text: `… ${before} lines before this cited definition omitted`});
+    let previous = null;
+    for (const index of selected) {
+      if (previous !== null && index > previous + 1) {
+        const omitted = countLines(rows.slice(previous + 1, index));
+        output.push({type: 'gap', text: `… ${omitted} lines between cited ranges omitted`});
+      }
+      output.push(rows[index]);
+      previous = index;
+    }
+    const after = countLines(rows.slice(last + 1));
+    if (after) output.push({type: 'gap', text: `… ${after} lines after this cited definition omitted`});
+    return output;
+  }
   function allRows(spec) {
     if (spec.citation) return exactRows(spec.citation, true);
     if (spec.cache[spec.view]) return spec.cache[spec.view];
@@ -845,12 +1056,35 @@
     if (spec.raw) rows = diffRows(spec.raw.hunks);
     else if (spec.test) rows = definitionRows(spec.test);
     else {
-      for (const c of spec.changes) {
-        const source = c.after || c.before;
-        if (spec.view === 'diff') {
-          const r = diffRows(c.hunks);
-          rows.push(...(r.length ? r : [{type: 'note', text: `${source.name}: no textual edits in this paired definition.`}]));
+      const ordered = spec.view === 'diff' && spec.changes.length > 1
+        ? [...spec.changes].sort((left, right) =>
+          (left.after || left.before).start - (right.after || right.before).start
+        ) : spec.changes;
+      const seenDiffRows = new Set();
+      for (const c of ordered) {
+        if (spec.view === 'comparison' && !Array.isArray(c.comparison_hunks)) continue;
+        if (spec.view === 'diff' || spec.view === 'comparison') {
+          const r = diffRows(spec.view === 'comparison' ? c.functionHunks : c.hunks);
+          const source = c.after || c.before;
+          const unavailable = c.fileDiffs?.some(diff => ['unavailable', 'unbound'].includes(diff.patch_status));
+          const message = spec.view === 'diff' && unavailable
+            ? 'The original file patch is unavailable here. Inspect the supplied definitions or the separate function comparison.'
+            : `${source.name}: no textual edits in this comparison.`;
+          for (const row of (r.length ? r : [{type: 'note', text: message}])) {
+            const key = row.type === 'line'
+              ? JSON.stringify([row.type, row.tag, row.old, row.new, row.text])
+              : JSON.stringify([row.type, row.text]);
+            if (spec.changes.length === 1 || !seenDiffRows.has(key)) rows.push(row);
+            seenDiffRows.add(key);
+          }
+        } else if (spec.view === 'before' || spec.view === 'after') {
+          const source = c[spec.view];
+          if (!source) continue;
+          const prior = rows.filter(r => r.type === 'line').at(-1);
+          if (prior && prior.new + 1 !== source.start) rows.push({type: 'gap', text: '… between declarations'});
+          rows.push(...definitionRows(source));
         } else {
+          const source = c.after || c.before;
           const prior = rows.filter(r => r.type === 'line').at(-1);
           if (prior && prior.new + 1 !== source.start) rows.push({type: 'gap', text: '… between declarations'});
           rows.push(...definitionRows(source));
@@ -861,17 +1095,23 @@
     return rows;
   }
   const countLines = rows => rows.filter(r => r.type === 'line').length;
+  function foldedFocusRows(rows, label) {
+    if (countLines(rows) <= PREVIEW_LIMIT) return rows;
+    const head = rows.slice(0, PREVIEW_HEAD);
+    const tail = rows.slice(-PREVIEW_TAIL);
+    const omitted = countLines(rows) - countLines(head) - countLines(tail);
+    return [...head, {type: 'gap', text: `… ${omitted} cited ${label} lines folded; load the full view to inspect them`}, ...tail];
+  }
   function previewRows(spec) {
     const rows = allRows(spec);
     if (spec.expanded) return rows.slice(0, spec.loaded);
-    if (spec.focus && spec.view === 'definition') {
-      const selected = rows.filter(r => r.type === 'line' && r.new >= spec.focus.start && r.new <= spec.focus.end);
-      if (selected.length) {
-        const nAbove = rows.filter(r => r.type === 'line' && r.new < spec.focus.start).length;
-        const nBelow = rows.filter(r => r.type === 'line' && r.new > spec.focus.end).length;
-        return [...(nAbove ? [{type: 'gap', text: `… ${nAbove} lines above this excerpt`}] : []), ...(selected.length <= PREVIEW_LIMIT ? selected : [...selected.slice(0, PREVIEW_HEAD), {type: 'gap', text: `… ${selected.length - PREVIEW_HEAD - PREVIEW_TAIL} lines folded inside this excerpt`}, ...selected.slice(-PREVIEW_TAIL)]),
-          ...(nBelow ? [{type: 'gap', text: `… ${nBelow} lines below this excerpt`}] : [])];
-      }
+    if (spec.view === 'diff' || spec.view === 'comparison') {
+      const focused = citedDiffRows(rows, spec);
+      if (focused) return foldedFocusRows(focused, 'diff');
+    } else {
+      const side = spec.view === 'before' ? 'before' : 'after';
+      const focused = definitionPreview(rows, focusRanges(spec, side));
+      if (focused) return foldedFocusRows(focused, 'definition');
     }
     if (rows.length <= PREVIEW_LIMIT) return rows;
     const shown = rows.slice(0, PREVIEW_HEAD);
@@ -890,6 +1130,98 @@
       return `<div class="code-line ${isDiff ? esc(r.tag) : ''}">${gutters}<span class="code-text">${highlight(r.text)}</span></div>`;
     }).join('');
   }
+  function fileEvidenceForChangeSide(change, side) {
+    const entries = R.source_evidence?.file_evidence || [];
+    const other = side === 'base' ? 'head' : 'base';
+    const ownPath = change[side === 'base' ? 'before' : 'after']?.path;
+    if (ownPath) {
+      const entry = entries.find(item => item[side]?.path === ownPath);
+      if (entry) return entry[side];
+    }
+    const otherPath = change[side === 'base' ? 'after' : 'before']?.path;
+    if (otherPath) {
+      const entry = entries.find(item => item[other]?.path === otherPath);
+      if (entry) return entry[side] || null;
+    }
+    return null;
+  }
+  function materialCaveats(changes) {
+    const caveats = new Map();
+    const sourceIssues = new Map();
+    const add = (key, text, change = null) => {
+      let caveat = caveats.get(key);
+      if (!caveat) {
+        caveat = {text, reasons: []};
+        caveats.set(key, caveat);
+      }
+      const reason = String(change?.basis || '').trim();
+      if (reason && !caveat.reasons.includes(reason)) caveat.reasons.push(reason);
+    };
+    for (const change of changes) {
+      const before = change.before, after = change.after;
+      const path = before?.path || after?.path || '';
+      if (change.kind === 'observed_head') {
+        const name = after?.name || 'This declaration';
+        add(`unresolved-head:${path}:${name}`,
+          `Cannot confirm whether \`${name}\` was added to this file.`, change);
+      } else if (change.kind === 'observed_base') {
+        const name = before?.name || 'This declaration';
+        add(`unresolved-base:${path}:${name}`,
+          `Cannot confirm whether \`${name}\` was removed from this file.`, change);
+      } else if (change.kind === 'moved_modified') {
+        const name = after?.name || before?.name || 'This declaration';
+        add(`edited-move:${before?.path || ''}:${after?.path || ''}:${name}`,
+          `\`${name}\` may have moved and changed. Review both versions to confirm.`, change);
+      }
+      for (const side of ['base', 'head']) {
+        const evidence = fileEvidenceForChangeSide(change, side);
+        const source = change[side === 'base' ? 'before' : 'after'];
+        const other = change[side === 'base' ? 'after' : 'before'];
+        const sourcePath = evidence?.path || source?.path || other?.path;
+        if (!sourcePath) continue;
+        const fragments = (R.source_evidence?.fragments || []).filter(fragment =>
+          fragment.side === side && fragment.path === sourcePath);
+        const parseFailed = fragments.some(fragment => fragment.parse_status === 'failed')
+          || (evidence?.parse_statuses || []).includes('failed')
+          || source?.parse_status === 'failed';
+        const unavailable = evidence?.state === 'unavailable';
+        const partial = evidence?.state === 'supplied' && evidence.coverage === 'partial';
+        if (!unavailable && !partial && !parseFailed) continue;
+        const key = `${side}:${sourcePath}`;
+        let issue = sourceIssues.get(key);
+        if (!issue) {
+          issue = {side, path: sourcePath, unavailable: false, partial: false, parseFailed: false};
+          sourceIssues.set(key, issue);
+        }
+        issue.unavailable ||= unavailable;
+        issue.partial ||= partial;
+        issue.parseFailed ||= parseFailed;
+      }
+    }
+    for (const issue of sourceIssues.values()) {
+      const version = issue.side === 'base' ? 'earlier' : 'later';
+      let detail;
+      if (issue.unavailable) {
+        detail = `The ${version} version of \`${issue.path}\` was not available for comparison. This does not mean the file was absent.`;
+      } else if (issue.partial && issue.parseFailed) {
+        detail = `Only part of the ${version} version of \`${issue.path}\` is available. The tool could not read the supplied excerpt as Python, so function comparison may be unreliable. Code outside the excerpt was not checked.`;
+      } else if (issue.partial) {
+        detail = `Only part of the ${version} version of \`${issue.path}\` is available. Code outside the excerpt was not checked.`;
+      } else {
+        detail = `The tool could not read the ${version} version of \`${issue.path}\` as Python, so function comparison may be unreliable.`;
+      }
+      add(`source:${issue.side}:${issue.path}`, detail);
+    }
+    return [...caveats.values()];
+  }
+  function caveatsHTML(changes) {
+    return materialCaveats(changes).map(caveat => {
+      const details = caveat.reasons.length
+        ? `<details class="code-caveat-detail"><summary>Why this is uncertain</summary><ul>${caveat.reasons.map(reason => `<li>${inline(reason)}</li>`).join('')}</ul></details>`
+        : '';
+      return `<div class="code-caveat"><p>${inline(caveat.text)}</p>${details}</div>`;
+    }).join('');
+  }
 
   function blockHTML(changeIds, options = {}) {
     const cs = (changeIds || []).map(id => C.get(id)).filter(Boolean);
@@ -899,6 +1231,8 @@
     const spec = {
       id: `block-${++blockCounter}`, changes: cs, test: options.test || null,
       raw: options.raw || null, focus: options.focus || null, label: options.label || '',
+      related: options.related || false,
+      sourceOnly: options.sourceOnly || false,
       view: options.view || (options.test ? 'definition' : 'diff'),
       expanded: false, loaded: 0, materialized: false, cache: {}, primaryPath,
       baseURL: options.raw?.before_url || first?.before?.url,
@@ -906,18 +1240,22 @@
     };
     blocks.set(spec.id, spec);
     const fileStatusChange = cs.find(change => ['added', 'removed', 'observed_head', 'observed_base'].includes(change.kind));
-    let badge = options.raw ? ['Source hunk', ''] : fileStatusChange ? classification(fileStatusChange) : options.test ? ['Test source', ''] : cs.length > 1 ? [`${cs.length} moved declarations`, 'move'] : classification(first);
+    const badge = options.raw ? ['Source hunk', ''] : options.test ? ['Test source', ''] : spec.related ? [`${cs.length} related changes`, ''] : fileStatusChange ? classification(fileStatusChange) : cs.length > 1 ? [`${cs.length} moved declarations`, 'move'] : classification(first);
     const name = options.label || (cs.length > 1 ? 'graph constants' : source?.name === 'module imports / context' ? 'imports' : source?.name === 'file context' ? '' : source?.name || '');
+    spec.badge = badge;
+    spec.name = name;
     const symbol = name ? `<span class="symbol-name">· ${esc(name)}</span>` : '';
-    const focusedEstimate = spec.focus && spec.view === 'definition'
-      ? spec.focus.end - spec.focus.start + 3
-      : null;
+    const estimateSide = spec.view === 'before' ? 'before' : 'after';
+    const focusedEstimate = spec.view === 'diff' ? null
+      : focusRanges(spec, estimateSide).reduce((total, range) => total + range.end - range.start + 5, 0) || null;
     const sourceEstimate = options.raw
       ? options.raw.hunks.reduce((total, hunk) => total + hunk.rows.length + 1, 0)
       : options.test
         ? options.test.end - options.test.start + 1
         : cs.reduce((total, change) => {
-          const source = change.after || change.before;
+          const source = spec.view === 'before' || spec.view === 'after'
+            ? change[spec.view] : change.after || change.before;
+          if (!source) return total;
           const size = spec.view === 'diff'
             ? change.hunks.reduce((hunkTotal, hunk) => hunkTotal + hunk.rows.length + 1, 0)
             : source.end - source.start + 1;
@@ -925,40 +1263,84 @@
         }, 0);
     const estimated = Math.min(PREVIEW_LIMIT, focusedEstimate ?? sourceEstimate);
     const beforeAnchors = cs.filter(c => !anchors.has(c.id)).map(c => { anchors.add(c.id); return `<span id="unit-${c.id}" class="change-anchor"></span>`; }).join('');
-    const basis = cs.map(change => `<div class="code-note code-basis">${esc(change.basis)}</div>`).join('');
-    return `${beforeAnchors}<figure class="code-block" id="${spec.id}" data-block="${spec.id}" data-changes="${cs.map(c => c.id).join(' ')}"><figcaption class="code-header"><span class="filename" title="${esc(primaryPath)}">${esc(basename(primaryPath))}${symbol}</span><span class="classification ${badge[1]}">${esc(badge[0])}</span></figcaption>${basis}<div class="code-body"><div class="lazy-shell" style="min-height:${Math.max(58, Math.min(430, estimated * 22))}px"><button data-load-preview="${spec.id}">Load ${spec.view === 'diff' ? 'diff' : 'code'} ↓</button></div></div><div class="code-footer"></div></figure>`;
+    const caveats = caveatsHTML(cs);
+    return `${beforeAnchors}<figure class="code-block" id="${spec.id}" data-block="${spec.id}" data-view="${esc(spec.view)}" data-changes="${cs.map(c => c.id).join(' ')}"><figcaption class="code-header"><span class="filename" title="${esc(primaryPath)}">${esc(basename(primaryPath))}${symbol}</span><span class="classification ${badge[1]}">${esc(badge[0])}</span></figcaption>${caveats}<div class="code-body"><div class="lazy-shell" style="min-height:${Math.max(58, Math.min(430, estimated * 22))}px"><button data-load-preview="${spec.id}">Load ${spec.view === 'diff' ? 'diff' : 'code'} ↓</button></div></div><div class="code-footer"></div></figure>`;
   }
   function blockFooter(spec, shown, total) {
     const first = spec.changes[0];
-    const a = spec.test || first?.after || first?.before;
+    const side = spec.view === 'before' ? 'before' : 'after';
+    const a = spec.test || (spec.view === 'before' || spec.view === 'after'
+      ? spec.changes.find(change => change[spec.view])?.[spec.view]
+      : first?.after || first?.before);
     const b = first?.before;
     let location = spec.changes.length > 1
-      ? (spec.view === 'diff' ? 'Paired diffs' : 'Definitions')
-      : spec.view === 'diff' ? 'Paired diff' : a ? `L${spec.focus && !spec.expanded ? spec.focus.start : a.start}–${spec.focus && !spec.expanded ? spec.focus.end : (spec.changes.at(-1)?.after || spec.changes.at(-1)?.before || a).end}` : 'Source';
+      ? (spec.view === 'diff' ? 'Paired diffs' : `${spec.view === 'before' ? 'Before' : 'After'} definitions`)
+      : spec.view === 'diff' ? 'Paired diff' : a ? `L${focusRanges(spec, side)[0]?.start || a.start}–${focusRanges(spec, side).at(-1)?.end || a.end}` : 'Source';
+    if (spec.view === 'comparison') {
+      location = 'Function comparison · generated';
+    } else if (!flatMode && !spec.raw && spec.view === 'diff') {
+      location = 'Source comparison · generated';
+    } else if (spec.view === 'diff') {
+      const diffs = spec.raw ? [spec.raw] : spec.changes.flatMap(change => change.fileDiffs || []);
+      const origins = new Set(diffs.map(diff => diff.diff_origin));
+      location = diffs.some(diff => ['unavailable', 'unbound'].includes(diff.patch_status))
+        ? 'Original patch unavailable'
+        : origins.size === 1 && origins.has('github') ? (spec.raw ? 'Original GitHub patch' : 'GitHub patch excerpt')
+          : origins.size === 1 && origins.has('git') ? (spec.raw ? 'Original Git patch' : 'Git patch excerpt') : 'Original patch excerpts';
+    }
     if (first?.before && first?.after && first.before.path !== first.after.path) location = `${basename(b.path)} → ${basename(first.after.path)} · ${location}`;
-    const modeButton = !spec.raw && !spec.test && spec.changes.length > 0
-      ? `<button class="text-button" data-switch="${spec.id}">${spec.view === 'diff' ? 'Read definition' : 'View diff'}</button>` : '';
+    let modeButton = '';
+    if (!spec.raw && !spec.test && !spec.sourceOnly && spec.changes.length > 0) {
+      if (flatMode) {
+        const hasBefore = spec.changes.some(change => change.before);
+        const hasAfter = spec.changes.some(change => change.after);
+        const beforeButton = hasBefore ? `<button class="text-button${spec.view === 'before' ? ' is-active' : ''}" data-view="${spec.id}" data-side="before" aria-pressed="${spec.view === 'before'}">Before definition</button>` : '';
+        const afterButton = hasAfter ? `<button class="text-button${spec.view === 'after' ? ' is-active' : ''}" data-view="${spec.id}" data-side="after" aria-pressed="${spec.view === 'after'}">After definition</button>` : '';
+        const comparison = spec.changes.some(change => Array.isArray(change.comparison_hunks))
+          ? `<button class="text-button${spec.view === 'comparison' ? ' is-active' : ''}" data-view="${spec.id}" data-side="comparison" aria-pressed="${spec.view === 'comparison'}">Compare function versions</button>` : '';
+        modeButton = `${beforeButton}${afterButton}<button class="text-button${spec.view === 'diff' ? ' is-active' : ''}" data-view="${spec.id}" data-side="diff" aria-pressed="${spec.view === 'diff'}">View diff</button>${comparison}`;
+      } else {
+        modeButton = `<button class="text-button" data-switch="${spec.id}">${spec.view === 'diff' ? 'Read definition' : 'View diff'}</button>`;
+      }
+    }
     const collapse = spec.expanded ? `<button class="text-button" data-collapse="${spec.id}">Collapse</button>` : '';
     const base = spec.baseURL ? link(spec.baseURL, 'Base', 'code-source-link') : '';
     const head = spec.headURL ? link(spec.headURL, 'Source', 'code-source-link') : '';
     return `<span class="code-location">${esc(location)}</span>${modeButton}${collapse}${base}${head}`;
+  }
+  function paintBlockHeader(spec, element) {
+    const active = spec.view === 'before' || spec.view === 'after'
+      ? spec.changes.find(change => change[spec.view])?.[spec.view]
+      : spec.test || spec.changes[0]?.after || spec.changes[0]?.before;
+    const path = spec.raw?.path || active?.path || spec.primaryPath;
+    const filename = $('.filename', element);
+    filename.title = path || '';
+    filename.innerHTML = `${esc(basename(path))}${spec.name ? `<span class="symbol-name">· ${esc(spec.name)}</span>` : ''}`;
+    element.dataset.view = spec.view;
   }
   function paintBlock(spec) {
     if (spec.citation) { paintSourceBlock(spec); return; }
     const element = document.getElementById(spec.id);
     if (!element) return;
     spec.materialized = true;
+    paintBlockHeader(spec, element);
     const full = allRows(spec), shown = previewRows(spec);
     const total = countLines(full), visible = countLines(shown);
-    const isDiff = spec.view === 'diff';
+    const isDiff = spec.view === 'diff' || spec.view === 'comparison';
     let load = '';
     if (!spec.expanded && visible < total) {
-      const label = spec.focus && !isDiff ? 'Read full definition' : isDiff ? 'Load full diff' : 'Load full code';
+      const label = spec.view === 'before' || spec.view === 'after'
+        ? `Load full ${spec.view} definition`
+        : spec.focus && !isDiff ? 'Read full definition' : isDiff ? 'Load full diff' : 'Load full code';
       load = `<button class="load-bar" data-expand="${spec.id}"><span aria-hidden="true">↓</span> ${label} <span class="load-count">· ${total - visible} more lines${total > CHUNK ? ' · loaded in chunks' : ''}</span></button>`;
     } else if (spec.expanded && spec.loaded < full.length) {
       load = `<button class="load-bar" data-expand="${spec.id}">Load next ${Math.min(CHUNK, full.length - spec.loaded)} rows <span class="load-count">· ${total - visible} lines remaining</span></button>`;
     }
-    $('.code-body', element).innerHTML = `<div class="code-region" tabindex="0" role="region" aria-label="${esc(basename(spec.primaryPath))} ${isDiff ? 'diff' : 'code'}"><div class="code-lines">${shown.length ? rowsHTML(shown, isDiff) : '<div class="code-note">No textual edits between these paired definitions. Module paths and bindings still matter.</div>'}</div></div>${load}`;
+    const activePath = $('.filename', element)?.title || spec.primaryPath;
+    const viewLabel = spec.view === 'comparison' ? 'function comparison' : isDiff ? 'diff' : spec.view === 'before' ? 'before definition' : spec.view === 'after' ? 'after definition' : 'code';
+    const emptyMessage = spec.raw && ['unavailable', 'unbound'].includes(spec.raw.patch_status)
+      ? 'Original patch rows are unavailable for this file.' : 'No line changes in this view.';
+    $('.code-body', element).innerHTML = `<div class="code-region" tabindex="0" role="region" aria-label="${esc(basename(activePath))} ${viewLabel}"><div class="code-lines">${shown.length ? rowsHTML(shown, isDiff) : `<div class="code-note">${esc(emptyMessage)}</div>`}</div></div>${load}`;
     $('.code-footer', element).innerHTML = blockFooter(spec, visible, total);
     element.dataset.loaded = 'true';
   }
@@ -991,13 +1373,65 @@
       return {text, change_ids: [c.id]};
     });
   }
+  function passageFocus(p, changes) {
+    if (!flatMode || !Array.isArray(p.citations)) return p.focus || null;
+    const focus = {before: [], after: []};
+    const refs = p.citations.map(ref => R.flatDefinition(ref));
+    for (const change of changes) {
+      for (const side of ['before', 'after']) {
+        const source = change[side];
+        if (!source) continue;
+        for (const ref of refs) {
+          if (ref.source_id !== source.source_id || ref.side !== (side === 'before' ? 'base' : 'head')) continue;
+          focus[side].push({start: ref.start, end: ref.end});
+        }
+      }
+    }
+    return focus.before.length || focus.after.length ? focus : null;
+  }
+  function passageBlocks(p) {
+    const ids = p.change_ids || [];
+    if (!flatMode) {
+      const changes = ids.map(id => C.get(id)).filter(Boolean);
+      if (changes.length > 1 && changes.every(change => change.kind === 'moved')) {
+        return blockHTML(ids, {view: 'diff', label: p.label, focus: p.focus});
+      }
+      return ids.map(id => blockHTML([id], {view: 'diff', focus: p.focus, label: p.label})).join('');
+    }
+    const groups = new Map();
+    for (const id of ids) {
+      const change = C.get(id);
+      if (!change) continue;
+      const key = `${change.before?.path || ''}\u0000${change.after?.path || ''}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(change);
+    }
+    return [...groups.values()].map(changes => {
+      const label = changes.length > 1 ? `${changes.length} related changes` : '';
+      return blockHTML(changes.map(change => change.id), {
+        view: 'diff',
+        focus: passageFocus(p, changes),
+        label,
+        related: changes.length > 1,
+      });
+    }).join('');
+  }
   function passageHTML(p) {
-    // Lead with the paired edits; a focused definition remains available in the block toggle.
-    const changeIds = p.change_ids;
-    const code = changeIds.length > 1 && changeIds.every(id => C.get(id)?.kind === 'moved')
-      ? blockHTML(changeIds, {view: 'diff', label: p.label, focus: p.focus})
-      : changeIds.map(id => blockHTML([id], {view: 'diff', focus: p.focus, label: p.label})).join('');
-    return `<div class="passage"><div class="prose">${prose(p.text)}</div>${code}</div>`;
+    const anchor = flatMode && typeof p.id === 'string'
+      ? ` id="${passageAnchor(p.id)}"` : '';
+    const code = passageBlocks(p);
+    let citations = '';
+    if (flatMode && p.citations.length) {
+      const sources = p.citations.map(ref => {
+        const source = R.flatDefinition(ref);
+        const id = `flat-citation-${++flatCitationCount}`;
+        C.set(id, {id, kind: 'text', label: 'Cited source', basis: `Pinned ${source.side} revision · original lines ${ref.start}–${ref.end}`,
+          before: source.side === 'base' ? source : null, after: source.side === 'head' ? source : null, hunks: []});
+        return blockHTML([id], {view: 'definition', sourceOnly: true});
+      }).join('');
+      citations = `<details class="section-extra citation-sources"><summary>Cited source <span>· ${p.citations.length}</span></summary>${sources}</details>`;
+    }
+    return `<div class="passage"${anchor}><div class="prose">${prose(p.text)}</div>${code}${citations}</div>`;
   }
   function sectionHTML(g) {
     const n = g.narrative;
@@ -1069,6 +1503,105 @@
     body += paragraphs(content.slice(cursor));
     return `<section class="preamble" aria-labelledby="preamble-heading"><h2 id="preamble-heading">Before the code</h2><div class="preamble-body">${body}</div></section>`;
   }
+  function passageSentences(value) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!text) return [];
+    const sentences = [];
+    let start = 0;
+    for (let index = 0; index < text.length; index++) {
+      if (!'.!?'.includes(text[index])) continue;
+      let end = index + 1;
+      while (end < text.length && '.!?'.includes(text[end])) end++;
+      if (end < text.length && !/\s/u.test(text[end])) continue;
+      const sentence = text.slice(start, end).trim();
+      if (sentence) sentences.push(sentence);
+      while (end < text.length && /\s/u.test(text[end])) end++;
+      start = end;
+      index = end - 1;
+    }
+    const rest = text.slice(start).trim();
+    if (rest) sentences.push(rest);
+    return sentences.length ? sentences : [text];
+  }
+  function passageSentence(record) {
+    const text = String(record.passage.text || '').replace(/\s+/g, ' ').trim();
+    const sentence = passageSentences(text)[0] || text;
+    return sentence.length > 150 ? `${sentence.slice(0, 147).trimEnd()}…` : sentence;
+  }
+  function passageLinks(ids, className = 'passage-links') {
+    const targets = [...new Set(Array.isArray(ids) ? ids : [])]
+      .map(id => ({id, record: flatPassages.get(id)}))
+      .filter(target => target.record);
+    const sectionCounts = new Map();
+    for (const {record} of targets) {
+      sectionCounts.set(record.group, (sectionCounts.get(record.group) || 0) + 1);
+    }
+    const links = targets.map(({id, record}) => {
+      const title = record.group.title;
+      const paragraphIndex = (record.group.narrative.passages || [])
+        .findIndex(passage => passage.id === id) + 1;
+      const label = sectionCounts.get(record.group) > 1 && paragraphIndex > 0
+        ? `${title} · paragraph ${paragraphIndex}` : title;
+      return `<a href="#${passageAnchor(id)}" title="${esc(passageSentence(record))}">${inline(label)}</a>`;
+    }).filter(Boolean);
+    return links.length
+      ? `<span class="${className}">${links.join('')}</span>` : '';
+  }
+  function walkthroughOpeningHTML() {
+    if (!flatMode || !flatStory) return '';
+    let summary = '';
+    const quick = flatStory.quick_summary;
+    if (quick && typeof quick.before === 'string' && typeof quick.after === 'string') {
+      summary = `<section class="quick-summary" aria-labelledby="quick-summary-heading"><h2 id="quick-summary-heading">Before and after</h2><dl class="summary-pair"><div><dt>Before</dt><dd>${inline(quick.before)}</dd></div><div><dt>After</dt><dd>${inline(quick.after)}</dd></div></dl><p class="summary-evidence"><span class="evidence-label">Evidence</span>${passageLinks(quick.passage_ids)}</p></section>`;
+    }
+    let impact = '';
+    if (Object.prototype.hasOwnProperty.call(flatStory, 'impact')) {
+      impact = flatStory.impact && typeof flatStory.impact.text === 'string'
+        ? `<section class="walkthrough-impact"><h2>Practical impact</h2><p>${inline(flatStory.impact.text)}</p>${passageLinks(flatStory.impact.passage_ids, 'passage-links impact-links')}</section>`
+        : flatStory.impact === null
+          ? '<section class="walkthrough-impact"><h2>Practical impact</h2><p>Practical impact is not established by the supplied evidence.</p></section>'
+          : '';
+    }
+    const route = Array.isArray(flatStory.route) && flatStory.route.length
+      ? `<nav class="reading-route" aria-label="Reading route"><h2>Reading route</h2>${flatStory.route.map(item => `<p><span class="route-label">${esc(item.kind[0].toUpperCase() + item.kind.slice(1))}</span>${passageLinks(item.passage_ids, 'passage-links route-links')}</p>`).join('')}</nav>`
+      : '';
+    const checks = Array.isArray(flatStory.author_reported_checks)
+      ? flatStory.author_reported_checks : [];
+    const authorBody = checks.length
+      ? `<ul>${checks.map(check => `<li>${inline(check)}</li>`).join('')}</ul>`
+      : '<p>No results were extracted from the captured description.</p>';
+    const analyzerRuns = Number.isInteger(R.stats.test_runs)
+      ? `${R.stats.test_runs} test runs verified by Diffstory.`
+      : 'Test-run results are not recorded by Diffstory.';
+    const staticStatus = R.tests?.length
+      ? ' Static test sources are references for review; they do not show that a test ran.'
+      : ' No individual test definitions are listed separately. Test code may still be available in the cited source.';
+    const authorLabel = checks.length
+      ? 'Author-reported checks · not independently verified'
+      : 'Author-reported checks · not independently verified · No results were extracted';
+    const verification = `<section class="verification-status" aria-label="Verification status"><p><strong>Analyzer verification</strong> ${esc(analyzerRuns)}${esc(staticStatus)}</p><details class="author-reported"><summary>${esc(authorLabel)}</summary>${authorBody}</details></section>`;
+    return `<section class="walkthrough-opening" aria-label="Change summary">${summary}${impact}${route}${verification}</section>`;
+  }
+  function reviewChecksHTML() {
+    if (!flatMode || !flatStory) return '';
+    const checks = flatStory.review_checks;
+    if (!Array.isArray(checks)) {
+      return '<section class="review-checks"><h2>Review checks</h2><p>No structured review checks are available for this archived story.</p></section>';
+    }
+    if (!checks.length) {
+      return '<section class="review-checks"><h2>Review checks</h2><p>No open review checks were recorded in this story.</p></section>';
+    }
+    const testById = new Map((R.tests || []).map(test => [test.id, test]));
+    const rows = checks.map(check => {
+      const tests = (check.test_ids || []).map(id => testById.get(id)).filter(Boolean);
+      const testHTML = tests.length
+        ? `<details class="review-test-source"><summary>Static test source · ${tests.map(test => esc(test.name || basename(test.path))).join(', ')} <span>(source reference, not execution proof)</span></summary>${tests.map(test => blockHTML([], {test})).join('')}</details>`
+        : (check.test_ids || []).length
+          ? '<p class="review-source-note">Local source for a referenced static test is not included.</p>' : '';
+      return `<article class="review-check"><p>${inline(check.text)}</p><p class="review-evidence"><span class="evidence-label">Related passages</span>${passageLinks(check.passage_ids, 'passage-links review-links')}</p>${testHTML}</article>`;
+    }).join('');
+    return `<section class="review-checks" aria-labelledby="review-checks-heading"><h2 id="review-checks-heading">Open review checks</h2><p class="review-source-note">These are questions for source review. Static test references show code that can be inspected; they do not show execution.</p>${rows}</section>`;
+  }
   function buildHeader() {
     const m = R.meta, doc = R.document || {};
     const title = m.title || 'Read the change, one idea at a time';
@@ -1082,15 +1615,64 @@
   }
   function buildFooter() {
     const closing = R.document?.closing || 'The definitions, their callers, and the available tests are now in one reading path. Structural matches and test references guide review; they do not substitute for execution evidence.';
-    $('#documentFooter').innerHTML = `<div class="closing"><span class="closing-label">The shape of the change</span>${Reader ? statementsHTML(typedDocument.closing) : inline(closing)}</div><details id="source-hunks" class="appendix" data-appendix="raw"><summary>Original source hunks</summary><div class="appendix-content"></div></details><details id="evidence" class="appendix" data-appendix="evidence"><summary>Evidence, revisions & scope</summary><div class="appendix-content"></div></details><div class="bottom-line"><span>Diffstory 0.3 · by Epistemic AI · stored locally</span><a href="#top">Back to top ↑</a></div>`;
+    $('#documentFooter').innerHTML = `<div class="closing"><span class="closing-label">The shape of the change</span>${Reader ? statementsHTML(typedDocument.closing) : inline(closing)}</div>${reviewChecksHTML()}<details id="source-hunks" class="appendix" data-appendix="raw"><summary>Original source hunks</summary><div class="appendix-content"></div></details><details id="evidence" class="appendix" data-appendix="evidence"><summary>Evidence, revisions & scope</summary><div class="appendix-content"></div></details><div class="bottom-line"><span>Diffstory 0.3 · by Epistemic AI · stored locally</span><a href="#top">Back to top ↑</a></div>`;
+  }
+  function normalizedSearch(value) {
+    return plainInline(String(value ?? '')).replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+  function passageSearchSentence(passage, query) {
+    const text = String(passage.text || '').replace(/\s+/g, ' ').trim();
+    const result = passageSentences(text).find(sentence => normalizedSearch(sentence).includes(query)) || text;
+    const plain = plainInline(result).replace(/\s+/g, ' ').trim();
+    if (plain.length <= 240) return result;
+
+    const queryText = normalizedSearch(query);
+    let source = result;
+    let matchIndex = source.toLowerCase().indexOf(queryText);
+    if (matchIndex < 0) {
+      source = plain;
+      matchIndex = source.toLowerCase().indexOf(queryText);
+    }
+    if (matchIndex < 0) return `${plain.slice(0, 237).trimEnd()}…`;
+
+    const budget = Math.max(240, queryText.length + 96);
+    const context = Math.floor((budget - queryText.length) / 2);
+    let start = Math.max(0, matchIndex - context);
+    let end = Math.min(source.length, matchIndex + queryText.length + context);
+    if (source === result) {
+      for (const match of source.matchAll(/`[^`\n]+`/g)) {
+        const spanStart = match.index;
+        const spanEnd = spanStart + match[0].length;
+        if (spanStart < start && spanEnd > start) start = spanStart;
+        if (spanStart < end && spanEnd > end) end = spanEnd;
+      }
+    }
+    while (start > 0 && !/\s/u.test(source[start - 1])) start--;
+    while (end < source.length && !/\s/u.test(source[end])) end++;
+    const excerpt = source.slice(start, end).trim();
+    return `${start > 0 ? '…' : ''}${excerpt}${end < source.length ? '…' : ''}`;
   }
   function contents() {
-    const q = $('#search').value.trim().toLowerCase();
+    const q = normalizedSearch($('#search').value);
     $('#sectionCount').textContent = `${R.groups.length} sections`;
-    const filtered = R.groups.filter(g => [g.title, g.path, g.theme, g.narrative.intent, ...g.change_ids.map(id => {
-      const c = C.get(id); return [c.before?.name, c.after?.name, c.before?.path, c.after?.path].join(' ');
-    })].join(' ').toLowerCase().includes(q));
-    $('#contentsList').innerHTML = filtered.map(g => `<a class="contents-item" href="#${g.id}" data-section="${g.id}" ${activeSection === g.id ? 'aria-current="location"' : ''}><span class="contents-number">${String(g.number).padStart(2, '0')}</span><span>${inline(g.title)}</span></a>`).join('') || '<p class="empty">No matching section or symbol.</p>';
+    const rows = [];
+    for (const g of R.groups) {
+      const sectionText = [g.title, g.path, g.theme, g.narrative.intent, ...g.change_ids.map(id => {
+        const c = C.get(id); return [c.before?.name, c.after?.name, c.before?.path, c.after?.path].join(' ');
+      })].join(' ');
+      const sectionMatches = !q || normalizedSearch(sectionText).includes(q);
+      const passageMatches = flatMode && q
+        ? (g.narrative.passages || []).filter(p => normalizedSearch(p.text).includes(q)).slice(0, 2)
+        : [];
+      if (sectionMatches || passageMatches.length) {
+        rows.push(`<a class="contents-item" href="#${g.id}" data-section="${g.id}" ${activeSection === g.id ? 'aria-current="location"' : ''}><span class="contents-number">${String(g.number).padStart(2, '0')}</span><span>${inline(g.title)}</span></a>`);
+      }
+      for (const passage of passageMatches) {
+        const sentence = passageSearchSentence(passage, q);
+        rows.push(`<a class="contents-item passage-result" href="#${passageAnchor(passage.id)}" data-passage-result="true"><span class="contents-number" aria-hidden="true">↳</span><span>${inline(sentence)}</span></a>`);
+      }
+    }
+    $('#contentsList').innerHTML = rows.join('') || '<p class="empty">No matching section, symbol, or passage.</p>';
   }
   function ensureExtra(details) {
     if (details.dataset.ready) return;
@@ -1106,7 +1688,7 @@
     if (details.dataset.appendix === 'raw') {
       const files = new Map();
       R.raw_files.forEach(f => { if (!files.has(f.path)) files.set(f.path, []); files.get(f.path).push(f); });
-      body.innerHTML = `<p>${R.meta.scope === 'selected excerpts' ? 'These are diffs of the supplied excerpts, not the full GitHub patch.' : 'Hunks computed from the supplied before/after file snapshots.'} Open a file to load its hunks. Nothing below changes the reading order above.</p>${[...files.entries()].map(([path, fs], i) => `<details class="raw-file" data-raw="${i}"><summary>${esc(path)} <span class="region-label">· ${fs.length} region${fs.length === 1 ? '' : 's'}</span></summary><div class="raw-body"></div></details>`).join('')}`;
+      body.innerHTML = `<p>Git/GitHub patches keep their original line grouping. An unavailable original patch is never replaced with a generated one. Open a file to inspect its diff.</p>${[...files.entries()].map(([path, fs], i) => `<details class="raw-file" data-raw="${i}"><summary>${esc(path)} <span class="region-label">· ${fs.length} region${fs.length === 1 ? '' : 's'}</span></summary><div class="raw-body"></div></details>`).join('')}`;
     } else {
       const m = R.meta;
       body.innerHTML = `<dl><dt>Repository</dt><dd>${link(m.url, m.repository || 'Local Git') || esc(m.repository || 'Local Git')}</dd><dt>Base revision</dt><dd class="mono">${esc(m.base_sha)}</dd><dt>Head revision</dt><dd class="mono">${esc(m.head_sha)}</dd><dt>Scope</dt><dd>${esc(m.scope)}</dd><dt>Captured</dt><dd>${esc(m.captured_at || 'Not recorded')}</dd><dt>Supplied source</dt><dd>${R.stats.supplied_paths} paths · ${R.stats.units} analysis units</dd><dt>Test runs</dt><dd>0 runs verified by this analyzer</dd></dl><h3>What the matches establish</h3><p>An identical AST is structural evidence, not a proof that a move preserves behavior. Changed global bindings, import paths, initialization order and external consumers still need review. An edited pair is not automatically a confirmed behavioral change.</p><h3>Provenance</h3><p>${esc(m.validation || 'No execution evidence was attached.')}</p><p>Narrative paragraphs are authored interpretations linked to immutable source ranges. They cannot override the compiler’s source, structural classifications or test status.</p>${R.notes.length ? `<h3>Analysis notes</h3><ul>${R.notes.map(note => `<li>${esc(note)}</li>`).join('')}</ul>` : ''}${R.warnings.length ? `<h3>Limits of this input</h3><ul>${R.warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}<details><summary>Compiler methods</summary><dl>${Object.entries(R.method).map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('')}</dl></details>${m.description ? `<details><summary>PR description, as captured</summary><pre>${esc(m.description)}</pre></details>` : ''}<h3>Local by design</h3><p>No external fonts, libraries, analytics or network requests are needed. The HTML embeds the source snapshot; keep it private for a private repository. Diffs are rendered lazily from that embedded data, not fetched from a server. Clicking a source link opens GitHub.</p>`;
@@ -1117,7 +1699,12 @@
     if (details.dataset.ready) return;
     const paths = [...new Set(R.raw_files.map(f => f.path))];
     const files = R.raw_files.filter(f => f.path === paths[Number(details.dataset.raw)]);
-    $('.raw-body', details).innerHTML = files.map(f => blockHTML([], {raw: f, view: 'diff'})).join('');
+    $('.raw-body', details).innerHTML = files.map(f => {
+      const original = typeof f.original_patch === 'string'
+        ? `<details class="original-patch"><summary>Original patch text</summary><pre>${esc(f.original_patch || 'No line changes in the supplied patch.')}</pre></details>`
+        : f.patch_status === 'unavailable' ? '<p class="code-note">The original patch was not supplied. No replacement diff has been generated.</p>' : '';
+      return blockHTML([], {raw: f, view: 'diff'}) + original;
+    }).join('');
     details.dataset.ready = 'true'; observeBlocks(details);
   }
   document.addEventListener('toggle', event => {
@@ -1185,8 +1772,35 @@
   window.addEventListener('hashchange', () => navigateTo(location.hash, false));
   window.addEventListener('popstate', () => navigateTo(location.hash || '#top', false));
 
+  function sharedDownloadParts(scriptJSON) {
+    const replacements = new Map([
+      ['\\u0026', '&'], ['\\u003c', '<'], ['\\u003e', '>'],
+      ['\\u2028', '\u2028'], ['\\u2029', '\u2029']
+    ]);
+    let inString = false, escaped = false, copiedThrough = 0, parts = null;
+    for (let index = 0; index < scriptJSON.length; index += 1) {
+      const character = scriptJSON[index];
+      if (!inString) {
+        if (character === '"') inString = true;
+        continue;
+      }
+      if (escaped) { escaped = false; continue; }
+      if (character === '"') { inString = false; continue; }
+      if (character !== '\\') continue;
+      const token = scriptJSON.slice(index, index + 6);
+      if (replacements.has(token)) {
+        parts ||= [];
+        parts.push(scriptJSON.slice(copiedThrough, index), replacements.get(token));
+        index += 5; copiedThrough = index + 1;
+      } else escaped = true;
+    }
+    if (!parts) return [scriptJSON];
+    parts.push(scriptJSON.slice(copiedThrough));
+    return parts;
+  }
   function download(name, value, rawJSON = false) {
-    const blob = new Blob([rawJSON ? value : JSON.stringify(value, null, 2)], {type: 'application/json'});
+    const parts = rawJSON ? sharedDownloadParts(value) : [JSON.stringify(value, null, 2)];
+    const blob = new Blob(parts, {type: 'application/json'});
     const url = URL.createObjectURL(blob), a = document.createElement('a');
     a.href = url; a.download = name; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 3000);
@@ -1211,6 +1825,12 @@
       if (above) element.scrollIntoView({block: 'start'});
       return;
     }
+    if (button.dataset.view) {
+      const s = blocks.get(button.dataset.view), element = document.getElementById(s.id);
+      const above = element.getBoundingClientRect().top < 60;
+      s.view = button.dataset.side; s.expanded = false; s.loaded = 0;
+      paintBlock(s); if (above) element.scrollIntoView({block: 'start'}); return;
+    }
     if (button.dataset.switch) {
       const s = blocks.get(button.dataset.switch);
       const element = document.getElementById(s.id), above = element.getBoundingClientRect().top < 60;
@@ -1223,7 +1843,7 @@
       closePopovers(); if (active) navigateTo('#' + active, false); return;
     }
     if (button.id === 'downloadReport') {
-      if (sharedMode) download('diffstory-report.json', reportDataElement.textContent, true);
+      if (sharedMode || flatMode) download('diffstory-report.json', reportDataElement.textContent, true);
       else download('diffstory-report.json', R);
       closePopovers(); return;
     }
@@ -1238,7 +1858,7 @@
 
   buildHeader();
   if (Reader?.shared) appendSharedTypedStory();
-  else $('#story').innerHTML = Reader ? typedStoryHTML() : `${preambleHTML()}${R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>'}`;
+  else $('#story').innerHTML = Reader ? typedStoryHTML() : `${preambleHTML()}${walkthroughOpeningHTML()}${R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>'}`;
   buildFooter(); contents(); observeBlocks(); updateScroll();
   if (testMetricsEnabled) {
     readerMetrics.heapAfterRenderBytes = heapBytes();

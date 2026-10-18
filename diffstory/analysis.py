@@ -30,12 +30,14 @@ from .evidence import DefinitionEvidence
 from .evidence import FileCoverage
 from .evidence import build_file_coverage
 from .models import MAX_NARRATIVE_TEXT_CHARS
+from .models import FilePatch
 from .models import GenerationUsage
 from .models import ParseStatus
 from .models import SnapshotInput
 from .models import SourceFragment
 from .models import StrictModel
 from .models import validate_document
+from .patches import parse_file_patch
 from .source_lines import split_source_lines
 
 if TYPE_CHECKING:
@@ -731,7 +733,13 @@ def make_hunks(  # noqa: PLR0913  # Text, offsets, and diff display options are 
     keep_line_endings: bool = False,
 ) -> Sequence[dict]:
     """
-    Create line-based diff hunks with original line numbers and row tags.
+    Compare two pieces of source and keep their original line numbers.
+
+    This is a generated comparison, not an imported Git or GitHub patch.
+    For example, a function can move from users.py to text.py and gain one
+    call to strip(). Comparing its two versions makes that small edit clear.
+    File-level PR views must keep the original patch instead; see
+    ``docs/ARCHITECTURE.md`` for the full example.
 
     Args:
         a: Base source text.
@@ -1398,6 +1406,7 @@ class PreparedSnapshot(StrictModel):
         symbols_by_side: Parsed declarations and assignments by revision.
         imports_by_side: Import evidence by revision and source path.
         coverage_index: File coverage indexed by revision and path.
+        patches: Original file patches indexed by the later file path.
         notes: Informational text-only analysis notes.
         warnings: Producer warnings and Python parse failures.
     """
@@ -1408,6 +1417,7 @@ class PreparedSnapshot(StrictModel):
     symbols_by_side: dict[str, list[dict]]
     imports_by_side: dict[str, dict[str, list[dict]]]
     coverage_index: dict[tuple[str, str], FileCoverage]
+    patches: dict[str, FilePatch]
     notes: list[str]
     warnings: list[str]
 
@@ -1482,6 +1492,11 @@ def _prepare_snapshot(snapshot: dict) -> PreparedSnapshot:
     coverage = build_file_coverage(
         indexed, parse_statuses, evidence=source.file_evidence
     )
+    if {item.path for item in source.patches} != {
+        record.head.path for record in source.file_evidence
+    }:
+        msg = "Each file evidence record requires one matching original patch record"
+        raise ValueError(msg)
     return PreparedSnapshot(
         meta=source.meta,
         fragments=fragments,
@@ -1489,6 +1504,7 @@ def _prepare_snapshot(snapshot: dict) -> PreparedSnapshot:
         symbols_by_side=symbols,
         imports_by_side=imports,
         coverage_index=coverage,
+        patches={item.path: item for item in source.patches},
         notes=notes,
         warnings=warnings,
     )
@@ -1595,6 +1611,9 @@ def _append_change(  # noqa: PLR0913  # Each mutable index and evidence input is
         "before": _public(before_symbol),
         "after": _public(after_symbol),
         "basis": basis,
+        # A generated comparison of these two source spans. The original
+        # file patch is stored separately in raw_files and must not use this
+        # comparison's line grouping.
         "hunks": make_hunks(
             before_data.get("source", ""),
             after_data.get("source", ""),
@@ -1775,50 +1794,60 @@ def _context_symbol(
     }
 
 
-def _raw_file_change(
+def _raw_file_change(  # noqa: PLR0913 # Original patch and source completeness are independent inputs.
     region: str,
     before_fragment: dict | None,
     after_fragment: dict | None,
     meta: dict,
-) -> tuple[str, dict, list[dict]]:
+    patch: FilePatch,
+    *,
+    complete_source: bool = True,
+) -> dict:
     """
-    Build the full-file diff record and source links for one changed region.
+    Keep the original file patch; never generate a replacement file diff.
 
     Args:
         region: Stable source region shared by the before and after fragments.
         before_fragment: Base source fragment, if present.
         after_fragment: Head source fragment, if present.
         meta: Revision metadata used to build source permalinks.
+        patch: Required Git/GitHub record; its text may be unavailable.
+        complete_source: Whether patch rows can be checked against whole files.
 
     Returns:
-        Raw change ID, report record, and its diff hunks.
+        One raw file-change report record with its ID and diff hunks.
     """
     before_text = (before_fragment or {}).get("text", "")
     after_text = (after_fragment or {}).get("text", "")
     current_fragment = after_fragment or before_fragment
-    hunks = make_hunks(
-        before_text,
-        after_text,
-        (before_fragment or {}).get("start_line", 1),
-        (after_fragment or {}).get("start_line", 1),
-    )
+    if patch.patch is None or not complete_source:
+        # Missing source cannot validate patch coordinates. Keep any captured
+        # patch text for inspection, but do not invent replacement diff rows.
+        hunks = []
+        patch_status = "unavailable" if patch.patch is None else "unbound"
+    else:
+        try:
+            hunks = parse_file_patch(patch.patch, before_text, after_text)
+        except ValueError as error:
+            msg = f"Original patch for {patch.path!r} could not be verified: {error}"
+            raise ValueError(msg) from error
+        patch_status = "captured"
     raw_id = stable_id("raw", region)
     before_url = _fragment_url(before_fragment, "base", meta, before_text)
     after_url = _fragment_url(after_fragment, "head", meta, after_text)
-    return (
-        raw_id,
-        {
-            "id": raw_id,
-            "path": current_fragment["path"],
-            "old_path": (before_fragment or {}).get("path"),
-            "region": region,
-            "scope": current_fragment.get("scope", "full"),
-            "hunks": hunks,
-            "before_url": before_url,
-            "after_url": after_url,
-        },
-        hunks,
-    )
+    return {
+        "id": raw_id,
+        "path": current_fragment["path"],
+        "old_path": (before_fragment or {}).get("path"),
+        "region": region,
+        "scope": current_fragment.get("scope", "full"),
+        "hunks": hunks,
+        "diff_origin": patch.origin,
+        "patch_status": patch_status,
+        "original_patch": patch.patch,
+        "before_url": before_url,
+        "after_url": after_url,
+    }
 
 
 def _fragment_url(
@@ -2020,22 +2049,54 @@ def _collect_raw_changes(
         after_fragment = sides.get("head")
         before_text = (before_fragment or {}).get("text", "")
         after_text = (after_fragment or {}).get("text", "")
+        fragment = after_fragment or before_fragment
+        coverage = source.coverage_index[(fragment["side"], fragment["path"])]
+        head_path = (
+            fragment["path"] if after_fragment else coverage.counterpart_path
+        )
+        patch = source.patches[head_path]
         if before_text == after_text:
             continue
-        raw_id, raw_record, hunks = _raw_file_change(
+        base_path = (
+            before_fragment["path"]
+            if before_fragment
+            else coverage.counterpart_path
+        )
+        base_coverage = source.coverage_index[("base", base_path)]
+        head_coverage = source.coverage_index[("head", head_path)]
+        complete_source = (
+            base_coverage.absent
+            or (base_coverage.full_source and before_fragment is not None)
+        ) and (
+            head_coverage.absent
+            or (head_coverage.full_source and after_fragment is not None)
+        )
+        raw_record = _raw_file_change(
             region,
             before_fragment,
             after_fragment,
             source.meta,
+            patch,
+            complete_source=complete_source,
         )
+        raw_id = raw_record["id"]
+        hunks = raw_record["hunks"]
         raw_changes.append(raw_record)
-        exact_hunks = make_hunks(
-            before_text,
-            after_text,
-            (before_fragment or {}).get("start_line", 1),
-            (after_fragment or {}).get("start_line", 1),
-            context=0,
-            keep_line_endings=True,
+        # The original patch already accounts for the changed file lines.
+        # A second file diff could choose a different occurrence of repeated
+        # text and invent another change. An unavailable patch still needs
+        # source accounting, but these rows never replace the file patch.
+        exact_hunks = (
+            hunks
+            if raw_record["patch_status"] == "captured"
+            else make_hunks(
+                before_text,
+                after_text,
+                (before_fragment or {}).get("start_line", 1),
+                (after_fragment or {}).get("start_line", 1),
+                context=0,
+                keep_line_endings=True,
+            )
         )
         # Keep existing context records and IDs, then assign only remaining raw
         # lines. A classified span already owns its original line-ending bytes.
@@ -2046,7 +2107,9 @@ def _collect_raw_changes(
                 after_fragment,
                 index.covered_lines,
             )
-            has_changed_text = any(
+            has_changed_text = split_source_lines(
+                before_text
+            ) != split_source_lines(after_text) and any(
                 row["text"].strip() for row in unassigned_rows
             )
             if not unassigned_rows or (not raw_only and not has_changed_text):

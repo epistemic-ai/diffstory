@@ -1970,7 +1970,7 @@ class ReportSession:
             raise ValueError(msg)
         return application
 
-    def report_data(self, report: ValidatedReport) -> dict:
+    def report_data(self, report: ValidatedReport) -> dict:  # noqa: C901, PLR0915 # Keep the explicit compatibility expansion and selector checks at this boundary.
         """Return detached compatibility report data for a live report handle.
 
         Preconditions:
@@ -2000,14 +2000,48 @@ class ReportSession:
             )
             overlay = _thaw_owned(application.overlay)
             expanded["document"] = overlay["document"]
-            groups_by_id = {group["id"]: group for group in expanded["groups"]}
-            for item in overlay["groups"]:
-                group = groups_by_id.get(item["group_id"])
-                if group is None:
+            groups = expanded.get("groups")
+            overlay_groups = overlay.get("groups")
+            if type(groups) not in {list, tuple} or type(
+                overlay_groups
+            ) not in {list, tuple}:
+                msg = "invalid_indexed_applied_fields"
+                raise ValueError(msg)
+            groups_by_id: dict[str, dict] = {}
+            for group in groups:
+                if type(group) is not dict or type(group.get("id")) is not str:
+                    msg = "invalid_indexed_applied_fields"
+                    raise ValueError(msg)
+                group_id = group["id"]
+                if group_id in groups_by_id:
+                    msg = "invalid_indexed_applied_fields"
+                    raise ValueError(msg)
+                groups_by_id[group_id] = group
+
+            ordered_groups = []
+            seen: set[str] = set()
+            for item in overlay_groups:
+                if (
+                    type(item) is not dict
+                    or set(item)
+                    != {"group_id", "title", "number", "next_id", "narrative"}
+                    or type(item.get("group_id")) is not str
+                ):
+                    msg = "invalid_indexed_applied_fields"
+                    raise ValueError(msg)
+                group_id = item["group_id"]
+                group = groups_by_id.get(group_id)
+                if group is None or group_id in seen:
                     msg = "invalid_indexed_applied_fields"
                     raise ValueError(msg)
                 for field in ("title", "number", "next_id", "narrative"):
                     group[field] = item[field]
+                seen.add(group_id)
+                ordered_groups.append(group)
+            if seen != set(groups_by_id):
+                msg = "invalid_indexed_applied_fields"
+                raise ValueError(msg)
+            expanded["groups"] = ordered_groups
             presentation = V2Presentation.model_validate(
                 _tuple_model_input(expanded["narrative_v2"])
             )

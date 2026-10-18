@@ -34,7 +34,13 @@ Pydantic validates source evidence and narration data. Build and browser-test to
 
 ## A reading path, not a dashboard
 
-The reader alternates an explanation with the paired diff that supports it, preserving original line numbers. Diffs open by default; **Read definition** switches a block in place. Code identifiers, paths, commands, and literal values use inline code styling. Long code starts with an excerpt; **Load full diff** and **Read full definition** progressively reveal the rest, at most 160 display rows per expansion. Code scrolls with the document, not inside a second vertical viewport.
+The reader keeps each explanation close to the source, with original line
+numbers. File diffs open by default. **Before definition** and **After
+definition** show the supplied code; **Compare function versions** opens the
+separate, generated comparison. Older reports retain their **Read definition**
+control. Code identifiers, paths, commands, and literal values use inline code
+styling. Long blocks expand where you are reading, at most 160 display rows
+per action. Code scrolls with the document.
 
 **Contents** searches sections and symbols without filtering the document away. Reader options collapse expanded code or download the analysis JSON.
 
@@ -52,7 +58,15 @@ Replace `OWNER/REPO#NUMBER` with a real PR. For private repositories, Diffstory 
 
 The CLI performs read-only requests, paginates changed files, pins both revisions, and rejects a PR that changes during retrieval. It does not inherit credentials from a chat application. The local Git comparison defaults to **merge-base(base, head) → head**; use `--two-dot` for an endpoint comparison. Uncommitted and untracked work is not included.
 
-Snapshots must include `file_evidence` with an explicit source state for both revisions of each file. The Git and GitHub commands supply these records. Inputs that omit them are rejected.
+File diffs keep the original Git or GitHub patch and its line grouping.
+**Compare function versions** is a separate, generated view: it can show a
+function moving between files while changing just one line. It helps explain
+the edit without replacing the PR's patch. See the
+[moved-function example](docs/ARCHITECTURE.md#original-patch-and-function-comparison).
+If an original patch is unavailable, the reader says so. Older saved inputs
+that contain only source text show a labeled **Source comparison**.
+
+Snapshots must include `file_evidence` with an explicit source state for both revisions of each file, plus one `patches` record per file. A patch record contains the original Git/GitHub patch or null when unavailable. The Git and GitHub commands supply these records. Older snapshots that omit them are rejected; capture them again with the current command.
 
 Every compilation writes standalone HTML plus an adjacent `.report.json`. Binary, oversized, unsupported, or missing source is explicitly reported; it is not silently treated as a complete analysis.
 
@@ -121,7 +135,58 @@ Before the first model request, Diffstory displays the destination, PR revisions
 
 Narration packs bounded evidence chunks to fit the selected model's context and uses multi-level summaries for larger changes. Long source lines are split into slices without dropping source text. After a successful run, the CLI prints provider-reported input tokens, cached input tokens, and output tokens; these totals are also stored in the annotations and report. `--max-source-bytes` can lower the hard 64 MB cap on captured source across both revisions. Excess source is rejected before narration, and the GitHub reader stops fetching files once the configured cap is exceeded.
 
-There are no run-wide token, call-count, or elapsed-time ceilings. Each individual provider call has a 15-minute timeout to prevent a stalled request from hanging indefinitely; a run may make as many calls as its source requires.
+In the default v2 architecture, there are no run-wide token, call-count, or elapsed-time ceilings. Each individual provider call has a 15-minute timeout to prevent a stalled request from hanging indefinitely; a run may make as many calls as its source requires.
+
+In default v2, independent narration tasks run concurrently. The default limit is four active tasks. Set `--concurrency N` to a positive integer to change the limit.
+
+In default v2, Diffstory saves validated narration results as checkpoints by default. The default directory is `Path(out).with_suffix('.narration-cache')`; for `walkthrough.html`, this is `walkthrough.narration-cache/`. Use `--cache-dir PATH` to choose another directory or `--no-cache` to disable persistent checkpoints. These options are mutually exclusive.
+
+A default v2 checkpoint is reused only when the run matches: the exact base and head revisions, report source and pull-request context, provider and model, prepared prompt and schema, output reservation, and validation version. Diffstory excludes only the report's `captured_at` timestamp from this identity. It validates each saved result again before reuse. Progress reports the current stage, active calls, completed and planned tasks, reused results, provider calls, and elapsed time. A reused-result count is separate from current provider calls and provider-reported cached input tokens.
+
+### Opt-in walkthrough architecture
+
+The default architecture remains v2. To use the bounded, flat walkthrough
+architecture, select it explicitly:
+
+```bash
+diffstory github 'OWNER/REPO#NUMBER' \
+  --narrate \
+  --architecture walkthrough \
+  --out walkthrough.html
+```
+
+Walkthrough mode allows at most 12 provider attempts across writers and the
+editor, including retries; each request can be attempted at most twice. It
+allows 1 to 4 concurrent calls, rejects higher concurrency, and applies one
+240-second deadline to local preparation and generation. Interactive
+confirmation wait does not use the budget. The shared 1 MiB response-byte
+limit counts canonical JSON response bytes before validation, including
+responses that fail validation and accepted cached results. The separate 1 MiB
+saved-story limit remains in force.
+
+If a request or limit fails, walkthrough mode stops submitting new work, lets
+active calls finish, and does not write new output files. It retains
+attempts, measured usage, response bytes, and accepted-result digests in its
+durable run state. The default state directory is
+`Path(out).with_suffix('.narration-state')`; set `--state-dir PATH` to choose a
+different one. Resume with the same state directory to retain the original
+attempts and deadline. A resume does not start a new 240-second period. Use
+`--fresh-state NEW_DIRECTORY` only to start a new budget in a new directory;
+the old state stays in place. Incompatible run-state versions are rejected;
+use a new state directory instead of reusing an unknown accounting format.
+
+Payload caching is separate from run state. The default cache directory is
+`Path(out).with_suffix('.narration-cache')`; use `--cache-dir PATH` to choose
+another directory or `--no-cache` to disable cached result payloads. Disabling
+the cache does not disable durable attempt and deadline state. Cache results
+are revalidated before reuse. If a durable run already accepted a result for a
+request, resume accepts only that result digest; a changed cache result is
+rejected. A cache hit counts against the response-byte budget once per run, and
+reusing that exact result on resume does not charge it again. With Codex's
+unresolved default model, the cache is disabled; pass an explicit `--model` to
+enable it.
+
+In default v2, the CLI proceeds without persistent checkpoints when `--provider codex` uses the unresolved default model. Set `--model MODEL_ID` to enable them. Diffstory rejects `--cache-dir` when Codex has no explicit model. If a stage fails, default v2 stops submitting tasks, waits for active calls to finish, and keeps valid checkpoints so a later run can reuse them.
 
 Successful runs write HTML, `.report.json`, and candidate `.annotations.json` files. Each generated passage is tied to a change ID and checked against its group and source range. The generated report preserves its provider/model, revisions, measured usage, and chunk coverage, and displays a visible **model-generated · unverified** warning. It does not validate whether prose is true.
 
@@ -131,15 +196,20 @@ The OpenAI API request sets `store: false`, but this is not a zero-retention pro
 
 ## Develop and verify
 
+Development uses Python 3.13, pinned in `.python-version`. The package supports
+Python 3.10 and newer. `uv sync --locked` creates `.venv` and installs the
+project with its development tools from `uv.lock`; `uv run --locked` runs each
+command in that environment without manual activation.
+
 ```bash
-python -m pip install -e '.[dev]'
-python -m unittest discover -s tests -v
-python examples/make_demo.py
-python scripts/check_release.py
-python -m playwright install chromium
-python tests/browser_smoke.py
-python -m build
-python -m twine check dist/*
+uv sync --locked
+uv run --locked python -m unittest discover -s tests -v
+uv run --locked python examples/make_demo.py
+uv run --locked python scripts/check_release.py
+uv run --locked python -m playwright install chromium
+uv run --locked python tests/browser_smoke.py
+uv build
+uv run --locked twine check dist/*
 ```
 
 For a system Chromium installation, set `DIFFSTORY_CHROMIUM` to its executable path. Browser tests exercise rendering, navigation, expansion, responsive layout, and offline behavior. They do not claim tests passed in the analyzed repository. See [verification](docs/VERIFICATION.md) for the checks actually run on this release.

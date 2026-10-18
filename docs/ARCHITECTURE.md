@@ -1,8 +1,9 @@
 # Internal contract
 
 ```text
-Committed Git objects / pinned GitHub sources / saved snapshot
-    → Python AST units + independent textual hunks
+Original Git/GitHub patches + pinned source
+    → retained file patches + separate function comparisons
+    → Python AST units
     → conservative cross-file declaration pairs
     → calls / references / imports / test references
     → semantic chapters + prerequisite graph
@@ -14,7 +15,58 @@ Committed Git objects / pinned GitHub sources / saved snapshot
 
 ## Evidence and presentation are separate
 
-A Git hunk is not the identity of a conceptual change. A moved definition is represented by a single change with both source spans and an independently computed paired delta. The raw source view retains file-oriented hunks, including imports and code that was not parsed into symbols.
+### Original patch and function comparison
+
+The original patch shows what changed in each file. Git ingestion captures the
+output of `git diff`; GitHub ingestion retains each file's `patch` from the
+[PR files API](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files).
+We keep that text and its line grouping. We check the rows against
+the captured file versions; we do not run another diff algorithm to replace
+Git's or GitHub's choices. An incomplete or mismatched patch is rejected.
+
+The **function comparison** is an extra view. It compares the earlier and
+later versions of a matched function, even when they are in different files.
+It is generated from source and labeled separately. It does not replace the
+original patch.
+
+Passages can show excerpts from that original patch. Selecting a smaller
+range must not choose a different alignment of its lines. The complete
+captured patch remains available under **Original source hunks**.
+
+For example, suppose `normalize_name()` moves from `users.py` to `text.py`.
+Both files already exist. The original file patch shows:
+
+```diff
+# users.py
+-def normalize_name(name):
+-    return name.lower()
+
+# text.py
++def normalize_name(name):
++    return name.strip().lower()
+```
+
+The optional function comparison shows the small edit more directly:
+
+```diff
+ def normalize_name(name):
+-    return name.lower()
++    return name.strip().lower()
+```
+
+The function moved, and it now removes surrounding spaces before lowercasing.
+For a 200-line function, this view avoids reading the whole function twice.
+Keep both views: the original patch records the PR; the function comparison
+helps explain a move or edit. A proposed match still needs review when the
+tool cannot confirm that the two definitions belong together.
+
+If GitHub omits a file patch, record it as unavailable. Do not silently replace
+it with a generated diff. Source can still support the separate function
+comparison. Snapshots must include a patch record for each file, even when
+the patch text is unavailable. Older snapshots without these records are
+rejected; capture them again with the current Git or GitHub command.
+The retained original text also
+keeps file headers and no-newline markers that are not ordinary code rows.
 
 Matching uses four stages: unique same-path/name matches; unique exact-AST cross-file matches; unique function/class matches with only the declaration name and leading docstring excluded; and conservative same-name candidates with a structural similarity threshold. Ambiguous duplicates remain unpaired. Similarity is evidence for correspondence, not evidence for preserved behavior. A same-path implementation edit is not automatically called a behavioral regression.
 
@@ -45,6 +97,11 @@ Module environment differences are deliberately not erased. Renaming a reference
     "base": {"path": "pkg/module.py", "state": "absent"},
     "head": {"path": "pkg/module.py", "state": "supplied", "coverage": "full"}
   }],
+  "patches": [{
+    "path": "pkg/module.py",
+    "origin": "git",
+    "patch": "@@ -0,0 +1,2 @@\n+def f(x):\n+    return x\n"
+  }],
   "warnings": []
 }
 ```
@@ -56,6 +113,13 @@ Only the current snapshot contract is supported. `file_evidence` is required. It
 Use `scope: "selected excerpts"` for partial snapshots and set each supplied excerpt side to `coverage: "partial"` in its file evidence. If the other revision was not supplied, mark it `unavailable` with a reason. Each excerpt retains its original line offset. When multiple excerpts are supplied from the same file, set a distinct `region` to identify each before/after pair; source ranges must not overlap. Full snapshots include both sides of modified files and the existing side of truly added/deleted files. A confirmed Python definition addition or removal needs full, parsed source for the relevant file pair. A warning about another file, including a Markdown file, does not weaken that evidence. Missing source and parse failures on the relevant file leave the counterpart unresolved. Snapshots without `file_evidence` are rejected.
 
 The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_files`, `cycles`, `notes`, `warnings`, `stats`, `meta` and `method`. Stable IDs join evidence and narrative. Line URLs bind to a commit, not a moving branch. The renderer rejects malformed identifiers, numeric fields, diff tags and missing group references, escapes source/prose and prevents literal script terminators in embedded JSON.
+
+Snapshots require `patches`, a list of `{path, origin, patch}` records.
+The path is the later path from the file evidence; `origin` is `git` or
+`github`; `patch` contains the original text or is null when unavailable.
+The snapshot's pinned revisions apply to these records too. Patch paths must
+be unique, with one record for every file evidence pair. Total retained patch
+text has a separate 64,000,000-byte cap. It does not raise the source-byte limit.
 
 ## Annotation handoff
 
@@ -148,13 +212,51 @@ durable v2 state. Library callers select v2 with `architecture="v2"` and a stabl
 `recovery_dir`. An ordinary command without `--narrate` still produces the
 deterministic baseline narrative.
 
-```text
-Compiled report → evidence ledger → packed detail requests → detailed results
-                                                             ↓
-                                  bounded hierarchical plan → section requests
-                                                             ↓
-                                         document → validated complete report
+The diagram shows the current v2 data flow. Sizes are approximate decimal MB
+from one local synthetic-provider benchmark. Report component sizes use the
+pretty-printed JSON representation. These measurements are not fixed limits or
+measurements of real LLM prose. Arrows show data flow, not proportional byte
+volume.
+
+```mermaid
+flowchart TD
+    PR["PR source · ~19 MB"] --> C["Compiler<br/>Changes, definitions, dependencies"]
+    C --> E["Evidence ledger<br/>Source spans + explanation obligations"]
+    E --> N["Narration runtime<br/>Details → planning → sections → document"]
+
+    N -->|"Uncached requests"| LLM["LLM provider"]
+    LLM -->|"Structured results"| N
+    N <-->|"Store / reuse"| CACHE[("Optional cache · ~92 MB<br/>Shared invocation/request records on disk<br/>Expanded and audited on reuse")]
+
+    N --> M["Generation manifest<br/>Results + producer history + receipts"]
+    M --> APPLY["Apply narration<br/>Reconstruct and validate full proof"]
+    C --> APPLY
+
+    subgraph REPORT["Self-contained report"]
+        BASE["Compiler data<br/>~110 MB"]
+        GEN["Generation + audit data<br/>~155 MB"]
+        VIEW["Reader representation · ~414 MB<br/>Includes ~333 MB citation catalog"]
+        GEN -.->|"Detail results copied here"| VIEW
+        BASE --> JSON["Pretty-printed exported report JSON · ~678 MB"]
+        GEN --> JSON
+        VIEW --> JSON
+    end
+
+    APPLY --> BASE
+    APPLY --> GEN
+    APPLY --> VIEW
+
+    JSON --> RENDER["Renderer<br/>Reconstruct and validate full proof again"]
+    RENDER --> HTML["Standalone HTML · ~504 MB<br/>Embeds the complete report"]
 ```
+
+The report retains overlapping generation and reader records. Applying
+narration and rendering the report each reconstruct the offline proof without
+provider calls or the optional cache. These checks establish coverage and
+reference validity; generated prose remains unverified. Shared cache records
+reduce disk duplication, but they are still expanded and audited on reuse.
+Sharing exported records and reusing validated immutable data within a run are
+future improvements; this diagram describes current behavior.
 
 An evidence unit accounts for supplied source spans and explanation obligations.
 An obligation describes a changed region, a structural change, or an explicit
@@ -350,8 +452,9 @@ If a result exceeds the selected limit, the error gives the required byte bound.
 Use that explicit bound for generation and subsequent reload if intended. This
 provides a supported reload route without silent truncation or an unbounded
 read. The default accommodates the known 109,957,391-byte compiled-report size;
-final narrated size, memory use, and pinned cold/resumed performance remain to
-be measured in the later benchmark. No call target, current-PR benchmark
+the synthetic-provider benchmark in the diagram measures exported narrated
+size. Live-provider memory use, pinned cold/resumed performance, and narration
+quality require separate measurements. No call target, current-PR benchmark
 success, or live-model quality result is claimed here.
 
 ### Supported UV commands
@@ -387,3 +490,86 @@ uv run --locked diffstory render large.report.json --max-report-bytes 512000000 
 The two default state/cache suffixes are ignored by Git. Custom paths should be
 kept outside version control. No command above publishes a report or changes
 repository source.
+
+## Implemented shared records and run-scoped validation
+
+This section documents the implemented indexed/shared path and supersedes earlier statements about rebuilding full expanded reports during output and reparsing shared cache records for each lookup. The earlier flow and measurements remain the expanded-format baseline. Expanded output remains the default and rollback path.
+
+```mermaid
+flowchart LR
+  INPUT["Captured report + configuration"] --> SESSION["Live ReportSession"]
+  SESSION --> PROOF["Complete production proof"]
+  GEN --> APPLY["Apply + surface checks"]
+  APPLY --> REPORT["ValidatedReport"]
+  REPORT --> JSON["Bounded JSON stream"]
+  REPORT --> HTML["Escaped HTML stream"]
+  JSON --> IMPORT["Shared import"]
+  IMPORT --> FRESH["New session + full proof"]
+  BYTES["Current cache bytes"] --> MEMO["8 MiB exact-byte parse memo"]
+  MEMO --> AUDIT["Per-leaf parse, identity, dependency + producer checks"]
+  AUDIT --> PROOF
+  PROOF --> GEN["ValidatedGeneration"]
+```
+
+A `ReportSession` owns a detached immutable snapshot of the report and request configuration. It issues distinct `ParsedRecords`, `ValidatedGeneration`, and `ValidatedReport` capabilities. Parsing alone grants no proof authority. The session registers the exact capability object and pins its scope, configuration, validation versions, run identity, source bytes, source and revision bindings, and completed proof inputs. A copied or serialized value cannot transfer authority. Closing the context expires its handles and retained proofs.
+
+Fresh generation, apply, and trusted output can reuse completed proof work only through the exact live handle in that session. Each operation rechecks handle identity, captured inputs, current bindings, and limits; HTML still checks and escapes every output. A persisted shared import starts a new session and performs a complete independent proof. Public dictionary apply, validation, and rendering also create fresh proof scopes. An annotation import must include its matching compiler report. The changed-input boundary maps only known capture or binding changes to the public dependency-change error; unrelated mutation or validation errors remain visible.
+
+The `diffstory.report-storage.v1` envelope has 13 closed typed tables: results, plans, evidence references, source targets, resolved citations, URLs, runs, invocations, requests, producers, receipts, readers, and inherited provenance. Pointers are legal only at declared schema positions. A canonical content address checks record integrity; it does not establish proof authority. Reports carry the full source and proof closure, including producer, request, peer-dependency, receipt, and support records. The codec preserves field presence, scalar types, source coordinates, and semantic array and group order. A literal compiler field named `$ref` remains ordinary data. Table references do not rewrite compiler data.
+
+`report_data()` and full expansion are explicit compatibility adapters. The indexed production, apply, export, and browser paths use the shared graph and reader indexes without first building a full expanded generation and presentation tree.
+
+The public narrator path keeps one session open through generation, apply, and writing:
+
+```python
+with narrator.capture_session(report) as session:
+    generation = narrator.generate_validated(report, session=session)
+    applied = session.apply(generation)
+    with output_path.open("wb") as output:
+        for chunk in session.iter_report_json(
+            applied,
+            report_storage="shared",
+            max_output_bytes=256_000_000,
+        ):
+            output.write(chunk)
+```
+
+For fresh bytes, `ReportSession.import_indexed` requires `max_input_bytes` and returns `(ReportSession, ValidatedGeneration)`. Report bytes contain their own base report, so omit `compiler_report`; passing a non-null value is rejected. Annotation bytes require `compiler_report` set to the matching compiler report. Keep the returned session live through apply and output:
+
+```python
+session, generation = ReportSession.import_indexed(
+    report_bytes,
+    max_input_bytes=256_000_000,
+)
+with session:
+    applied = session.apply(generation)
+    with output_path.open("wb") as output:
+        for chunk in session.iter_report_json(
+            applied,
+            report_storage="shared",
+            max_output_bytes=256_000_000,
+        ):
+            output.write(chunk)
+```
+
+The caller or CLI remains responsible for source-transfer consent before provider work.
+
+The artifact cache now keeps an 8 MiB per-store parse memo. It reads each leaf and its shared records from disk on every lookup, then reuses parsing and expansion only when the bytes read match a previously checked byte value exactly. Paths, timestamps, sizes, and content addresses do not grant reuse. Leaf identity, current dependency membership, result validity, and applicable producer/request audits still run for every lookup. Eviction causes another parse. This cache memo is separate from session proof reuse and from report-record sharing. Provider schemas, packing, retries, budgets, durability, recovery, invalidation, and legacy behavior keep their existing contracts.
+
+The browser builds one index over the shared graph and creates a temporary projection for the section it renders. It retains complete prose, context, source, provenance, and proof data in the offline page; it does not build a second full presentation tree. JSON and HTML writers emit bounded chunks of at most 16 KiB. The HTML writer escapes script-context data, checks the live handle during output, and enforces its cap over encoded HTML bytes. The CLI accepts `--report-storage shared`; expanded remains the default. An expanded v2 report selected for shared output passes through the explicit codec adapter and a fresh proof import. `--max-report-bytes` and `--max-html-bytes` are separate positive encoded-byte limits, each defaulting to 256,000,000 bytes. Raising either report or HTML limit does not raise the source cap.
+
+The CLI stages each requested file in a temporary file beside its destination and promotes files after writers finish. Promotion uses sequential replacements. A cross-directory I/O failure during promotion can leave a partially promoted set of outputs.
+
+Measurements support a tradeoff, not a general performance claim. Python compact `generation-storage.v1` bytes versus shared report bytes were:
+
+| Count | Compact expanded | Shared | Change |
+|---:|---:|---:|---:|
+| 2 | 101,285 | 98,156 | −3.1% |
+| 4 | 176,479 | 166,792 | −5.5% |
+| 8 | 326,851 | 304,048 | −7.0% |
+
+Across six matched same-proof timing pairs, shared medians were about 1.1–1.5% lower in wall time and 1.2–1.6% lower in thread CPU; several ranges overlap. The exact authored fixture went from 5,367,644 compact expanded bytes to 5,852,636 shared bytes (+9.04%). Table and reference overhead exceeded the duplicates left in that already compact baseline.
+
+The browser 2/4/8 mixed-prose fixtures contain different report bytes from the Python 2/4/8 fixtures, which is why their byte savings differ. They showed shared raw JSON reductions of 9.22%, 10.96%, and 12.06%. On the exact fixture, shared output instead increased retained V8 heap after garbage collection from 8,347,964 to 9,163,988 bytes and raised index build time from 3.8 to 6.3 ms (three observations). Retained heap is not peak memory and excludes native DOM memory.
+
+One instrumented Python run measured exact-fixture shared import at 54.362 seconds, with indexed production proof nested at 52.1505 seconds and unique-row structural validation at 0.6461 seconds. The results show that independent proof can remain expensive. Small matched timing gains do not establish a general CPU, RSS, or memory win; whole paired-process RSS includes both formats and cannot compare per-format peaks. Shared output therefore remains opt-in.

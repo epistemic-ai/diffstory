@@ -183,6 +183,33 @@ def require(condition: bool, reason: str = "schema") -> None:  # noqa: FBT001
         raise ArtifactRuntimeError(reason)
 
 
+def _run_public_session_boundary(
+    operation: Callable[[], object],
+) -> object:
+    """Expose known session input changes through the public runtime contract.
+
+    Preconditions:
+        ``operation`` is one strict session capture or production-binding
+        check used at a public generation boundary.
+    Postconditions:
+        Returns the operation result, or reports an exact known input change
+        as ``ArtifactRuntimeError("dependencies_changed")``.
+    Essential behavior:
+        Leaves every other ``ValueError`` unchanged and keeps the session's
+        strict rejection in place.
+    """
+    try:
+        return operation()
+    except ValueError as error:
+        if error.args in (
+            ("captured_input_session_mismatch",),
+            ("captured_production_binding_changed",),
+        ):
+            reason = "dependencies_changed"
+            raise ArtifactRuntimeError(reason) from None
+        raise
+
+
 class DispatchHandle(Contract):
     """Small immutable key; serializers dereference the shared trusted index."""
 
@@ -2272,7 +2299,9 @@ class BatchedNarrator:
                 prepared: PreparedArtifactRequest,
             ) -> ProviderReply:
                 if session is not None:
-                    session._check_stage_binding(stage)  # noqa: SLF001 # Verify the exact registered stage before dispatch.
+                    _run_public_session_boundary(
+                        lambda: session._check_stage_binding(stage)  # noqa: SLF001 # Verify the exact registered stage before dispatch.
+                    )
                 self.check_approval(self.approved_report)
                 return send(prepared)
 
@@ -2362,7 +2391,9 @@ class BatchedNarrator:
         require(set(artifacts) == set(stage.items), "coverage")
         ordered_artifacts = tuple(artifacts[k] for k in stage.items)
         if session is not None:
-            session._check_stage_binding(stage)  # noqa: SLF001 # Reject post-execution stage rebinding.
+            _run_public_session_boundary(
+                lambda: session._check_stage_binding(stage)  # noqa: SLF001 # Reject post-execution stage rebinding.
+            )
             self._last_stage_proof = session._complete_stage(  # noqa: SLF001 # Execute the session validator at successful ordered coverage.
                 stage,
                 ordered_artifacts,
@@ -2396,8 +2427,10 @@ class BatchedNarrator:
         if self.inputs is None:
             self.preview(report, session=session)
         elif self.session is None:
-            session._adopt_preview_capture(  # noqa: SLF001 # Reuse an earlier unattached preview snapshot exactly.
-                self.inputs._captured_input  # noqa: SLF001 # Adopt the exact earlier preview capture.
+            _run_public_session_boundary(
+                lambda: session._adopt_preview_capture(  # noqa: SLF001 # Reuse the exact earlier preview snapshot.
+                    self.inputs._captured_input  # noqa: SLF001 # Adopt the exact earlier preview capture.
+                )
             )
             self.session = session
         else:
@@ -2514,8 +2547,10 @@ class BatchedNarrator:
             )
             session = ReportSession.capture(report, descriptor)
             if self.inputs is not None:
-                session._adopt_preview_capture(  # noqa: SLF001 # Adopt the exact earlier preview capture.
-                    self.inputs._captured_input  # noqa: SLF001 # Adopt the exact earlier preview capture.
+                _run_public_session_boundary(
+                    lambda: session._adopt_preview_capture(  # noqa: SLF001 # Adopt the exact earlier preview capture.
+                        self.inputs._captured_input  # noqa: SLF001 # Adopt the exact earlier preview capture.
+                    )
                 )
         else:
             session = self.session

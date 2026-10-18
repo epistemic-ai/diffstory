@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from difflib import unified_diff
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -270,6 +271,22 @@ def demo_snapshot() -> dict:
                     {"path": path, "state": "supplied", "coverage": "full"}
                     if path in after
                     else {"path": path, "state": "absent"}
+                ),
+            }
+            for path in sorted(before.keys() | after.keys())
+        ],
+        # Build synthetic input patches here. Live ingestion retains Git/GitHub text.
+        "patches": [
+            {
+                "path": path,
+                "origin": "git",
+                "patch": "".join(
+                    unified_diff(
+                        before.get(path, "").splitlines(keepends=True),
+                        after.get(path, "").splitlines(keepends=True),
+                        fromfile=f"a/{path}",
+                        tofile=f"b/{path}",
+                    )
                 ),
             }
             for path in sorted(before.keys() | after.keys())
