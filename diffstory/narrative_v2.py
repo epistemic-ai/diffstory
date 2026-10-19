@@ -34,13 +34,14 @@ from .narrative_contracts import StoryCard
 from .narrative_contracts import StoryPlan
 from .narrative_contracts import SupportSet
 from .narrative_contracts import result_key
+from .narrative_hierarchy import IndexedPlanningSources
+from .narrative_hierarchy import _inherited_support_checked
 from .narrative_hierarchy import atom_key
 from .narrative_hierarchy import build_production_plan
 from .narrative_hierarchy import capture_indexed_consumed_prose
 from .narrative_hierarchy import derive_planning_sources
 from .narrative_hierarchy import derive_planning_sources_indexed
 from .narrative_hierarchy import fragment_material
-from .narrative_hierarchy import inherited_support
 from .narrative_hierarchy import material_support
 from .narrative_hierarchy import planning_waves
 from .narrative_hierarchy import projection_material
@@ -796,12 +797,36 @@ class ProductionInputs:
 
     def result_support(self, results: tuple[object, ...]) -> SupportSet:
         """Collect the typed immediate proof used by complete result statements."""
+        return self._result_support_checked(results)
+
+    def _result_support_checked(
+        self,
+        results: tuple[object, ...],
+        checked_sources: IndexedPlanningSources | None = None,
+    ) -> SupportSet:
+        """Collect immediate proof within one current-source operation.
+
+        Preconditions:
+            A supplied source owner was just checked by the enclosing call,
+            which invokes no external callback during this traversal.
+        Postconditions:
+            Every indexed row retains its exact source and selector bindings;
+            proof ordering and author attribution match the public path.
+        Essential behavior:
+            The default path checks sources freshly and retains no authority.
+        """
         from .narrative_hierarchy import IndexedProseResult
 
         values = []
         for result in results:
             if type(result) is IndexedProseResult:
-                entries = result.statement_entries()
+                entries = (
+                    result._statement_entries_bound(  # noqa: SLF001 # Resolve the exact checked row without another source walk.
+                        result._check_current_for_sources(checked_sources)  # noqa: SLF001 # Keep source, selector, slot, and arena checks.
+                    )
+                    if checked_sources is not None
+                    else result.statement_entries()
+                )
                 values.extend(
                     statement
                     for path, statement in entries
@@ -827,11 +852,32 @@ class ProductionInputs:
 
     def forwarded_support(self, result: object) -> dict:
         """Bound both proof and exact handles exported to the next consumer."""
+        return self._forwarded_support_checked(result)
+
+    def _forwarded_support_checked(
+        self,
+        result: object,
+        checked_sources: IndexedPlanningSources | None = None,
+    ) -> dict:
+        """Build forwarded proof within one exact current-source operation.
+
+        Preconditions:
+            A supplied source owner was just checked by the enclosing call;
+            no external callback occurs during this traversal.
+        Postconditions:
+            Proof and grants retain their exact existing bytes and endpoints.
+        Essential behavior:
+            Checked authority is local; the public path remains fresh.
+        """
         return {
-            "proof": self.support_payload(self.result_support((result,))),
+            "proof": self.support_payload(
+                self._result_support_checked((result,), checked_sources)
+            ),
             "grants": self.support_payload(
-                inherited_support(
-                    (result,), author_context_digest=self.author_digest
+                _inherited_support_checked(
+                    (result,),
+                    author_context_digest=self.author_digest,
+                    checked_sources=checked_sources,
                 )
             ),
         }
@@ -908,9 +954,22 @@ class ProductionInputs:
         produced: Mapping[str, object],
         budget: CardBudget,
     ) -> InputItem:
-        """Build only actual immutable request bytes and explicit consumed producers."""
+        """Build immutable request bytes from the actual consumed producers.
+
+        Preconditions:
+            Indexed construction has one current arena reader. Dependencies
+            name actual owned rows and material comes from the accepted plan.
+        Postconditions:
+            Returns detached request bytes and an explicit consumed selector;
+            every selected row remains bound to its exact current source owner.
+        Essential behavior:
+            Checks indexed sources once for this synchronous construction and
+            keeps per-row checks. No provider callback runs in this operation,
+            and no checked authority is retained by its returned context.
+        """
         indexed = self._indexed_arena is not None
         selector = None
+        checked_sources = None
         if indexed:
             require(
                 self._indexed_reader is not None, "indexed_reader_required"
@@ -921,15 +980,20 @@ class ProductionInputs:
             selector = capture_indexed_consumed_prose(
                 self._indexed_reader, child_refs, self.sources
             )
+            selector.check_current()
+            checked_sources = self.sources
             children = tuple(
-                selector.select(reference.item_key) for reference in child_refs
+                selector._select_bound(reference.item_key)  # noqa: SLF001 # The exact selector was checked at this operation's entry.
+                for reference in child_refs
             )
         else:
             children = tuple(produced[k] for k in dict.fromkeys(dependencies))
         support = self.merge_support(
             self.material_grants(material),
-            inherited_support(
-                children, author_context_digest=self.author_digest
+            _inherited_support_checked(
+                children,
+                author_context_digest=self.author_digest,
+                checked_sources=checked_sources,
             ),
         )
         data = {
@@ -943,14 +1007,22 @@ class ProductionInputs:
                 {
                     "subject": self.wire.aliases.add(
                         "c",
-                        self._indexed_reader.result_binding_facts(r.reference)[
-                            1
-                        ]
+                        self._indexed_reader.result_binding_facts(
+                            r._check_current_for_sources(checked_sources)  # noqa: SLF001 # Keep each exact row bound to the checked owner.
+                        )[1]
                         if indexed
                         else r.binding.subject_key,
                     ),
-                    "prose": self.wire.prose_input(r),
-                    "proof": self.forwarded_support(r)["proof"],
+                    "prose": (
+                        self.wire._prose_input_indexed_checked(  # noqa: SLF001 # Reuse only this synchronous item's exact source check.
+                            r, checked_sources
+                        )
+                        if indexed
+                        else self.wire.prose_input(r)
+                    ),
+                    "proof": self._forwarded_support_checked(
+                        r, checked_sources
+                    )["proof"],
                 }
                 for r in children
             ],
@@ -1940,14 +2012,17 @@ def _audit_stage_records(  # noqa: PLR0913 # Keep stage identity, audit rows, re
     receipts: tuple[object, ...],
     replay: CodecReplay,
     *,
-    validate_result: Callable[[str], None],
+    validate_result: Callable[[str], None] | None = None,
+    validate_results: Callable[[tuple[str, ...]], None] | None = None,
 ) -> tuple[tuple[BatchSpec, ...], tuple[tuple[str, StageInputs], ...]]:
     """Audit actual stage producers, successful requests, and accepted rows.
 
     Preconditions:
         ``stage`` is the exact current stage; ``producers`` and ``receipts``
         came from actual successful artifacts or the complete imported
-        manifest; and ``replay`` uses the existing codec audit rules.
+        manifest; ``replay`` uses the existing codec audit rules; exactly one
+        validator is supplied. A batch validator owns only the final result
+        traversal, after every replay and subject audit has returned.
     Postconditions:
         Every ordered stage result is checked, every referenced producer and
         successful request is audited, planning subject audits are returned in
@@ -1956,6 +2031,9 @@ def _audit_stage_records(  # noqa: PLR0913 # Keep stage identity, audit rows, re
     Essential behavior:
         Shares fresh completion and independent import's producer/result loop.
     """
+    require(
+        (validate_result is None) != (validate_results is None), "coverage"
+    )
     expected_keys = tuple(stage.items)
     require(item_keys == expected_keys, "coverage")
     producer_by_key = {producer.key: producer for producer in producers}
@@ -2019,8 +2097,11 @@ def _audit_stage_records(  # noqa: PLR0913 # Keep stage identity, audit rows, re
         selected_views.append((producer_key, view))
         if stage.stage == "planning":
             subject_audits.append(view.subject_audit(invocation))
-    for item_key in expected_keys:
-        validate_result(item_key)
+    if validate_results is not None:
+        validate_results(expected_keys)
+    else:
+        for item_key in expected_keys:
+            validate_result(item_key)
     return tuple(subject_audits), tuple(selected_views)
 
 

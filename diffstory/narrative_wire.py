@@ -32,6 +32,7 @@ from .narrative_contracts import Text
 from .narrative_contracts import result_model
 from .narrative_contracts import structured_output_schema
 from .narrative_hierarchy import IndexedConsumedProse
+from .narrative_hierarchy import IndexedPlanningSources
 from .narrative_hierarchy import IndexedProseResult
 from .narrative_hierarchy import PlanningSource
 from .narrative_hierarchy import ProseResult
@@ -477,8 +478,31 @@ class WireAdapter:
             producer before serialization. It retains no producer model or
             complete-result presentation tree.
         """
-        item_key, result_kind, entries, terms = result.prose_projection(
-            index=self.index
+        return self._prose_input_indexed_checked(result)
+
+    def _prose_input_indexed_checked(
+        self,
+        result: IndexedProseResult,
+        checked_sources: IndexedPlanningSources | None = None,
+    ) -> dict:
+        """Encode selected prose within one current-source operation.
+
+        Preconditions:
+            A supplied ``checked_sources`` was just validated by the enclosing
+            synchronous call, with no intervening external callback.
+        Postconditions:
+            Exact owner, row, and wire-index bindings hold. Bytes and aliases
+            match the public adapter, and returned values carry no authority.
+        Essential behavior:
+            The default path checks sources freshly. Both paths use the same
+            ordered statement encoding and preserve all field defaults.
+        """
+        item_key, result_kind, entries, terms = (
+            result.prose_projection(index=self.index)
+            if checked_sources is None
+            else result._prose_projection_checked(  # noqa: SLF001 # The enclosing operation checked this exact owner.
+                checked_sources, index=self.index
+            )
         )
         by_field: dict[str, list[tuple[int, SupportedStatement]]] = {}
         for path, statement in entries:

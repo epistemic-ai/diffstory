@@ -2316,8 +2316,8 @@ class ReportSession:
             audit, and retains only owned references plus compact audits.
         """
         from .narrative_hierarchy import capture_indexed_consumed_prose
+        from .narrative_manifest import _validate_prose_support_checked
         from .narrative_manifest import build_receipts
-        from .narrative_manifest import validate_prose_support
         from .narrative_runtime import StoredArtifact
         from .narrative_v2 import CodecReplay
         from .narrative_v2 import _audit_stage_records
@@ -2443,23 +2443,53 @@ class ReportSession:
             reference.item_key: reference for reference in result_refs
         }
 
-        def validate_owned_result(item_key: str) -> None:
-            """Run current checks against the exact arena-owned result row."""
-            reference = refs_by_key.get(item_key)
-            _require_session(reference is not None, "coverage")
-            if binding.stage_name == "detail":
-                _require_session(reference.kind == "detail", "coverage")
-                return
-            result = output_selector.select(item_key)
-            context = stage.contexts.get(item_key)
-            _require_session(context is not None, "dependencies_changed")
-            validate_prose_support(result, context, inputs.wire)
-            if binding.stage_name == "planning":
+        def validate_owned_results(ordered_keys: tuple[str, ...]) -> None:
+            """Validate owned rows after all external replay audits finish.
+
+            Preconditions:
+                ``ordered_keys`` is the exact accepted stage order. All replay
+                and subject audits have returned before this callback starts.
+            Postconditions:
+                Each exact owned row passes the existing support and budget
+                checks under a freshly checked source owner.
+            Essential behavior:
+                Shares source validation only within this synchronous loop;
+                no checked authority survives its return or exception.
+            """
+            if output_selector is not None:
+                output_selector.check_current()
+                current_sources = inputs.sources
                 _require_session(
-                    len(canonical_bytes(inputs.forwarded_support(result)))
-                    <= context.max_support_bytes,
-                    "schema",
+                    output_selector._sources is current_sources,  # noqa: SLF001 # Pin the freshly checked selector to the exact input owner.
+                    "planning_sources_changed",
                 )
+            for item_key in ordered_keys:
+                reference = refs_by_key.get(item_key)
+                _require_session(reference is not None, "coverage")
+                if binding.stage_name == "detail":
+                    _require_session(reference.kind == "detail", "coverage")
+                    continue
+                result = output_selector._select_bound(item_key)  # noqa: SLF001 # Source and selector were checked at this loop's entry.
+                context = stage.contexts.get(item_key)
+                _require_session(context is not None, "dependencies_changed")
+                _validate_prose_support_checked(
+                    result,
+                    context,
+                    inputs.wire,
+                    checked_sources=current_sources,
+                )
+                if binding.stage_name == "planning":
+                    _require_session(
+                        len(
+                            canonical_bytes(
+                                inputs._forwarded_support_checked(  # noqa: SLF001 # Reuse only this final loop's freshly checked owner.
+                                    result, current_sources
+                                )
+                            )
+                        )
+                        <= context.max_support_bytes,
+                        "schema",
+                    )
 
         subject_audits, selected_views = _audit_stage_records(
             stage,
@@ -2467,7 +2497,7 @@ class ReportSession:
             producers,
             receipts,
             audit_replay,
-            validate_result=validate_owned_result,
+            validate_results=validate_owned_results,
         )
         receipt_by_item = {receipt.item_key: receipt for receipt in receipts}
         producer_views = []
@@ -3214,6 +3244,8 @@ class ReportSession:
         Essential behavior:
             Reuses completed stage evidence, runs the indexed support forest
             once, and performs no offline production or ledger reconstruction.
+            Collects final prose rows after one fresh selector/source check;
+            the support forest starts its own fresh source validation afterward.
         """
         from .narrative_hierarchy import capture_indexed_consumed_prose
         from .narrative_hierarchy import validate_support_forest
@@ -3276,8 +3308,9 @@ class ReportSession:
             tuple(prose_refs),
             inputs.sources,
         )
+        prose_selector.check_current()
         prose_results = tuple(
-            prose_selector.select(reference.item_key)
+            prose_selector._select_bound(reference.item_key)  # noqa: SLF001 # Collect exact rows after this selector's fresh source check.
             for reference in prose_refs
         )
         validate_support_forest(prose_results, inputs.sources, prose_selector)

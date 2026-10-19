@@ -8,13 +8,18 @@ import copy
 import tempfile
 import unittest
 from dataclasses import replace
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 from test_narrative_v2 import FixtureProvider
 from test_narrative_v2 import golden_report
 
 from diffstory.narrative import Narrator
+from diffstory.narrative_hierarchy import IndexedPlanningSources
+from diffstory.narrative_hierarchy import _IndexedSourceState
+from diffstory.narrative_hierarchy import capture_indexed_consumed_prose
 from diffstory.narrative_hierarchy import planning_waves
+from diffstory.narrative_hierarchy import validate_support_forest
 from diffstory.narrative_manifest import expanded_generation
 from diffstory.narrative_manifest import persisted_manifest
 from diffstory.narrative_manifest import validate_generation
@@ -29,7 +34,11 @@ from diffstory.narrative_session import _IndexedGenerationProof
 from diffstory.narrative_session import _stage_proof_witness
 from diffstory.narrative_v2 import BatchedNarrator
 from diffstory.narrative_v2 import Transport
+from diffstory.narrative_v2 import _audit_stage_records
 from diffstory.report_storage import GenerationRecordSet
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class NarrativeIndexedProductionTests(unittest.TestCase):
@@ -50,6 +59,390 @@ class NarrativeIndexedProductionTests(unittest.TestCase):
             options=options,
         )
         return coordinator, session, report
+
+    @staticmethod
+    def _count_source_validation(
+        operation: Callable[[], object],
+        *,
+        window: Callable[[], bool] | None = None,
+    ) -> tuple[object, tuple[int, int]]:
+        """Measure full source walks inside one supplied synchronous operation.
+
+        Preconditions:
+            ``operation`` uses only the local fixture and returns synchronously.
+            An optional ``window`` identifies the measured part of that call.
+        Postconditions:
+            Returns its value and source-check/metadata-fingerprint counts.
+        Essential behavior:
+            Wraps the actual guards, without replacing their validation.
+        """
+        counts = [0, 0]
+        source_check = IndexedPlanningSources.check_current
+        fingerprint = _IndexedSourceState.current_metadata_fingerprint
+
+        def check_source(sources: IndexedPlanningSources) -> None:
+            """Count and perform the actual full source check."""
+            if window is None or window():
+                counts[0] += 1
+            source_check(sources)
+
+        def check_metadata(state: _IndexedSourceState) -> str:
+            """Count and compute the actual metadata fingerprint."""
+            if window is None or window():
+                counts[1] += 1
+            return fingerprint(state)
+
+        with (
+            patch.object(
+                IndexedPlanningSources, "check_current", new=check_source
+            ),
+            patch.object(
+                _IndexedSourceState,
+                "current_metadata_fingerprint",
+                new=check_metadata,
+            ),
+        ):
+            result = operation()
+        return result, (counts[0], counts[1])
+
+    def test_finish_collects_all_prose_with_one_source_check(self) -> None:
+        """Final prose collection could repeat a full source walk per owned row.
+
+        Input/expected case matrix:
+            one-unit report: one source check and fingerprint during collection.
+            three-unit report with more prose rows: the same bounded counts.
+
+        Preconditions:
+            Actual production reaches finish with complete registered stages.
+        Postconditions:
+            All exact ordered prose references reach the real support forest;
+            collection work is bounded independently of the reference count.
+        """
+        finish = ReportSession.finish_production
+        measured = []
+
+        def measured_finish(
+            session: ReportSession,
+            records: GenerationRecordSet,
+            stage_proofs: tuple[StageProof, ...],
+        ) -> ValidatedGeneration:
+            """Observe only actual collection between capture and the forest."""
+            active = [False]
+            captured = []
+            expected = (*records.planning, *records.sections, records.document)
+
+            def capture(*args: object, **kwargs: object) -> object:
+                """Start measurement after the actual selector is captured."""
+                selector = capture_indexed_consumed_prose(*args, **kwargs)
+                captured.append(selector)
+                active[0] = True
+                return selector
+
+            def forest(*args: object, **kwargs: object) -> None:
+                """Observe exact input rows before the forest's fresh check."""
+                active[0] = False
+                results, _sources, producers = args
+                self.assertEqual(
+                    tuple(result.reference for result in results), expected
+                )
+                self.assertEqual(len(captured), 1)
+                self.assertIs(producers, captured[0])
+                validate_support_forest(*args, **kwargs)
+
+            with (
+                patch(
+                    "diffstory.narrative_hierarchy.capture_indexed_consumed_prose",
+                    new=capture,
+                ),
+                patch(
+                    "diffstory.narrative_hierarchy.validate_support_forest",
+                    new=forest,
+                ),
+            ):
+                generation, counts = self._count_source_validation(
+                    lambda: finish(session, records, stage_proofs),
+                    window=lambda: active[0],
+                )
+            measured.append((len(expected), counts))
+            return generation
+
+        cases = (("one unit", 1, (1, 1)), ("three units", 3, (1, 1)))
+        for name, unit_count, expected in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                report = golden_report(unit_count)
+                provider = FixtureProvider()
+                options = V2Options()
+                session = ReportSession.capture(
+                    report, Transport(provider, options).descriptor
+                )
+                coordinator = BatchedNarrator(
+                    provider,
+                    recovery_dir=directory,
+                    concurrency=1,
+                    options=options,
+                )
+                with patch.object(
+                    ReportSession, "finish_production", new=measured_finish
+                ):
+                    coordinator.generate_validated(report, session=session)
+                self.assertEqual(measured[-1][1], expected)
+                session.close()
+        self.assertEqual(len(measured), len(cases))
+        self.assertLess(measured[0][0], measured[1][0])
+
+    def test_prose_item_checks_sources_once_as_consumed_rows_grow(
+        self,
+    ) -> None:
+        """More consumed rows could repeat whole-source validation per accessor.
+
+        Input/expected case matrix:
+            one consumed row: one source check and one metadata fingerprint.
+            all planning and section rows: the same bounded counts.
+
+        Preconditions:
+            Every row comes from one completed local generation and arena.
+        Postconditions:
+            Each new item validates sources once, regardless of child count.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, session, report = self._coordinator(
+                FixtureProvider(), directory
+            )
+            generation = coordinator.generate_validated(
+                report, session=session
+            )
+            proof = session._registered_payload(
+                generation, ValidatedGeneration, "generation"
+            )
+            inputs = coordinator.inputs
+            references = (*proof.records.planning, *proof.records.sections)
+            self.assertGreater(len(references), 1)
+            cases = (
+                ("one child", references[:1], (1, 1)),
+                ("many children", references, (1, 1)),
+            )
+            inputs.begin_indexed_items()
+            try:
+                for name, consumed, expected in cases:
+                    with self.subTest(case=name):
+                        item, counts = self._count_source_validation(
+                            lambda consumed=consumed: inputs.prose_item(
+                                "section",
+                                inputs.plan.id,
+                                (),
+                                {},
+                                tuple(ref.item_key for ref in consumed),
+                                {ref.item_key: ref for ref in consumed},
+                                inputs.plan.production.card_budget,
+                            )
+                        )
+                        self.assertEqual(counts, expected)
+                        self.assertEqual(
+                            len(item.context.consumed._reference_values),
+                            len(consumed),
+                        )
+            finally:
+                inputs.end_indexed_items()
+                session.close()
+
+    def test_completion_checks_sources_once_per_final_result_loop(
+        self,
+    ) -> None:
+        """Accepted result accessors could repeat full validation per owned row.
+
+        Input/expected case matrix:
+            detail completion: no new indexed result-source traversal.
+            each prose completion, including multiple rows: one source check
+                and one fingerprint for its final result loop.
+
+        Preconditions:
+            Actual producer replay audits finish before the measured callback.
+        Postconditions:
+            All ordered owned rows are checked with bounded source work.
+        """
+        measured = []
+
+        def audit(*args: object, **kwargs: object) -> object:
+            """Measure only the actual final owned-result callback."""
+            batch = kwargs.get("validate_results")
+            if batch is not None:
+
+                def validate(keys: tuple[str, ...]) -> None:
+                    """Count fresh checks after the real replay traversal."""
+                    _, counts = self._count_source_validation(
+                        lambda: batch(keys)
+                    )
+                    measured.append((args[0].stage, len(keys), counts))
+
+                kwargs["validate_results"] = validate
+            return _audit_stage_records(*args, **kwargs)
+
+        cases = (("two-unit report", (0, 0), (1, 1)),)
+        for name, expected_detail, expected_prose in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                coordinator, session, report = self._coordinator(
+                    FixtureProvider(), directory
+                )
+                with patch(
+                    "diffstory.narrative_v2._audit_stage_records", new=audit
+                ):
+                    coordinator.generate_validated(report, session=session)
+                self.assertTrue(measured)
+                for stage, _size, counts in measured:
+                    self.assertEqual(
+                        counts,
+                        expected_detail
+                        if stage == "detail"
+                        else expected_prose,
+                    )
+                self.assertGreater(
+                    max(
+                        size
+                        for stage, size, _ in measured
+                        if stage != "detail"
+                    ),
+                    1,
+                )
+                session.close()
+
+    def test_next_prose_item_rejects_changed_or_foreign_source_owner(
+        self,
+    ) -> None:
+        """A previous item's source check could be reused after source mutation.
+
+        Input/expected case matrix:
+            nested source-owner metadata changed: planning_sources_changed.
+            equal copied source adapter: unregistered_planning_sources.
+
+        Preconditions:
+            An item was built successfully from one completed local generation.
+        Postconditions:
+            The next item performs fresh checks and rejects changed authority.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, session, report = self._coordinator(
+                FixtureProvider(), directory
+            )
+            generation = coordinator.generate_validated(
+                report, session=session
+            )
+            proof = session._registered_payload(
+                generation, ValidatedGeneration, "generation"
+            )
+            inputs = coordinator.inputs
+            reference = proof.records.planning[0]
+
+            def build_item() -> object:
+                """Build one item from the same exact consumed arena row."""
+                return inputs.prose_item(
+                    "section",
+                    inputs.plan.id,
+                    (),
+                    {},
+                    (reference.item_key,),
+                    {reference.item_key: reference},
+                    inputs.plan.production.card_budget,
+                )
+
+            sources = inputs.sources
+            owner = next(iter(sources._source_state.record_owners.values()))
+            cases = (
+                (
+                    "nested metadata",
+                    owner,
+                    "kind",
+                    "damaged",
+                    "planning_sources_changed",
+                ),
+                (
+                    "foreign owner",
+                    inputs,
+                    "sources",
+                    IndexedPlanningSources(sources._source_state),
+                    "unregistered_planning_sources",
+                ),
+            )
+            inputs.begin_indexed_items()
+            try:
+                build_item()
+                for name, target, attribute, changed, reason in cases:
+                    original = getattr(target, attribute)
+                    with self.subTest(case=name):
+                        object.__setattr__(target, attribute, changed)
+                        try:
+                            with self.assertRaisesRegex(ValueError, reason):
+                                build_item()
+                        finally:
+                            object.__setattr__(target, attribute, original)
+                        build_item()
+            finally:
+                inputs.end_indexed_items()
+                session.close()
+
+    def test_final_result_loop_rechecks_sources_after_replay(self) -> None:
+        """Completion could trust its entry check after a replay callback changed sources.
+
+        Input/expected case matrix:
+            source metadata changed after replay: planning_sources_changed.
+
+        Preconditions:
+            A planning stage has completed provider work and replay auditing.
+        Postconditions:
+            The final owned-result loop rejects the changed source metadata.
+        """
+        cases = (
+            ("metadata changed after replay", "planning_sources_changed"),
+        )
+        for name, reason in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                coordinator, session, report = self._coordinator(
+                    FixtureProvider(), directory
+                )
+
+                def audit(
+                    *args: object,
+                    _coordinator: BatchedNarrator = coordinator,
+                    **kwargs: object,
+                ) -> object:
+                    """Inject mutation immediately before the final callback."""
+                    batch = kwargs.get("validate_results")
+                    if args[0].stage == "planning" and batch is not None:
+
+                        def changed(keys: tuple[str, ...]) -> None:
+                            """Mutate nested metadata after real replay returns."""
+                            owner = next(
+                                iter(
+                                    _coordinator.inputs.sources._source_state.record_owners.values()
+                                )
+                            )
+                            original = owner.kind
+                            object.__setattr__(owner, "kind", "damaged")
+                            try:
+                                batch(keys)
+                            finally:
+                                object.__setattr__(owner, "kind", original)
+
+                        kwargs["validate_results"] = changed
+                    return _audit_stage_records(*args, **kwargs)
+
+                with (
+                    patch(
+                        "diffstory.narrative_v2._audit_stage_records",
+                        new=audit,
+                    ),
+                    self.assertRaisesRegex(ValueError, reason),
+                ):
+                    coordinator.generate_validated(report, session=session)
+                session.close()
 
     def test_fresh_finish_reuses_completed_owned_rows(self) -> None:
         """Offline reconstruction or whole-output expansion could replace stage evidence."""

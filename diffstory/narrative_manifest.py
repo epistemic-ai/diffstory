@@ -503,7 +503,7 @@ class GenerationManifest(Contract):
         )
 
 
-def validate_prose_support(  # noqa: C901 # Keep the existing current prose predicates in one shared validation path.
+def validate_prose_support(
     result: NarrativeResult | IndexedProseResult,
     context: ProseContext,
     wire: WireAdapter,
@@ -514,6 +514,29 @@ def validate_prose_support(  # noqa: C901 # Keep the existing current prose pred
     against the current ledger. A result cannot grant itself extra support.
     These checks establish references and coverage, not semantic truth.
     """
+    _validate_prose_support_checked(result, context, wire)
+
+
+def _validate_prose_support_checked(  # noqa: C901 # Preserve all shared prose predicates.
+    result: NarrativeResult | IndexedProseResult,
+    context: ProseContext,
+    wire: WireAdapter,
+    *,
+    checked_sources: IndexedPlanningSources | None = None,
+) -> None:
+    """Validate owned prose within one synchronous current-source operation.
+
+    Preconditions:
+        A supplied ``checked_sources`` was just validated by the enclosing
+        operation. No external callback occurs before this traversal returns.
+    Postconditions:
+        The original binding, coverage, support, wire-size, and exact source
+        owner predicates hold. Error reasons and wire bytes are unchanged.
+    Essential behavior:
+        The default public path remains fresh. The checked path keeps per-row
+        selector checks and stores no reusable current-source authority.
+    """
+    from .narrative_hierarchy import _validate_consumed_support_checked
     from .narrative_hierarchy import validate_consumed_support
     from .narrative_runtime import ArtifactRuntimeError
 
@@ -524,15 +547,34 @@ def validate_prose_support(  # noqa: C901 # Keep the existing current prose pred
     from .narrative_hierarchy import IndexedProseResult
 
     indexed = type(result) is IndexedProseResult
-    binding = result.binding
+    reference = (
+        result._check_current_for_sources(checked_sources)  # noqa: SLF001 # The enclosing operation checked the exact source owner.
+        if indexed and checked_sources is not None
+        else None
+    )
+    binding = (
+        result._binding_bound(reference)  # noqa: SLF001 # Keep the just-checked owned row.
+        if reference is not None
+        else result.binding
+    )
     require(binding == context.binding, "dependencies_changed")
-    item_key = result.item_key
+    item_key = reference.item_key if reference is not None else result.item_key
     require(item_key == context.binding.key, "dependencies_changed")
+    require(checked_sources is None or context.sources is checked_sources)
     if context.sources is not None:
         try:
-            validate_consumed_support(
-                result, context.support, context.sources, context.consumed
-            )
+            if checked_sources is None:
+                validate_consumed_support(
+                    result, context.support, context.sources, context.consumed
+                )
+            else:
+                _validate_consumed_support_checked(
+                    result,
+                    context.support,
+                    context.sources,
+                    context.consumed,
+                    checked_sources=checked_sources,
+                )
         except ValueError:
             msg = "citation"
             raise ArtifactRuntimeError(msg) from None
@@ -540,7 +582,11 @@ def validate_prose_support(  # noqa: C901 # Keep the existing current prose pred
     allowed_citations = frozenset(context.citations)
     indexed_entries = ()
     if indexed:
-        indexed_entries = result.statement_entries()
+        indexed_entries = (
+            result._statement_entries_bound(reference)  # noqa: SLF001 # Resolve statements only from the checked owned row.
+            if reference is not None
+            else result.statement_entries()
+        )
         values = [statement for _path, statement in indexed_entries]
     else:
         values = [term.definition for term in result.terminology]
@@ -570,7 +616,11 @@ def validate_prose_support(  # noqa: C901 # Keep the existing current prose pred
             )
         )
     if context.final:
-        if indexed and result.kind == "section":
+        if (
+            indexed
+            and (reference.kind if reference is not None else result.kind)
+            == "section"
+        ):
             require(
                 not any(
                     path.field == "transition" for path, _ in indexed_entries
@@ -580,7 +630,13 @@ def validate_prose_support(  # noqa: C901 # Keep the existing current prose pred
         elif isinstance(result, SectionResult):
             require(result.transition == (), "coverage")
     require(
-        len(canonical_bytes(wire.prose_input(result)))
+        len(
+            canonical_bytes(
+                wire._prose_input_indexed_checked(result, checked_sources)  # noqa: SLF001 # Reuse only this operation's exact source check.
+                if reference is not None
+                else wire.prose_input(result)
+            )
+        )
         <= context.max_wire_bytes,
         "schema",
     )

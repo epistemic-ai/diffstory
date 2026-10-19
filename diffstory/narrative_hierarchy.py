@@ -787,6 +787,30 @@ class IndexedProseResult:
         """Return a fresh immutable result address, never the retained tuple."""
         return self._check_current()
 
+    def _check_current_for_sources(
+        self, checked_sources: IndexedPlanningSources
+    ) -> ResultRef:
+        """Resolve one row within an enclosing current-source operation.
+
+        Preconditions:
+            The caller just checked ``checked_sources`` and invokes no external
+            callback before this synchronous projection finishes.
+        Postconditions:
+            The exact source owner, selector, slot, reference, and arena row
+            remain bound. No current-source authority is retained.
+        Essential behavior:
+            Reuses only the enclosing operation's full source validation.
+        """
+        _require(
+            id(self._selector) == self._selector_id,
+            "indexed_prose_result_changed",
+        )
+        _require(
+            self._selector._sources is checked_sources,  # noqa: SLF001 # Pin the exact owner checked by the enclosing call.
+            "planning_sources_changed",
+        )
+        return self._check_current(check_sources=False)
+
     @property
     def item_key(self) -> str:
         """Return the semantic key bound to this selected result."""
@@ -811,6 +835,18 @@ class IndexedProseResult:
             Supports exact current-context checks over normalized arena data.
         """
         reference = self._check_current()
+        return self._binding_bound(reference)
+
+    def _binding_bound(self, reference: ResultRef) -> ProseBinding:
+        """Return a detached binding after the caller checked this result row.
+
+        Preconditions:
+            ``reference`` is this result's just-checked exact arena address.
+        Postconditions:
+            Returns the same complete typed binding as the public accessor.
+        Essential behavior:
+            Resolves the owned binding without repeating source validation.
+        """
         value = self._selector._reader.result_prose_binding(  # noqa: SLF001 # Select only this owned result's binding.
             reference
         )
@@ -963,6 +999,49 @@ class IndexedProseResult:
             Performs one source liveness check and does not retain a result tree.
         """
         reference = self._check_current()
+        return self._prose_projection_bound(reference, index=index)
+
+    def _prose_projection_checked(
+        self,
+        checked_sources: IndexedPlanningSources,
+        *,
+        index: LedgerIndex | None = None,
+    ) -> tuple[
+        str,
+        str,
+        tuple[tuple[StatementPath, SupportedStatement], ...],
+        tuple[str, ...],
+    ]:
+        """Project prose within one exact current-source operation.
+
+        Preconditions:
+            The caller just checked ``checked_sources`` without an intervening
+            callback. ``index`` is the source owner's exact index if supplied.
+        Postconditions:
+            Returns detached fields with all row and index bindings checked.
+        Essential behavior:
+            Retains no authority beyond this synchronous call.
+        """
+        reference = self._check_current_for_sources(checked_sources)
+        return self._prose_projection_bound(reference, index=index)
+
+    def _prose_projection_bound(
+        self, reference: ResultRef, *, index: LedgerIndex | None
+    ) -> tuple[
+        str,
+        str,
+        tuple[tuple[StatementPath, SupportedStatement], ...],
+        tuple[str, ...],
+    ]:
+        """Select detached fields after the enclosing call checked this row.
+
+        Preconditions:
+            ``reference`` is this result's just-checked arena address.
+        Postconditions:
+            Returns ordered statements and terms bound to the exact index.
+        Essential behavior:
+            Shares identical projection predicates across both entry paths.
+        """
         if index is not None:
             _require(
                 type(index) is LedgerIndex
@@ -3146,6 +3225,29 @@ def inherited_support(
         Returns direct implementation statement references and matching author
         attribution, with duplicates removed in first-seen order.
     """
+    return _inherited_support_checked(
+        consumed, author_context_digest=author_context_digest
+    )
+
+
+def _inherited_support_checked(
+    consumed: tuple[ProseResult | IndexedProseResult, ...],
+    *,
+    author_context_digest: str | None = None,
+    checked_sources: IndexedPlanningSources | None = None,
+) -> SupportSet:
+    """Forward exact grants within one synchronous source operation.
+
+    Preconditions:
+        ``checked_sources``, if supplied, was just validated by the caller;
+        no external callback occurs before this traversal returns.
+    Postconditions:
+        Every indexed producer retains the exact checked source owner and its
+        selector, slot, reference, and arena bindings. Output order is unchanged.
+    Essential behavior:
+        The default path performs fresh source validation. Checked authority is
+        never stored in the returned support or a producer.
+    """
     indexed = tuple(
         item for item in consumed if type(item) is IndexedProseResult
     )
@@ -3154,7 +3256,14 @@ def inherited_support(
         selectors = {id(item._selector): item._selector for item in indexed}  # noqa: SLF001 # Require one current source selector.
         _require(len(selectors) == 1, "mixed_consumed_prose")
         selector = next(iter(selectors.values()))
-        selector.check_current()
+        if checked_sources is None:
+            selector.check_current()
+        else:
+            _require(
+                selector._sources is checked_sources,  # noqa: SLF001 # A selector cannot borrow another source owner's check.
+                "planning_sources_changed",
+            )
+            selector._check_bound()  # noqa: SLF001 # Keep every captured selector binding.
     else:
         selector = None
     entries_by_result = []
@@ -3275,6 +3384,40 @@ def validate_consumed_support(
     """
     if type(sources) is IndexedPlanningSources:
         sources.check_current()
+    _validate_consumed_support_checked(
+        result,
+        allowed,
+        sources,
+        consumed,
+        checked_sources=(
+            sources if type(sources) is IndexedPlanningSources else None
+        ),
+    )
+
+
+def _validate_consumed_support_checked(
+    result: ProseResult | IndexedProseResult,
+    allowed: SupportSet,
+    sources: PlanningSource,
+    consumed: Mapping[str, ProseResult | IndexedProseResult]
+    | IndexedConsumedProse,
+    *,
+    checked_sources: IndexedPlanningSources | None,
+) -> None:
+    """Check immediate support within one exact current-source operation.
+
+    Preconditions:
+        The enclosing call just validated ``checked_sources`` when ``sources``
+        is indexed, and invokes no external callback during this traversal.
+    Postconditions:
+        All original support, source-owner, selector, and endpoint predicates
+        hold with unchanged rejection reasons.
+    Essential behavior:
+        Reuses source validation only for the exact supplied owner and retains
+        no authority after returning or raising.
+    """
+    if type(sources) is IndexedPlanningSources:
+        _require(sources is checked_sources, "planning_sources_changed")
     allowed = SupportSet.model_validate(allowed)
     state = _state(sources)
     result, indexed_root, root_reference = _current_consumed_support_root(

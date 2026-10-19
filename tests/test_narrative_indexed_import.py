@@ -1147,8 +1147,10 @@ class IndexedStorageImportTests(unittest.TestCase):
           repeated existing stage-audit calls, and one validation count per
           unique stored row family.
         * One current compiler report -> one ledger, one ledger index, and one
-          compiler-fact scan; the exact source owner metadata fingerprint
-          count and full report digest bytes are also measured.
+          compiler-fact scan; metadata fingerprint scans stay within the
+          pre-reuse budget of 69 for one exact source owner. Operation-local
+          reuse may reduce scans while fresh-boundary mutation guards remain
+          enforced. Full report digest bytes are also measured.
         * Expansion, legacy full validation, and full manifest construction
           during the import -> immediate test failure.
         """
@@ -1254,7 +1256,7 @@ class IndexedStorageImportTests(unittest.TestCase):
             self.assertEqual(ledgers.call_count, 1)
             self.assertEqual(indexes.call_count, 1)
             self.assertEqual(fact_scans.call_count, 1)
-            self.assertEqual(len(metadata_scans), 69)
+            self.assertLessEqual(len(metadata_scans), 69)
             self.assertEqual(len({id(state) for state in metadata_scans}), 1)
             raw_hash_passes = sum(
                 value is session._captured_input.report_view  # noqa: SLF001 # Count actual full-root hasher inputs.
