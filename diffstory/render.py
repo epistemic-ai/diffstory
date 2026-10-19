@@ -7,7 +7,6 @@ import re
 from pathlib import Path
 
 from .analysis import SCHEMA
-from .analysis import validate_generated_report
 from .analysis import validate_passages
 from .models import validate_document
 
@@ -32,14 +31,7 @@ NUMERIC_REPORT_FIELDS = frozenset(
 
 
 def _validate_nested_value(value: object) -> None:
-    """Reject malformed report identifiers, numbers, and diff row tags.
-
-    Args:
-        value: Nested report value to validate recursively.
-
-    Raises:
-        ValueError: If a recognized identifier, number, or diff tag is invalid.
-    """
+    """Reject malformed report identifiers, numbers, and diff row tags."""
     if isinstance(value, dict):
         for key, item in value.items():
             is_identifier = (
@@ -72,51 +64,25 @@ def _validate_nested_value(value: object) -> None:
 
 
 def _validate_report_collections(report: dict) -> None:
-    """Validate object collections and string-list report fields.
-
-    Args:
-        report: Parsed Diffstory report mapping.
-
-    Raises:
-        ValueError: If an object collection contains a non-object, or warnings
-            and notes are not lists of strings.
-    """
-    for name in (
-        "groups",
-        "changes",
-        "tests",
-        "edges",
-        "raw_files",
-    ):
+    """Validate object collections and string-list report fields."""
+    for name in ("groups", "changes", "tests", "edges", "raw_files"):
         records = report.get(name)
         if not isinstance(records, list) or any(
             not isinstance(record, dict) for record in records
         ):
             msg = f"Report {name} must be a list of objects"
             raise ValueError(msg)
-    warnings = report.get("warnings")
-    if not isinstance(warnings, list) or any(
-        not isinstance(value, str) for value in warnings
-    ):
-        msg = "Report warnings must be a list of strings"
-        raise ValueError(msg)
-    notes = report.get("notes")
-    if not isinstance(notes, list) or any(
-        not isinstance(value, str) for value in notes
-    ):
-        msg = "Report notes must be a list of strings"
-        raise ValueError(msg)
+    for name in ("warnings", "notes"):
+        values = report.get(name)
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) for value in values
+        ):
+            msg = f"Report {name} must be a list of strings"
+            raise ValueError(msg)
 
 
 def _validate_report_stats(stats: object) -> None:
-    """Require nonnegative integer report statistics and classification counts.
-
-    Args:
-        stats: Report statistics field.
-
-    Raises:
-        ValueError: If statistics are absent, malformed, or negative.
-    """
+    """Require nonnegative integer report statistics and classification counts."""
     if not isinstance(stats, dict):
         msg = "Report stats must be an object"
         raise ValueError(msg)
@@ -138,17 +104,7 @@ def _validate_group_links(
     changes: set[str],
     changes_by_id: dict[str, dict],
 ) -> None:
-    """Validate group citations and prerequisite/next-group references.
-
-    Args:
-        report: Parsed report with validated collection records.
-        groups: Valid group IDs.
-        changes: Valid change IDs.
-        changes_by_id: Change lookup used by passage validation.
-
-    Raises:
-        ValueError: If a group references an unknown change or group.
-    """
+    """Validate group citations and prerequisite/next-group references."""
     for group in report["groups"]:
         narrative = group.get("narrative", {})
         if not isinstance(narrative, dict):
@@ -169,40 +125,64 @@ def _validate_group_links(
 
 
 def validate_report(report: dict) -> None:
-    """
-    Validate report structure and values that affect safe rendering.
-
-    Textual prose is rendered as escaped data by the browser UI. This check
-    validates report identifiers, numeric fields, narrative evidence, and
-    generated-report provenance before embedding the report.
+    """Validate one current compiler or flat walkthrough report.
 
     Args:
-        report: Parsed Diffstory report mapping.
+        report: Untrusted decoded report mapping to validate before rendering,
+            exporting evidence, or applying an annotation boundary.
+
+    Returns:
+        ``None`` when the report follows a supported current schema and all
+        links checked by that schema resolve.
 
     Raises:
-        ValueError: If the schema or any renderer-facing field is invalid.
-        TypeError: If a value has an unsupported container or scalar type.
+        ValueError: If the schema, report structure, IDs, links, annotations,
+            or retired storage markers are unsupported or inconsistent.
 
+    Preconditions:
+        The report is parsed JSON-like data. This function does not accept a
+        persisted storage envelope.
+    Postconditions:
+        Compiler v1 reports have valid narrative and source links; flat v2
+        reports pass their complete walkthrough, packet, and coverage checks.
+        Structural acceptance does not establish that prose is true.
     """
+    if type(report) is not dict:
+        msg = "Expected a diffstory report"
+        raise ValueError(msg)
+    if (
+        "storage_version" in report
+        or "artifact_kind" in report
+        or ("root" in report and "tables" in report)
+    ):
+        msg = "Unsupported stored report format"
+        raise ValueError(msg)
+    if report.get("schema") == "diffstory.report.v2":
+        from .walkthrough import validate_walkthrough
+
+        validate_walkthrough(report)
+        return
+    if "generation" in report or "narrative_v2" in report:
+        msg = "Unsupported generated report format"
+        raise ValueError(msg)
     if report.get("schema") != SCHEMA:
         msg = "Expected a diffstory report"
         raise ValueError(msg)
+
     _validate_report_collections(report)
     _validate_nested_value(report)
     _validate_report_stats(report.get("stats"))
-    groups = {g["id"] for g in report["groups"]}
-    changes = {c["id"] for c in report["changes"]}
+    groups = {group["id"] for group in report["groups"]}
+    changes = {change["id"] for change in report["changes"]}
     if len(groups) != len(report["groups"]) or len(changes) != len(
-        report["changes"],
+        report["changes"]
     ):
         msg = "Duplicate report identifiers"
         raise ValueError(msg)
-    changes_by_id = {c["id"]: c for c in report["changes"]}
+    changes_by_id = {change["id"]: change for change in report["changes"]}
     if "document" in report:
         validate_document(report["document"])
     _validate_group_links(report, groups, changes, changes_by_id)
-    if "generation" in report:
-        validate_generated_report(report)
 
 
 def render(report: dict) -> str:
@@ -220,8 +200,41 @@ def render(report: dict) -> str:
         OSError: If a packaged renderer asset cannot be read.
         TypeError: If the report cannot be serialized as JSON.
 
+    Preconditions:
+        ``report`` is parsed report data and may be untrusted. The public
+        renderer validates it on every call.
+    Postconditions:
+        The returned page embeds the validated report with JSON-context
+        escaping and packaged local assets.
+
     """
     validate_report(report)
+    return _render_prevalidated(report)
+
+
+def _render_prevalidated(report: dict) -> str:
+    """Render a report that a caller has just validated at its input boundary.
+
+    Args:
+        report: Report mapping that passed ``validate_report`` or was returned
+            by the just-completed ``WalkthroughNarrator.generate_prepared``
+            call and has not been changed since.
+
+    Returns:
+        Self-contained HTML containing the report and packaged reader assets.
+
+    Raises:
+        OSError: If a packaged renderer asset cannot be read.
+        TypeError: If the report cannot be serialized as JSON.
+
+    Preconditions:
+        The exact mapping passed here was validated in the current synchronous
+        call path. Do not call this with a loaded or changed report before its
+        independent public validation boundary.
+    Postconditions:
+        Report content is escaped for the embedded JSON context. No validation
+        result or trust marker is stored on the report.
+    """
     assets = Path(__file__).with_name("assets")
     payload = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
     # application/json script elements can be closed by an unescaped </script>.

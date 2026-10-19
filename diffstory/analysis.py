@@ -16,7 +16,11 @@ from collections import Counter
 from collections import defaultdict
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from heapq import heapify
+from heapq import heappop
+from heapq import heappush
 from itertools import islice
+from itertools import zip_longest
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 from urllib.parse import quote
@@ -26,36 +30,32 @@ from .evidence import DefinitionEvidence
 from .evidence import FileCoverage
 from .evidence import build_file_coverage
 from .models import MAX_NARRATIVE_TEXT_CHARS
-from .models import GenerationUsage
+from .models import FilePatch
 from .models import ParseStatus
 from .models import SnapshotInput
 from .models import SourceFragment
 from .models import StrictModel
 from .models import validate_document
+from .patches import parse_file_patch
+from .source_lines import split_source_lines
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
     from collections.abc import Set as AbstractSet
 
 SCHEMA = "diffstory.report.v1"
+SOURCE_EVIDENCE_SCHEMA = "diffstory.source-evidence.v1"
 MAX_SOURCE_BYTES = 8_000_000
 MIN_SYMBOL_SIMILARITY = 0.40
 RELATED_SYMBOL_THRESHOLD = 4
 MAX_QUESTION_CHARS = 2_000
 MAX_TITLE_CHARS = 200
-MAX_PROVIDER_NAME_CHARS = 80
-MAX_MODEL_NAME_CHARS = 160
 MAX_PASSAGE_LABEL_CHARS = 160
-GENERATION_CHUNK_FIELDS = frozenset(
-    {"id", "group_id", "change_ids", "source_slices", "status"},
-)
-GENERATION_SOURCE_SLICE_FIELDS = frozenset(
-    {"change_id", "side", "start", "end"},
-)
 DECLARATION_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 SYMBOL_TYPES = (*DECLARATION_TYPES, ast.Assign, ast.AnnAssign)
 LABELS = {
@@ -495,7 +495,7 @@ def extract(
         note = f"AST unavailable: {type(error).__name__}: {str(error)[:180]}"
         return ExtractionResult(status="failed", note=note)
 
-    source_lines = source_text.splitlines()
+    source_lines = split_source_lines(source_text)
     symbols = tuple(
         _symbol_record(fragment, meta, node, index, source_lines)
         for index, node in enumerate(tree.body)
@@ -714,15 +714,23 @@ def classify(a: dict, b: dict) -> str:
     return "moved_modified" if moved else "modified"
 
 
-def make_hunks(
+def make_hunks(  # noqa: PLR0913  # Text, offsets, and diff display options are independent.
     a: str,
     b: str,
     astart: int = 1,
     bstart: int = 1,
     context: int = 3,
+    *,
+    keep_line_endings: bool = False,
 ) -> Sequence[dict]:
     """
-    Create line-based diff hunks with original line numbers and row tags.
+    Compare two pieces of source and keep their original line numbers.
+
+    This is a generated comparison, not an imported Git or GitHub patch.
+    For example, a function can move from users.py to text.py and gain one
+    call to strip(). Comparing its two versions makes that small edit clear.
+    File-level PR views must keep the original patch instead; see
+    ``docs/ARCHITECTURE.md`` for the full example.
 
     Args:
         a: Base source text.
@@ -730,14 +738,15 @@ def make_hunks(
         astart: Original line number of the first base line.
         bstart: Original line number of the first head line.
         context: Number of equal lines retained around each changed region.
+        keep_line_endings: Compare exact source lines, including their endings.
 
     Returns:
         Hunks containing ``context``, ``delete``, and ``add`` rows with their
         original line numbers.
 
     """
-    old_lines = a.splitlines()
-    new_lines = b.splitlines()
+    old_lines = split_source_lines(a, keepends=keep_line_endings)
+    new_lines = split_source_lines(b, keepends=keep_line_endings)
     matcher = difflib.SequenceMatcher(
         None,
         old_lines,
@@ -807,15 +816,19 @@ def _public(s: dict | None) -> dict | None:
         s: Internal symbol record, or ``None`` for an absent side.
 
     Returns:
-        A shallow copy without fingerprints and fragment linkage, or ``None``.
+        A shallow copy without fingerprints, with a public fragment binding,
+        or ``None``.
 
     """
     if s is None:
         return None
     internal_fields = {"fingerprint", "rename_fingerprint", "fragment_id"}
-    return {
+    public = {
         key: value for key, value in s.items() if key not in internal_fields
     }
+    if "fragment_id" in s:
+        public["fragment_key"] = s["fragment_id"]
+    return public
 
 
 def _theme(change: dict) -> str:
@@ -1067,7 +1080,9 @@ def ordered_components(
     Args:
         nodes: Node identifiers to order.
         prereqs: Mapping from node to prerequisite node identifiers.
-        priority: Sort-key function for stable ordering among available nodes.
+        priority: Sort-key function for ordering among available components
+            (by their minimum node priority) and within each component. Equal
+            priorities use node identity, independent of traversal order.
 
     Returns:
         A prerequisite-respecting node order and the multi-node strongly
@@ -1087,9 +1102,7 @@ def ordered_components(
     )
     order = _topological_component_order(components, dependencies, priority)
     cycles = tuple(
-        tuple(sorted(component))
-        for component in components
-        if len(component) > 1
+        sorted(component for component in components if len(component) > 1)
     )
     return order, cycles
 
@@ -1099,14 +1112,15 @@ def _strongly_connected_components(
     prereqs: Mapping[str, AbstractSet[str]],
 ) -> tuple[tuple[str, ...], ...]:
     """
-    Find deterministic Tarjan components for a prerequisite graph.
+    Find deterministic Tarjan components without recursive graph traversal.
 
     Args:
         nodes: Node identifiers to traverse.
         prereqs: Mapping from each node to its prerequisites.
 
     Returns:
-        Strongly connected components in Tarjan traversal order.
+        Components in deterministic DFS completion order, with sorted members.
+        Reachable prerequisites are included even if not listed in nodes.
     """
     next_index = 0
     indices = {}
@@ -1115,36 +1129,55 @@ def _strongly_connected_components(
     active_nodes = set()
     components = []
 
-    def visit(node: str) -> None:
-        """Visit a node and collect its Tarjan strongly connected set."""
+    def enter(node: str) -> tuple[str, Iterator[str]]:
+        """Record a discovered node and return its suspended traversal frame."""
         nonlocal next_index
         indices[node] = next_index
         lowlinks[node] = next_index
         next_index += 1
         stack.append(node)
         active_nodes.add(node)
+        return node, iter(sorted(prereqs.get(node, ())))
 
-        for prerequisite in sorted(prereqs.get(node, set())):
+    for root in sorted(set(nodes)):
+        if root in indices:
+            continue
+        frames = [enter(root)]
+        while frames:
+            node, prerequisites = frames[-1]
+            prerequisite = next(prerequisites, None)
+            if prerequisite is None:
+                frames.pop()
+                if lowlinks[node] == indices[node]:
+                    component = _pop_component(node, stack)
+                    active_nodes.difference_update(component)
+                    components.append(component)
+                if frames:
+                    parent = frames[-1][0]
+                    lowlinks[parent] = min(lowlinks[parent], lowlinks[node])
+                continue
             if prerequisite not in indices:
-                visit(prerequisite)
-                lowlinks[node] = min(lowlinks[node], lowlinks[prerequisite])
+                frames.append(enter(prerequisite))
             elif prerequisite in active_nodes:
                 lowlinks[node] = min(lowlinks[node], indices[prerequisite])
-
-        if lowlinks[node] == indices[node]:
-            component = []
-            while True:
-                member = stack.pop()
-                active_nodes.remove(member)
-                component.append(member)
-                if member == node:
-                    break
-            components.append(tuple(component))
-
-    for node in nodes:
-        if node not in indices:
-            visit(node)
     return tuple(components)
+
+
+def _pop_component(root: str, stack: list[str]) -> tuple[str, ...]:
+    """
+    Remove one completed SCC from the active Tarjan stack.
+
+    Args:
+        root: Component root, which must be on the active stack.
+        stack: Active nodes, mutated by removing members through the root.
+
+    Returns:
+        Component members sorted by stable node identity.
+    """
+    component = [stack.pop()]
+    while component[-1] != root:
+        component.append(stack.pop())
+    return tuple(sorted(component))
 
 
 def _component_prerequisites(
@@ -1189,20 +1222,44 @@ def _topological_component_order(
 
     Returns:
         Nodes in prerequisite-respecting order.
+
+    Raises:
+        ValueError: If component dependencies contain a cycle.
     """
-    remaining = set(range(len(components)))
-    completed = set()
+    # Preserve the caller's minimum-priority choice. Node identity only resolves
+    # ties that previously depended on Tarjan discovery or set iteration order.
+    node_keys = {
+        node: (priority(node), node)
+        for component in components
+        for node in component
+    }
+    component_keys = [
+        min(node_keys[node] for node in component) for component in components
+    ]
+    remaining = {
+        index: len(dependencies[index]) for index in range(len(components))
+    }
+    dependents = defaultdict(set)
+    for index, prerequisites in dependencies.items():
+        for prerequisite in prerequisites:
+            dependents[prerequisite].add(index)
+    ready = [
+        (component_keys[index], index)
+        for index, count in remaining.items()
+        if not count
+    ]
+    heapify(ready)
     order = []
-    while remaining:
-        chosen = min(
-            (index for index in remaining if dependencies[index] <= completed),
-            key=lambda index: min(
-                priority(node) for node in components[index]
-            ),
-        )
-        order.extend(sorted(components[chosen], key=priority))
-        completed.add(chosen)
-        remaining.remove(chosen)
+    while ready:
+        _, chosen = heappop(ready)
+        order.extend(sorted(components[chosen], key=node_keys.__getitem__))
+        for dependent in dependents[chosen]:
+            remaining[dependent] -= 1
+            if not remaining[dependent]:
+                heappush(ready, (component_keys[dependent], dependent))
+    if len(order) != len(node_keys):
+        msg = "Component prerequisites must be acyclic"
+        raise ValueError(msg)
     return tuple(order)
 
 
@@ -1248,20 +1305,26 @@ def _narrative(group: dict, changes: Sequence[dict]) -> dict:
         )
 
     questions = [
-        "Are observable outputs, exceptions and calling conventions preserved "
-        "or intentionally changed?",
+        (
+            "Are observable outputs, exceptions and calling conventions preserved "
+            "or intentionally changed?"
+        ),
     ]
     invariants = [
         "Check the expected inputs, outputs and failure cases against both revisions.",
     ]
     if kinds <= {"moved", "source_only"}:
         invariants = [
-            "The compared ASTs are identical, including literals, signatures "
-            "and decorators.",
+            (
+                "The compared ASTs are identical, including literals, signatures "
+                "and decorators."
+            ),
         ]
         questions = [
-            "Do imported globals, relative imports, initialization order or "
-            "serialization depend on the previous module location?",
+            (
+                "Do imported globals, relative imports, initialization order or "
+                "serialization depend on the previous module location?"
+            ),
         ]
     if kinds & {"moved_renamed", "renamed"}:
         invariants.append(
@@ -1275,21 +1338,29 @@ def _narrative(group: dict, changes: Sequence[dict]) -> dict:
         )
     if theme == "wiring":
         invariants = [
-            "Each imported symbol must resolve at the new module path in the "
-            "deployed build.",
+            (
+                "Each imported symbol must resolve at the new module path in the "
+                "deployed build."
+            ),
         ]
         questions = [
-            "Are old import paths intentionally retired or still needed by "
-            "callers outside these changed files?",
+            (
+                "Are old import paths intentionally retired or still needed by "
+                "callers outside these changed files?"
+            ),
         ]
     if theme == "tests":
         invariants = [
-            "Assertions should express the intended contract, not merely repeat "
-            "the implementation.",
+            (
+                "Assertions should express the intended contract, not merely repeat "
+                "the implementation."
+            ),
         ]
         questions = [
-            "Do these assertions exercise the changed behavior, including "
-            "negative and boundary cases?",
+            (
+                "Do these assertions exercise the changed behavior, including "
+                "negative and boundary cases?"
+            ),
         ]
 
     before_paths = {
@@ -1340,6 +1411,7 @@ class PreparedSnapshot(StrictModel):
         symbols_by_side: Parsed declarations and assignments by revision.
         imports_by_side: Import evidence by revision and source path.
         coverage_index: File coverage indexed by revision and path.
+        patches: Original file patches indexed by the later file path.
         notes: Informational text-only analysis notes.
         warnings: Producer warnings and Python parse failures.
     """
@@ -1350,6 +1422,7 @@ class PreparedSnapshot(StrictModel):
     symbols_by_side: dict[str, list[dict]]
     imports_by_side: dict[str, dict[str, list[dict]]]
     coverage_index: dict[tuple[str, str], FileCoverage]
+    patches: dict[str, FilePatch]
     notes: list[str]
     warnings: list[str]
 
@@ -1369,7 +1442,7 @@ def _validate_fragment_range(
     """
     if not fragment.text:
         return
-    end = fragment.start_line + len(fragment.text.splitlines()) - 1
+    end = fragment.start_line + len(split_source_lines(fragment.text)) - 1
     key = (fragment.side, fragment.path)
     overlaps = any(
         max(fragment.start_line, start) <= min(end, stop)
@@ -1424,6 +1497,11 @@ def _prepare_snapshot(snapshot: dict) -> PreparedSnapshot:
     coverage = build_file_coverage(
         indexed, parse_statuses, evidence=source.file_evidence
     )
+    if {item.path for item in source.patches} != {
+        record.head.path for record in source.file_evidence
+    }:
+        msg = "Each file evidence record requires one matching original patch record"
+        raise ValueError(msg)
     return PreparedSnapshot(
         meta=source.meta,
         fragments=fragments,
@@ -1431,12 +1509,73 @@ def _prepare_snapshot(snapshot: dict) -> PreparedSnapshot:
         symbols_by_side=symbols,
         imports_by_side=imports,
         coverage_index=coverage,
+        patches={item.path: item for item in source.patches},
         notes=notes,
         warnings=warnings,
     )
 
 
-def _append_change(  # noqa: PLR0913  # Each mutable index and evidence input is explicit.
+def _source_evidence(source: PreparedSnapshot) -> dict:
+    """Project validated file states and exact original UTF-8 source buffers.
+
+    Fragment keys bind records within this report; they are not content keys.
+    Line offsets refer to the original file. Any later byte offsets must be
+    relative to the explicit fragment buffer, including for partial excerpts.
+    Omitted producer scope is null; only file coverage establishes completeness.
+
+    Args:
+        source: Prepared source with validated coverage and region pairing.
+
+    Returns:
+        Versioned public evidence without producer extras or AST bookkeeping.
+    """
+    files = []
+    statuses = {}
+    for (side, _path), base in source.coverage_index.items():
+        if side != "base":
+            continue
+        head = source.coverage_index[("head", base.counterpart_path)]
+        record = {}
+        for side_name, coverage in (("base", base), ("head", head)):
+            record[side_name] = {
+                **coverage.source.model_dump(
+                    include={"path", "state", "coverage", "reason"},
+                ),
+                "fragment_keys": list(coverage.fragment_ids),
+                "parse_statuses": list(coverage.parse_statuses),
+                "full_source": coverage.full_source,
+                "full_and_parsed": coverage.full_and_parsed,
+            }
+            statuses.update(
+                zip(
+                    coverage.fragment_ids, coverage.parse_statuses, strict=True
+                ),
+            )
+        files.append(record)
+    fragments = [
+        {
+            "key": key,
+            "side": fragment["side"],
+            "path": fragment["path"],
+            "start_line": fragment.get("start_line", 1),
+            "region": fragment["_raw_region"],
+            "scope": fragment.get("scope"),
+            "text": fragment["text"],
+            "content_digest": hashlib.sha256(
+                fragment["text"].encode("utf-8"),
+            ).hexdigest(),
+            "parse_status": statuses[key],
+        }
+        for key, fragment in source.fragments_by_id.items()
+    ]
+    return {
+        "schema": SOURCE_EVIDENCE_SCHEMA,
+        "file_evidence": files,
+        "fragments": fragments,
+    }
+
+
+def _append_change(  # noqa: PLR0913, PLR0917  # Each mutable index and evidence input is explicit.
     changes: list[dict],
     covered_lines: dict[str, set[int]],
     symbol_to_change: dict[str, str],
@@ -1477,6 +1616,9 @@ def _append_change(  # noqa: PLR0913  # Each mutable index and evidence input is
         "before": _public(before_symbol),
         "after": _public(after_symbol),
         "basis": basis,
+        # A generated comparison of these two source spans. The original
+        # file patch is stored separately in raw_files and must not use this
+        # comparison's line grouping.
         "hunks": make_hunks(
             before_data.get("source", ""),
             after_data.get("source", ""),
@@ -1595,6 +1737,7 @@ def _context_symbol(
     *,
     is_wiring: bool,
     meta: dict,
+    raw_only: bool = False,
 ) -> dict | None:
     """
     Build a symbol record for unclassified changed lines on one side.
@@ -1604,6 +1747,8 @@ def _context_symbol(
         unassigned_rows: Changed rows outside already classified symbols.
         is_wiring: Whether the rows contain import wiring.
         meta: Revision metadata used to construct a source permalink.
+        raw_only: Include blank rows and retain exact line endings in new text
+            records; use a distinct ID from the existing context record.
 
     Returns:
         A context symbol for relevant unclassified lines, or ``None``.
@@ -1615,7 +1760,7 @@ def _context_symbol(
     origin = fragment.get("start_line", 1)
     line_numbers = []
     for row in unassigned_rows:
-        if not row["text"].strip():
+        if not raw_only and not row["text"].strip():
             continue
         line_number = row["old"] if fragment["side"] == "base" else row["new"]
         if line_number is not None:
@@ -1625,10 +1770,15 @@ def _context_symbol(
 
     start = min(line_numbers)
     end = max(line_numbers)
-    fragment_lines = fragment["text"].splitlines()
-    source = "\n".join(fragment_lines[start - origin : end - origin + 1])
+    fragment_lines = split_source_lines(fragment["text"], keepends=raw_only)
+    separator = "" if raw_only else "\n"
+    source = separator.join(fragment_lines[start - origin : end - origin + 1])
     return {
-        "id": stable_id(fragment["id"], "context"),
+        "id": (
+            stable_id(fragment["id"], "raw-text", start, end)
+            if raw_only
+            else stable_id(fragment["id"], "context")
+        ),
         "path": fragment["path"],
         "name": "module imports / context" if is_wiring else "file context",
         "side": fragment["side"],
@@ -1649,50 +1799,60 @@ def _context_symbol(
     }
 
 
-def _raw_file_change(
+def _raw_file_change(  # noqa: PLR0913 # Original patch and source completeness are independent inputs.
     region: str,
     before_fragment: dict | None,
     after_fragment: dict | None,
     meta: dict,
-) -> tuple[str, dict, list[dict]]:
+    patch: FilePatch,
+    *,
+    complete_source: bool = True,
+) -> dict:
     """
-    Build the full-file diff record and source links for one changed region.
+    Keep the original file patch; never generate a replacement file diff.
 
     Args:
         region: Stable source region shared by the before and after fragments.
         before_fragment: Base source fragment, if present.
         after_fragment: Head source fragment, if present.
         meta: Revision metadata used to build source permalinks.
+        patch: Required Git/GitHub record; its text may be unavailable.
+        complete_source: Whether patch rows can be checked against whole files.
 
     Returns:
-        Raw change ID, report record, and its diff hunks.
+        One raw file-change report record with its ID and diff hunks.
     """
     before_text = (before_fragment or {}).get("text", "")
     after_text = (after_fragment or {}).get("text", "")
     current_fragment = after_fragment or before_fragment
-    hunks = make_hunks(
-        before_text,
-        after_text,
-        (before_fragment or {}).get("start_line", 1),
-        (after_fragment or {}).get("start_line", 1),
-    )
+    if patch.patch is None or not complete_source:
+        # Missing source cannot validate patch coordinates. Keep any captured
+        # patch text for inspection, but do not invent replacement diff rows.
+        hunks = []
+        patch_status = "unavailable" if patch.patch is None else "unbound"
+    else:
+        try:
+            hunks = parse_file_patch(patch.patch, before_text, after_text)
+        except ValueError as error:
+            msg = f"Original patch for {patch.path!r} could not be verified: {error}"
+            raise ValueError(msg) from error
+        patch_status = "captured"
     raw_id = stable_id("raw", region)
     before_url = _fragment_url(before_fragment, "base", meta, before_text)
     after_url = _fragment_url(after_fragment, "head", meta, after_text)
-    return (
-        raw_id,
-        {
-            "id": raw_id,
-            "path": current_fragment["path"],
-            "old_path": (before_fragment or {}).get("path"),
-            "region": region,
-            "scope": current_fragment.get("scope", "full"),
-            "hunks": hunks,
-            "before_url": before_url,
-            "after_url": after_url,
-        },
-        hunks,
-    )
+    return {
+        "id": raw_id,
+        "path": current_fragment["path"],
+        "old_path": (before_fragment or {}).get("path"),
+        "region": region,
+        "scope": current_fragment.get("scope", "full"),
+        "hunks": hunks,
+        "diff_origin": patch.origin,
+        "patch_status": patch_status,
+        "original_patch": patch.patch,
+        "before_url": before_url,
+        "after_url": after_url,
+    }
 
 
 def _fragment_url(
@@ -1717,7 +1877,7 @@ def _fragment_url(
     if fragment is None:
         return None
     start = fragment.get("start_line", 1)
-    end = start + max(0, len(source_text.splitlines()) - 1)
+    end = start + max(0, len(split_source_lines(source_text)) - 1)
     return source_url(meta, fragment["path"], side, start, end)
 
 
@@ -1753,22 +1913,127 @@ def _unassigned_changed_rows(
     return rows
 
 
+def _raw_text_basis(
+    sides: Mapping[str, dict], source: PreparedSnapshot
+) -> str:
+    """Describe raw text evidence without treating missing source as absence.
+
+    Args:
+        sides: Supplied fragments for one validated raw region.
+        source: Prepared file states used to distinguish absence from no source.
+
+    Returns:
+        A text-only basis with an explicit limitation for an unpaired region.
+    """
+    basis = (
+        "Raw source lines differ outside existing change spans. This comparison "
+        "includes blank lines, line endings, and terminal newline bytes. "
+        "No behavior change is inferred from this text evidence."
+    )
+    if "base" in sides and "head" in sides:
+        return basis
+    side, fragment = next(iter(sides.items()))
+    opposite = "head" if side == "base" else "base"
+    own = source.coverage_index[(side, fragment["path"])]
+    counterpart = source.coverage_index[(opposite, own.counterpart_path)]
+    if counterpart.absent:
+        return basis + f" The {opposite} file is confirmed absent."
+    return (
+        basis + f" No {opposite} fragment was supplied for this region; "
+        "this comparison does not establish file addition or removal."
+    )
+
+
+def _raw_row_groups(rows: Sequence[dict]) -> list[list[dict]]:
+    """Pair contiguous unowned runs without spanning classified source lines.
+
+    Args:
+        rows: Exact changed rows after existing ownership has been removed.
+
+    Returns:
+        Before/after runs paired in source order within one validated region.
+        A run with no counterpart stays one-sided; pairing asserts no AST match.
+    """
+    runs = {"old": [], "new": []}
+    for row in rows:
+        side = "old" if row["tag"] == "delete" else "new"
+        side_runs = runs[side]
+        if not side_runs or row[side] != side_runs[-1][-1][side] + 1:
+            side_runs.append([])
+        side_runs[-1].append(row)
+    return [
+        [*before, *after]
+        for before, after in zip_longest(
+            runs["old"], runs["new"], fillvalue=()
+        )
+    ]
+
+
+def _append_context_change(  # noqa: PLR0913  # Explicit compiler state and region ownership.
+    source: PreparedSnapshot,
+    index: ChangeIndex,
+    sides: Mapping[str, dict],
+    raw_id: str,
+    rows: Sequence[dict],
+    *,
+    raw_only: bool,
+) -> None:
+    """Assign one context span or raw line run to a compiler-owned change.
+
+    Args:
+        source: Validated source and file states.
+        index: Mutable changes and coverage indexes.
+        sides: Supplied fragments in the current raw region.
+        raw_id: ID of the raw diff that owns these rows.
+        rows: Unassigned changed rows for this change record.
+        raw_only: Preserve exact raw lines without assigning AST meaning.
+    """
+    is_wiring = not raw_only and any(
+        row["text"].strip().startswith(("from ", "import ")) for row in rows
+    )
+    basis = (
+        _raw_text_basis(sides, source)
+        if raw_only
+        else (
+            f"{len(rows)} changed line(s) outside classified symbol "
+            "spans. Full region shown for context; overlapping code is not counted "
+            "twice in AST metrics."
+        )
+    )
+    change = _append_change(
+        index.changes,
+        index.covered_lines,
+        index.symbol_to_change,
+        _context_symbol(
+            sides.get("base"),
+            rows,
+            is_wiring=is_wiring,
+            meta=source.meta,
+            raw_only=raw_only,
+        ),
+        _context_symbol(
+            sides.get("head"),
+            rows,
+            is_wiring=is_wiring,
+            meta=source.meta,
+            raw_only=raw_only,
+        ),
+        "wiring" if is_wiring else "text",
+        basis,
+    )
+    change["raw_id"] = raw_id
+
+
 def _collect_raw_changes(
-    fragments_by_id: Mapping[str, dict],
-    covered_lines: dict[str, set[int]],
-    changes: list[dict],
-    symbol_to_change: dict[str, str],
-    meta: dict,
+    source: PreparedSnapshot,
+    index: ChangeIndex,
 ) -> Sequence[dict]:
     """
     Preserve raw diffs and classify source lines outside matched symbols.
 
     Args:
-        fragments_by_id: Snapshot fragments indexed by stable fragment ID.
-        covered_lines: Lines already covered by symbol-level changes.
-        changes: Mutable report changes to extend with context changes.
-        symbol_to_change: Symbol ID to change ID lookup to update.
-        meta: Revision metadata used to construct source permalinks.
+        source: Validated fragments, region pairing, file states, and metadata.
+        index: Changes and coverage indexes to extend with context changes.
 
     Returns:
         Raw file diffs, each retaining its complete changed-line evidence.
@@ -1778,11 +2043,10 @@ def _collect_raw_changes(
 
     """
     fragments_by_region = defaultdict(dict)
-    for fragment in fragments_by_id.values():
-        region = fragment.get(
-            "_raw_region", fragment.get("region", fragment["path"])
+    for fragment in source.fragments_by_id.values():
+        fragments_by_region[fragment["_raw_region"]][fragment["side"]] = (
+            fragment
         )
-        fragments_by_region[region][fragment["side"]] = fragment
 
     raw_changes = []
     for region, sides in fragments_by_region.items():
@@ -1790,60 +2054,86 @@ def _collect_raw_changes(
         after_fragment = sides.get("head")
         before_text = (before_fragment or {}).get("text", "")
         after_text = (after_fragment or {}).get("text", "")
+        fragment = after_fragment or before_fragment
+        coverage = source.coverage_index[(fragment["side"], fragment["path"])]
+        head_path = (
+            fragment["path"] if after_fragment else coverage.counterpart_path
+        )
+        patch = source.patches[head_path]
         if before_text == after_text:
             continue
-        raw_id, raw_record, hunks = _raw_file_change(
+        base_path = (
+            before_fragment["path"]
+            if before_fragment
+            else coverage.counterpart_path
+        )
+        base_coverage = source.coverage_index[("base", base_path)]
+        head_coverage = source.coverage_index[("head", head_path)]
+        complete_source = (
+            base_coverage.absent
+            or (base_coverage.full_source and before_fragment is not None)
+        ) and (
+            head_coverage.absent
+            or (head_coverage.full_source and after_fragment is not None)
+        )
+        raw_record = _raw_file_change(
             region,
             before_fragment,
             after_fragment,
-            meta,
+            source.meta,
+            patch,
+            complete_source=complete_source,
         )
+        raw_id = raw_record["id"]
+        hunks = raw_record["hunks"]
         raw_changes.append(raw_record)
-        unassigned_rows = _unassigned_changed_rows(
-            hunks,
-            before_fragment,
-            after_fragment,
-            covered_lines,
+        # The original patch already accounts for the changed file lines.
+        # A second file diff could choose a different occurrence of repeated
+        # text and invent another change. An unavailable patch still needs
+        # source accounting, but these rows never replace the file patch.
+        exact_hunks = (
+            hunks
+            if raw_record["patch_status"] == "captured"
+            else make_hunks(
+                before_text,
+                after_text,
+                (before_fragment or {}).get("start_line", 1),
+                (after_fragment or {}).get("start_line", 1),
+                context=0,
+                keep_line_endings=True,
+            )
         )
-
-        has_changed_text = any(row["text"].strip() for row in unassigned_rows)
-        if not unassigned_rows or not has_changed_text:
-            continue
-
-        nonblank_code = (
-            row["text"].strip()
-            for row in unassigned_rows
-            if row["text"].strip() and not row["text"].lstrip().startswith("#")
-        )
-        is_wiring = any(
-            line.startswith(("from ", "import ")) for line in nonblank_code
-        )
-        context_kind = "wiring" if is_wiring else "text"
-        context_basis = (
-            f"{len(unassigned_rows)} changed line(s) outside classified symbol "
-            "spans. Full region shown for context; overlapping code is not counted "
-            "twice in AST metrics."
-        )
-        change = _append_change(
-            changes,
-            covered_lines,
-            symbol_to_change,
-            _context_symbol(
+        # Keep existing context records and IDs, then assign only remaining raw
+        # lines. A classified span already owns its original line-ending bytes.
+        for raw_only, region_hunks in ((False, hunks), (True, exact_hunks)):
+            unassigned_rows = _unassigned_changed_rows(
+                region_hunks,
                 before_fragment,
-                unassigned_rows,
-                is_wiring=is_wiring,
-                meta=meta,
-            ),
-            _context_symbol(
                 after_fragment,
-                unassigned_rows,
-                is_wiring=is_wiring,
-                meta=meta,
-            ),
-            context_kind,
-            context_basis,
-        )
-        change["raw_id"] = raw_id
+                index.covered_lines,
+            )
+            has_changed_text = split_source_lines(
+                before_text
+            ) != split_source_lines(after_text) and any(
+                row["text"].strip() for row in unassigned_rows
+            )
+            if not unassigned_rows or (not raw_only and not has_changed_text):
+                continue
+
+            row_groups = (
+                _raw_row_groups(unassigned_rows)
+                if raw_only
+                else [unassigned_rows]
+            )
+            for rows in row_groups:
+                _append_context_change(
+                    source,
+                    index,
+                    sides,
+                    raw_id,
+                    rows,
+                    raw_only=raw_only,
+                )
 
     return raw_changes
 
@@ -2115,7 +2405,7 @@ def _build_group_dependencies(
     )
 
 
-def _order_groups(  # noqa: PLR0913  # Ordering uses distinct source and dependency indexes.
+def _order_groups(  # noqa: PLR0913, PLR0917  # Ordering uses distinct source and dependency indexes.
     groups: dict,
     prerequisites: Mapping[str, AbstractSet[str]],
     symbol_edges: Sequence[dict],
@@ -2286,13 +2576,7 @@ def compile_snapshot(snapshot: dict) -> dict:
     change_index = _collect_symbol_changes(matched, removed, added, source)
     changes = change_index.changes
     symbol_to_change = change_index.symbol_to_change
-    raw_changes = _collect_raw_changes(
-        source.fragments_by_id,
-        change_index.covered_lines,
-        changes,
-        symbol_to_change,
-        source.meta,
-    )
+    raw_changes = _collect_raw_changes(source, change_index)
 
     groups, group_by_change, changes_by_id = _create_groups(changes)
     (
@@ -2376,6 +2660,7 @@ def compile_snapshot(snapshot: dict) -> dict:
         "symbol_edges": symbol_edges,
         "tests": tests,
         "raw_files": raw_changes,
+        "source_evidence": _source_evidence(source),
         "cycles": cycles,
         "unresolved": unresolved,
         "stats": stats,
@@ -2562,36 +2847,6 @@ def evidence_packet(report: dict) -> dict:
     }
 
 
-def _generation_ids(generation: dict, field: str) -> Sequence[str]:
-    """
-    Read a unique list of well-formed IDs from a generation manifest.
-
-    Args:
-        generation: Persisted generation metadata.
-        field: ID-list field to validate.
-
-    Returns:
-        The validated ID sequence.
-
-    Raises:
-        ValueError: If the field is absent, duplicated, malformed, or not a list.
-
-    """
-    value = generation.get(field)
-    if (
-        not isinstance(value, list)
-        or any(
-            not isinstance(item, str)
-            or not re.fullmatch(r"[a-f0-9]{16}", item)
-            for item in value
-        )
-        or len(value) != len(set(value))
-    ):
-        msg = f"Invalid generated narration {field}"
-        raise ValueError(msg)
-    return value
-
-
 def _validate_group_order(
     group_order: list[str],
     groups: Sequence[dict],
@@ -2699,358 +2954,15 @@ def _validate_cycle_adjacency(
             raise ValueError(msg)
 
 
-def _validate_chunk_coverage(
-    generation: dict,
-    expected_chunks: Sequence[str],
-    groups: dict[str, dict],
-    change_map: dict[str, dict],
-) -> None:
-    """
-    Require generated chunks to cover each expected chunk and change.
-
-    Each recorded source slice must cite a change in its chunk and stay within
-    that change's original source range.
-
-    Args:
-        generation: Persisted generation mapping containing chunk coverage.
-        expected_chunks: Deterministic chunk IDs planned for this generation.
-        groups: Group lookup used to constrain chunk change IDs.
-        change_map: Change lookup used to validate source-slice bounds.
-
-    Raises:
-        ValueError: If coverage is malformed, incomplete, duplicated, or cites
-            an invalid group, change, side, or line range.
-
-    """
-    chunks = generation.get("chunk_coverage")
-    if not isinstance(chunks, list) or len(chunks) != len(expected_chunks):
-        msg = "Invalid generated narration chunk coverage"
-        raise ValueError(msg)
-
-    seen_chunks: set[str] = set()
-    seen_changes: set[str] = set()
-    for chunk in chunks:
-        chunk_id, change_ids = _validate_generation_chunk(
-            chunk,
-            groups,
-            change_map,
-        )
-        if chunk_id in seen_chunks:
-            msg = "Invalid or duplicate generated chunk ID"
-            raise ValueError(msg)
-        seen_chunks.add(chunk_id)
-        seen_changes.update(change_ids)
-
-    if seen_chunks != set(expected_chunks) or seen_changes != set(change_map):
-        msg = "Generated narration chunk manifest is incomplete"
-        raise ValueError(msg)
-
-
-def _validate_generation_chunk(
-    chunk: dict,
-    groups: Mapping[str, dict],
-    change_map: Mapping[str, dict],
-) -> tuple[str, list[str]]:
-    """
-    Validate one chunk's group, change, and source-slice coverage.
-
-    Args:
-        chunk: Persisted generation chunk record.
-        groups: Report groups indexed by ID.
-        change_map: Report changes indexed by ID.
-
-    Returns:
-        Stable chunk ID and cited change IDs.
-
-    Raises:
-        ValueError: If the chunk or any source slice is malformed or invalid.
-    """
-    if not isinstance(chunk, dict) or set(chunk) != GENERATION_CHUNK_FIELDS:
-        msg = "Invalid generated narration chunk entry"
-        raise ValueError(msg)
-
-    chunk_id = chunk["id"]
-    group_id = chunk["group_id"]
-    if not isinstance(chunk_id, str) or not re.fullmatch(
-        r"[a-f0-9]{16}",
-        chunk_id,
-    ):
-        msg = "Invalid or duplicate generated chunk ID"
-        raise ValueError(msg)
-    if not isinstance(group_id, str) or group_id not in groups:
-        msg = "Generated narration has an incomplete or unknown chunk"
-        raise ValueError(msg)
-    if chunk["status"] != "complete":
-        msg = "Generated narration has an incomplete or unknown chunk"
-        raise ValueError(msg)
-
-    change_ids = chunk["change_ids"]
-    if (
-        not isinstance(change_ids, list)
-        or not change_ids
-        or any(not isinstance(change_id, str) for change_id in change_ids)
-        or len(change_ids) != len(set(change_ids))
-        or not set(change_ids) <= set(groups[group_id]["change_ids"])
-    ):
-        msg = "Generated chunk cites changes outside its group"
-        raise ValueError(msg)
-
-    source_slices = chunk["source_slices"]
-    if not isinstance(source_slices, list):
-        msg = "Invalid generated source-slice coverage"
-        raise ValueError(msg)
-    for source_slice in source_slices:
-        _validate_generation_source_slice(source_slice, change_ids, change_map)
-    return chunk_id, change_ids
-
-
-def _validate_generation_source_slice(
-    source_slice: dict,
-    change_ids: Sequence[str],
-    change_map: Mapping[str, dict],
-) -> None:
-    """
-    Validate a generated source slice against its cited change's line range.
-
-    Args:
-        source_slice: Persisted source-line citation.
-        change_ids: Changes cited by the containing chunk.
-        change_map: Report changes indexed by ID.
-
-    Raises:
-        ValueError: If the citation is malformed, out of scope, or outside the
-            supplied source range.
-    """
-    if (
-        not isinstance(source_slice, dict)
-        or set(source_slice) != GENERATION_SOURCE_SLICE_FIELDS
-    ):
-        msg = "Invalid generated source-slice coverage"
-        raise ValueError(msg)
-    change_id = source_slice["change_id"]
-    side = source_slice["side"]
-    start = source_slice["start"]
-    end = source_slice["end"]
-    if (
-        not isinstance(change_id, str)
-        or change_id not in change_ids
-        or not isinstance(side, str)
-        or side not in {"base", "head"}
-        or type(start) is not int
-        or type(end) is not int
-        or start < 1
-        or end < start
-    ):
-        msg = "Invalid generated source-slice range"
-        raise ValueError(msg)
-
-    source = change_map[change_id].get("after" if side == "head" else "before")
-    if not source or not source.get("start", 1) <= start <= end <= source.get(
-        "end",
-        0,
-    ):
-        msg = "Generated source-slice range is outside its report change"
-        raise ValueError(msg)
-
-
-def validate_generation(report: dict, generation: dict) -> None:
-    """
-    Validate generated-prose provenance, revision binding, and coverage.
-
-    Args:
-        report: Compiled report to which the generation belongs.
-        generation: Persisted generation manifest.
-
-    Raises:
-        ValueError: If provenance, revisions, usage, group order, change
-            coverage, chunk coverage, or completion state is invalid.
-
-    """
-    required_fields = {
-        "schema",
-        "origin",
-        "verification",
-        "provider",
-        "model",
-        "base_sha",
-        "head_sha",
-        "usage",
-        "expected_groups",
-        "completed_groups",
-        "expected_changes",
-        "covered_changes",
-        "expected_chunks",
-        "chunk_coverage",
-        "errors",
-    }
-    if (
-        not isinstance(generation, dict)
-        or generation.keys() != required_fields
-    ):
-        msg = "Invalid generated narration manifest"
-        raise ValueError(msg)
-
-    has_generated_provenance = (
-        generation.get("schema") == "diffstory.generation.v1"
-        and generation.get("origin") == "model_generated"
-        and generation.get("verification") == "unverified"
-    )
-    if not has_generated_provenance:
-        msg = "Invalid generated narration provenance"
-        raise ValueError(msg)
-
-    meta = report.get("meta", {})
-    revisions_match = generation.get("base_sha") == meta.get(
-        "base_sha",
-    ) and generation.get("head_sha") == meta.get("head_sha")
-    if not revisions_match:
-        msg = "Generated narration belongs to different revisions"
-        raise ValueError(msg)
-
-    provider = generation.get("provider")
-    model = generation.get("model")
-    if (
-        not isinstance(provider, str)
-        or not provider
-        or len(provider) > MAX_PROVIDER_NAME_CHARS
-        or not isinstance(model, str)
-        or not model
-        or len(model) > MAX_MODEL_NAME_CHARS
-    ):
-        msg = "Invalid generated narration provider metadata"
-        raise ValueError(msg)
-
-    expected_groups = _generation_ids(generation, "expected_groups")
-    completed_groups = _generation_ids(generation, "completed_groups")
-    expected_changes = _generation_ids(generation, "expected_changes")
-    covered_changes = _generation_ids(generation, "covered_changes")
-    expected_chunks = _generation_ids(generation, "expected_chunks")
-
-    report_groups = [group["id"] for group in report.get("groups", [])]
-    report_changes = [change["id"] for change in report.get("changes", [])]
-    if set(expected_groups) != set(report_groups) or set(
-        completed_groups,
-    ) != set(report_groups):
-        msg = "Generated narration does not cover every report group"
-        raise ValueError(msg)
-    _validate_group_order(report_groups, report.get("groups", []))
-    if expected_changes != report_changes or set(covered_changes) != set(
-        report_changes,
-    ):
-        msg = "Generated narration does not cover every report change"
-        raise ValueError(msg)
-
-    GenerationUsage.model_validate(generation.get("usage"))
-
-    groups_by_id = {group["id"]: group for group in report.get("groups", [])}
-    changes_by_id = {
-        change["id"]: change for change in report.get("changes", [])
-    }
-    _validate_chunk_coverage(
-        generation,
-        expected_chunks,
-        groups_by_id,
-        changes_by_id,
-    )
-
-    if generation.get("errors") != []:
-        msg = "A completed generated report cannot contain generation errors"
-        raise ValueError(msg)
-
-
-def validate_generated_report(report: dict) -> None:
-    """
-    Require a generated report to retain provenance and complete evidence.
-
-    Args:
-        report: Report carrying a generated narrative and generation manifest.
-
-    Raises:
-        ValueError: If generation metadata, document narration, provenance
-            labels, evidence IDs, or source-bound passages are incomplete.
-
-    """
-    generation = report.get("generation")
-    validate_generation(report, generation)
-    validate_document(report.get("document"), generated=True)
-    changes = {change["id"]: change for change in report["changes"]}
-    for group in report["groups"]:
-        narrative = group.get("narrative", {})
-        if narrative.get("provenance") != "model-generated · unverified":
-            msg = "Generated report lost its model-generated provenance label"
-            raise ValueError(msg)
-        refs = narrative.get("evidence_change_ids")
-        if (
-            not isinstance(refs, list)
-            or len(refs) != len(set(refs))
-            or set(refs) != set(group["change_ids"])
-        ):
-            msg = "Generated step does not cover its expected changes"
-            raise ValueError(msg)
-        passages = narrative.get("passages")
-        if not isinstance(passages, list) or not passages:
-            msg = "Generated step is missing source-bound passages"
-            raise ValueError(msg)
-        validate_passages(passages, group, changes)
-        covered = {
-            change_id
-            for passage in passages
-            for change_id in passage["change_ids"]
-        }
-        if covered != set(group["change_ids"]):
-            msg = "Generated passages do not cover every change in the group"
-            raise ValueError(msg)
-
-
-def _apply_document_annotations(
-    annotations: dict,
-    result: dict,
-    *,
-    generated: bool,
-) -> None:
-    """
-    Validate and copy document-level narration into a report.
-
-    Args:
-        annotations: Annotation document containing optional preamble, lead,
-            and closing fields.
-        result: Deep-copied report being annotated.
-        generated: Whether the annotation source is a model provider.
-
-    Raises:
-        ValueError: If document fields are invalid or generated narration omits
-            its required preamble, opening, or closing.
-    """
-    if "document" in annotations or generated:
-        document = validate_document(
-            annotations.get("document"), generated=generated
-        )
+def _apply_document_annotations(annotations: dict, result: dict) -> None:
+    """Validate and copy optional human-authored document prose."""
+    if "document" in annotations:
+        document = validate_document(annotations["document"])
         result["document"] = document.model_dump(exclude_unset=True)
 
 
-def _step_evidence_ids(
-    step: dict,
-    group_id: str,
-    group: dict,
-    *,
-    generated: bool,
-) -> list[str]:
-    """
-    Validate evidence IDs for one narrative step.
-
-    Args:
-        step: Authored or generated narrative step.
-        group_id: Report group identified by the step.
-        group: Report group whose changed IDs are valid evidence.
-        generated: Whether the annotation source is a model provider.
-
-    Returns:
-        Valid evidence IDs in the authored order.
-
-    Raises:
-        ValueError: If evidence is empty, duplicated, outside the group, or
-            incomplete for generated narration.
-    """
+def _step_evidence_ids(step: dict, group_id: str, group: dict) -> list[str]:
+    """Validate one authored step's evidence IDs against its report group."""
     evidence_ids = step.get("evidence_change_ids", [])
     if (
         not isinstance(evidence_ids, list)
@@ -3061,26 +2973,11 @@ def _step_evidence_ids(
     ):
         msg = f"Narrative evidence is missing or outside its group: {group_id}"
         raise ValueError(msg)
-    if generated and set(evidence_ids) != set(group["change_ids"]):
-        msg = (
-            "Generated narrative step does not cite every change in group "
-            f"{group_id}"
-        )
-        raise ValueError(msg)
     return evidence_ids
 
 
 def _apply_step_fields(step: dict, group: dict) -> None:
-    """
-    Validate and apply scalar and list-based narrative fields.
-
-    Args:
-        step: Authored or generated narrative step.
-        group: Report group whose narrative mapping is updated.
-
-    Raises:
-        ValueError: If prose, questions, or invariants violate their limits.
-    """
+    """Validate and apply scalar and list-based authored narrative fields."""
     scalar_fields = ("intent", "why_now", "takeaway", "transition")
     list_fields = ("invariants", "questions")
     for field in scalar_fields:
@@ -3109,43 +3006,12 @@ def _apply_step_passages(
     step: dict,
     group: dict,
     changes: Mapping[str, dict],
-    *,
-    generated: bool,
-    group_id: str,
 ) -> None:
-    """
-    Validate source passages and apply their evidence links.
-
-    Args:
-        step: Authored or generated narrative step.
-        group: Report group whose passage list is updated.
-        changes: Report changes indexed by ID.
-        generated: Whether every generated step must cite every group change.
-        group_id: Report group ID used to identify validation failures.
-
-    Raises:
-        ValueError: If generated passage coverage is missing or incomplete.
-    """
-    passages = step.get("passages")
-    if generated and (not isinstance(passages, list) or not passages):
-        msg = f"Generated narrative step is missing source-bound passages: {group_id}"
-        raise ValueError(msg)
+    """Validate and apply authored source passages when the field is present."""
     if "passages" not in step:
         return
-
+    passages = step["passages"]
     validate_passages(passages, group, changes)
-    if generated:
-        covered = {
-            change_id
-            for passage in passages
-            for change_id in passage["change_ids"]
-        }
-        if covered != set(group["change_ids"]):
-            msg = (
-                "Generated passages do not cover every change in group "
-                f"{group_id}"
-            )
-            raise ValueError(msg)
     group["narrative"]["passages"] = copy.deepcopy(passages)
 
 
@@ -3153,25 +3019,8 @@ def _apply_annotation_step(
     step: dict,
     groups: Mapping[str, dict],
     changes: Mapping[str, dict],
-    *,
-    generated: bool,
 ) -> str:
-    """
-    Validate and apply one narrative step to its report group.
-
-    Args:
-        step: Authored or generated narrative step.
-        groups: Report groups indexed by ID.
-        changes: Report changes indexed by ID.
-        generated: Whether the annotation source is a model provider.
-
-    Returns:
-        The report group ID covered by this step.
-
-    Raises:
-        ValueError: If the step references an unknown group or contains invalid
-            evidence or narrative fields.
-    """
+    """Validate and apply one human-authored step to its report group."""
     if not isinstance(step, dict):
         msg = "Invalid narrative step"
         raise ValueError(msg)
@@ -3180,20 +3029,9 @@ def _apply_annotation_step(
         msg = f"Unknown narrative group: {group_id}"
         raise ValueError(msg)
     group = groups[group_id]
-    evidence_ids = _step_evidence_ids(
-        step,
-        group_id,
-        group,
-        generated=generated,
-    )
+    evidence_ids = _step_evidence_ids(step, group_id, group)
     _apply_step_fields(step, group)
-    _apply_step_passages(
-        step,
-        group,
-        changes,
-        generated=generated,
-        group_id=group_id,
-    )
+    _apply_step_passages(step, group, changes)
 
     if "title" in step:
         title = step["title"]
@@ -3203,9 +3041,7 @@ def _apply_annotation_step(
         group["title"] = title
 
     group["narrative"]["provenance"] = (
-        "model-generated · unverified"
-        if generated
-        else "authored interpretation, linked to source; "
+        "authored interpretation, linked to source; "
         "not machine-verified semantics"
     )
     group["narrative"]["evidence_change_ids"] = copy.deepcopy(evidence_ids)
@@ -3247,47 +3083,17 @@ def _apply_annotation_steps(
     steps: list,
     groups: dict[str, dict],
     changes: Mapping[str, dict],
-    *,
-    generated: bool,
     report_groups: list[dict],
 ) -> None:
-    """
-    Apply validated steps, enforce generated coverage, and set story order.
-
-    Args:
-        steps: Narrative steps in requested story order.
-        groups: Report groups indexed by ID.
-        changes: Report changes indexed by ID.
-        generated: Whether every report group must have one generated step.
-        report_groups: Existing groups used for dependency-order validation.
-
-    Raises:
-        ValueError: If generated narration duplicates or omits a group.
-    """
-    seen_groups: set[str] = set()
-    step_order = []
-    for step in steps:
-        if isinstance(step, dict):
-            group_id = step.get("group_id")
-            if generated and group_id in seen_groups:
-                msg = f"Duplicate generated narrative step: {group_id}"
-                raise ValueError(msg)
-        group_id = _apply_annotation_step(
-            step,
-            groups,
-            changes,
-            generated=generated,
-        )
-        seen_groups.add(group_id)
-        step_order.append(group_id)
-
-    if generated and seen_groups != set(groups):
-        msg = (
-            "Generated narration must include exactly one step for every "
-            "report group"
-        )
-        raise ValueError(msg)
-    if steps and len(step_order) == len(groups) and seen_groups == set(groups):
+    """Apply authored steps and update story order when it is complete."""
+    step_order = [
+        _apply_annotation_step(step, groups, changes) for step in steps
+    ]
+    if (
+        steps
+        and len(step_order) == len(groups)
+        and set(step_order) == set(groups)
+    ):
         ordered_groups = _order_annotated_groups(
             groups,
             step_order,
@@ -3297,23 +3103,18 @@ def _apply_annotation_steps(
 
 
 def apply_annotations(report: dict, annotations: dict) -> dict:
-    """
-    Apply revision-bound narrative annotations without replacing report facts.
-
-    Args:
-        report: Deterministic report to annotate.
-        annotations: Authored or generated ``diffstory.annotations.v1`` data.
-
-    Returns:
-        A deep-copied report with validated narrative fields applied.
-
-    Raises:
-        ValueError: If schema, revisions, provenance, group coverage, evidence,
-            or passage ranges do not match the report.
-
-    """
+    """Apply human-authored annotations to their matching compiler report."""
+    if report.get("schema") != SCHEMA:
+        msg = "Annotations require a compiler report"
+        raise ValueError(msg)
+    if "generation" in report or "narrative_v2" in report:
+        msg = "Generated report formats are not compiler annotation inputs"
+        raise ValueError(msg)
     if annotations.get("schema") != "diffstory.annotations.v1":
         msg = "Expected diffstory.annotations.v1"
+        raise ValueError(msg)
+    if "generation" in annotations or "narrative_v2" in annotations:
+        msg = "Generated annotation formats are not supported"
         raise ValueError(msg)
     if annotations.get("head_sha") != report["meta"].get("head_sha"):
         msg = "Narrative belongs to a different head revision"
@@ -3322,35 +3123,14 @@ def apply_annotations(report: dict, annotations: dict) -> dict:
         msg = "Narrative belongs to a different base revision"
         raise ValueError(msg)
 
-    generated = "generation" in annotations
-    if "generation" in report and not generated:
-        msg = (
-            "Reapplying annotations to a generated report requires its "
-            "generation manifest"
-        )
-        raise ValueError(
-            msg,
-        )
     result = copy.deepcopy(report)
     groups = {group["id"]: group for group in result["groups"]}
     changes = {change["id"]: change for change in result["changes"]}
-    if generated:
-        validate_generation(report, annotations["generation"])
-        result["generation"] = copy.deepcopy(annotations["generation"])
-
-    _apply_document_annotations(annotations, result, generated=generated)
+    _apply_document_annotations(annotations, result)
 
     steps = annotations.get("steps", [])
     if not isinstance(steps, list):
         msg = "Narrative steps must be a list"
         raise ValueError(msg)
-    _apply_annotation_steps(
-        steps,
-        groups,
-        changes,
-        generated=generated,
-        report_groups=result["groups"],
-    )
-    if generated:
-        validate_generated_report(result)
+    _apply_annotation_steps(steps, groups, changes, result["groups"])
     return result

@@ -40,6 +40,7 @@ TOP_FILES = {
     ".editorconfig",
 }
 TREES = {"diffstory", "tests", "examples", "docs", "scripts", ".github"}
+LOCAL_PRIVATE_DIRECTORY = ".goal.narration-state"
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -177,6 +178,8 @@ def _walk_publication_tree(
             msg = f"Symlinks are not public release inputs: {relative}"
             raise ValueError(msg)
         if path.is_dir():
+            if directory == root and path.name == LOCAL_PRIVATE_DIRECTORY:
+                continue
             if path.name in SKIP_DIRS or path.name.endswith(".egg-info"):
                 continue
             if directory == root and path.name not in TREES:
@@ -190,6 +193,9 @@ def _walk_publication_tree(
 
 def publication_files(root: Path) -> list[Path]:
     """Return approved release files, rejecting unrecognized inputs and symlinks.
+
+    The exact root-level ``.goal.narration-state`` directory is never traversed
+    or included; it holds private local workflow state.
 
     Args:
         root: Candidate publication root.

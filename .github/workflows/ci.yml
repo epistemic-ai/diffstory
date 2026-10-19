@@ -40,5 +40,6 @@ jobs:
       - run: uv run --locked ruff format --check .
       - run: uv run --locked python -m playwright install --with-deps chromium
       - run: uv run --locked python tests/browser_smoke.py
+      - run: uv run --locked python tests/browser_walkthrough.py
       - run: uv build
       - run: uv run --locked twine check dist/*

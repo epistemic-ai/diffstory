@@ -79,18 +79,10 @@
       "group_id": "d970addaf2694ce2",
       "title": "Build one parsing boundary",
       "evidence_change_ids": [
-        "2df2308a41a0a306",
         "d3dec5cc1a2d0ac6",
         "9b8438c727c24ffd"
       ],
       "passages": [
-        {
-          "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
-          "change_ids": [
-            "2df2308a41a0a306"
-          ],
-          "view": "diff"
-        },
         {
           "text": "`split_tags` becomes `parse_tags` in the parsing module. Empty fields disappear, tags become lowercase, and source order—including duplicates—survives. Only the declaration name changes; internal names and literal values still participate in the structural comparison.",
           "change_ids": [
@@ -129,17 +121,9 @@
       "group_id": "35701946bdbc9a3e",
       "title": "Return to the search entry point",
       "evidence_change_ids": [
-        "d2f5bacb5e03490d",
         "d7ea39d8954cab6b"
       ],
       "passages": [
-        {
-          "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
-          "change_ids": [
-            "d2f5bacb5e03490d"
-          ],
-          "view": "diff"
-        },
         {
           "text": "Now the entry point is readable as a sequence: construct a query, execute it, interpret each row, and merge duplicates. It still materializes the parsed rows before merging. The tighter page-size rule reaches users through this call; it must not be hidden under the refactor label.",
           "change_ids": [
@@ -172,9 +156,13 @@
       "title": "Make the preserved rules executable",
       "evidence_change_ids": [
         "fd323c917ce3337c",
+        "e8caa805d19a0a31",
         "ec92156828e995bb",
+        "8ea44102faf3f0cb",
         "189601f74b8680b9",
+        "7f30cd06810af923",
         "a3331c56ed891d8c",
+        "aff1ab8eaa16d3d2",
         "6fab283d650e6f28"
       ],
       "passages": [
@@ -186,9 +174,23 @@
           "view": "diff"
         },
         {
+          "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+          "change_ids": [
+            "e8caa805d19a0a31"
+          ],
+          "view": "definition"
+        },
+        {
           "text": "A representative row checks the complete display record: identifier, normalized label, ordered tags, and the rounded click rate. Delegation should not change those values.",
           "change_ids": [
             "ec92156828e995bb"
+          ],
+          "view": "definition"
+        },
+        {
+          "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+          "change_ids": [
+            "8ea44102faf3f0cb"
           ],
           "view": "definition"
         },
@@ -200,9 +202,23 @@
           "view": "definition"
         },
         {
+          "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+          "change_ids": [
+            "7f30cd06810af923"
+          ],
+          "view": "definition"
+        },
+        {
           "text": "Case normalization and empty-tag removal must not turn the list into a set. The assertion preserves duplicates and source order.",
           "change_ids": [
             "a3331c56ed891d8c"
+          ],
+          "view": "definition"
+        },
+        {
+          "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+          "change_ids": [
+            "aff1ab8eaa16d3d2"
           ],
           "view": "definition"
         },
@@ -221,8 +237,11 @@
       "title": "Check the contract at its boundary",
       "evidence_change_ids": [
         "026672cb30fc46d7",
+        "a4f8ee39ebf2ae8e",
         "a7badff14d18e6f6",
+        "f4d726b89f56991c",
         "e5b7162fc4b0a209",
+        "47998d0309eebb30",
         "6fda0fd2afd4b3ab"
       ],
       "passages": [
@@ -234,9 +253,23 @@
           "view": "diff"
         },
         {
+          "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+          "change_ids": [
+            "a4f8ee39ebf2ae8e"
+          ],
+          "view": "definition"
+        },
+        {
           "text": "The default case locks down the 25-row page size and the shape of the parameter tuple. This test calls the extracted query module directly.",
           "change_ids": [
             "a7badff14d18e6f6"
+          ],
+          "view": "definition"
+        },
+        {
+          "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+          "change_ids": [
+            "f4d726b89f56991c"
           ],
           "view": "definition"
         },
@@ -248,11 +281,108 @@
           "view": "definition"
         },
         {
+          "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+          "change_ids": [
+            "47998d0309eebb30"
+          ],
+          "view": "definition"
+        },
+        {
           "text": "These are the boundary cases for the intentional behavior change. Accept 1 and 100; reject 0, 101, booleans, and other non-integer values. This is test source, not a recorded passing run.",
           "change_ids": [
             "6fda0fd2afd4b3ab"
           ],
           "view": "definition"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "12a55d5d4c51b680",
+      "title": "Point imports at the defining modules",
+      "evidence_change_ids": [
+        "2df2308a41a0a306",
+        "4ff0691afd736322",
+        "e49e81e87f43fab2",
+        "abcdb7bbc698272c"
+      ],
+      "passages": [
+        {
+          "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
+          "change_ids": [
+            "2df2308a41a0a306"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+          "change_ids": [
+            "4ff0691afd736322"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+          "change_ids": [
+            "e49e81e87f43fab2"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+          "change_ids": [
+            "abcdb7bbc698272c"
+          ],
+          "view": "diff"
+        }
+      ],
+      "transition": "Follow the next dependency without leaving this document."
+    },
+    {
+      "group_id": "c7e2bd25042d1cae",
+      "title": "Point imports at the defining modules",
+      "evidence_change_ids": [
+        "d2f5bacb5e03490d",
+        "731b07ef041382e9",
+        "cc4de3fc6a6def38",
+        "5757daf981b589ca",
+        "2753abafa78d7787"
+      ],
+      "passages": [
+        {
+          "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
+          "change_ids": [
+            "d2f5bacb5e03490d"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+          "change_ids": [
+            "731b07ef041382e9"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+          "change_ids": [
+            "cc4de3fc6a6def38"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+          "change_ids": [
+            "5757daf981b589ca"
+          ],
+          "view": "diff"
+        },
+        {
+          "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+          "change_ids": [
+            "2753abafa78d7787"
+          ],
+          "view": "diff"
         }
       ],
       "transition": "The source trail now reaches the tests as well as the callers."

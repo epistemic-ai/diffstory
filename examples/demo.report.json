@@ -127,7 +127,8 @@
         "is_test": false,
         "signature": "connection, term: str, limit: int=25",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "e81ca5f46901d4db"
       },
       "after": {
         "id": "0d29f6c32cc0d31e",
@@ -238,7 +239,8 @@
         "is_test": false,
         "signature": "connection, term: str, limit: int=25",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "eb262a6b59bf3a5b"
       },
       "basis": "same declaration location",
       "hunks": [
@@ -346,7 +348,8 @@
         "is_test": false,
         "signature": "value",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "1a0d5df3887c4e44"
       },
       "after": {
         "id": "2ea80861607ea62e",
@@ -382,7 +385,8 @@
         "is_test": false,
         "signature": "value",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "5fb4aeea3b263f97"
       },
       "basis": "same declaration location",
       "hunks": [
@@ -489,7 +493,8 @@
         "is_test": false,
         "signature": "records",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "e81ca5f46901d4db"
       },
       "after": {
         "id": "7ef992f83fb42315",
@@ -560,7 +565,8 @@
         "is_test": false,
         "signature": "records",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "1b59ac0b675e18ac"
       },
       "basis": "unique name + identical AST",
       "hunks": [],
@@ -613,7 +619,8 @@
         "is_test": false,
         "signature": "value: str",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "e81ca5f46901d4db"
       },
       "after": {
         "id": "9a354024ec622592",
@@ -657,7 +664,8 @@
         "is_test": false,
         "signature": "value: str",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "470887404445a502"
       },
       "basis": "unique name + identical AST",
       "hunks": [],
@@ -756,7 +764,8 @@
         "is_test": false,
         "signature": "value: str",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "e81ca5f46901d4db"
       },
       "after": {
         "id": "6b568c92db6c5511",
@@ -846,7 +855,8 @@
         "is_test": false,
         "signature": "value: str",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "275c82e1da3a4a13"
       },
       "basis": "unique declaration-name/docstring-normalized AST; internal names and literals preserved",
       "hunks": [
@@ -939,7 +949,8 @@
         "is_test": false,
         "signature": "term: str, limit: int=25",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "e81ca5f46901d4db"
       },
       "after": {
         "id": "79926ff73f6a3c95",
@@ -1018,7 +1029,8 @@
         "is_test": false,
         "signature": "term: str, limit: int=25",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "2985e7c778f55ef4"
       },
       "basis": "unique matching name (ignoring leading underscores)/type + AST-text similarity 0.527; candidate correspondence, not an equivalence proof",
       "hunks": [
@@ -1365,7 +1377,8 @@
         "is_test": false,
         "signature": "row",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "e81ca5f46901d4db"
       },
       "after": {
         "id": "e251bf265e4cc54a",
@@ -1454,7 +1467,8 @@
         "is_test": false,
         "signature": "row",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "275c82e1da3a4a13"
       },
       "basis": "unique matching name (ignoring leading underscores)/type + AST-text similarity 0.598; candidate correspondence, not an equivalence proof",
       "hunks": [
@@ -1712,7 +1726,8 @@
         "is_test": false,
         "signature": "row, result",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "275c82e1da3a4a13"
       },
       "basis": "Definition populate_metrics was added to the supplied file catalog/parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
@@ -1785,7 +1800,8 @@
         "is_test": true,
         "signature": "",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "cb6534dfca8c9ae9"
       },
       "basis": "Definition test_record_preserves_display_contract was added to the supplied file tests/test_parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
@@ -1864,7 +1880,8 @@
         "is_test": true,
         "signature": "",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "cb6534dfca8c9ae9"
       },
       "basis": "Definition test_missing_and_zero_views was added to the supplied file tests/test_parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
@@ -1931,7 +1948,8 @@
         "is_test": true,
         "signature": "",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "cb6534dfca8c9ae9"
       },
       "basis": "Definition test_tag_order_and_duplicates was added to the supplied file tests/test_parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
@@ -2015,7 +2033,8 @@
         "is_test": true,
         "signature": "",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "cb6534dfca8c9ae9"
       },
       "basis": "Definition test_first_record_wins was added to the supplied file tests/test_parsing.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
@@ -2100,7 +2119,8 @@
         "is_test": true,
         "signature": "",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "4acf8f202ee42688"
       },
       "basis": "Definition test_query_default was added to the supplied file tests/test_query.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
@@ -2198,7 +2218,8 @@
         "is_test": true,
         "signature": "",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "4acf8f202ee42688"
       },
       "basis": "Definition test_term_stays_a_parameter was added to the supplied file tests/test_query.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
@@ -2315,7 +2336,8 @@
         "is_test": true,
         "signature": "",
         "url": null,
-        "scope": "full"
+        "scope": "full",
+        "fragment_key": "4acf8f202ee42688"
       },
       "basis": "Definition test_page_size_boundaries was added to the supplied file tests/test_query.py. The file is confirmed absent at the base revision. The head file is fully supplied and parsed. This result does not establish whether the definition or its behavior exists elsewhere in the repository.",
       "hunks": [
@@ -2399,7 +2421,8 @@
         "url": null,
         "calls": [],
         "references": [],
-        "is_test": false
+        "is_test": false,
+        "fragment_key": "eb262a6b59bf3a5b"
       },
       "basis": "11 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.",
       "hunks": [
@@ -2433,6 +2456,182 @@
       "raw_id": "9be9092f1c5cb908"
     },
     {
+      "id": "731b07ef041382e9",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": {
+        "id": "97b3b91beefd646b",
+        "path": "catalog/search.py",
+        "name": "file context",
+        "side": "base",
+        "start": 4,
+        "end": 5,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "e81ca5f46901d4db"
+      },
+      "after": null,
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence.",
+      "hunks": [
+        {
+          "old_start": 4,
+          "new_start": 1,
+          "old_count": 2,
+          "new_count": 0,
+          "rows": [
+            {
+              "tag": "delete",
+              "old": 4,
+              "new": null,
+              "text": ""
+            },
+            {
+              "tag": "delete",
+              "old": 5,
+              "new": null,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "9be9092f1c5cb908"
+    },
+    {
+      "id": "cc4de3fc6a6def38",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": {
+        "id": "f75fb06a93220761",
+        "path": "catalog/search.py",
+        "name": "file context",
+        "side": "base",
+        "start": 13,
+        "end": 14,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "e81ca5f46901d4db"
+      },
+      "after": null,
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence.",
+      "hunks": [
+        {
+          "old_start": 13,
+          "new_start": 1,
+          "old_count": 2,
+          "new_count": 0,
+          "rows": [
+            {
+              "tag": "delete",
+              "old": 13,
+              "new": null,
+              "text": ""
+            },
+            {
+              "tag": "delete",
+              "old": 14,
+              "new": null,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "9be9092f1c5cb908"
+    },
+    {
+      "id": "5757daf981b589ca",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": {
+        "id": "5da8e168319dc295",
+        "path": "catalog/search.py",
+        "name": "file context",
+        "side": "base",
+        "start": 24,
+        "end": 25,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "e81ca5f46901d4db"
+      },
+      "after": null,
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence.",
+      "hunks": [
+        {
+          "old_start": 24,
+          "new_start": 1,
+          "old_count": 2,
+          "new_count": 0,
+          "rows": [
+            {
+              "tag": "delete",
+              "old": 24,
+              "new": null,
+              "text": ""
+            },
+            {
+              "tag": "delete",
+              "old": 25,
+              "new": null,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "9be9092f1c5cb908"
+    },
+    {
+      "id": "2753abafa78d7787",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": {
+        "id": "7d9c5edc15256ba9",
+        "path": "catalog/search.py",
+        "name": "file context",
+        "side": "base",
+        "start": 38,
+        "end": 39,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "e81ca5f46901d4db"
+      },
+      "after": null,
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence.",
+      "hunks": [
+        {
+          "old_start": 38,
+          "new_start": 1,
+          "old_count": 2,
+          "new_count": 0,
+          "rows": [
+            {
+              "tag": "delete",
+              "old": 38,
+              "new": null,
+              "text": ""
+            },
+            {
+              "tag": "delete",
+              "old": 39,
+              "new": null,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "9be9092f1c5cb908"
+    },
+    {
       "id": "c8c8225325973641",
       "kind": "wiring",
       "label": "Import wiring",
@@ -2447,7 +2646,8 @@
         "url": null,
         "calls": [],
         "references": [],
-        "is_test": false
+        "is_test": false,
+        "fragment_key": "1a0d5df3887c4e44"
       },
       "after": {
         "id": "7ea59ea9e79df617",
@@ -2460,7 +2660,8 @@
         "url": null,
         "calls": [],
         "references": [],
-        "is_test": false
+        "is_test": false,
+        "fragment_key": "5fb4aeea3b263f97"
       },
       "basis": "2 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.",
       "hunks": [
@@ -2505,7 +2706,8 @@
         "url": null,
         "calls": [],
         "references": [],
-        "is_test": false
+        "is_test": false,
+        "fragment_key": "275c82e1da3a4a13"
       },
       "basis": "7 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.",
       "hunks": [
@@ -2520,6 +2722,138 @@
               "old": null,
               "new": 1,
               "text": "from catalog.labels import normalize_label"
+            }
+          ]
+        }
+      ],
+      "raw_id": "20c0b99366424327"
+    },
+    {
+      "id": "4ff0691afd736322",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "ca5462ab749217a2",
+        "path": "catalog/parsing.py",
+        "name": "file context",
+        "side": "head",
+        "start": 2,
+        "end": 3,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "275c82e1da3a4a13"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 2,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 2,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 3,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "20c0b99366424327"
+    },
+    {
+      "id": "e49e81e87f43fab2",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "776f266f42ef4e7f",
+        "path": "catalog/parsing.py",
+        "name": "file context",
+        "side": "head",
+        "start": 11,
+        "end": 12,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "275c82e1da3a4a13"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 11,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 11,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 12,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "20c0b99366424327"
+    },
+    {
+      "id": "abcdb7bbc698272c",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "60e296fe6e9d0b95",
+        "path": "catalog/parsing.py",
+        "name": "file context",
+        "side": "head",
+        "start": 17,
+        "end": 18,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "275c82e1da3a4a13"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 17,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 17,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 18,
+              "text": ""
             }
           ]
         }
@@ -2542,7 +2876,8 @@
         "url": null,
         "calls": [],
         "references": [],
-        "is_test": false
+        "is_test": false,
+        "fragment_key": "cb6534dfca8c9ae9"
       },
       "basis": "10 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.",
       "hunks": [
@@ -2570,6 +2905,182 @@
       "raw_id": "f124e8484c649024"
     },
     {
+      "id": "e8caa805d19a0a31",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "c7aee2f050e34ced",
+        "path": "tests/test_parsing.py",
+        "name": "file context",
+        "side": "head",
+        "start": 3,
+        "end": 4,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "cb6534dfca8c9ae9"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 3,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 3,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 4,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "f124e8484c649024"
+    },
+    {
+      "id": "8ea44102faf3f0cb",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "114b66df2a416563",
+        "path": "tests/test_parsing.py",
+        "name": "file context",
+        "side": "head",
+        "start": 9,
+        "end": 10,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "cb6534dfca8c9ae9"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 9,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 9,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 10,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "f124e8484c649024"
+    },
+    {
+      "id": "7f30cd06810af923",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "9156481c0c2fa236",
+        "path": "tests/test_parsing.py",
+        "name": "file context",
+        "side": "head",
+        "start": 14,
+        "end": 15,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "cb6534dfca8c9ae9"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 14,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 14,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 15,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "f124e8484c649024"
+    },
+    {
+      "id": "aff1ab8eaa16d3d2",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "e2b193e775ecd5b7",
+        "path": "tests/test_parsing.py",
+        "name": "file context",
+        "side": "head",
+        "start": 18,
+        "end": 19,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "cb6534dfca8c9ae9"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 18,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 18,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 19,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "f124e8484c649024"
+    },
+    {
       "id": "026672cb30fc46d7",
       "kind": "wiring",
       "label": "Import wiring",
@@ -2585,7 +3096,8 @@
         "url": null,
         "calls": [],
         "references": [],
-        "is_test": false
+        "is_test": false,
+        "fragment_key": "4acf8f202ee42688"
       },
       "basis": "7 changed line(s) outside classified symbol spans. Full region shown for context; overlapping code is not counted twice in AST metrics.",
       "hunks": [
@@ -2600,6 +3112,138 @@
               "old": null,
               "new": 1,
               "text": "from catalog.query import construct_query"
+            }
+          ]
+        }
+      ],
+      "raw_id": "e6a5939255d0ce93"
+    },
+    {
+      "id": "a4f8ee39ebf2ae8e",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "ab692c56d375e776",
+        "path": "tests/test_query.py",
+        "name": "file context",
+        "side": "head",
+        "start": 2,
+        "end": 3,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "4acf8f202ee42688"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 2,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 2,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 3,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "e6a5939255d0ce93"
+    },
+    {
+      "id": "f4d726b89f56991c",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "676bc177b4ec2421",
+        "path": "tests/test_query.py",
+        "name": "file context",
+        "side": "head",
+        "start": 8,
+        "end": 9,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "4acf8f202ee42688"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 8,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 8,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 9,
+              "text": ""
+            }
+          ]
+        }
+      ],
+      "raw_id": "e6a5939255d0ce93"
+    },
+    {
+      "id": "47998d0309eebb30",
+      "kind": "text",
+      "label": "Text-only change",
+      "before": null,
+      "after": {
+        "id": "a56ef756678adda3",
+        "path": "tests/test_query.py",
+        "name": "file context",
+        "side": "head",
+        "start": 15,
+        "end": 16,
+        "source": "\n\n",
+        "url": null,
+        "calls": [],
+        "references": [],
+        "is_test": false,
+        "fragment_key": "4acf8f202ee42688"
+      },
+      "basis": "Raw source lines differ outside existing change spans. This comparison includes blank lines, line endings, and terminal newline bytes. No behavior change is inferred from this text evidence. The base file is confirmed absent.",
+      "hunks": [
+        {
+          "old_start": 1,
+          "new_start": 15,
+          "old_count": 0,
+          "new_count": 2,
+          "rows": [
+            {
+              "tag": "add",
+              "old": null,
+              "new": 15,
+              "text": ""
+            },
+            {
+              "tag": "add",
+              "old": null,
+              "new": 16,
+              "text": ""
             }
           ]
         }
@@ -2804,7 +3448,6 @@
       "theme": "result parsing",
       "title": "Build one parsing boundary",
       "change_ids": [
-        "2df2308a41a0a306",
         "d3dec5cc1a2d0ac6",
         "9b8438c727c24ffd"
       ],
@@ -2839,9 +3482,9 @@
       "narrative": {
         "intent": "Follow the relocation of result parsing, pairing the old and new definitions instead of reading deletion and addition separately.",
         "why_now": "Build on Label normalization · labels.py; Value conversion · parsing.py. The source links show why these definitions are prerequisites.",
-        "before": "No base definition in this unit; catalog/search.py",
+        "before": "catalog/search.py",
         "after": "catalog/parsing.py",
-        "takeaway": "You have inspected 3 change unit(s) concerning module imports / context, parse_tags, parse_record.",
+        "takeaway": "You have inspected 2 change unit(s) concerning parse_tags, parse_record.",
         "invariants": [
           "Check the expected inputs, outputs and failure cases against both revisions.",
           "The rename match preserves internal identifiers and literals; declaration name and leading docstring are excluded only for this explicitly labeled match."
@@ -2853,13 +3496,6 @@
         "provenance": "authored interpretation, linked to source; not machine-verified semantics",
         "transition": "Follow the next dependency without leaving this document.",
         "passages": [
-          {
-            "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
-            "change_ids": [
-              "2df2308a41a0a306"
-            ],
-            "view": "diff"
-          },
           {
             "text": "`split_tags` becomes `parse_tags` in the parsing module. Empty fields disappear, tags become lowercase, and source order—including duplicates—survives. Only the declaration name changes; internal names and literal values still participate in the structural comparison.",
             "change_ids": [
@@ -2876,7 +3512,6 @@
           }
         ],
         "evidence_change_ids": [
-          "2df2308a41a0a306",
           "d3dec5cc1a2d0ac6",
           "9b8438c727c24ffd"
         ]
@@ -2931,7 +3566,6 @@
       "theme": "orchestration",
       "title": "Return to the search entry point",
       "change_ids": [
-        "d2f5bacb5e03490d",
         "d7ea39d8954cab6b"
       ],
       "prerequisites": [
@@ -2944,9 +3578,9 @@
       "narrative": {
         "intent": "Follow orchestration in search.py.",
         "why_now": "Build on Record merging · merge.py; Query construction · query.py; Result parsing · parsing.py. The source links show why these definitions are prerequisites.",
-        "before": "No base definition in this unit; catalog/search.py",
+        "before": "catalog/search.py",
         "after": "catalog/search.py",
-        "takeaway": "You have inspected 2 change unit(s) concerning module imports / context, get_records.",
+        "takeaway": "You have inspected 1 change unit(s) concerning get_records.",
         "invariants": [
           "Check the expected inputs, outputs and failure cases against both revisions."
         ],
@@ -2957,13 +3591,6 @@
         "transition": "Follow the next dependency without leaving this document.",
         "passages": [
           {
-            "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
-            "change_ids": [
-              "d2f5bacb5e03490d"
-            ],
-            "view": "diff"
-          },
-          {
             "text": "Now the entry point is readable as a sequence: construct a query, execute it, interpret each row, and merge duplicates. It still materializes the parsed rows before merging. The tighter page-size rule reaches users through this call; it must not be hidden under the refactor label.",
             "change_ids": [
               "d7ea39d8954cab6b"
@@ -2972,7 +3599,6 @@
           }
         ],
         "evidence_change_ids": [
-          "d2f5bacb5e03490d",
           "d7ea39d8954cab6b"
         ]
       },
@@ -3027,9 +3653,13 @@
       "title": "Make the preserved rules executable",
       "change_ids": [
         "fd323c917ce3337c",
+        "e8caa805d19a0a31",
         "ec92156828e995bb",
+        "8ea44102faf3f0cb",
         "189601f74b8680b9",
+        "7f30cd06810af923",
         "a3331c56ed891d8c",
+        "aff1ab8eaa16d3d2",
         "6fab283d650e6f28"
       ],
       "prerequisites": [
@@ -3043,7 +3673,7 @@
         "why_now": "Build on Record merging · merge.py; Result parsing · parsing.py. The source links show why these definitions are prerequisites.",
         "before": "No base definition in this unit",
         "after": "tests/test_parsing.py",
-        "takeaway": "You have inspected 5 change unit(s) concerning module imports / context, test_record_preserves_display_contract, test_missing_and_zero_views, test_tag_order_and_duplicates and related symbols.",
+        "takeaway": "You have inspected 9 change unit(s) concerning module imports / context, file context, test_record_preserves_display_contract, file context and related symbols.",
         "invariants": [
           "Assertions should express the intended contract, not merely repeat the implementation."
         ],
@@ -3061,9 +3691,23 @@
             "view": "diff"
           },
           {
+            "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+            "change_ids": [
+              "e8caa805d19a0a31"
+            ],
+            "view": "definition"
+          },
+          {
             "text": "A representative row checks the complete display record: identifier, normalized label, ordered tags, and the rounded click rate. Delegation should not change those values.",
             "change_ids": [
               "ec92156828e995bb"
+            ],
+            "view": "definition"
+          },
+          {
+            "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+            "change_ids": [
+              "8ea44102faf3f0cb"
             ],
             "view": "definition"
           },
@@ -3075,9 +3719,23 @@
             "view": "definition"
           },
           {
+            "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+            "change_ids": [
+              "7f30cd06810af923"
+            ],
+            "view": "definition"
+          },
+          {
             "text": "Case normalization and empty-tag removal must not turn the list into a set. The assertion preserves duplicates and source order.",
             "change_ids": [
               "a3331c56ed891d8c"
+            ],
+            "view": "definition"
+          },
+          {
+            "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+            "change_ids": [
+              "aff1ab8eaa16d3d2"
             ],
             "view": "definition"
           },
@@ -3091,9 +3749,13 @@
         ],
         "evidence_change_ids": [
           "fd323c917ce3337c",
+          "e8caa805d19a0a31",
           "ec92156828e995bb",
+          "8ea44102faf3f0cb",
           "189601f74b8680b9",
+          "7f30cd06810af923",
           "a3331c56ed891d8c",
+          "aff1ab8eaa16d3d2",
           "6fab283d650e6f28"
         ]
       },
@@ -3106,8 +3768,11 @@
       "title": "Check the contract at its boundary",
       "change_ids": [
         "026672cb30fc46d7",
+        "a4f8ee39ebf2ae8e",
         "a7badff14d18e6f6",
+        "f4d726b89f56991c",
         "e5b7162fc4b0a209",
+        "47998d0309eebb30",
         "6fda0fd2afd4b3ab"
       ],
       "prerequisites": [
@@ -3120,7 +3785,7 @@
         "why_now": "Build on Query construction · query.py. The source links show why these definitions are prerequisites.",
         "before": "No base definition in this unit",
         "after": "tests/test_query.py",
-        "takeaway": "You have inspected 4 change unit(s) concerning module imports / context, test_query_default, test_term_stays_a_parameter, test_page_size_boundaries.",
+        "takeaway": "You have inspected 7 change unit(s) concerning module imports / context, file context, test_query_default, file context and related symbols.",
         "invariants": [
           "Assertions should express the intended contract, not merely repeat the implementation."
         ],
@@ -3128,7 +3793,7 @@
           "Do these assertions exercise the changed behavior, including negative and boundary cases?"
         ],
         "provenance": "authored interpretation, linked to source; not machine-verified semantics",
-        "transition": "The source trail now reaches the tests as well as the callers.",
+        "transition": "Follow the next dependency without leaving this document.",
         "passages": [
           {
             "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
@@ -3138,6 +3803,13 @@
             "view": "diff"
           },
           {
+            "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+            "change_ids": [
+              "a4f8ee39ebf2ae8e"
+            ],
+            "view": "definition"
+          },
+          {
             "text": "The default case locks down the 25-row page size and the shape of the parameter tuple. This test calls the extracted query module directly.",
             "change_ids": [
               "a7badff14d18e6f6"
@@ -3145,9 +3817,23 @@
             "view": "definition"
           },
           {
+            "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+            "change_ids": [
+              "f4d726b89f56991c"
+            ],
+            "view": "definition"
+          },
+          {
             "text": "A quote in the search term must remain data rather than changing the SQL statement. Inspect both the SQL and the bound value; checking only that the call succeeds would miss the contract.",
             "change_ids": [
               "e5b7162fc4b0a209"
+            ],
+            "view": "definition"
+          },
+          {
+            "text": "`file context` states an expectation about the public boundary. This is test source, not an executed result.",
+            "change_ids": [
+              "47998d0309eebb30"
             ],
             "view": "definition"
           },
@@ -3161,9 +3847,155 @@
         ],
         "evidence_change_ids": [
           "026672cb30fc46d7",
+          "a4f8ee39ebf2ae8e",
           "a7badff14d18e6f6",
+          "f4d726b89f56991c",
           "e5b7162fc4b0a209",
+          "47998d0309eebb30",
           "6fda0fd2afd4b3ab"
+        ]
+      },
+      "next_id": "12a55d5d4c51b680"
+    },
+    {
+      "id": "12a55d5d4c51b680",
+      "path": "catalog/parsing.py",
+      "theme": "supporting",
+      "title": "Point imports at the defining modules",
+      "change_ids": [
+        "2df2308a41a0a306",
+        "4ff0691afd736322",
+        "e49e81e87f43fab2",
+        "abcdb7bbc698272c"
+      ],
+      "prerequisites": [],
+      "test_links": [],
+      "number": 11,
+      "narrative": {
+        "intent": "Follow supporting in parsing.py.",
+        "why_now": "This is another foundation for the walkthrough. No prerequisite among the other changed units was resolved statically.",
+        "before": "No base definition in this unit",
+        "after": "catalog/parsing.py",
+        "takeaway": "You have inspected 4 change unit(s) concerning module imports / context, file context, file context, file context.",
+        "invariants": [
+          "Check the expected inputs, outputs and failure cases against both revisions."
+        ],
+        "questions": [
+          "Are observable outputs, exceptions and calling conventions preserved or intentionally changed?"
+        ],
+        "provenance": "authored interpretation, linked to source; not machine-verified semantics",
+        "transition": "Follow the next dependency without leaving this document.",
+        "passages": [
+          {
+            "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
+            "change_ids": [
+              "2df2308a41a0a306"
+            ],
+            "view": "diff"
+          },
+          {
+            "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+            "change_ids": [
+              "4ff0691afd736322"
+            ],
+            "view": "diff"
+          },
+          {
+            "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+            "change_ids": [
+              "e49e81e87f43fab2"
+            ],
+            "view": "diff"
+          },
+          {
+            "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+            "change_ids": [
+              "abcdb7bbc698272c"
+            ],
+            "view": "diff"
+          }
+        ],
+        "evidence_change_ids": [
+          "2df2308a41a0a306",
+          "4ff0691afd736322",
+          "e49e81e87f43fab2",
+          "abcdb7bbc698272c"
+        ]
+      },
+      "next_id": "c7e2bd25042d1cae"
+    },
+    {
+      "id": "c7e2bd25042d1cae",
+      "path": "catalog/search.py",
+      "theme": "supporting",
+      "title": "Point imports at the defining modules",
+      "change_ids": [
+        "d2f5bacb5e03490d",
+        "731b07ef041382e9",
+        "cc4de3fc6a6def38",
+        "5757daf981b589ca",
+        "2753abafa78d7787"
+      ],
+      "prerequisites": [],
+      "test_links": [],
+      "number": 12,
+      "narrative": {
+        "intent": "Follow supporting in search.py.",
+        "why_now": "This is another foundation for the walkthrough. No prerequisite among the other changed units was resolved statically.",
+        "before": "No base definition in this unit; catalog/search.py",
+        "after": "No head definition in this unit; catalog/search.py",
+        "takeaway": "You have inspected 5 change unit(s) concerning module imports / context, file context, file context, file context and related symbols.",
+        "invariants": [
+          "Check the expected inputs, outputs and failure cases against both revisions."
+        ],
+        "questions": [
+          "Are observable outputs, exceptions and calling conventions preserved or intentionally changed?"
+        ],
+        "provenance": "authored interpretation, linked to source; not machine-verified semantics",
+        "transition": "The source trail now reaches the tests as well as the callers.",
+        "passages": [
+          {
+            "text": "These imports bind the names used below to their defining modules. This is wiring, not a new runtime rule; still check the import paths and module initialization order.",
+            "change_ids": [
+              "d2f5bacb5e03490d"
+            ],
+            "view": "diff"
+          },
+          {
+            "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+            "change_ids": [
+              "731b07ef041382e9"
+            ],
+            "view": "diff"
+          },
+          {
+            "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+            "change_ids": [
+              "cc4de3fc6a6def38"
+            ],
+            "view": "diff"
+          },
+          {
+            "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+            "change_ids": [
+              "5757daf981b589ca"
+            ],
+            "view": "diff"
+          },
+          {
+            "text": "This supporting change remains part of the same reading. Its source is preserved here rather than being dropped from the review because it is not a primary abstraction.",
+            "change_ids": [
+              "2753abafa78d7787"
+            ],
+            "view": "diff"
+          }
+        ],
+        "evidence_change_ids": [
+          "d2f5bacb5e03490d",
+          "731b07ef041382e9",
+          "cc4de3fc6a6def38",
+          "5757daf981b589ca",
+          "2753abafa78d7787"
         ]
       },
       "next_id": null
@@ -3400,7 +4232,8 @@
       "is_test": true,
       "signature": "",
       "url": null,
-      "scope": "full"
+      "scope": "full",
+      "fragment_key": "cb6534dfca8c9ae9"
     },
     {
       "id": "2b4431a78f24bb49",
@@ -3438,7 +4271,8 @@
       "is_test": true,
       "signature": "",
       "url": null,
-      "scope": "full"
+      "scope": "full",
+      "fragment_key": "cb6534dfca8c9ae9"
     },
     {
       "id": "dc33bfbcccfa55b6",
@@ -3470,7 +4304,8 @@
       "is_test": true,
       "signature": "",
       "url": null,
-      "scope": "full"
+      "scope": "full",
+      "fragment_key": "cb6534dfca8c9ae9"
     },
     {
       "id": "80536d493b015b1a",
@@ -3525,7 +4360,8 @@
       "is_test": true,
       "signature": "",
       "url": null,
-      "scope": "full"
+      "scope": "full",
+      "fragment_key": "cb6534dfca8c9ae9"
     },
     {
       "id": "5097b82a20a56ba8",
@@ -3569,7 +4405,8 @@
       "is_test": true,
       "signature": "",
       "url": null,
-      "scope": "full"
+      "scope": "full",
+      "fragment_key": "4acf8f202ee42688"
     },
     {
       "id": "8ce250d333db724d",
@@ -3626,7 +4463,8 @@
       "is_test": true,
       "signature": "",
       "url": null,
-      "scope": "full"
+      "scope": "full",
+      "fragment_key": "4acf8f202ee42688"
     },
     {
       "id": "0a90355d661697f0",
@@ -3696,7 +4534,8 @@
       "is_test": true,
       "signature": "",
       "url": null,
-      "scope": "full"
+      "scope": "full",
+      "fragment_key": "4acf8f202ee42688"
     }
   ],
   "raw_files": [
@@ -3709,397 +4548,400 @@
       "hunks": [
         {
           "old_start": 1,
-          "new_start": 1,
           "old_count": 57,
+          "new_start": 1,
           "new_count": 12,
           "rows": [
             {
               "tag": "delete",
+              "text": "def normalize_label(value: str) -> str:",
               "old": 1,
-              "new": null,
-              "text": "def normalize_label(value: str) -> str:"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"",
               "old": 2,
-              "new": null,
-              "text": "    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    return \" \".join(value.split())",
               "old": 3,
-              "new": null,
-              "text": "    return \" \".join(value.split())"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "",
               "old": 4,
-              "new": null,
-              "text": ""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "",
               "old": 5,
-              "new": null,
-              "text": ""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "def split_tags(value: str) -> list[str]:",
               "old": 6,
-              "new": null,
-              "text": "def split_tags(value: str) -> list[str]:"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"",
               "old": 7,
-              "new": null,
-              "text": "    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    tags = []",
               "old": 8,
-              "new": null,
-              "text": "    tags = []"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    for part in value.split(\",\"):",
               "old": 9,
-              "new": null,
-              "text": "    for part in value.split(\",\"):"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        if part.strip():",
               "old": 10,
-              "new": null,
-              "text": "        if part.strip():"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "            tags.append(part.strip().lower())",
               "old": 11,
-              "new": null,
-              "text": "            tags.append(part.strip().lower())"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    return tags",
               "old": 12,
-              "new": null,
-              "text": "    return tags"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "",
               "old": 13,
-              "new": null,
-              "text": ""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "",
               "old": 14,
-              "new": null,
-              "text": ""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "def merge_records(records):",
               "old": 15,
-              "new": null,
-              "text": "def merge_records(records):"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"",
               "old": 16,
-              "new": null,
-              "text": "    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    seen = set()",
               "old": 17,
-              "new": null,
-              "text": "    seen = set()"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    for record in records:",
               "old": 18,
-              "new": null,
-              "text": "    for record in records:"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        key = record[\"id\"]",
               "old": 19,
-              "new": null,
-              "text": "        key = record[\"id\"]"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        if key in seen:",
               "old": 20,
-              "new": null,
-              "text": "        if key in seen:"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "            continue",
               "old": 21,
-              "new": null,
-              "text": "            continue"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        seen.add(key)",
               "old": 22,
-              "new": null,
-              "text": "        seen.add(key)"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        yield record",
               "old": 23,
-              "new": null,
-              "text": "        yield record"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "",
               "old": 24,
-              "new": null,
-              "text": ""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "",
               "old": 25,
-              "new": null,
-              "text": ""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "def construct_query(term: str, limit: int = 25):",
               "old": 26,
-              "new": null,
-              "text": "def construct_query(term: str, limit: int = 25):"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    \"\"\"Select a page of catalog items using bound parameters.",
               "old": 27,
-              "new": null,
-              "text": "    \"\"\"Select a page of catalog items using bound parameters."
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "",
               "old": 28,
-              "new": null,
-              "text": ""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    The caller provides a database connection. This helper only produces",
               "old": 29,
-              "new": null,
-              "text": "    The caller provides a database connection. This helper only produces"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    a statement and its parameters; it never executes a query itself.",
               "old": 30,
-              "new": null,
-              "text": "    a statement and its parameters; it never executes a query itself."
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    LIKE wildcard semantics are intentionally left to the database.",
               "old": 31,
-              "new": null,
-              "text": "    LIKE wildcard semantics are intentionally left to the database."
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    \"\"\"",
               "old": 32,
-              "new": null,
-              "text": "    \"\"\""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    statement = (",
               "old": 33,
-              "new": null,
-              "text": "    statement = ("
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        \"SELECT id, label, tags, views, clicks FROM items \"",
               "old": 34,
-              "new": null,
-              "text": "        \"SELECT id, label, tags, views, clicks FROM items \""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"",
               "old": 35,
-              "new": null,
-              "text": "        \"WHERE label LIKE ? ORDER BY id LIMIT ?\""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    )",
               "old": 36,
-              "new": null,
-              "text": "    )"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    return statement, (f\"%{term}%\", limit)",
               "old": 37,
-              "new": null,
-              "text": "    return statement, (f\"%{term}%\", limit)"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "",
               "old": 38,
-              "new": null,
-              "text": ""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "",
               "old": 39,
-              "new": null,
-              "text": ""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "def parse_record(row):",
               "old": 40,
-              "new": null,
-              "text": "def parse_record(row):"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    \"\"\"Turn a database row into a display record.\"\"\"",
               "old": 41,
-              "new": null,
-              "text": "    \"\"\"Turn a database row into a display record.\"\"\""
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    result = {",
               "old": 42,
-              "new": null,
-              "text": "    result = {"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        \"id\": str(row[\"id\"]),",
               "old": 43,
-              "new": null,
-              "text": "        \"id\": str(row[\"id\"]),"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        \"label\": normalize_label(row[\"label\"]),",
               "old": 44,
-              "new": null,
-              "text": "        \"label\": normalize_label(row[\"label\"]),"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        \"tags\": split_tags(row.get(\"tags\", \"\")),",
               "old": 45,
-              "new": null,
-              "text": "        \"tags\": split_tags(row.get(\"tags\", \"\")),"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        \"click_rate\": None,",
               "old": 46,
-              "new": null,
-              "text": "        \"click_rate\": None,"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    }",
               "old": 47,
-              "new": null,
-              "text": "    }"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    if row.get(\"views\"):",
               "old": 48,
-              "new": null,
-              "text": "    if row.get(\"views\"):"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)",
               "old": 49,
-              "new": null,
-              "text": "        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    return result",
               "old": 50,
-              "new": null,
-              "text": "    return result"
+              "new": null
             },
             {
               "tag": "add",
+              "text": "from catalog.query import construct_query",
               "old": null,
-              "new": 1,
-              "text": "from catalog.query import construct_query"
+              "new": 1
             },
             {
               "tag": "add",
+              "text": "from catalog.parsing import parse_record",
               "old": null,
-              "new": 2,
-              "text": "from catalog.parsing import parse_record"
+              "new": 2
             },
             {
               "tag": "add",
+              "text": "from catalog.merge import merge_records",
               "old": null,
-              "new": 3,
-              "text": "from catalog.merge import merge_records"
+              "new": 3
             },
             {
               "tag": "context",
+              "text": "",
               "old": 51,
-              "new": 4,
-              "text": ""
+              "new": 4
             },
             {
               "tag": "context",
+              "text": "",
               "old": 52,
-              "new": 5,
-              "text": ""
+              "new": 5
             },
             {
               "tag": "context",
+              "text": "def get_records(connection, term: str, limit: int = 25):",
               "old": 53,
-              "new": 6,
-              "text": "def get_records(connection, term: str, limit: int = 25):"
+              "new": 6
             },
             {
               "tag": "add",
+              "text": "    \"\"\"Build, execute, interpret, then deduplicate a single catalog page.\"\"\"",
               "old": null,
-              "new": 7,
-              "text": "    \"\"\"Build, execute, interpret, then deduplicate a single catalog page.\"\"\""
+              "new": 7
             },
             {
               "tag": "context",
+              "text": "    statement, parameters = construct_query(term, limit)",
               "old": 54,
-              "new": 8,
-              "text": "    statement, parameters = construct_query(term, limit)"
+              "new": 8
             },
             {
               "tag": "context",
+              "text": "    rows = connection.execute(statement, parameters)",
               "old": 55,
-              "new": 9,
-              "text": "    rows = connection.execute(statement, parameters)"
+              "new": 9
             },
             {
               "tag": "delete",
+              "text": "    parsed = [parse_record(row) for row in rows]",
               "old": 56,
-              "new": null,
-              "text": "    parsed = [parse_record(row) for row in rows]"
+              "new": null
             },
             {
               "tag": "delete",
+              "text": "    return list(merge_records(parsed))",
               "old": 57,
-              "new": null,
-              "text": "    return list(merge_records(parsed))"
+              "new": null
             },
             {
               "tag": "add",
+              "text": "    # Materialize rows before merging, as before this extraction.",
               "old": null,
-              "new": 10,
-              "text": "    # Materialize rows before merging, as before this extraction."
+              "new": 10
             },
             {
               "tag": "add",
+              "text": "    records = [parse_record(row) for row in rows]",
               "old": null,
-              "new": 11,
-              "text": "    records = [parse_record(row) for row in rows]"
+              "new": 11
             },
             {
               "tag": "add",
+              "text": "    return list(merge_records(records))",
               "old": null,
-              "new": 12,
-              "text": "    return list(merge_records(records))"
+              "new": 12
             }
           ]
         }
       ],
+      "diff_origin": "git",
+      "patch_status": "captured",
+      "original_patch": "--- a/catalog/search.py\n+++ b/catalog/search.py\n@@ -1,57 +1,12 @@\n-def normalize_label(value: str) -> str:\n-    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"\n-    return \" \".join(value.split())\n-\n-\n-def split_tags(value: str) -> list[str]:\n-    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"\n-    tags = []\n-    for part in value.split(\",\"):\n-        if part.strip():\n-            tags.append(part.strip().lower())\n-    return tags\n-\n-\n-def merge_records(records):\n-    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"\n-    seen = set()\n-    for record in records:\n-        key = record[\"id\"]\n-        if key in seen:\n-            continue\n-        seen.add(key)\n-        yield record\n-\n-\n-def construct_query(term: str, limit: int = 25):\n-    \"\"\"Select a page of catalog items using bound parameters.\n-\n-    The caller provides a database connection. This helper only produces\n-    a statement and its parameters; it never executes a query itself.\n-    LIKE wildcard semantics are intentionally left to the database.\n-    \"\"\"\n-    statement = (\n-        \"SELECT id, label, tags, views, clicks FROM items \"\n-        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"\n-    )\n-    return statement, (f\"%{term}%\", limit)\n-\n-\n-def parse_record(row):\n-    \"\"\"Turn a database row into a display record.\"\"\"\n-    result = {\n-        \"id\": str(row[\"id\"]),\n-        \"label\": normalize_label(row[\"label\"]),\n-        \"tags\": split_tags(row.get(\"tags\", \"\")),\n-        \"click_rate\": None,\n-    }\n-    if row.get(\"views\"):\n-        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)\n-    return result\n+from catalog.query import construct_query\n+from catalog.parsing import parse_record\n+from catalog.merge import merge_records\n \n \n def get_records(connection, term: str, limit: int = 25):\n+    \"\"\"Build, execute, interpret, then deduplicate a single catalog page.\"\"\"\n     statement, parameters = construct_query(term, limit)\n     rows = connection.execute(statement, parameters)\n-    parsed = [parse_record(row) for row in rows]\n-    return list(merge_records(parsed))\n+    # Materialize rows before merging, as before this extraction.\n+    records = [parse_record(row) for row in rows]\n+    return list(merge_records(records))\n",
       "before_url": null,
       "after_url": null
     },
@@ -4112,55 +4954,58 @@
       "hunks": [
         {
           "old_start": 1,
-          "new_start": 1,
           "old_count": 5,
+          "new_start": 1,
           "new_count": 5,
           "rows": [
             {
               "tag": "delete",
+              "text": "from catalog.search import split_tags",
               "old": 1,
-              "new": null,
-              "text": "from catalog.search import split_tags"
+              "new": null
             },
             {
               "tag": "add",
+              "text": "from catalog.parsing import parse_tags",
               "old": null,
-              "new": 1,
-              "text": "from catalog.parsing import parse_tags"
+              "new": 1
             },
             {
               "tag": "context",
+              "text": "",
               "old": 2,
-              "new": 2,
-              "text": ""
+              "new": 2
             },
             {
               "tag": "context",
+              "text": "",
               "old": 3,
-              "new": 3,
-              "text": ""
+              "new": 3
             },
             {
               "tag": "context",
+              "text": "def export_tags(value):",
               "old": 4,
-              "new": 4,
-              "text": "def export_tags(value):"
+              "new": 4
             },
             {
               "tag": "delete",
+              "text": "    return \";\".join(split_tags(value))",
               "old": 5,
-              "new": null,
-              "text": "    return \";\".join(split_tags(value))"
+              "new": null
             },
             {
               "tag": "add",
+              "text": "    return \";\".join(parse_tags(value))",
               "old": null,
-              "new": 5,
-              "text": "    return \";\".join(parse_tags(value))"
+              "new": 5
             }
           ]
         }
       ],
+      "diff_origin": "git",
+      "patch_status": "captured",
+      "original_patch": "--- a/tools/export.py\n+++ b/tools/export.py\n@@ -1,5 +1,5 @@\n-from catalog.search import split_tags\n+from catalog.parsing import parse_tags\n \n \n def export_tags(value):\n-    return \";\".join(split_tags(value))\n+    return \";\".join(parse_tags(value))\n",
       "before_url": null,
       "after_url": null
     },
@@ -4172,32 +5017,35 @@
       "scope": "full",
       "hunks": [
         {
-          "old_start": 1,
-          "new_start": 1,
+          "old_start": 0,
           "old_count": 0,
+          "new_start": 1,
           "new_count": 3,
           "rows": [
             {
               "tag": "add",
+              "text": "def normalize_label(value: str) -> str:",
               "old": null,
-              "new": 1,
-              "text": "def normalize_label(value: str) -> str:"
+              "new": 1
             },
             {
               "tag": "add",
+              "text": "    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"",
               "old": null,
-              "new": 2,
-              "text": "    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\""
+              "new": 2
             },
             {
               "tag": "add",
+              "text": "    return \" \".join(value.split())",
               "old": null,
-              "new": 3,
-              "text": "    return \" \".join(value.split())"
+              "new": 3
             }
           ]
         }
       ],
+      "diff_origin": "git",
+      "patch_status": "captured",
+      "original_patch": "--- a/catalog/labels.py\n+++ b/catalog/labels.py\n@@ -0,0 +1,3 @@\n+def normalize_label(value: str) -> str:\n+    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"\n+    return \" \".join(value.split())\n",
       "before_url": null,
       "after_url": null
     },
@@ -4209,68 +5057,71 @@
       "scope": "full",
       "hunks": [
         {
-          "old_start": 1,
-          "new_start": 1,
+          "old_start": 0,
           "old_count": 0,
+          "new_start": 1,
           "new_count": 9,
           "rows": [
             {
               "tag": "add",
+              "text": "def merge_records(records):",
               "old": null,
-              "new": 1,
-              "text": "def merge_records(records):"
+              "new": 1
             },
             {
               "tag": "add",
+              "text": "    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"",
               "old": null,
-              "new": 2,
-              "text": "    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\""
+              "new": 2
             },
             {
               "tag": "add",
+              "text": "    seen = set()",
               "old": null,
-              "new": 3,
-              "text": "    seen = set()"
+              "new": 3
             },
             {
               "tag": "add",
+              "text": "    for record in records:",
               "old": null,
-              "new": 4,
-              "text": "    for record in records:"
+              "new": 4
             },
             {
               "tag": "add",
+              "text": "        key = record[\"id\"]",
               "old": null,
-              "new": 5,
-              "text": "        key = record[\"id\"]"
+              "new": 5
             },
             {
               "tag": "add",
+              "text": "        if key in seen:",
               "old": null,
-              "new": 6,
-              "text": "        if key in seen:"
+              "new": 6
             },
             {
               "tag": "add",
+              "text": "            continue",
               "old": null,
-              "new": 7,
-              "text": "            continue"
+              "new": 7
             },
             {
               "tag": "add",
+              "text": "        seen.add(key)",
               "old": null,
-              "new": 8,
-              "text": "        seen.add(key)"
+              "new": 8
             },
             {
               "tag": "add",
+              "text": "        yield record",
               "old": null,
-              "new": 9,
-              "text": "        yield record"
+              "new": 9
             }
           ]
         }
       ],
+      "diff_origin": "git",
+      "patch_status": "captured",
+      "original_patch": "--- a/catalog/merge.py\n+++ b/catalog/merge.py\n@@ -0,0 +1,9 @@\n+def merge_records(records):\n+    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"\n+    seen = set()\n+    for record in records:\n+        key = record[\"id\"]\n+        if key in seen:\n+            continue\n+        seen.add(key)\n+        yield record\n",
       "before_url": null,
       "after_url": null
     },
@@ -4282,272 +5133,275 @@
       "scope": "full",
       "hunks": [
         {
-          "old_start": 1,
-          "new_start": 1,
+          "old_start": 0,
           "old_count": 0,
+          "new_start": 1,
           "new_count": 43,
           "rows": [
             {
               "tag": "add",
+              "text": "from catalog.labels import normalize_label",
               "old": null,
-              "new": 1,
-              "text": "from catalog.labels import normalize_label"
+              "new": 1
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 2,
-              "text": ""
+              "new": 2
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 3,
-              "text": ""
+              "new": 3
             },
             {
               "tag": "add",
+              "text": "def parse_tags(value: str) -> list[str]:",
               "old": null,
-              "new": 4,
-              "text": "def parse_tags(value: str) -> list[str]:"
+              "new": 4
             },
             {
               "tag": "add",
+              "text": "    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"",
               "old": null,
-              "new": 5,
-              "text": "    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\""
+              "new": 5
             },
             {
               "tag": "add",
+              "text": "    tags = []",
               "old": null,
-              "new": 6,
-              "text": "    tags = []"
+              "new": 6
             },
             {
               "tag": "add",
+              "text": "    for part in value.split(\",\"):",
               "old": null,
-              "new": 7,
-              "text": "    for part in value.split(\",\"):"
+              "new": 7
             },
             {
               "tag": "add",
+              "text": "        if part.strip():",
               "old": null,
-              "new": 8,
-              "text": "        if part.strip():"
+              "new": 8
             },
             {
               "tag": "add",
+              "text": "            tags.append(part.strip().lower())",
               "old": null,
-              "new": 9,
-              "text": "            tags.append(part.strip().lower())"
+              "new": 9
             },
             {
               "tag": "add",
+              "text": "    return tags",
               "old": null,
-              "new": 10,
-              "text": "    return tags"
+              "new": 10
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 11,
-              "text": ""
+              "new": 11
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 12,
-              "text": ""
+              "new": 12
             },
             {
               "tag": "add",
+              "text": "def populate_metrics(row, result):",
               "old": null,
-              "new": 13,
-              "text": "def populate_metrics(row, result):"
+              "new": 13
             },
             {
               "tag": "add",
+              "text": "    \"\"\"Add a click rate only when views are present and nonzero.\"\"\"",
               "old": null,
-              "new": 14,
-              "text": "    \"\"\"Add a click rate only when views are present and nonzero.\"\"\""
+              "new": 14
             },
             {
               "tag": "add",
+              "text": "    if row.get(\"views\"):",
               "old": null,
-              "new": 15,
-              "text": "    if row.get(\"views\"):"
+              "new": 15
             },
             {
               "tag": "add",
+              "text": "        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)",
               "old": null,
-              "new": 16,
-              "text": "        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)"
+              "new": 16
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 17,
-              "text": ""
+              "new": 17
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 18,
-              "text": ""
+              "new": 18
             },
             {
               "tag": "add",
+              "text": "def parse_record(row):",
               "old": null,
-              "new": 19,
-              "text": "def parse_record(row):"
+              "new": 19
             },
             {
               "tag": "add",
+              "text": "    \"\"\"Turn a database row into a display record.",
               "old": null,
-              "new": 20,
-              "text": "    \"\"\"Turn a database row into a display record."
+              "new": 20
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 21,
-              "text": ""
+              "new": 21
             },
             {
               "tag": "add",
+              "text": "    Output fields:",
               "old": null,
-              "new": 22,
-              "text": "    Output fields:"
+              "new": 22
             },
             {
               "tag": "add",
+              "text": "        id: stable string representation of the source identifier.",
               "old": null,
-              "new": 23,
-              "text": "        id: stable string representation of the source identifier."
+              "new": 23
             },
             {
               "tag": "add",
+              "text": "        label: whitespace-normalized title with original capitalization.",
               "old": null,
-              "new": 24,
-              "text": "        label: whitespace-normalized title with original capitalization."
+              "new": 24
             },
             {
               "tag": "add",
+              "text": "        tags: lower-case tags in their original encounter order.",
               "old": null,
-              "new": 25,
-              "text": "        tags: lower-case tags in their original encounter order."
+              "new": 25
             },
             {
               "tag": "add",
+              "text": "        click_rate: clicks divided by views, rounded to four places.",
               "old": null,
-              "new": 26,
-              "text": "        click_rate: clicks divided by views, rounded to four places."
+              "new": 26
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 27,
-              "text": ""
+              "new": 27
             },
             {
               "tag": "add",
+              "text": "    Absent or zero views leave click_rate as None. Missing required",
               "old": null,
-              "new": 28,
-              "text": "    Absent or zero views leave click_rate as None. Missing required"
+              "new": 28
             },
             {
               "tag": "add",
+              "text": "    identifiers and labels still raise KeyError; we do not silently",
               "old": null,
-              "new": 29,
-              "text": "    identifiers and labels still raise KeyError; we do not silently"
+              "new": 29
             },
             {
               "tag": "add",
+              "text": "    invent identifiers or descriptions in a normalization step.",
               "old": null,
-              "new": 30,
-              "text": "    invent identifiers or descriptions in a normalization step."
+              "new": 30
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 31,
-              "text": ""
+              "new": 31
             },
             {
               "tag": "add",
+              "text": "    The metrics calculation is now shared, but its rounding precision",
               "old": null,
-              "new": 32,
-              "text": "    The metrics calculation is now shared, but its rounding precision"
+              "new": 32
             },
             {
               "tag": "add",
+              "text": "    and missing-value rule are not intended to change. Test those rules",
               "old": null,
-              "new": 33,
-              "text": "    and missing-value rule are not intended to change. Test those rules"
+              "new": 33
             },
             {
               "tag": "add",
+              "text": "    at the public parse_record boundary, not just on the helper.",
               "old": null,
-              "new": 34,
-              "text": "    at the public parse_record boundary, not just on the helper."
+              "new": 34
             },
             {
               "tag": "add",
+              "text": "    \"\"\"",
               "old": null,
-              "new": 35,
-              "text": "    \"\"\""
+              "new": 35
             },
             {
               "tag": "add",
+              "text": "    result = {",
               "old": null,
-              "new": 36,
-              "text": "    result = {"
+              "new": 36
             },
             {
               "tag": "add",
+              "text": "        \"id\": str(row[\"id\"]),",
               "old": null,
-              "new": 37,
-              "text": "        \"id\": str(row[\"id\"]),"
+              "new": 37
             },
             {
               "tag": "add",
+              "text": "        \"label\": normalize_label(row[\"label\"]),",
               "old": null,
-              "new": 38,
-              "text": "        \"label\": normalize_label(row[\"label\"]),"
+              "new": 38
             },
             {
               "tag": "add",
+              "text": "        \"tags\": parse_tags(row.get(\"tags\", \"\")),",
               "old": null,
-              "new": 39,
-              "text": "        \"tags\": parse_tags(row.get(\"tags\", \"\")),"
+              "new": 39
             },
             {
               "tag": "add",
+              "text": "        \"click_rate\": None,",
               "old": null,
-              "new": 40,
-              "text": "        \"click_rate\": None,"
+              "new": 40
             },
             {
               "tag": "add",
+              "text": "    }",
               "old": null,
-              "new": 41,
-              "text": "    }"
+              "new": 41
             },
             {
               "tag": "add",
+              "text": "    populate_metrics(row, result)",
               "old": null,
-              "new": 42,
-              "text": "    populate_metrics(row, result)"
+              "new": 42
             },
             {
               "tag": "add",
+              "text": "    return result",
               "old": null,
-              "new": 43,
-              "text": "    return result"
+              "new": 43
             }
           ]
         }
       ],
+      "diff_origin": "git",
+      "patch_status": "captured",
+      "original_patch": "--- a/catalog/parsing.py\n+++ b/catalog/parsing.py\n@@ -0,0 +1,43 @@\n+from catalog.labels import normalize_label\n+\n+\n+def parse_tags(value: str) -> list[str]:\n+    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"\n+    tags = []\n+    for part in value.split(\",\"):\n+        if part.strip():\n+            tags.append(part.strip().lower())\n+    return tags\n+\n+\n+def populate_metrics(row, result):\n+    \"\"\"Add a click rate only when views are present and nonzero.\"\"\"\n+    if row.get(\"views\"):\n+        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)\n+\n+\n+def parse_record(row):\n+    \"\"\"Turn a database row into a display record.\n+\n+    Output fields:\n+        id: stable string representation of the source identifier.\n+        label: whitespace-normalized title with original capitalization.\n+        tags: lower-case tags in their original encounter order.\n+        click_rate: clicks divided by views, rounded to four places.\n+\n+    Absent or zero views leave click_rate as None. Missing required\n+    identifiers and labels still raise KeyError; we do not silently\n+    invent identifiers or descriptions in a normalization step.\n+\n+    The metrics calculation is now shared, but its rounding precision\n+    and missing-value rule are not intended to change. Test those rules\n+    at the public parse_record boundary, not just on the helper.\n+    \"\"\"\n+    result = {\n+        \"id\": str(row[\"id\"]),\n+        \"label\": normalize_label(row[\"label\"]),\n+        \"tags\": parse_tags(row.get(\"tags\", \"\")),\n+        \"click_rate\": None,\n+    }\n+    populate_metrics(row, result)\n+    return result\n",
       "before_url": null,
       "after_url": null
     },
@@ -4559,200 +5413,203 @@
       "scope": "full",
       "hunks": [
         {
-          "old_start": 1,
-          "new_start": 1,
+          "old_start": 0,
           "old_count": 0,
+          "new_start": 1,
           "new_count": 31,
           "rows": [
             {
               "tag": "add",
+              "text": "def construct_query(term: str, limit: int = 25):",
               "old": null,
-              "new": 1,
-              "text": "def construct_query(term: str, limit: int = 25):"
+              "new": 1
             },
             {
               "tag": "add",
+              "text": "    \"\"\"Select a bounded page of catalog items using bound parameters.",
               "old": null,
-              "new": 2,
-              "text": "    \"\"\"Select a bounded page of catalog items using bound parameters."
+              "new": 2
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 3,
-              "text": ""
+              "new": 3
             },
             {
               "tag": "add",
+              "text": "    Query construction is independent of connection management and row",
               "old": null,
-              "new": 4,
-              "text": "    Query construction is independent of connection management and row"
+              "new": 4
             },
             {
               "tag": "add",
+              "text": "    interpretation. It returns two values: SQL and the parameter tuple.",
               "old": null,
-              "new": 5,
-              "text": "    interpretation. It returns two values: SQL and the parameter tuple."
+              "new": 5
             },
             {
               "tag": "add",
+              "text": "    The caller passes both directly to connection.execute().",
               "old": null,
-              "new": 6,
-              "text": "    The caller passes both directly to connection.execute()."
+              "new": 6
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 7,
-              "text": ""
+              "new": 7
             },
             {
               "tag": "add",
+              "text": "    Contract:",
               "old": null,
-              "new": 8,
-              "text": "    Contract:"
+              "new": 8
             },
             {
               "tag": "add",
+              "text": "        * Only integer page sizes from 1 through 100 are accepted.",
               "old": null,
-              "new": 9,
-              "text": "        * Only integer page sizes from 1 through 100 are accepted."
+              "new": 9
             },
             {
               "tag": "add",
+              "text": "        * Booleans are rejected even though bool is an int subclass.",
               "old": null,
-              "new": 10,
-              "text": "        * Booleans are rejected even though bool is an int subclass."
+              "new": 10
             },
             {
               "tag": "add",
+              "text": "        * Search terms remain parameters, never SQL fragments.",
               "old": null,
-              "new": 11,
-              "text": "        * Search terms remain parameters, never SQL fragments."
+              "new": 11
             },
             {
               "tag": "add",
+              "text": "        * ORDER BY id keeps the page ordering deterministic.",
               "old": null,
-              "new": 12,
-              "text": "        * ORDER BY id keeps the page ordering deterministic."
+              "new": 12
             },
             {
               "tag": "add",
+              "text": "        * The default page size remains 25.",
               "old": null,
-              "new": 13,
-              "text": "        * The default page size remains 25."
+              "new": 13
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 14,
-              "text": ""
+              "new": 14
             },
             {
               "tag": "add",
+              "text": "    LIKE wildcards inside a search term are not escaped by this function.",
               "old": null,
-              "new": 15,
-              "text": "    LIKE wildcards inside a search term are not escaped by this function."
+              "new": 15
             },
             {
               "tag": "add",
+              "text": "    The caller should not interpret the search as a literal substring",
               "old": null,
-              "new": 16,
-              "text": "    The caller should not interpret the search as a literal substring"
+              "new": 16
             },
             {
               "tag": "add",
+              "text": "    match when the input contains SQL wildcard characters.",
               "old": null,
-              "new": 17,
-              "text": "    match when the input contains SQL wildcard characters."
+              "new": 17
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 18,
-              "text": ""
+              "new": 18
             },
             {
               "tag": "add",
+              "text": "    This extraction intentionally introduces a page-size restriction.",
               "old": null,
-              "new": 19,
-              "text": "    This extraction intentionally introduces a page-size restriction."
+              "new": 19
             },
             {
               "tag": "add",
+              "text": "    That is a behavioral edit, not an unchanged move. Callers that used",
               "old": null,
-              "new": 20,
-              "text": "    That is a behavioral edit, not an unchanged move. Callers that used"
+              "new": 20
             },
             {
               "tag": "add",
+              "text": "    zero, a negative value, or more than 100 now receive ValueError.",
               "old": null,
-              "new": 21,
-              "text": "    zero, a negative value, or more than 100 now receive ValueError."
+              "new": 21
             },
             {
               "tag": "add",
+              "text": "    \"\"\"",
               "old": null,
-              "new": 22,
-              "text": "    \"\"\""
+              "new": 22
             },
             {
               "tag": "add",
+              "text": "    if type(limit) is not int or not 1 <= limit <= 100:",
               "old": null,
-              "new": 23,
-              "text": "    if type(limit) is not int or not 1 <= limit <= 100:"
+              "new": 23
             },
             {
               "tag": "add",
+              "text": "        raise ValueError(\"limit must be an integer between 1 and 100\")",
               "old": null,
-              "new": 24,
-              "text": "        raise ValueError(\"limit must be an integer between 1 and 100\")"
+              "new": 24
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 25,
-              "text": ""
+              "new": 25
             },
             {
               "tag": "add",
+              "text": "    statement = (",
               "old": null,
-              "new": 26,
-              "text": "    statement = ("
+              "new": 26
             },
             {
               "tag": "add",
+              "text": "        \"SELECT id, label, tags, views, clicks FROM items \"",
               "old": null,
-              "new": 27,
-              "text": "        \"SELECT id, label, tags, views, clicks FROM items \""
+              "new": 27
             },
             {
               "tag": "add",
+              "text": "        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"",
               "old": null,
-              "new": 28,
-              "text": "        \"WHERE label LIKE ? ORDER BY id LIMIT ?\""
+              "new": 28
             },
             {
               "tag": "add",
+              "text": "    )",
               "old": null,
-              "new": 29,
-              "text": "    )"
+              "new": 29
             },
             {
               "tag": "add",
+              "text": "    parameters = (f\"%{term}%\", limit)",
               "old": null,
-              "new": 30,
-              "text": "    parameters = (f\"%{term}%\", limit)"
+              "new": 30
             },
             {
               "tag": "add",
+              "text": "    return statement, parameters",
               "old": null,
-              "new": 31,
-              "text": "    return statement, parameters"
+              "new": 31
             }
           ]
         }
       ],
+      "diff_origin": "git",
+      "patch_status": "captured",
+      "original_patch": "--- a/catalog/query.py\n+++ b/catalog/query.py\n@@ -0,0 +1,31 @@\n+def construct_query(term: str, limit: int = 25):\n+    \"\"\"Select a bounded page of catalog items using bound parameters.\n+\n+    Query construction is independent of connection management and row\n+    interpretation. It returns two values: SQL and the parameter tuple.\n+    The caller passes both directly to connection.execute().\n+\n+    Contract:\n+        * Only integer page sizes from 1 through 100 are accepted.\n+        * Booleans are rejected even though bool is an int subclass.\n+        * Search terms remain parameters, never SQL fragments.\n+        * ORDER BY id keeps the page ordering deterministic.\n+        * The default page size remains 25.\n+\n+    LIKE wildcards inside a search term are not escaped by this function.\n+    The caller should not interpret the search as a literal substring\n+    match when the input contains SQL wildcard characters.\n+\n+    This extraction intentionally introduces a page-size restriction.\n+    That is a behavioral edit, not an unchanged move. Callers that used\n+    zero, a negative value, or more than 100 now receive ValueError.\n+    \"\"\"\n+    if type(limit) is not int or not 1 <= limit <= 100:\n+        raise ValueError(\"limit must be an integer between 1 and 100\")\n+\n+    statement = (\n+        \"SELECT id, label, tags, views, clicks FROM items \"\n+        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"\n+    )\n+    parameters = (f\"%{term}%\", limit)\n+    return statement, parameters\n",
       "before_url": null,
       "after_url": null
     },
@@ -4764,152 +5621,155 @@
       "scope": "full",
       "hunks": [
         {
-          "old_start": 1,
-          "new_start": 1,
+          "old_start": 0,
           "old_count": 0,
+          "new_start": 1,
           "new_count": 23,
           "rows": [
             {
               "tag": "add",
+              "text": "from catalog.parsing import parse_record, parse_tags",
               "old": null,
-              "new": 1,
-              "text": "from catalog.parsing import parse_record, parse_tags"
+              "new": 1
             },
             {
               "tag": "add",
+              "text": "from catalog.merge import merge_records",
               "old": null,
-              "new": 2,
-              "text": "from catalog.merge import merge_records"
+              "new": 2
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 3,
-              "text": ""
+              "new": 3
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 4,
-              "text": ""
+              "new": 4
             },
             {
               "tag": "add",
+              "text": "def test_record_preserves_display_contract():",
               "old": null,
-              "new": 5,
-              "text": "def test_record_preserves_display_contract():"
+              "new": 5
             },
             {
               "tag": "add",
+              "text": "    assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {",
               "old": null,
-              "new": 6,
-              "text": "    assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {"
+              "new": 6
             },
             {
               "tag": "add",
+              "text": "        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,",
               "old": null,
-              "new": 7,
-              "text": "        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,"
+              "new": 7
             },
             {
               "tag": "add",
+              "text": "    }",
               "old": null,
-              "new": 8,
-              "text": "    }"
+              "new": 8
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 9,
-              "text": ""
+              "new": 9
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 10,
-              "text": ""
+              "new": 10
             },
             {
               "tag": "add",
+              "text": "def test_missing_and_zero_views():",
               "old": null,
-              "new": 11,
-              "text": "def test_missing_and_zero_views():"
+              "new": 11
             },
             {
               "tag": "add",
+              "text": "    for row in ({\"id\": 7, \"label\": \"Pen\"}, {\"id\": 7, \"label\": \"Pen\", \"views\": 0}):",
               "old": null,
-              "new": 12,
-              "text": "    for row in ({\"id\": 7, \"label\": \"Pen\"}, {\"id\": 7, \"label\": \"Pen\", \"views\": 0}):"
+              "new": 12
             },
             {
               "tag": "add",
+              "text": "        assert parse_record(row)[\"click_rate\"] is None",
               "old": null,
-              "new": 13,
-              "text": "        assert parse_record(row)[\"click_rate\"] is None"
+              "new": 13
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 14,
-              "text": ""
+              "new": 14
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 15,
-              "text": ""
+              "new": 15
             },
             {
               "tag": "add",
+              "text": "def test_tag_order_and_duplicates():",
               "old": null,
-              "new": 16,
-              "text": "def test_tag_order_and_duplicates():"
+              "new": 16
             },
             {
               "tag": "add",
+              "text": "    assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]",
               "old": null,
-              "new": 17,
-              "text": "    assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]"
+              "new": 17
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 18,
-              "text": ""
+              "new": 18
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 19,
-              "text": ""
+              "new": 19
             },
             {
               "tag": "add",
+              "text": "def test_first_record_wins():",
               "old": null,
-              "new": 20,
-              "text": "def test_first_record_wins():"
+              "new": 20
             },
             {
               "tag": "add",
+              "text": "    first = {\"id\": \"7\", \"label\": \"First\"}",
               "old": null,
-              "new": 21,
-              "text": "    first = {\"id\": \"7\", \"label\": \"First\"}"
+              "new": 21
             },
             {
               "tag": "add",
+              "text": "    later = {\"id\": \"7\", \"label\": \"Later\"}",
               "old": null,
-              "new": 22,
-              "text": "    later = {\"id\": \"7\", \"label\": \"Later\"}"
+              "new": 22
             },
             {
               "tag": "add",
+              "text": "    assert list(merge_records([first, later])) == [first]",
               "old": null,
-              "new": 23,
-              "text": "    assert list(merge_records([first, later])) == [first]"
+              "new": 23
             }
           ]
         }
       ],
+      "diff_origin": "git",
+      "patch_status": "captured",
+      "original_patch": "--- a/tests/test_parsing.py\n+++ b/tests/test_parsing.py\n@@ -0,0 +1,23 @@\n+from catalog.parsing import parse_record, parse_tags\n+from catalog.merge import merge_records\n+\n+\n+def test_record_preserves_display_contract():\n+    assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {\n+        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,\n+    }\n+\n+\n+def test_missing_and_zero_views():\n+    for row in ({\"id\": 7, \"label\": \"Pen\"}, {\"id\": 7, \"label\": \"Pen\", \"views\": 0}):\n+        assert parse_record(row)[\"click_rate\"] is None\n+\n+\n+def test_tag_order_and_duplicates():\n+    assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]\n+\n+\n+def test_first_record_wins():\n+    first = {\"id\": \"7\", \"label\": \"First\"}\n+    later = {\"id\": \"7\", \"label\": \"Later\"}\n+    assert list(merge_records([first, later])) == [first]\n",
       "before_url": null,
       "after_url": null
     },
@@ -4921,180 +5781,495 @@
       "scope": "full",
       "hunks": [
         {
-          "old_start": 1,
-          "new_start": 1,
+          "old_start": 0,
           "old_count": 0,
+          "new_start": 1,
           "new_count": 25,
           "rows": [
             {
               "tag": "add",
+              "text": "from catalog.query import construct_query",
               "old": null,
-              "new": 1,
-              "text": "from catalog.query import construct_query"
+              "new": 1
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 2,
-              "text": ""
+              "new": 2
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 3,
-              "text": ""
+              "new": 3
             },
             {
               "tag": "add",
+              "text": "def test_query_default():",
               "old": null,
-              "new": 4,
-              "text": "def test_query_default():"
+              "new": 4
             },
             {
               "tag": "add",
+              "text": "    statement, parameters = construct_query(\"notebook\")",
               "old": null,
-              "new": 5,
-              "text": "    statement, parameters = construct_query(\"notebook\")"
+              "new": 5
             },
             {
               "tag": "add",
+              "text": "    assert \"ORDER BY id LIMIT ?\" in statement",
               "old": null,
-              "new": 6,
-              "text": "    assert \"ORDER BY id LIMIT ?\" in statement"
+              "new": 6
             },
             {
               "tag": "add",
+              "text": "    assert parameters == (\"%notebook%\", 25)",
               "old": null,
-              "new": 7,
-              "text": "    assert parameters == (\"%notebook%\", 25)"
+              "new": 7
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 8,
-              "text": ""
+              "new": 8
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 9,
-              "text": ""
+              "new": 9
             },
             {
               "tag": "add",
+              "text": "def test_term_stays_a_parameter():",
               "old": null,
-              "new": 10,
-              "text": "def test_term_stays_a_parameter():"
+              "new": 10
             },
             {
               "tag": "add",
+              "text": "    term = \"paper' OR 1=1 --\"",
               "old": null,
-              "new": 11,
-              "text": "    term = \"paper' OR 1=1 --\""
+              "new": 11
             },
             {
               "tag": "add",
+              "text": "    statement, parameters = construct_query(term)",
               "old": null,
-              "new": 12,
-              "text": "    statement, parameters = construct_query(term)"
+              "new": 12
             },
             {
               "tag": "add",
+              "text": "    assert term not in statement",
               "old": null,
-              "new": 13,
-              "text": "    assert term not in statement"
+              "new": 13
             },
             {
               "tag": "add",
+              "text": "    assert parameters[0] == f\"%{term}%\"",
               "old": null,
-              "new": 14,
-              "text": "    assert parameters[0] == f\"%{term}%\""
+              "new": 14
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 15,
-              "text": ""
+              "new": 15
             },
             {
               "tag": "add",
+              "text": "",
               "old": null,
-              "new": 16,
-              "text": ""
+              "new": 16
             },
             {
               "tag": "add",
+              "text": "def test_page_size_boundaries():",
               "old": null,
-              "new": 17,
-              "text": "def test_page_size_boundaries():"
+              "new": 17
             },
             {
               "tag": "add",
+              "text": "    for limit in (1, 100):",
               "old": null,
-              "new": 18,
-              "text": "    for limit in (1, 100):"
+              "new": 18
             },
             {
               "tag": "add",
+              "text": "        assert construct_query(\"pen\", limit)[1][1] == limit",
               "old": null,
-              "new": 19,
-              "text": "        assert construct_query(\"pen\", limit)[1][1] == limit"
+              "new": 19
             },
             {
               "tag": "add",
+              "text": "    for limit in (0, -1, 101, True, 2.5):",
               "old": null,
-              "new": 20,
-              "text": "    for limit in (0, -1, 101, True, 2.5):"
+              "new": 20
             },
             {
               "tag": "add",
+              "text": "        try:",
               "old": null,
-              "new": 21,
-              "text": "        try:"
+              "new": 21
             },
             {
               "tag": "add",
+              "text": "            construct_query(\"pen\", limit)",
               "old": null,
-              "new": 22,
-              "text": "            construct_query(\"pen\", limit)"
+              "new": 22
             },
             {
               "tag": "add",
+              "text": "        except ValueError:",
               "old": null,
-              "new": 23,
-              "text": "        except ValueError:"
+              "new": 23
             },
             {
               "tag": "add",
+              "text": "            continue",
               "old": null,
-              "new": 24,
-              "text": "            continue"
+              "new": 24
             },
             {
               "tag": "add",
+              "text": "        raise AssertionError(f\"unexpectedly accepted {limit!r}\")",
               "old": null,
-              "new": 25,
-              "text": "        raise AssertionError(f\"unexpectedly accepted {limit!r}\")"
+              "new": 25
             }
           ]
         }
       ],
+      "diff_origin": "git",
+      "patch_status": "captured",
+      "original_patch": "--- a/tests/test_query.py\n+++ b/tests/test_query.py\n@@ -0,0 +1,25 @@\n+from catalog.query import construct_query\n+\n+\n+def test_query_default():\n+    statement, parameters = construct_query(\"notebook\")\n+    assert \"ORDER BY id LIMIT ?\" in statement\n+    assert parameters == (\"%notebook%\", 25)\n+\n+\n+def test_term_stays_a_parameter():\n+    term = \"paper' OR 1=1 --\"\n+    statement, parameters = construct_query(term)\n+    assert term not in statement\n+    assert parameters[0] == f\"%{term}%\"\n+\n+\n+def test_page_size_boundaries():\n+    for limit in (1, 100):\n+        assert construct_query(\"pen\", limit)[1][1] == limit\n+    for limit in (0, -1, 101, True, 2.5):\n+        try:\n+            construct_query(\"pen\", limit)\n+        except ValueError:\n+            continue\n+        raise AssertionError(f\"unexpectedly accepted {limit!r}\")\n",
       "before_url": null,
       "after_url": null
     }
   ],
+  "source_evidence": {
+    "schema": "diffstory.source-evidence.v1",
+    "file_evidence": [
+      {
+        "base": {
+          "path": "catalog/labels.py",
+          "state": "absent",
+          "fragment_keys": [],
+          "parse_statuses": [],
+          "full_source": false,
+          "full_and_parsed": false
+        },
+        "head": {
+          "path": "catalog/labels.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "470887404445a502"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        }
+      },
+      {
+        "base": {
+          "path": "catalog/merge.py",
+          "state": "absent",
+          "fragment_keys": [],
+          "parse_statuses": [],
+          "full_source": false,
+          "full_and_parsed": false
+        },
+        "head": {
+          "path": "catalog/merge.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "1b59ac0b675e18ac"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        }
+      },
+      {
+        "base": {
+          "path": "catalog/parsing.py",
+          "state": "absent",
+          "fragment_keys": [],
+          "parse_statuses": [],
+          "full_source": false,
+          "full_and_parsed": false
+        },
+        "head": {
+          "path": "catalog/parsing.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "275c82e1da3a4a13"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        }
+      },
+      {
+        "base": {
+          "path": "catalog/query.py",
+          "state": "absent",
+          "fragment_keys": [],
+          "parse_statuses": [],
+          "full_source": false,
+          "full_and_parsed": false
+        },
+        "head": {
+          "path": "catalog/query.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "2985e7c778f55ef4"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        }
+      },
+      {
+        "base": {
+          "path": "catalog/search.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "e81ca5f46901d4db"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        },
+        "head": {
+          "path": "catalog/search.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "eb262a6b59bf3a5b"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        }
+      },
+      {
+        "base": {
+          "path": "tests/test_parsing.py",
+          "state": "absent",
+          "fragment_keys": [],
+          "parse_statuses": [],
+          "full_source": false,
+          "full_and_parsed": false
+        },
+        "head": {
+          "path": "tests/test_parsing.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "cb6534dfca8c9ae9"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        }
+      },
+      {
+        "base": {
+          "path": "tests/test_query.py",
+          "state": "absent",
+          "fragment_keys": [],
+          "parse_statuses": [],
+          "full_source": false,
+          "full_and_parsed": false
+        },
+        "head": {
+          "path": "tests/test_query.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "4acf8f202ee42688"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        }
+      },
+      {
+        "base": {
+          "path": "tools/export.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "1a0d5df3887c4e44"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        },
+        "head": {
+          "path": "tools/export.py",
+          "state": "supplied",
+          "coverage": "full",
+          "fragment_keys": [
+            "5fb4aeea3b263f97"
+          ],
+          "parse_statuses": [
+            "ok"
+          ],
+          "full_source": true,
+          "full_and_parsed": true
+        }
+      }
+    ],
+    "fragments": [
+      {
+        "key": "e81ca5f46901d4db",
+        "side": "base",
+        "path": "catalog/search.py",
+        "start_line": 1,
+        "region": "catalog/search.py",
+        "scope": "full",
+        "text": "def normalize_label(value: str) -> str:\n    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"\n    return \" \".join(value.split())\n\n\ndef split_tags(value: str) -> list[str]:\n    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"\n    tags = []\n    for part in value.split(\",\"):\n        if part.strip():\n            tags.append(part.strip().lower())\n    return tags\n\n\ndef merge_records(records):\n    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"\n    seen = set()\n    for record in records:\n        key = record[\"id\"]\n        if key in seen:\n            continue\n        seen.add(key)\n        yield record\n\n\ndef construct_query(term: str, limit: int = 25):\n    \"\"\"Select a page of catalog items using bound parameters.\n\n    The caller provides a database connection. This helper only produces\n    a statement and its parameters; it never executes a query itself.\n    LIKE wildcard semantics are intentionally left to the database.\n    \"\"\"\n    statement = (\n        \"SELECT id, label, tags, views, clicks FROM items \"\n        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"\n    )\n    return statement, (f\"%{term}%\", limit)\n\n\ndef parse_record(row):\n    \"\"\"Turn a database row into a display record.\"\"\"\n    result = {\n        \"id\": str(row[\"id\"]),\n        \"label\": normalize_label(row[\"label\"]),\n        \"tags\": split_tags(row.get(\"tags\", \"\")),\n        \"click_rate\": None,\n    }\n    if row.get(\"views\"):\n        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)\n    return result\n\n\ndef get_records(connection, term: str, limit: int = 25):\n    statement, parameters = construct_query(term, limit)\n    rows = connection.execute(statement, parameters)\n    parsed = [parse_record(row) for row in rows]\n    return list(merge_records(parsed))\n",
+        "content_digest": "e190bef482a93a613634cc1c4dcde07fdd90449d19ba8a204f494ea2e6f4ada1",
+        "parse_status": "ok"
+      },
+      {
+        "key": "1a0d5df3887c4e44",
+        "side": "base",
+        "path": "tools/export.py",
+        "start_line": 1,
+        "region": "tools/export.py",
+        "scope": "full",
+        "text": "from catalog.search import split_tags\n\n\ndef export_tags(value):\n    return \";\".join(split_tags(value))\n",
+        "content_digest": "23b26fa1bdde9d71a4f4f03de6d811d92ed30f08df1376186b9eadd90f292859",
+        "parse_status": "ok"
+      },
+      {
+        "key": "470887404445a502",
+        "side": "head",
+        "path": "catalog/labels.py",
+        "start_line": 1,
+        "region": "catalog/labels.py",
+        "scope": "full",
+        "text": "def normalize_label(value: str) -> str:\n    \"\"\"Collapse incidental whitespace without changing case or punctuation.\"\"\"\n    return \" \".join(value.split())\n",
+        "content_digest": "c7e378667aacd0fda57b8211ec4838891a0c7d1388d7abaa81df86a6c713905c",
+        "parse_status": "ok"
+      },
+      {
+        "key": "1b59ac0b675e18ac",
+        "side": "head",
+        "path": "catalog/merge.py",
+        "start_line": 1,
+        "region": "catalog/merge.py",
+        "scope": "full",
+        "text": "def merge_records(records):\n    \"\"\"Keep the first occurrence of each identifier, in encounter order.\"\"\"\n    seen = set()\n    for record in records:\n        key = record[\"id\"]\n        if key in seen:\n            continue\n        seen.add(key)\n        yield record\n",
+        "content_digest": "ccffd036044c1a5d80605a81bc49395be626bc0172f35074a9b40219a5d97bd9",
+        "parse_status": "ok"
+      },
+      {
+        "key": "275c82e1da3a4a13",
+        "side": "head",
+        "path": "catalog/parsing.py",
+        "start_line": 1,
+        "region": "catalog/parsing.py",
+        "scope": "full",
+        "text": "from catalog.labels import normalize_label\n\n\ndef parse_tags(value: str) -> list[str]:\n    \"\"\"Preserve source order while dropping empty, whitespace-only tags.\"\"\"\n    tags = []\n    for part in value.split(\",\"):\n        if part.strip():\n            tags.append(part.strip().lower())\n    return tags\n\n\ndef populate_metrics(row, result):\n    \"\"\"Add a click rate only when views are present and nonzero.\"\"\"\n    if row.get(\"views\"):\n        result[\"click_rate\"] = round(row.get(\"clicks\", 0) / row[\"views\"], 4)\n\n\ndef parse_record(row):\n    \"\"\"Turn a database row into a display record.\n\n    Output fields:\n        id: stable string representation of the source identifier.\n        label: whitespace-normalized title with original capitalization.\n        tags: lower-case tags in their original encounter order.\n        click_rate: clicks divided by views, rounded to four places.\n\n    Absent or zero views leave click_rate as None. Missing required\n    identifiers and labels still raise KeyError; we do not silently\n    invent identifiers or descriptions in a normalization step.\n\n    The metrics calculation is now shared, but its rounding precision\n    and missing-value rule are not intended to change. Test those rules\n    at the public parse_record boundary, not just on the helper.\n    \"\"\"\n    result = {\n        \"id\": str(row[\"id\"]),\n        \"label\": normalize_label(row[\"label\"]),\n        \"tags\": parse_tags(row.get(\"tags\", \"\")),\n        \"click_rate\": None,\n    }\n    populate_metrics(row, result)\n    return result\n",
+        "content_digest": "d8e9374a2b53a1701dead5faf17d3e2c7ad814d0df83b441c89a7d47a45de078",
+        "parse_status": "ok"
+      },
+      {
+        "key": "2985e7c778f55ef4",
+        "side": "head",
+        "path": "catalog/query.py",
+        "start_line": 1,
+        "region": "catalog/query.py",
+        "scope": "full",
+        "text": "def construct_query(term: str, limit: int = 25):\n    \"\"\"Select a bounded page of catalog items using bound parameters.\n\n    Query construction is independent of connection management and row\n    interpretation. It returns two values: SQL and the parameter tuple.\n    The caller passes both directly to connection.execute().\n\n    Contract:\n        * Only integer page sizes from 1 through 100 are accepted.\n        * Booleans are rejected even though bool is an int subclass.\n        * Search terms remain parameters, never SQL fragments.\n        * ORDER BY id keeps the page ordering deterministic.\n        * The default page size remains 25.\n\n    LIKE wildcards inside a search term are not escaped by this function.\n    The caller should not interpret the search as a literal substring\n    match when the input contains SQL wildcard characters.\n\n    This extraction intentionally introduces a page-size restriction.\n    That is a behavioral edit, not an unchanged move. Callers that used\n    zero, a negative value, or more than 100 now receive ValueError.\n    \"\"\"\n    if type(limit) is not int or not 1 <= limit <= 100:\n        raise ValueError(\"limit must be an integer between 1 and 100\")\n\n    statement = (\n        \"SELECT id, label, tags, views, clicks FROM items \"\n        \"WHERE label LIKE ? ORDER BY id LIMIT ?\"\n    )\n    parameters = (f\"%{term}%\", limit)\n    return statement, parameters\n",
+        "content_digest": "e905e224392d43e737c5af4fc12804616c918718ba66a499c8e9794a3f430f46",
+        "parse_status": "ok"
+      },
+      {
+        "key": "eb262a6b59bf3a5b",
+        "side": "head",
+        "path": "catalog/search.py",
+        "start_line": 1,
+        "region": "catalog/search.py",
+        "scope": "full",
+        "text": "from catalog.query import construct_query\nfrom catalog.parsing import parse_record\nfrom catalog.merge import merge_records\n\n\ndef get_records(connection, term: str, limit: int = 25):\n    \"\"\"Build, execute, interpret, then deduplicate a single catalog page.\"\"\"\n    statement, parameters = construct_query(term, limit)\n    rows = connection.execute(statement, parameters)\n    # Materialize rows before merging, as before this extraction.\n    records = [parse_record(row) for row in rows]\n    return list(merge_records(records))\n",
+        "content_digest": "52d738ecab3cda0eebf9fcce238ad3a8e10a9deacf653b42e73cf48950009a2b",
+        "parse_status": "ok"
+      },
+      {
+        "key": "cb6534dfca8c9ae9",
+        "side": "head",
+        "path": "tests/test_parsing.py",
+        "start_line": 1,
+        "region": "tests/test_parsing.py",
+        "scope": "full",
+        "text": "from catalog.parsing import parse_record, parse_tags\nfrom catalog.merge import merge_records\n\n\ndef test_record_preserves_display_contract():\n    assert parse_record({\"id\": 7, \"label\": \"  Blue   notebook \", \"tags\": \"Office,, PAPER \", \"views\": 3, \"clicks\": 1}) == {\n        \"id\": \"7\", \"label\": \"Blue notebook\", \"tags\": [\"office\", \"paper\"], \"click_rate\": 0.3333,\n    }\n\n\ndef test_missing_and_zero_views():\n    for row in ({\"id\": 7, \"label\": \"Pen\"}, {\"id\": 7, \"label\": \"Pen\", \"views\": 0}):\n        assert parse_record(row)[\"click_rate\"] is None\n\n\ndef test_tag_order_and_duplicates():\n    assert parse_tags(\"paper, office, PAPER\") == [\"paper\", \"office\", \"paper\"]\n\n\ndef test_first_record_wins():\n    first = {\"id\": \"7\", \"label\": \"First\"}\n    later = {\"id\": \"7\", \"label\": \"Later\"}\n    assert list(merge_records([first, later])) == [first]\n",
+        "content_digest": "bc2989d8fb90c02d615cfa84e4e61987761deb646c1514071e9b4df0a4cf3dff",
+        "parse_status": "ok"
+      },
+      {
+        "key": "4acf8f202ee42688",
+        "side": "head",
+        "path": "tests/test_query.py",
+        "start_line": 1,
+        "region": "tests/test_query.py",
+        "scope": "full",
+        "text": "from catalog.query import construct_query\n\n\ndef test_query_default():\n    statement, parameters = construct_query(\"notebook\")\n    assert \"ORDER BY id LIMIT ?\" in statement\n    assert parameters == (\"%notebook%\", 25)\n\n\ndef test_term_stays_a_parameter():\n    term = \"paper' OR 1=1 --\"\n    statement, parameters = construct_query(term)\n    assert term not in statement\n    assert parameters[0] == f\"%{term}%\"\n\n\ndef test_page_size_boundaries():\n    for limit in (1, 100):\n        assert construct_query(\"pen\", limit)[1][1] == limit\n    for limit in (0, -1, 101, True, 2.5):\n        try:\n            construct_query(\"pen\", limit)\n        except ValueError:\n            continue\n        raise AssertionError(f\"unexpectedly accepted {limit!r}\")\n",
+        "content_digest": "1e12ea80bfbbee23f89254765885e221252cbc8bb35455b8c83df22137e1e4fe",
+        "parse_status": "ok"
+      },
+      {
+        "key": "5fb4aeea3b263f97",
+        "side": "head",
+        "path": "tools/export.py",
+        "start_line": 1,
+        "region": "tools/export.py",
+        "scope": "full",
+        "text": "from catalog.parsing import parse_tags\n\n\ndef export_tags(value):\n    return \";\".join(parse_tags(value))\n",
+        "content_digest": "fc568ae160097d1d97dcc2487c51fd12ce598e23490c87877845c7ef353850d4",
+        "parse_status": "ok"
+      }
+    ]
+  },
   "cycles": [],
   "unresolved": [],
   "stats": {
-    "groups": 10,
-    "units": 20,
+    "groups": 12,
+    "units": 34,
     "by_kind": {
       "modified": 2,
       "moved": 2,
       "moved_renamed": 1,
       "moved_modified": 2,
       "added": 8,
-      "wiring": 5
+      "wiring": 5,
+      "text": 14
     },
     "identical_ast_moves": 2,
     "supplied_paths": 8,

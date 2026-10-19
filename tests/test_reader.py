@@ -9,6 +9,7 @@ from diffstory.analysis import evidence_packet
 from diffstory.models import MAX_PREAMBLE_CHARS
 from diffstory.models import MAX_PREAMBLE_SKETCH_CHARS
 from diffstory.render import render
+from diffstory.render import validate_report
 
 
 def report() -> dict:
@@ -21,6 +22,10 @@ def report() -> dict:
     """
     return compile_snapshot(
         {
+            "patches": [
+                {"path": "query.py", "origin": "github", "patch": None},
+                {"path": "parse.py", "origin": "github", "patch": None},
+            ],
             "schema": "diffstory.snapshot.v1",
             "meta": {
                 "base_sha": "a" * 40,
@@ -220,16 +225,6 @@ class LiterateReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "document"):
             apply_annotations(r, a)
 
-    def test_reader_is_one_document_not_view_tabs(self) -> None:
-        """Render a continuous reader with lazy source loading and no tabs or pager."""
-        h = render(apply_annotations(report(), annotations(report())))
-        self.assertIn('id="story"', h)
-        self.assertNotIn('role="tablist"', h)
-        self.assertNotIn('class="sidebar"', h)
-        self.assertNotIn("Next →", h)
-        self.assertIn("IntersectionObserver", h)
-        self.assertIn("Load full diff", h)
-
     def test_malicious_prose_embedded_as_data(self) -> None:
         """Escape malicious narration as embedded data under a no-network policy."""
         r = report()
@@ -359,6 +354,10 @@ class LiterateReaderTests(unittest.TestCase):
         """Notes and warnings must be present as lists of strings."""
         compiled = compile_snapshot(
             {
+                "patches": [
+                    {"path": path, "origin": "github", "patch": None}
+                    for path in ("README.md", "broken.py")
+                ],
                 "schema": "diffstory.snapshot.v1",
                 "meta": {"changed_files": 2},
                 "fragments": [
@@ -420,6 +419,9 @@ class LiterateReaderTests(unittest.TestCase):
         source = "def f():\n    return 1\n"
         unresolved_report = compile_snapshot(
             {
+                "patches": [
+                    {"path": "x.py", "origin": "github", "patch": None}
+                ],
                 "schema": "diffstory.snapshot.v1",
                 "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40},
                 "file_evidence": [
@@ -449,6 +451,9 @@ class LiterateReaderTests(unittest.TestCase):
         )
         new_report = compile_snapshot(
             {
+                "patches": [
+                    {"path": "x.py", "origin": "github", "patch": None}
+                ],
                 "schema": "diffstory.snapshot.v1",
                 "meta": {"base_sha": "a" * 40, "head_sha": "b" * 40},
                 "fragments": [
@@ -480,6 +485,45 @@ class LiterateReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside its group"):
             apply_annotations(new_report, current)
 
+    def test_old_generated_markers_are_not_manual_reports_or_annotations(
+        self,
+    ) -> None:
+        """The manual v1 boundary rejects archived generation proof fields."""
+        compiler_report = report()
+        validate_report(compiler_report)
+        for field, value in (
+            ("generation", {"version": "diffstory.generation.v1"}),
+            ("narrative_v2", {"schema": "diffstory.presentation.v2"}),
+        ):
+            with self.subTest(field=field):
+                archived = copy.deepcopy(compiler_report)
+                archived[field] = value
+                with self.assertRaises(ValueError):
+                    validate_report(archived)
+                with self.assertRaises(ValueError):
+                    render(archived)
 
-if __name__ == "__main__":
-    unittest.main()
+        old_annotations = annotations(compiler_report)
+        old_annotations["generation"] = {"version": "diffstory.generation.v1"}
+        with self.assertRaises(ValueError):
+            apply_annotations(compiler_report, old_annotations)
+
+    def test_retired_storage_markers_are_rejected_by_public_renderer(
+        self,
+    ) -> None:
+        """Current reports cannot enter the renderer through old storage keys."""
+        compiler_report = report()
+        validate_report(compiler_report)
+        markers = [
+            {"storage_version": "diffstory.generation-storage.v1"},
+            {"artifact_kind": "stored-report"},
+            {"root": {}, "tables": {}},
+        ]
+        for marker in markers:
+            with self.subTest(marker=marker):
+                stored = copy.deepcopy(compiler_report)
+                stored.update(marker)
+                with self.assertRaisesRegex(
+                    ValueError, "Unsupported stored report format"
+                ):
+                    render(stored)

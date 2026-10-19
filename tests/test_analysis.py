@@ -1,16 +1,27 @@
 """Deterministic semantic analysis and annotation regression tests."""
 
 import copy
+import hashlib
+import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from collections import Counter
+from difflib import unified_diff
+from itertools import permutations
+from itertools import product
 from pathlib import Path
 
 from diffstory.analysis import apply_annotations
 from diffstory.analysis import compile_snapshot
 from diffstory.analysis import evidence_packet
+from diffstory.analysis import make_hunks
 from diffstory.analysis import ordered_components
 from diffstory.ingest import parse_pr
 from diffstory.render import render
+from diffstory.source_lines import split_source_lines
 
 
 def snap(
@@ -67,6 +78,29 @@ def snap(
         },
         "fragments": fragments,
         "file_evidence": records,
+        # Synthetic test input only. Production must capture the supplied patch.
+        "patches": [
+            {
+                "path": path,
+                "origin": "github",
+                "patch": "\n".join(
+                    row.rstrip("\r\n")
+                    for row in unified_diff(
+                        split_source_lines(
+                            before.get(path, ""), keepends=True
+                        ),
+                        split_source_lines(after.get(path, ""), keepends=True),
+                        lineterm="",
+                    )
+                )
+                if all(
+                    side["state"] == "absent" or side.get("coverage") == "full"
+                    for side in record.values()
+                )
+                else None,
+            }
+            for path, record in zip(paths, records, strict=True)
+        ],
         "warnings": warnings or [],
     }
 
@@ -83,6 +117,280 @@ def symbols(r: dict) -> list[dict]:
 
     """
     return [c for c in r["changes"] if c["kind"] not in {"wiring", "text"}]
+
+
+def graph_snapshot(size: int, *, cyclic: bool) -> dict:
+    """Build full modules whose functions call the next module in a chain or ring."""
+    sources = {}
+    for index in range(size):
+        following = (index + 1) % size
+        sources[f"m_{index:04d}.py"] = (
+            f"from m_{following:04d} import f_{following}\n"
+            f"def f_{index}():\n    return f_{following}()\n"
+            if cyclic or index + 1 < size
+            else f"def f_{index}():\n    return 1\n"
+        )
+    return snap({}, sources)
+
+
+class GraphOrderingTests(unittest.TestCase):
+    """Check SCC membership, deterministic audits, and compiler priority rules."""
+
+    def test_all_three_node_graphs_match_reachability(self) -> None:
+        """Check every directed graph, including self edges and nested cycles."""
+        nodes = ("a", "b", "c")
+        possible_edges = tuple(product(nodes, repeat=2))
+        for mask in range(1 << len(possible_edges)):
+            with self.subTest(mask=mask):
+                prereqs = {node: set() for node in nodes}
+                for bit, (node, prerequisite) in enumerate(possible_edges):
+                    if mask & (1 << bit):
+                        prereqs[node].add(prerequisite)
+                reachable = {node: {node, *prereqs[node]} for node in nodes}
+                for intermediate in nodes:
+                    for node in nodes:
+                        if intermediate in reachable[node]:
+                            reachable[node].update(reachable[intermediate])
+                components = {
+                    tuple(
+                        other
+                        for other in nodes
+                        if other in reachable[node]
+                        and node in reachable[other]
+                    )
+                    for node in nodes
+                }
+                order, cycles = ordered_components(nodes, prereqs, str)
+                self.assertEqual(Counter(order), Counter(nodes))
+                self.assertEqual(
+                    cycles,
+                    tuple(sorted(c for c in components if len(c) > 1)),
+                )
+                position = {node: i for i, node in enumerate(order)}
+                for component in components:
+                    positions = [position[node] for node in component]
+                    self.assertEqual(
+                        max(positions) - min(positions) + 1, len(component)
+                    )
+                    for node in component:
+                        for prerequisite in prereqs[node] - set(component):
+                            self.assertLess(
+                                position[prerequisite], position[node]
+                            )
+
+    def test_ready_components_and_cycle_members_use_caller_priority(
+        self,
+    ) -> None:
+        """A newly available component can outrank one already in the queue."""
+        priorities = {"a": 9, "b": 1, "c": 8, "d": 0, "e": 4, "f": 3}
+        order, cycles = ordered_components(
+            reversed(priorities),
+            {"b": {"c"}, "c": {"b"}, "d": {"b"}, "f": {"e"}},
+            priorities.__getitem__,
+        )
+        self.assertEqual(order, ("b", "c", "d", "e", "f", "a"))
+        self.assertEqual(cycles, (("b", "c"),))
+
+    def test_shuffled_nodes_and_adjacencies_keep_equal_priority_order(
+        self,
+    ) -> None:
+        """Equal priorities and multiple cycles do not inherit traversal order."""
+        graph = {
+            "a": {"b", "c"},
+            "b": {"a", "c"},
+            "c": set(),
+            "d": {"e"},
+            "e": {"d"},
+        }
+        expected = (("c", "a", "b", "d", "e"), (("a", "b"), ("d", "e")))
+        for nodes in permutations(graph):
+            for reverse in (False, True):
+                # dict_keys is set-like but lets this test vary adjacency order.
+                prereqs = {
+                    node: dict.fromkeys(
+                        sorted(graph[node], reverse=reverse)
+                    ).keys()
+                    for node in nodes
+                }
+                self.assertEqual(
+                    ordered_components(iter(nodes), prereqs, lambda _: 0),
+                    expected,
+                )
+
+    def test_empty_duplicate_and_reachable_nodes(self) -> None:
+        """Retain prerequisite closure and omit singleton self loops from cycles."""
+        self.assertEqual(ordered_components([], {}, str), ((), ()))
+        self.assertEqual(
+            ordered_components(
+                iter(("b", "b")), {"b": {"a"}, "a": {"a", "c"}}, str
+            ),
+            (("c", "a", "b"), ()),
+        )
+
+    def test_public_report_and_graph_audits_are_hash_seed_independent(
+        self,
+    ) -> None:
+        """Subprocess hash seeds cannot change report order or SCC audit arrays."""
+        probe = """
+import hashlib
+import json
+from diffstory.analysis import compile_snapshot, ordered_components
+from test_analysis import snap
+
+nodes = set('abcdefg')
+prereqs = {node: set() for node in nodes}
+for node, prerequisite in {('a', 'b'), ('b', 'a'), ('c', 'd'), ('d', 'c'),
+                            ('e', 'a'), ('e', 'c'), ('g', 'f')}:
+    prereqs[node].add(prerequisite)
+sources = {
+    f'{node}.py': ''.join(f'from {p} import f_{p}\\n' for p in sorted(prereqs[node]))
+    + f'def f_{node}():\\n    return '
+    + (' + '.join(f'f_{p}()' for p in sorted(prereqs[node])) or '1') + '\\n'
+    for node in sorted(nodes)
+}
+payload = {
+    'report': compile_snapshot(snap({}, sources)),
+    'graph': ordered_components(nodes, prereqs, lambda _: 0),
+}
+print(hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest())
+"""
+        digests = []
+        for seed in ("1", "7", "101", "999"):
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                cwd=Path(__file__).resolve().parents[1],
+                env={
+                    **os.environ,
+                    "PYTHONPATH": str(Path(__file__).resolve().parent),
+                    "PYTHONHASHSEED": seed,
+                },
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+            digests.append(result.stdout.strip())
+        self.assertRegex(digests[0], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(set(digests)), 1)
+
+
+class CompilerGraphTests(unittest.TestCase):
+    """Exercise deep graphs through the compiler, annotation, and reader APIs."""
+
+    def check_compiled_graph(self, *, cyclic: bool) -> None:
+        """Require exact source changes, graph membership, edges, and ordering."""
+        recursion_limit = sys.getrecursionlimit()
+        size = max(1050, recursion_limit + 50)
+        report = compile_snapshot(graph_snapshot(size, cyclic=cyclic))
+        edge_count = size if cyclic else size - 1
+        expected_paths = {f"m_{index:04d}.py" for index in range(size)}
+        groups = report["groups"]
+        by_path = {group["path"]: group for group in groups}
+        self.assertEqual(len(groups), size)
+        self.assertEqual(by_path.keys(), expected_paths)
+        changes = report["changes"]
+        self.assertEqual(
+            Counter(change["kind"] for change in changes),
+            {"added": size, "wiring": edge_count},
+        )
+        functions = {
+            change["after"]["name"]: change["after"]["id"]
+            for change in changes
+            if change["kind"] == "added"
+        }
+        self.assertEqual(functions.keys(), {f"f_{i}" for i in range(size)})
+        members = {path: [] for path in expected_paths}
+        for change in changes:
+            members[change["after"]["path"]].append(change["id"])
+        self.assertEqual(
+            Counter(cid for group in groups for cid in group["change_ids"]),
+            Counter(c["id"] for c in changes),
+        )
+        for path, group in by_path.items():
+            self.assertEqual(set(group["change_ids"]), set(members[path]))
+        expected_symbol_edges = set()
+        expected_group_edges = set()
+        for index in range(size):
+            group = by_path[f"m_{index:04d}.py"]
+            if not cyclic and index == size - 1:
+                self.assertEqual(group["prerequisites"], [])
+                continue
+            following = (index + 1) % size
+            prerequisite = by_path[f"m_{following:04d}.py"]["id"]
+            self.assertEqual(group["prerequisites"], [prerequisite])
+            expected_symbol_edges.add(
+                (functions[f"f_{index}"], functions[f"f_{following}"], "calls")
+            )
+            expected_group_edges.add((prerequisite, group["id"], "calls"))
+        for field, expected in (
+            ("symbol_edges", expected_symbol_edges),
+            ("edges", expected_group_edges),
+        ):
+            self.assertEqual(len(report[field]), edge_count)
+            self.assertEqual(
+                {(e["from"], e["to"], e["type"]) for e in report[field]},
+                expected,
+            )
+        self.assertEqual(
+            [group["path"] for group in groups],
+            sorted(expected_paths, reverse=not cyclic),
+        )
+        self.assertEqual(
+            report["cycles"],
+            (tuple(sorted(g["id"] for g in groups)),) if cyclic else (),
+        )
+        self.assertEqual(report["tests"], [])
+        self.assertEqual(report["stats"]["test_runs"], 0)
+        annotated = apply_annotations(
+            report,
+            {
+                "schema": "diffstory.annotations.v1",
+                "base_sha": report["meta"]["base_sha"],
+                "head_sha": report["meta"]["head_sha"],
+                "steps": [
+                    {
+                        "group_id": group["id"],
+                        "evidence_change_ids": group["change_ids"],
+                        "passages": [
+                            {
+                                "text": "Follow this function and its import.",
+                                "change_ids": group["change_ids"],
+                                "view": "definition",
+                            }
+                        ],
+                    }
+                    for group in groups
+                ],
+            },
+        )
+        for field in (
+            "changes",
+            "edges",
+            "symbol_edges",
+            "cycles",
+            "source_evidence",
+            "tests",
+        ):
+            self.assertEqual(annotated[field], report[field])
+        for index, group in enumerate(annotated["groups"]):
+            self.assertEqual(group["number"], index + 1)
+            self.assertEqual(
+                group["next_id"],
+                groups[index + 1]["id"] if index + 1 < size else None,
+            )
+        self.assertIn(
+            "Follow this function and its import.",
+            render(json.loads(json.dumps(annotated))),
+        )
+        self.assertEqual(sys.getrecursionlimit(), recursion_limit)
+
+    def test_public_chain_above_recursion_limit(self) -> None:
+        """Compile, annotate, and render a chain longer than the call stack."""
+        self.check_compiled_graph(cyclic=False)
+
+    def test_public_cycle_above_recursion_limit(self) -> None:
+        """Retain the entire large function SCC through public consumers."""
+        self.check_compiled_graph(cyclic=True)
 
 
 class CompilerTests(unittest.TestCase):
@@ -523,6 +831,7 @@ class CompilerTests(unittest.TestCase):
     def test_partial_parse_failure_keeps_valid_symbols(self) -> None:
         """One failed excerpt must not discard symbols from another excerpt."""
         snapshot = {
+            "patches": [{"path": "x.py", "origin": "github", "patch": None}],
             "schema": "diffstory.snapshot.v1",
             "meta": {"scope": "selected excerpts", "changed_files": 1},
             "fragments": [
@@ -722,6 +1031,9 @@ class CompilerTests(unittest.TestCase):
                 },
             },
         )
+        accepted["patches"].append(
+            {"path": "not-read.py", "origin": "github", "patch": None}
+        )
         rejected = copy.deepcopy(snapshot)
         rejected["file_evidence"].append(
             {
@@ -744,6 +1056,7 @@ class CompilerTests(unittest.TestCase):
     def test_empty_snapshot_rule_is_preserved(self) -> None:
         """Evidence records alone must not replace the declared empty comparison rule."""
         empty = {
+            "patches": [],
             "schema": "diffstory.snapshot.v1",
             "meta": {"changed_files": 0},
             "fragments": [],
@@ -850,6 +1163,9 @@ class CompilerTests(unittest.TestCase):
         for name, second_start, accepted in rows:
             with self.subTest(case=name):
                 snapshot = {
+                    "patches": [
+                        {"path": "x.py", "origin": "github", "patch": None}
+                    ],
                     "schema": "diffstory.snapshot.v1",
                     "meta": {"changed_files": 1},
                     "fragments": [
@@ -1006,9 +1322,12 @@ class CompilerTests(unittest.TestCase):
         tags = {row["tag"] for hunk in raw["hunks"] for row in hunk["rows"]}
         self.assertEqual(tags, {"add", "delete"})
 
-    def test_partial_regions_keep_all_rows(self) -> None:
-        """Distinct partial regions must preserve every supplied source row."""
+    def test_partial_regions_keep_source_without_inventing_a_patch(
+        self,
+    ) -> None:
+        """Partial source stays available even when no original patch was supplied."""
         snapshot = {
+            "patches": [{"path": "x.py", "origin": "github", "patch": None}],
             "schema": "diffstory.snapshot.v1",
             "meta": {"changed_files": 1, "scope": "selected excerpts"},
             "fragments": [
@@ -1068,12 +1387,20 @@ class CompilerTests(unittest.TestCase):
                 for hunk in file["hunks"]
                 for row in hunk["rows"]
             ),
-            4,
+            0,
+        )
+        self.assertEqual(
+            [
+                fragment["text"]
+                for fragment in report["source_evidence"]["fragments"]
+            ],
+            [fragment["text"] for fragment in snapshot["fragments"]],
         )
 
     def test_basis_reasons_are_deterministic(self) -> None:
         """Basis text must list base then head blockers and both linked paths."""
         snapshot = {
+            "patches": [{"path": "new.py", "origin": "github", "patch": None}],
             "schema": "diffstory.snapshot.v1",
             "meta": {"changed_files": 1},
             "fragments": [
@@ -1269,30 +1596,595 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(e["schema"], "diffstory.narrative-request.v1")
         self.assertIn("untrusted", e["instructions"])
 
-    def test_evidence_packet_describes_a_flexible_conceptual_preamble(
-        self,
-    ) -> None:
-        """Describe the evidence-scaled overview and sketch rules in the packet instructions."""
-        packet = evidence_packet(compile_snapshot(snap({}, {"a.py": "x=1"})))
-        instructions = packet["instructions"]
-        self.assertIn("Preamble remains a string", instructions)
-        self.assertIn("about 200 to 450 words", instructions)
-        self.assertIn("under 4,000 characters", instructions)
-        self.assertIn("do not pad", instructions)
-        self.assertIn("fenced plain-text block", instructions)
-        self.assertIn("do not use Mermaid", instructions)
-        self.assertIn("blank line", instructions)
 
-    def test_evidence_packet_calls_for_natural_asd_style_guidance(
+class SourceEvidenceTests(unittest.TestCase):
+    """Check original source bindings, validated states, and raw text ownership."""
+
+    def test_projection_preserves_original_buffers_and_public_bindings(
         self,
     ) -> None:
-        """Ask packet writers to follow ASD principles with natural prose rhythm."""
-        packet = evidence_packet(compile_snapshot(snap({}, {"a.py": "x=1"})))
-        instructions = packet["instructions"]
-        self.assertIn("ASD-STE100 principles as a strong guide", instructions)
-        self.assertIn("roughly 80 to 90 percent", instructions)
-        self.assertIn("Do not claim formal compliance", instructions)
-        self.assertIn("natural rhythm", instructions)
+        """Reconstruct partial UTF-8 excerpts without inventing full-file bytes."""
+        snapshot = snap(
+            {"x.py": '# café\r\ndef f():\r\n    return "é"\r\n'},
+            {"x.py": '# changé\r\ndef f():\r\n    return "λ"'},
+            overrides={
+                (side, "x.py"): {"state": "supplied", "coverage": "partial"}
+                for side in ("base", "head")
+            },
+            fragment_options={
+                (side, "x.py"): {
+                    "start_line": 51,
+                    "region": "excerpt",
+                    "scope": "selected excerpts",
+                    "producer_secret": "must not escape",
+                    "id": "spoofed",
+                    "_raw_region": "spoofed",
+                    "parse_status": "spoofed",
+                    "content_digest": "spoofed",
+                }
+                for side in ("base", "head")
+            },
+        )
+        original = copy.deepcopy(snapshot)
+        report = compile_snapshot(snapshot)
+        self.assertEqual(snapshot, original)
+        projection = report["source_evidence"]
+        self.assertEqual(
+            set(projection),
+            {"schema", "file_evidence", "fragments"},
+        )
+        self.assertEqual(projection["schema"], "diffstory.source-evidence.v1")
+        self.assertEqual(json.loads(json.dumps(projection)), projection)
+        self.assertNotIn("must not escape", json.dumps(projection))
+        fragments = {item["key"]: item for item in projection["fragments"]}
+        self.assertEqual(len(fragments), 2)
+        for supplied, fragment in zip(
+            snapshot["fragments"],
+            projection["fragments"],
+            strict=True,
+        ):
+            self.assertEqual(
+                set(fragment),
+                {
+                    "key",
+                    "side",
+                    "path",
+                    "start_line",
+                    "region",
+                    "scope",
+                    "text",
+                    "content_digest",
+                    "parse_status",
+                },
+            )
+            self.assertRegex(fragment["key"], r"^[0-9a-f]{16}$")
+            raw = supplied["text"].encode("utf-8")
+            self.assertEqual(fragment["text"].encode("utf-8"), raw)
+            self.assertEqual(
+                fragment["content_digest"], hashlib.sha256(raw).hexdigest()
+            )
+            self.assertEqual(fragment["parse_status"], "ok")
+            self.assertEqual(fragment["region"], "excerpt")
+            self.assertEqual(fragment["scope"], "selected excerpts")
+            self.assertEqual(fragment["start_line"], 51)
+            # These offsets are relative to this fragment, even at file line 51.
+            encoded_lines = [
+                line.encode("utf-8")
+                for line in fragment["text"].splitlines(keepends=True)
+            ]
+            offset = 0
+            recovered = []
+            for line in encoded_lines:
+                stop = offset + len(line)
+                recovered.append(raw[offset:stop])
+                offset = stop
+            self.assertEqual(b"".join(recovered), raw)
+            self.assertEqual(offset, len(raw))
+        for change in report["changes"]:
+            for side, name in (("base", "before"), ("head", "after")):
+                record = change[name]
+                self.assertIsNotNone(record)
+                fragment = fragments[record["fragment_key"]]
+                self.assertEqual(fragment["side"], side)
+                self.assertEqual(fragment["path"], record["path"])
+                start = record["start"] - fragment["start_line"]
+                stop = record["end"] - fragment["start_line"] + 1
+                recovered = "".join(
+                    fragment["text"].splitlines(keepends=True)[start:stop]
+                )
+                self.assertEqual(
+                    recovered.splitlines(), record["source"].splitlines()
+                )
+                self.assertNotIn("fragment_id", record)
+                self.assertNotIn("fingerprint", record)
+        for state in projection["file_evidence"][0].values():
+            self.assertEqual(
+                set(state),
+                {
+                    "path",
+                    "state",
+                    "coverage",
+                    "fragment_keys",
+                    "parse_statuses",
+                    "full_source",
+                    "full_and_parsed",
+                },
+            )
+            self.assertEqual(state["coverage"], "partial")
+            self.assertEqual(state["parse_statuses"], ["ok"])
+            self.assertFalse(state["full_source"])
+            self.assertFalse(state["full_and_parsed"])
+            self.assertEqual(len(state["fragment_keys"]), 1)
+            self.assertIn(state["fragment_keys"][0], fragments)
+        render(report)
+
+    def test_empty_absent_and_unavailable_are_distinct(self) -> None:
+        """Keep empty supplied buffers even when no lines or changes exist."""
+        for state in (
+            {"state": "supplied", "coverage": "full"},
+            {"state": "absent"},
+            {"state": "unavailable", "reason": "read_failed"},
+        ):
+            with self.subTest(state=state["state"]):
+                snapshot = snap(
+                    {"empty.py": ""} if state["state"] == "supplied" else {},
+                    {"empty.py": ""},
+                    overrides={("base", "empty.py"): state},
+                )
+                report = compile_snapshot(snapshot)
+                evidence = report["source_evidence"]
+                pair = evidence["file_evidence"][0]
+                self.assertEqual(pair["base"]["state"], state["state"])
+                self.assertEqual(pair["head"]["state"], "supplied")
+                self.assertTrue(pair["head"]["full_and_parsed"])
+                self.assertEqual(pair["head"]["parse_statuses"], ["ok"])
+                self.assertEqual(report["changes"], [])
+                self.assertEqual(report["raw_files"], [])
+                if state["state"] != "supplied":
+                    self.assertEqual(pair["base"]["fragment_keys"], [])
+                    self.assertEqual(pair["base"]["parse_statuses"], [])
+                    self.assertFalse(pair["base"]["full_source"])
+                    self.assertFalse(pair["base"]["full_and_parsed"])
+                if state["state"] == "unavailable":
+                    self.assertEqual(pair["base"]["reason"], "read_failed")
+                for fragment in evidence["fragments"]:
+                    self.assertEqual(fragment["text"], "")
+                    self.assertEqual(
+                        fragment["content_digest"],
+                        hashlib.sha256(b"").hexdigest(),
+                    )
+                    self.assertIsNone(fragment["scope"])
+
+    def test_parse_states_are_compiler_owned(self) -> None:
+        """Expose actual parse results despite false producer metadata or warnings."""
+        snapshot = snap(
+            {"x.py": "def broken(:\n", "notes.txt": "old\r\n"},
+            {"x.py": "value = 1\n", "notes.txt": "new\r\n"},
+            fragment_options={
+                ("base", "x.py"): {
+                    "parse_status": "ok",
+                    "full_and_parsed": True,
+                },
+                ("head", "x.py"): {"parse_status": "failed"},
+            },
+            warnings=["All base definitions are confirmed absent."],
+        )
+        snapshot["file_evidence"].append(
+            {
+                side: {
+                    "path": "unread.py",
+                    "state": "unavailable",
+                    "reason": "size_limit",
+                }
+                for side in ("base", "head")
+            }
+        )
+        snapshot["patches"].append(
+            {"path": "unread.py", "origin": "github", "patch": None}
+        )
+        projection = compile_snapshot(snapshot)["source_evidence"]
+        pairs = {
+            item["base"]["path"]: item for item in projection["file_evidence"]
+        }
+        self.assertEqual(pairs["x.py"]["base"]["parse_statuses"], ["failed"])
+        self.assertFalse(pairs["x.py"]["base"]["full_and_parsed"])
+        self.assertTrue(pairs["x.py"]["base"]["full_source"])
+        self.assertTrue(pairs["x.py"]["head"]["full_and_parsed"])
+        self.assertEqual(
+            pairs["notes.txt"]["head"]["parse_statuses"], ["text_only"]
+        )
+        self.assertFalse(pairs["notes.txt"]["head"]["full_and_parsed"])
+        self.assertEqual(pairs["unread.py"]["head"]["fragment_keys"], [])
+        self.assertEqual(pairs["unread.py"]["head"]["reason"], "size_limit")
+        self.assertNotIn("warnings", projection)
+
+    def test_projection_rejects_invalid_source_claims(self) -> None:
+        """Producer projection fields cannot bypass source-state validation."""
+        valid = snap({"x.py": "value = 1\n"}, {"x.py": "value = 2\n"})
+        candidates = []
+        for fields in (
+            {"text": "\ud800"},
+            {"start_line": True},
+            {"start_line": 20},
+            {"region": "unpaired-full-file"},
+        ):
+            candidate = copy.deepcopy(valid)
+            candidate["fragments"][0].update(fields)
+            candidates.append(candidate)
+        candidate = copy.deepcopy(valid)
+        candidate["file_evidence"][0]["base"] = {
+            "path": "x.py",
+            "state": "unavailable",
+            "reason": "not_supplied",
+        }
+        candidates.append(candidate)
+        for index, candidate in enumerate(candidates):
+            with self.subTest(case=index):
+                candidate["source_evidence"] = {
+                    "schema": "spoofed",
+                    "fragments": [],
+                }
+                with self.assertRaises(ValueError):
+                    compile_snapshot(candidate)
+
+    def test_projection_keeps_separate_regions_and_renamed_paths(self) -> None:
+        """Keep fragment order, partial offsets, and cross-path file pairing."""
+        snapshot = {
+            "patches": [{"path": "new.py", "origin": "github", "patch": None}],
+            "schema": "diffstory.snapshot.v1",
+            "fragments": [
+                {
+                    "side": "head",
+                    "path": "new.py",
+                    "start_line": 40,
+                    "region": "later",
+                    "text": "value = 2\r\n",
+                },
+                {
+                    "side": "base",
+                    "path": "old.py",
+                    "start_line": 10,
+                    "region": "first",
+                    "text": "def broken(:\r\n",
+                },
+                {
+                    "side": "head",
+                    "path": "new.py",
+                    "start_line": 20,
+                    "region": "first",
+                    "text": "\r\n",
+                },
+                {
+                    "side": "base",
+                    "path": "old.py",
+                    "start_line": 30,
+                    "region": "later",
+                    "text": "value = 1\r\n",
+                },
+            ],
+            "file_evidence": [
+                {
+                    "base": {
+                        "path": "old.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                    "head": {
+                        "path": "new.py",
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                }
+            ],
+        }
+        projection = compile_snapshot(snapshot)["source_evidence"]
+        fragments = projection["fragments"]
+        self.assertEqual(
+            [item["text"] for item in fragments],
+            [item["text"] for item in snapshot["fragments"]],
+        )
+        self.assertEqual(
+            [item["start_line"] for item in fragments], [40, 10, 20, 30]
+        )
+        self.assertEqual(
+            [item["region"] for item in fragments],
+            ["later", "first", "first", "later"],
+        )
+        pair = projection["file_evidence"][0]
+        self.assertEqual(pair["base"]["path"], "old.py")
+        self.assertEqual(pair["head"]["path"], "new.py")
+        self.assertEqual(
+            pair["base"]["fragment_keys"],
+            [fragments[1]["key"], fragments[3]["key"]],
+        )
+        self.assertEqual(pair["base"]["parse_statuses"], ["failed", "ok"])
+        self.assertEqual(
+            pair["head"]["fragment_keys"],
+            [fragments[0]["key"], fragments[2]["key"]],
+        )
+        self.assertEqual(pair["head"]["parse_statuses"], ["ok", "ok"])
+        self.assertFalse(pair["head"]["full_and_parsed"])
+
+    def test_raw_formatting_changes_get_group_ownership(self) -> None:
+        """Retain blank-only and newline-only changes as bound text records."""
+        cases = [
+            (
+                "line endings",
+                "def f():\r\n    return 1\r\n",
+                "def f():\n    return 1\n",
+            ),
+            (
+                "final newline",
+                "def f():\n    return 1",
+                "def f():\n    return 1\n",
+            ),
+            ("empty to blank", "", "\n"),
+            ("blank to empty", "\r\n", ""),
+            ("blank whitespace", " \n", "\t\r\n"),
+            (
+                "trailing blank",
+                "def f():\n    return 1\n",
+                "def f():\n    return 1\n\n",
+            ),
+        ]
+        for name, before, after in cases:
+            with self.subTest(case=name):
+                snapshot = snap({"x.py": before}, {"x.py": after})
+                report = compile_snapshot(snapshot)
+                self.assertEqual(report, compile_snapshot(snapshot))
+                self.assertEqual(
+                    [item["kind"] for item in report["changes"]], ["text"]
+                )
+                change = report["changes"][0]
+                self.assertEqual(
+                    report["groups"][0]["change_ids"], [change["id"]]
+                )
+                self.assertEqual(
+                    change["raw_id"], report["raw_files"][0]["id"]
+                )
+                self.assertIn("terminal newline bytes", change["basis"])
+                self.assertIn(
+                    "No behavior change is inferred", change["basis"]
+                )
+                fragments = {
+                    item["key"]: item
+                    for item in report["source_evidence"]["fragments"]
+                }
+                for side in ("before", "after"):
+                    record = change[side]
+                    if record is None:
+                        continue
+                    fragment = fragments[record["fragment_key"]]
+                    lines = fragment["text"].splitlines(keepends=True)
+                    self.assertEqual(
+                        record["source"],
+                        "".join(lines[record["start"] - 1 : record["end"]]),
+                    )
+                render(report)
+
+    def test_existing_structural_changes_own_their_raw_bytes(self) -> None:
+        """Line endings inside edited declarations must not duplicate AST changes."""
+        original = compile_snapshot(
+            snap(
+                {"x.py": "def f():\n    return 1\n"},
+                {"x.py": "def f():\n    return 2\n"},
+            )
+        )
+        changed = compile_snapshot(
+            snap(
+                {"x.py": "def f():\r\n    return 1\r\n"},
+                {"x.py": "def f():\n    return 2"},
+            )
+        )
+        self.assertEqual(len(changed["changes"]), 1)
+        self.assertEqual(changed["changes"][0]["kind"], "modified")
+        original.pop("source_evidence")
+        changed.pop("source_evidence")
+        self.assertEqual(original["meta"].pop("source_bytes"), 44)
+        self.assertEqual(changed["meta"].pop("source_bytes"), 45)
+        for field in ("supplied_additions", "supplied_deletions"):
+            self.assertEqual(original["stats"].pop(field), 1)
+            self.assertEqual(changed["stats"].pop(field), 2)
+        self.assertNotEqual(
+            original.pop("raw_files"), changed.pop("raw_files")
+        )
+        self.assertEqual(original, changed)
+
+    def test_blank_changes_outside_edited_symbols_remain_owned(self) -> None:
+        """A substantive edit must not hide a separate changed blank region."""
+        report = compile_snapshot(
+            snap(
+                {"x.py": "def f():\n    return 1\n"},
+                {"x.py": "\ndef f():\n    return 2\n\n"},
+            )
+        )
+        self.assertEqual(
+            [item["kind"] for item in report["changes"]],
+            ["modified", "text", "text"],
+        )
+        text_changes = report["changes"][1:]
+        self.assertEqual(
+            [item["after"]["start"] for item in text_changes], [1, 4]
+        )
+        self.assertEqual(
+            [item["after"]["end"] for item in text_changes], [1, 4]
+        )
+        self.assertEqual(
+            [item["after"]["source"] for item in text_changes], ["\n", "\n"]
+        )
+        self.assertEqual(len({item["id"] for item in report["changes"]}), 3)
+        owned = [
+            key for group in report["groups"] for key in group["change_ids"]
+        ]
+        self.assertCountEqual(
+            owned, [item["id"] for item in report["changes"]]
+        )
+        self.assertEqual(
+            report["stats"]["by_kind"], {"modified": 1, "text": 2}
+        )
+
+    def test_unpaired_blank_region_does_not_claim_absence(self) -> None:
+        """Keep unavailable and supplied-partial counterpart states explicit."""
+        for direction in ("base", "head"):
+            other = "head" if direction == "base" else "base"
+            with self.subTest(side=direction):
+                snapshot = snap(
+                    {"x.py": "\r\n"} if direction == "base" else {},
+                    {"x.py": "\r\n"} if direction == "head" else {},
+                    overrides={
+                        (other, "x.py"): {
+                            "state": "unavailable",
+                            "reason": "not_supplied",
+                        }
+                    },
+                )
+                report = compile_snapshot(snapshot)
+                change = report["changes"][0]
+                self.assertEqual(change["kind"], "text")
+                self.assertIn(
+                    "does not establish file addition or removal",
+                    change["basis"],
+                )
+                self.assertNotIn("confirmed absent", change["basis"])
+                self.assertEqual(
+                    report["source_evidence"]["file_evidence"][0][other][
+                        "state"
+                    ],
+                    "unavailable",
+                )
+        snapshot = snap(
+            {"x.py": "\r\n"},
+            {"x.py": "\n"},
+            overrides={
+                (side, "x.py"): {"state": "supplied", "coverage": "partial"}
+                for side in ("base", "head")
+            },
+            fragment_options={
+                ("base", "x.py"): {"region": "first", "start_line": 10},
+                ("head", "x.py"): {"region": "second", "start_line": 20},
+            },
+        )
+        report = compile_snapshot(snapshot)
+        self.assertEqual(len(report["changes"]), 2)
+        for change in report["changes"]:
+            self.assertIn(
+                "does not establish file addition or removal", change["basis"]
+            )
+        self.assertEqual(
+            {
+                item["region"]
+                for item in report["source_evidence"]["fragments"]
+            },
+            {"first", "second"},
+        )
+
+    def test_unchanged_raw_source_has_no_changes(self) -> None:
+        """Store unchanged and empty source without adding narrative units."""
+        for text in ("", "\r\n", "def f():\r\n    return 'é'\r\n"):
+            with self.subTest(text=text):
+                report = compile_snapshot(snap({"x.py": text}, {"x.py": text}))
+                self.assertEqual(report["changes"], [])
+                self.assertEqual(report["groups"], [])
+                self.assertEqual(report["raw_files"], [])
+                fragments = report["source_evidence"]["fragments"]
+                self.assertEqual(
+                    [item["text"] for item in fragments], [text, text]
+                )
+                self.assertEqual(
+                    fragments[0]["content_digest"],
+                    fragments[1]["content_digest"],
+                )
+                self.assertNotEqual(fragments[0]["key"], fragments[1]["key"])
+
+
+class PhysicalSourceAnalysisTests(unittest.TestCase):
+    """Use physical source coordinates for extraction, excerpts, and display."""
+
+    def test_unicode_string_keeps_modified_function_and_return(self) -> None:
+        """Legal string characters must not remove the final function line."""
+        for separator in ("\u2028", "\u2029", "\x85", "\v", "\f"):
+            for eol in ("\n", "\r\n", "\r"):
+                with self.subTest(separator=separator, eol=eol):
+                    before = eol.join(
+                        (
+                            "def f():",
+                            f"    value = 'a{separator}b'",
+                            "    return 1",
+                            "",
+                        )
+                    )
+                    after = before.replace("return 1", "return 2")
+                    report = compile_snapshot(
+                        snap(
+                            {"example.py": before},
+                            {"example.py": after},
+                            repository="example/project",
+                        )
+                    )
+                    change = next(
+                        c for c in report["changes"] if c["kind"] == "modified"
+                    )
+                    self.assertEqual(change["after"]["name"], "f")
+                    self.assertEqual(change["after"]["end"], 3)
+                    self.assertIn("return 2", change["after"]["source"])
+                    self.assertIn(separator, change["after"]["source"])
+                    self.assertTrue(change["after"]["url"].endswith("#L1-L3"))
+                    rows = [r for h in change["hunks"] for r in h["rows"]]
+                    self.assertIn(
+                        3, [r["new"] for r in rows if "return 2" in r["text"]]
+                    )
+
+    def test_partial_adjacent_and_overlapping_unicode_excerpts(self) -> None:
+        """Only CR and LF reserve lines in partial source fragments."""
+        for eol in ("\n", "\r\n", "\r"):
+            source = snap(
+                {"x.py": "value = 'a\u2028b'" + eol},
+                {},
+                overrides={
+                    ("base", "x.py"): {
+                        "state": "supplied",
+                        "coverage": "partial",
+                    },
+                },
+                fragment_options={
+                    ("base", "x.py"): {"start_line": 20, "region": "one"}
+                },
+            )
+            source["fragments"].append(
+                {
+                    "path": "x.py",
+                    "side": "base",
+                    "text": "next_value = 2" + eol,
+                    "start_line": 21,
+                    "region": "two",
+                }
+            )
+            compile_snapshot(source)
+            source["fragments"][-1]["start_line"] = 20
+            with self.assertRaisesRegex(ValueError, "Overlapping"):
+                compile_snapshot(source)
+
+    def test_text_hunks_context_and_fragment_url_use_physical_lines(
+        self,
+    ) -> None:
+        """Non-Python source display and raw-file links keep exact line bounds."""
+        before = "a\u2028b\nold\n"
+        after = before.replace("old", "new")
+        report = compile_snapshot(
+            snap(
+                {"x.txt": before},
+                {"x.txt": after},
+                repository="example/project",
+            )
+        )
+        for change in report["changes"]:
+            if change["after"]:
+                self.assertLessEqual(change["after"]["end"], 2)
+                self.assertTrue(change["after"]["url"].endswith("-L2"))
+        self.assertTrue(report["raw_files"][0]["after_url"].endswith("#L1-L2"))
+        hunks = make_hunks(before, after)
+        rows = [r for h in hunks for r in h["rows"]]
+        self.assertIn(2, [r["new"] for r in rows if r["text"] == "new"])
 
 
 if __name__ == "__main__":

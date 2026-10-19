@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,6 +49,51 @@ class ModelCapacity:
         """
         return self.context_tokens - self.max_output_tokens
 
+    def output_guard(
+        self,
+        output_reservation: int | None = None,
+        *,
+        enforceable_output_cap: bool = False,
+    ) -> int:
+        """Reserve maximum output unless the adapter can enforce a smaller cap.
+
+        Args:
+            output_reservation: Requested output tokens, or the model maximum.
+            enforceable_output_cap: Whether the adapter enforces this request.
+
+        Returns:
+            Output tokens that must be held out of the context window.
+
+        Raises:
+            ValueError: If the reservation or enforcement flag is invalid.
+        """
+        requested = (
+            self.max_output_tokens
+            if output_reservation is None
+            else output_reservation
+        )
+        if (
+            type(requested) is not int
+            or not 0 < requested <= self.max_output_tokens
+        ):
+            msg = "Output reservation must fit the model output capacity"
+            raise ValueError(msg)
+        if type(enforceable_output_cap) is not bool:
+            msg = "Output cap enforcement must be a boolean"
+            raise ValueError(msg)
+        return requested if enforceable_output_cap else self.max_output_tokens
+
+    def input_bound_for(
+        self,
+        output_reservation: int | None = None,
+        *,
+        enforceable_output_cap: bool = False,
+    ) -> int:
+        """Return input capacity after the adapter's enforceable output guard."""
+        return self.context_tokens - self.output_guard(
+            output_reservation, enforceable_output_cap=enforceable_output_cap
+        )
+
 
 def estimate_input(request_body: bytes, *, overhead_bytes: int = 0) -> int:
     """
@@ -82,6 +128,7 @@ class RunUsage:
 
     def __init__(self) -> None:
         """Initialize zeroed token totals and call counters."""
+        self._lock = threading.Lock()
         self._input_tokens = 0
         self._cached_input_tokens = 0
         self._output_tokens = 0
@@ -101,28 +148,29 @@ class RunUsage:
                 and output counts and cached input no greater than input.
 
         """
-        self._calls += 1
-        if usage is None:
-            self._unreported_calls += 1
-            return
+        with self._lock:
+            self._calls += 1
+            if usage is None:
+                self._unreported_calls += 1
+                return
 
-        input_tokens = usage.get("input_tokens")
-        cached_input_tokens = usage.get("cached_input_tokens", 0)
-        output_tokens = usage.get("output_tokens")
-        if (
-            type(input_tokens) is not int
-            or input_tokens < 0
-            or type(cached_input_tokens) is not int
-            or not 0 <= cached_input_tokens <= input_tokens
-            or type(output_tokens) is not int
-            or output_tokens < 0
-        ):
-            self._unreported_calls += 1
-            return
+            input_tokens = usage.get("input_tokens")
+            cached_input_tokens = usage.get("cached_input_tokens", 0)
+            output_tokens = usage.get("output_tokens")
+            if (
+                type(input_tokens) is not int
+                or input_tokens < 0
+                or type(cached_input_tokens) is not int
+                or not 0 <= cached_input_tokens <= input_tokens
+                or type(output_tokens) is not int
+                or output_tokens < 0
+            ):
+                self._unreported_calls += 1
+                return
 
-        self._input_tokens += input_tokens
-        self._cached_input_tokens += cached_input_tokens
-        self._output_tokens += output_tokens
+            self._input_tokens += input_tokens
+            self._cached_input_tokens += cached_input_tokens
+            self._output_tokens += output_tokens
 
     def report(self) -> dict[str, int]:
         """
@@ -133,10 +181,11 @@ class RunUsage:
             unreported call counts. Mutating it does not change this accumulator.
 
         """
-        return {
-            "input_tokens": self._input_tokens,
-            "cached_input_tokens": self._cached_input_tokens,
-            "output_tokens": self._output_tokens,
-            "calls": self._calls,
-            "unreported_calls": self._unreported_calls,
-        }
+        with self._lock:
+            return {
+                "input_tokens": self._input_tokens,
+                "cached_input_tokens": self._cached_input_tokens,
+                "output_tokens": self._output_tokens,
+                "calls": self._calls,
+                "unreported_calls": self._unreported_calls,
+            }

@@ -1,8 +1,9 @@
 # Internal contract
 
 ```text
-Committed Git objects / pinned GitHub sources / saved snapshot
-    → Python AST units + independent textual hunks
+Original Git/GitHub patches + pinned source
+    → retained file patches + separate function comparisons
+    → Python AST units
     → conservative cross-file declaration pairs
     → calls / references / imports / test references
     → semantic chapters + prerequisite graph
@@ -14,7 +15,58 @@ Committed Git objects / pinned GitHub sources / saved snapshot
 
 ## Evidence and presentation are separate
 
-A Git hunk is not the identity of a conceptual change. A moved definition is represented by a single change with both source spans and an independently computed paired delta. The raw source view retains file-oriented hunks, including imports and code that was not parsed into symbols.
+### Original patch and function comparison
+
+The original patch shows what changed in each file. Git ingestion captures the
+output of `git diff`; GitHub ingestion retains each file's `patch` from the
+[PR files API](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files).
+We keep that text and its line grouping. We check the rows against
+the captured file versions; we do not run another diff algorithm to replace
+Git's or GitHub's choices. An incomplete or mismatched patch is rejected.
+
+The **function comparison** is an extra view. It compares the earlier and
+later versions of a matched function, even when they are in different files.
+It is generated from source and labeled separately. It does not replace the
+original patch.
+
+Passages can show excerpts from that original patch. Selecting a smaller
+range must not choose a different alignment of its lines. The complete
+captured patch remains available under **Original source hunks**.
+
+For example, suppose `normalize_name()` moves from `users.py` to `text.py`.
+Both files already exist. The original file patch shows:
+
+```diff
+# users.py
+-def normalize_name(name):
+-    return name.lower()
+
+# text.py
++def normalize_name(name):
++    return name.strip().lower()
+```
+
+The optional function comparison shows the small edit more directly:
+
+```diff
+ def normalize_name(name):
+-    return name.lower()
++    return name.strip().lower()
+```
+
+The function moved, and it now removes surrounding spaces before lowercasing.
+For a 200-line function, this view avoids reading the whole function twice.
+Keep both views: the original patch records the PR; the function comparison
+helps explain a move or edit. A proposed match still needs review when the
+tool cannot confirm that the two definitions belong together.
+
+If GitHub omits a file patch, record it as unavailable. Do not silently replace
+it with a generated diff. Source can still support the separate function
+comparison. Snapshots must include a patch record for each file, even when
+the patch text is unavailable. Older snapshots without these records are
+rejected; capture them again with the current Git or GitHub command.
+The retained original text also
+keeps file headers and no-newline markers that are not ordinary code rows.
 
 Matching uses four stages: unique same-path/name matches; unique exact-AST cross-file matches; unique function/class matches with only the declaration name and leading docstring excluded; and conservative same-name candidates with a structural similarity threshold. Ambiguous duplicates remain unpaired. Similarity is evidence for correspondence, not evidence for preserved behavior. A same-path implementation edit is not automatically called a behavioral regression.
 
@@ -45,6 +97,11 @@ Module environment differences are deliberately not erased. Renaming a reference
     "base": {"path": "pkg/module.py", "state": "absent"},
     "head": {"path": "pkg/module.py", "state": "supplied", "coverage": "full"}
   }],
+  "patches": [{
+    "path": "pkg/module.py",
+    "origin": "git",
+    "patch": "@@ -0,0 +1,2 @@\n+def f(x):\n+    return x\n"
+  }],
   "warnings": []
 }
 ```
@@ -57,7 +114,19 @@ Use `scope: "selected excerpts"` for partial snapshots and set each supplied exc
 
 The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_files`, `cycles`, `notes`, `warnings`, `stats`, `meta` and `method`. Stable IDs join evidence and narrative. Line URLs bind to a commit, not a moving branch. The renderer rejects malformed identifiers, numeric fields, diff tags and missing group references, escapes source/prose and prevents literal script terminators in embedded JSON.
 
-## Annotation handoff
+Snapshots require `patches`, a list of `{path, origin, patch}` records.
+The path is the later path from the file evidence; `origin` is `git` or
+`github`; `patch` contains the original text or is null when unavailable.
+The snapshot's pinned revisions apply to these records too. Patch paths must
+be unique, with one record for every file evidence pair. Total retained patch
+text has a separate 64,000,000-byte cap. It does not raise the source-byte limit.
+
+## Annotation handoff and current walkthrough
+
+Compiler output uses `diffstory.report.v1`. Human-authored prose can be saved
+separately as `diffstory.annotations.v1` and applied only to compiler output
+with matching base and head revisions. The example below shows the main shape;
+fields that need source context use existing group and change IDs.
 
 ```json
 {
@@ -65,23 +134,22 @@ The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_
   "base_sha": "<same effective base as the report>",
   "head_sha": "<same head as the report>",
   "document": {
-    "preamble": "A source-grounded overview of the whole change, before the code tour.",
-    "lead": "A short source-grounded opening paragraph.",
+    "preamble": "A source-grounded overview before the code tour.",
+    "lead": "A short opening paragraph.",
     "closing": "The mental model to retain."
   },
   "steps": [{
     "group_id": "<existing group ID>",
-    "title": "Explain the abstraction before its callers",
-    "intent": "What this change accomplishes, grounded in source.",
-    "why_now": "What the previous step established and what this one adds.",
-    "takeaway": "The mental model needed for the next step.",
+    "title": "Explain one part of the change",
+    "intent": "What this change does, based on source.",
+    "why_now": "How this part relates to the reading path.",
+    "takeaway": "The useful mental model.",
     "invariants": ["A concrete property to verify"],
     "questions": ["A review question, not an invented defect"],
-    "evidence_change_ids": ["<change ID belonging to this group>"],
-    "transition": "A sentence leading to the next idea.",
+    "evidence_change_ids": ["<change ID in this group>"],
     "passages": [{
-      "text": "This paragraph explains `the_symbol` immediately before its code.",
-      "change_ids": ["<change ID belonging to this group>"],
+      "text": "This paragraph explains `the_symbol` beside its code.",
+      "change_ids": ["<change ID in this group>"],
       "view": "definition",
       "focus": {"start": 120, "end": 130}
     }]
@@ -89,46 +157,116 @@ The report includes `changes`, `groups`, `edges`, `symbol_edges`, `tests`, `raw_
 }
 ```
 
-The preamble introduces the whole change before the code tour. It is optional in manual annotations and required in generated narration, including saved reports. It starts with a plain-language sentence about the supplied objective and context. If no goal was supplied, it describes what the evidence shows without guessing at motivation.
+The manual `preamble` is optional. In generated narration, **Before the code**
+is required. It introduces the system's purpose, concrete inputs, operation,
+outputs, and the roles of its main parts before implementation details. It
+starts with a plain sentence about supplied context. If the author did not give
+a goal, it describes what the evidence shows without guessing at motivation.
+It can name relevant classes with simple, source-grounded roles. It defines
+necessary technical terms when they first appear. It does not list files, give
+a code tour, or add unrelated review questions.
 
-The preamble then explains the affected system's purpose, concrete inputs, basic operation, outputs, and supported roles of its main parts, before technical mechanisms. It can name the project and relevant classes with simple, source-grounded roles. It describes supported before-and-after behavior conceptually. File paths, function names, internal changes, and implementation details stay in the walkthrough. It defines necessary technical terms when they first appear, including in the reading path. It does not list files, give a code tour, or add unrelated review questions.
+The preamble follows ASD-STE100 principles as a strong guide while keeping a
+natural reading rhythm and exact technical terms. The prose limit is 4,000
+characters. Complete fenced sketches have a separate 4,000-character limit,
+including fences; the combined field limit is 8,000 characters. A sketch is
+optional. Generated prose puts identifiers, paths, commands, and literal
+values in backticks. Manual annotations may be partial. Their revision and ID
+checks do not prove that a prose claim is true.
 
-A compact sketch or flow chart is optional when it clarifies a supported relationship or decision. No diagram is required. A two-path decision sketch uses a three-line plain-text flow chart. The preamble allows at most 4,000 characters of prose and a separate 4,000 characters for all complete fenced text sketches, including their fences. The whole field is limited to 8,000 characters. Unclosed fences count as prose. Other document prose has a 6,000-character limit.
+The `git`, `github`, and `snapshot` commands accept `--narrate`. The current
+flat report uses `diffstory.report.v2`; its source packet uses
+`diffstory.packet.v1`; its annotation export uses
+`diffstory.annotations.walkthrough.v1`. The packet stores each source buffer
+once. Passages refer to exact revisions and inclusive original line ranges.
+Every compiler change and changed diff region must be covered by at least one
+passage. Full supplied diffs remain available in the report. The writer can
+organize the explanation around concepts and combine related changes. Compiler
+groups and dependency edges are evidence and ordering hints. Validation checks
+references and coverage; it does not enforce compiler prerequisite order.
 
-The provider JSON schema comes from the same Pydantic document model used for response validation. The annotation, generated-report, and renderer checks share its field rules and limits. They check the preamble's presence, type, and structural limits, but not whether it gives a useful overview or whether its claims are correct. Generated prose remains unverified and needs human review.
+A successful generated report records provider, model, destination, exact
+revisions, evidence digest, usage, writing and editorial request counts, and
+cache counts. It contains no credentials. The renderer labels model prose
+**model-generated · unverified**. Validation checks shape, size, source links,
+citations, and changed-region coverage. It does not assess the truth of the
+prose or claim that repository tests ran.
 
-The compiler rejects a revision mismatch, missing or out-of-group evidence IDs, oversized prose, and invalid field types. Annotation fields cannot replace structural matches or claim test execution.
+### Provider consent, limits, and state
 
-When an annotation supplies a step for every group, the step array's order is the reading order. Narrated reports may choose a story order, but the validator keeps prerequisite groups before their dependents and groups in a dependency cycle adjacent. The generated step order is applied to the report's `groups` array, so the contents list and rendered document use the same path. Partial manual annotations retain the report's baseline order.
+OpenAI Responses is the default provider; `--provider codex` selects the
+signed-in Codex CLI. OpenAI uses an API key from `OPENAI_API_KEY` by default,
+or the environment variable named by `--api-key-env`. Codex uses `codex exec`
+and saved CLI sign-in. OpenAI currently supports `gpt-6.1-sol`; Codex accepts
+the known-capacity overrides `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and
+`gpt-5.3-codex`. Unknown Codex overrides are rejected before source transfer.
+Before sending source, the CLI displays the provider destination, revision
+scope, and planned request count, then asks for consent.
+`--yes` skips the prompt when the user has already approved that transfer. The
+source cap defaults to 64,000,000 bytes across both revisions and can be
+lowered with `--max-source-bytes`.
 
-Manually authored annotations can omit passages and group coverage. Generated annotations add a top-level `generation` object with schema `diffstory.generation.v1`. It records `origin: "model_generated"`, `verification: "unverified"`, provider/model, exact revisions, measured usage, expected/completed group and change IDs, chunk coverage, and sanitized errors. It contains no credentials. Generated annotations must have exactly one step for every group, cite every group change, and include nonempty source-bound passages covering every change. Passage focus ranges must fit both the inspected source slice and the report's original source lines. Incomplete generated candidates are rejected.
+The generation runtime allows at most 12 provider attempts including retries,
+four concurrent calls, and 240 seconds for preparation and generation. It
+allows 1 MiB of total canonical response bytes per run and a separate 1 MiB
+saved-annotation limit. Interactive consent wait is outside the deadline. A
+failed request or limit does not produce a complete report. The CLI prints
+provider-reported input, cached input, and output token totals. These counts do
+not show that the generated explanation is correct.
 
-When generated annotations are applied, the validated `generation` object is copied into the report JSON. Each generated group receives `provenance: "model-generated · unverified"`. Rendering checks the generation revisions, usage shape, chunk completion, group/change coverage, passages, and provenance label again. The reader displays both a document-level warning naming the provider/model and a per-step generated label. Re-rendering a generated report preserves this warning.
+Run attempts and the original deadline are stored durably. The default state
+path replaces the output suffix with `.narration-state`; `--state-dir` selects
+a path. Resume uses the recorded attempt budget and deadline. `--fresh-state`
+requires a new path and retains old state. Payload cache data is separate: by
+default it replaces the output suffix with `.narration-cache`. `--cache-dir`
+selects a path and `--no-cache` disables payload reuse without disabling run
+state. Cache entries are bound to prepared requests and revalidated before
+reuse. The unresolved Codex default model disables persistent caching; choose
+an explicit supported `--model` to enable it.
 
-## Continuous reader
+### Supported command flow
 
-`document`, `passages` and `transition` are optional fields in manually authored annotations. A focus range must fall inside one supplied head definition (or base when no head exists); ranges refer to original source lines, not snippet-relative offsets. A diff view cannot accept a definition focus. The passage `view` field is validated for focus checks but does not set the reader's initial mode. Repeated references in different passages are allowed for discussing a signature and body separately. Missing references do not remove units: the reader exposes them under Supporting changes. The renderer also validates annotations in a precompiled report.
+```bash
+# Compile local changes and write HTML plus a .report.json file.
+diffstory git --repo . --base BASE --head HEAD --out walkthrough.html
 
-The UI renders every section and prose passage into one document. Story passages open in diff view; **Read definition** switches a block in place and applies any validated focus range. Test source remains a definition, and raw appendix hunks remain diffs. Narration instructions require backticks around code identifiers, paths, commands and literal values. The renderer styles explicit backtick spans and automatically formats known source names, paths, short variable names and command flags when an annotation omits the markers. An IntersectionObserver defers offscreen code previews; manual load controls provide a fallback. A bounded preview is the default for long definitions/diffs. User expansion adds up to 160 display rows per action. No network fetch is involved: all source is embedded as escaped JSON. There is no side pane, tabbed dashboard or step router. A small Contents popover jumps to stable section anchors, while native page scrolling is preserved.
+# Read a pull request. Add --narrate only to send its prepared source to a provider.
+diffstory github 'OWNER/REPO#NUMBER' --narrate --out walkthrough.html
 
-Supporting units and original raw hunks are created on demand. Source/prose is escaped before display, and the page's CSP disallows network connections, external scripts and object loads.
+# Compile a saved diffstory.snapshot.v1 input.
+diffstory snapshot input.snapshot.json --out walkthrough.html
+
+# Export source evidence without a model call.
+diffstory evidence walkthrough.report.json --out evidence.json
+
+# Apply revision-bound manual or saved walkthrough annotations to compiler data.
+diffstory render compiler.report.json --annotations annotations.json --out annotated.html
+```
+
+Every compile or render writes a standalone HTML page and adjacent
+`.report.json`. Narration also writes a candidate `.annotations.json` unless
+`--annotations-out` changes its path. The manual evidence flow makes no
+provider call. The output page embeds report data, CSS, JavaScript, and the
+brand mark. It works offline; it does not execute supplied repository code or
+fetch source. Explicit source links open GitHub only when a reader clicks them.
+The OpenAI request uses `store: false`, but that setting is not a zero-retention
+promise. Data controls of the selected provider still apply.
+
+The reader presents prose beside code and diff evidence. Source and prose are
+escaped before display, and the page's content security policy blocks network
+connections, external scripts, and object loads. It preserves original source
+line numbers and supports lazy code previews and expansion. Structural checks
+and offline display do not replace human review or tests.
 
 ## Deliberate prototype boundaries
 
-Python AST support is implemented with the standard library, so parse support follows the interpreter running the CLI. A newer-syntax file falls back to textual evidence. Classes are atomic. Static resolution respects common import aliases and avoids simple local/parameter shadows, but does not claim whole-program completeness.
+Python AST support follows the interpreter running the CLI. Newer syntax falls
+back to textual evidence. Classes are atomic. Static resolution handles common
+import aliases and simple local or parameter shadows, but it does not claim
+whole-program completeness. Dynamic dispatch, reflection, unchanged external
+callers, and whole-program behavior are not fully resolved.
 
-The default narrative uses deterministic templates. The demo adds authored domain-specific annotations. The opt-in `--narrate` path supports the OpenAI Responses API and the user's signed-in Codex CLI. Both providers return structured output and assemble validated source-bound passages with hierarchical summaries. OpenAI requests use its selected model capacity; known Codex overrides use published model capacity, while the CLI default is packed against a conservative 400,000-token context bound. A planning call chooses a story order from group summaries; dependency constraints and cycle groups are enforced before section prose is written. Long source lines are split into bounded slices without dropping text. If a leaf response omits change citations, Diffstory may make one bounded repair request for that chunk. The Codex adapter runs `codex exec` from a temporary directory, in a read-only sandbox, with local shell, browser, app, and plugin tools disabled. Each provider call has a 900-second timeout. Both adapters use the standard library for transport. Shared data validation uses Pydantic. Successful calls contribute provider-reported input, cached input, and output token counts to a run summary; no run-wide token, call-count, or elapsed-time budget is imposed.
-
-Git and GitHub ingestion enforce a 64 MB aggregate source limit by default, and snapshot compilation enforces the same limit. The annotation manifest and report retain revisions, measured usage, and chunk coverage without storing credentials. The model-generated warning states that prose remains unverified.
-
-There is no background agent, GitHub write access, production deployment, formal equivalence engine, live coverage ingestion, or automatic merge recommendation. The UI does not execute supplied repository source. JavaScript executes only the local report interface.
-
-## High-value next increments
-
-First add full-repository symbol indexing with explicit resolution confidence and unchanged callers. Then add statement-level extraction matching (for shared helpers cut out of larger functions), followed by test-run artifact ingestion tied to exact revisions. Additional narrative adapters may be added later, but must remain downstream of evidence analysis and must not rewrite classifications or validation status.
-
-## Primary implementation references
-
-- Python AST API: https://docs.python.org/3/library/ast.html
-- GitHub pull-request file pagination: https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files
-- GitHub contents API: https://docs.github.com/en/rest/repos/contents
+The tool does not index the whole repository, match extracted statements,
+ingest verified test-run artifacts, execute supplied code, or issue a
+merge-safety verdict. Test references are not measured coverage or passing
+tests. Identical ASTs do not prove identical behavior.

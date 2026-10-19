@@ -28,6 +28,7 @@ from .models import MAX_SNAPSHOT_SOURCE_BYTES
 from .models import AbsentFile
 from .models import AvailabilityReason
 from .models import FileEvidence
+from .models import FilePatch
 from .models import RevisionSide
 from .models import SourceFragment
 from .models import StrictModel
@@ -445,6 +446,10 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
                 evidence_record, side, SuppliedFile(path=path, coverage="full")
             )
 
+    # Keep Git's own line alignment. Source reads are still needed for symbol
+    # matching and for the optional comparison of two function versions.
+    patches = _git_patches(root, file_evidence, effective, head_sha)
+
     meta = {
         "title": f"{base} → {head}",
         "repository": "",
@@ -469,8 +474,46 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
             fragment.model_dump(exclude_unset=True) for fragment in fragments
         ],
         "file_evidence": [record.model_dump() for record in file_evidence],
+        "patches": patches,
         "warnings": warnings,
     }
+
+
+def _git_patches(
+    repo: Path, records: Sequence[FileEvidence], base: str, head: str
+) -> list[dict]:
+    """Capture Git's patch only for files whose source was safe to read."""
+    patches = []
+    patch_bytes = 0
+    for record in records:
+        text = None
+        if not any(
+            isinstance(side, UnavailableFile)
+            for side in (record.base, record.head)
+        ):
+            data = _git(
+                repo,
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                base,
+                head,
+                "--",
+                record.head.path,
+            )
+            text = data.decode("utf-8")
+            patch_bytes += len(data)
+            if patch_bytes > MAX_SNAPSHOT_SOURCE_BYTES:
+                msg = "Original patches exceed the aggregate byte limit"
+                raise ValueError(msg)
+        patches.append(
+            FilePatch(
+                path=record.head.path, origin="git", patch=text
+            ).model_dump()
+        )
+    return patches
 
 
 class RejectRedirects(HTTPRedirectHandler):
@@ -1029,6 +1072,21 @@ def from_github(
         max_source_bytes,
     )
 
+    # The files API provides GitHub's patch for each file. Keep it verbatim;
+    # an omitted patch remains unavailable instead of becoming a Python diff.
+    patches = [
+        FilePatch(
+            path=item["filename"], origin="github", patch=item.get("patch")
+        ).model_dump()
+        for item in files
+    ]
+    if (
+        sum(len((item["patch"] or "").encode("utf-8")) for item in patches)
+        > MAX_SNAPSHOT_SOURCE_BYTES
+    ):
+        msg = "Original patches exceed the aggregate byte limit"
+        raise ValueError(msg)
+
     # Fail if the PR changed during the read; don't silently mix multiple revisions.
     end = api.get(f"/repos/{repo}/pulls/{number}")
     if end["head"]["sha"] != head or end["base"]["sha"] != base_tip:
@@ -1072,5 +1130,6 @@ def from_github(
         "file_evidence": [
             record.model_dump() for record in source.file_evidence
         ],
+        "patches": patches,
         "warnings": source.warnings,
     }
