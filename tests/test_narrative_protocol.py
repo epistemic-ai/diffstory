@@ -42,6 +42,32 @@ class LayeredProvider(FixtureProvider):
 class ProtocolTests(unittest.TestCase):
     """Pure serialization must be byte-identical to each supported live adapter."""
 
+    def test_wire_schemas_are_detached(self) -> None:
+        """Mutating returned schemas cannot change later results."""
+        stages = ("detail", "planning", "section", "document")
+        for stage in stages:
+            with self.subTest(stage=stage):
+                expected = wire_schema(stage)
+                returned = wire_schema(stage)
+                returned["properties"]["version"]["caller_mutation"] = stage
+                returned["properties"]["items"]["items"]["caller_mutation"] = (
+                    stage
+                )
+                self.assertEqual(wire_schema(stage), expected)
+
+    def test_wire_schemas_reuse_fixed_templates(self) -> None:
+        """Repeated schema reads do not rebuild their fixed templates."""
+        stages = ("detail", "planning", "section", "document")
+        with patch(
+            "diffstory.narrative_wire.structured_output_schema",
+            side_effect=AssertionError("fixed schema rebuilt"),
+        ) as build_schema:
+            for stage in stages:
+                with self.subTest(stage=stage):
+                    for _ in range(3):
+                        wire_schema(stage)
+            build_schema.assert_not_called()
+
     def test_all_codecs_roundtrip_exact_initial_and_repair_bytes(self) -> None:
         """Keep Unicode, schemas, output fields, key order, prefix and repair data."""
         providers = (

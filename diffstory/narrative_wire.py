@@ -231,15 +231,39 @@ class DocumentEnvelope(Contract):
     items: tuple[WireDocument, ...]
 
 
+_WIRE_SCHEMA_TEMPLATES = MappingProxyType(
+    {
+        stage: json.dumps(
+            structured_output_schema(model),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        for stage, model in (
+            ("detail", DetailEnvelope),
+            ("planning", CardEnvelope),
+            ("section", SectionEnvelope),
+            ("document", DocumentEnvelope),
+        )
+    }
+)
+
+
 def wire_schema(stage: str) -> dict:
-    """Produce a strict schema for the provider's actual output envelope."""
-    model = {
-        "detail": DetailEnvelope,
-        "planning": CardEnvelope,
-        "section": SectionEnvelope,
-        "document": DocumentEnvelope,
-    }[stage]
-    return structured_output_schema(model)
+    """Return a detached strict schema for one fixed output envelope.
+
+    Args:
+        stage: One of ``detail``, ``planning``, ``section``, or ``document``.
+
+    Returns:
+        A fresh dictionary decoded from the immutable byte template built once
+        when this module loads. Templates remain fixed for the module lifetime,
+        and caller mutations cannot affect later results.
+
+    Raises:
+        KeyError: If ``stage`` is not supported.
+    """
+    return json.loads(_WIRE_SCHEMA_TEMPLATES[stage])
 
 
 @dataclass(frozen=True)
