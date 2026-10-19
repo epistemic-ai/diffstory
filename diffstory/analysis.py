@@ -31,7 +31,6 @@ from .evidence import FileCoverage
 from .evidence import build_file_coverage
 from .models import MAX_NARRATIVE_TEXT_CHARS
 from .models import FilePatch
-from .models import GenerationUsage
 from .models import ParseStatus
 from .models import SnapshotInput
 from .models import SourceFragment
@@ -56,15 +55,7 @@ MIN_SYMBOL_SIMILARITY = 0.40
 RELATED_SYMBOL_THRESHOLD = 4
 MAX_QUESTION_CHARS = 2_000
 MAX_TITLE_CHARS = 200
-MAX_PROVIDER_NAME_CHARS = 80
-MAX_MODEL_NAME_CHARS = 160
 MAX_PASSAGE_LABEL_CHARS = 160
-GENERATION_CHUNK_FIELDS = frozenset(
-    {"id", "group_id", "change_ids", "source_slices", "status"},
-)
-GENERATION_SOURCE_SLICE_FIELDS = frozenset(
-    {"change_id", "side", "start", "end"},
-)
 DECLARATION_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 SYMBOL_TYPES = (*DECLARATION_TYPES, ast.Assign, ast.AnnAssign)
 LABELS = {
@@ -2856,36 +2847,6 @@ def evidence_packet(report: dict) -> dict:
     }
 
 
-def _generation_ids(generation: dict, field: str) -> Sequence[str]:
-    """
-    Read a unique list of well-formed IDs from a generation manifest.
-
-    Args:
-        generation: Persisted generation metadata.
-        field: ID-list field to validate.
-
-    Returns:
-        The validated ID sequence.
-
-    Raises:
-        ValueError: If the field is absent, duplicated, malformed, or not a list.
-
-    """
-    value = generation.get(field)
-    if (
-        not isinstance(value, list)
-        or any(
-            not isinstance(item, str)
-            or not re.fullmatch(r"[a-f0-9]{16}", item)
-            for item in value
-        )
-        or len(value) != len(set(value))
-    ):
-        msg = f"Invalid generated narration {field}"
-        raise ValueError(msg)
-    return value
-
-
 def _validate_group_order(
     group_order: list[str],
     groups: Sequence[dict],
@@ -2993,374 +2954,15 @@ def _validate_cycle_adjacency(
             raise ValueError(msg)
 
 
-def _validate_chunk_coverage(
-    generation: dict,
-    expected_chunks: Sequence[str],
-    groups: dict[str, dict],
-    change_map: dict[str, dict],
-) -> None:
-    """
-    Require generated chunks to cover each expected chunk and change.
-
-    Each recorded source slice must cite a change in its chunk and stay within
-    that change's original source range.
-
-    Args:
-        generation: Persisted generation mapping containing chunk coverage.
-        expected_chunks: Deterministic chunk IDs planned for this generation.
-        groups: Group lookup used to constrain chunk change IDs.
-        change_map: Change lookup used to validate source-slice bounds.
-
-    Raises:
-        ValueError: If coverage is malformed, incomplete, duplicated, or cites
-            an invalid group, change, side, or line range.
-
-    """
-    chunks = generation.get("chunk_coverage")
-    if not isinstance(chunks, list) or len(chunks) != len(expected_chunks):
-        msg = "Invalid generated narration chunk coverage"
-        raise ValueError(msg)
-
-    seen_chunks: set[str] = set()
-    seen_changes: set[str] = set()
-    for chunk in chunks:
-        chunk_id, change_ids = _validate_generation_chunk(
-            chunk,
-            groups,
-            change_map,
-        )
-        if chunk_id in seen_chunks:
-            msg = "Invalid or duplicate generated chunk ID"
-            raise ValueError(msg)
-        seen_chunks.add(chunk_id)
-        seen_changes.update(change_ids)
-
-    if seen_chunks != set(expected_chunks) or seen_changes != set(change_map):
-        msg = "Generated narration chunk manifest is incomplete"
-        raise ValueError(msg)
-
-
-def _validate_generation_chunk(
-    chunk: dict,
-    groups: Mapping[str, dict],
-    change_map: Mapping[str, dict],
-) -> tuple[str, list[str]]:
-    """
-    Validate one chunk's group, change, and source-slice coverage.
-
-    Args:
-        chunk: Persisted generation chunk record.
-        groups: Report groups indexed by ID.
-        change_map: Report changes indexed by ID.
-
-    Returns:
-        Stable chunk ID and cited change IDs.
-
-    Raises:
-        ValueError: If the chunk or any source slice is malformed or invalid.
-    """
-    if not isinstance(chunk, dict) or set(chunk) != GENERATION_CHUNK_FIELDS:
-        msg = "Invalid generated narration chunk entry"
-        raise ValueError(msg)
-
-    chunk_id = chunk["id"]
-    group_id = chunk["group_id"]
-    if not isinstance(chunk_id, str) or not re.fullmatch(
-        r"[a-f0-9]{16}",
-        chunk_id,
-    ):
-        msg = "Invalid or duplicate generated chunk ID"
-        raise ValueError(msg)
-    if not isinstance(group_id, str) or group_id not in groups:
-        msg = "Generated narration has an incomplete or unknown chunk"
-        raise ValueError(msg)
-    if chunk["status"] != "complete":
-        msg = "Generated narration has an incomplete or unknown chunk"
-        raise ValueError(msg)
-
-    change_ids = chunk["change_ids"]
-    if (
-        not isinstance(change_ids, list)
-        or not change_ids
-        or any(not isinstance(change_id, str) for change_id in change_ids)
-        or len(change_ids) != len(set(change_ids))
-        or not set(change_ids) <= set(groups[group_id]["change_ids"])
-    ):
-        msg = "Generated chunk cites changes outside its group"
-        raise ValueError(msg)
-
-    source_slices = chunk["source_slices"]
-    if not isinstance(source_slices, list):
-        msg = "Invalid generated source-slice coverage"
-        raise ValueError(msg)
-    for source_slice in source_slices:
-        _validate_generation_source_slice(source_slice, change_ids, change_map)
-    return chunk_id, change_ids
-
-
-def _validate_generation_source_slice(
-    source_slice: dict,
-    change_ids: Sequence[str],
-    change_map: Mapping[str, dict],
-) -> None:
-    """
-    Validate a generated source slice against its cited change's line range.
-
-    Args:
-        source_slice: Persisted source-line citation.
-        change_ids: Changes cited by the containing chunk.
-        change_map: Report changes indexed by ID.
-
-    Raises:
-        ValueError: If the citation is malformed, out of scope, or outside the
-            supplied source range.
-    """
-    if (
-        not isinstance(source_slice, dict)
-        or set(source_slice) != GENERATION_SOURCE_SLICE_FIELDS
-    ):
-        msg = "Invalid generated source-slice coverage"
-        raise ValueError(msg)
-    change_id = source_slice["change_id"]
-    side = source_slice["side"]
-    start = source_slice["start"]
-    end = source_slice["end"]
-    if (
-        not isinstance(change_id, str)
-        or change_id not in change_ids
-        or not isinstance(side, str)
-        or side not in {"base", "head"}
-        or type(start) is not int
-        or type(end) is not int
-        or start < 1
-        or end < start
-    ):
-        msg = "Invalid generated source-slice range"
-        raise ValueError(msg)
-
-    source = change_map[change_id].get("after" if side == "head" else "before")
-    if not source or not source.get("start", 1) <= start <= end <= source.get(
-        "end",
-        0,
-    ):
-        msg = "Generated source-slice range is outside its report change"
-        raise ValueError(msg)
-
-
-def validate_generation(report: dict, generation: dict) -> None:
-    """
-    Validate generated-prose provenance, revision binding, and coverage.
-
-    Args:
-        report: Compiled report to which the generation belongs.
-        generation: Persisted generation manifest.
-
-    Raises:
-        ValueError: If provenance, revisions, usage, group order, change
-            coverage, chunk coverage, or completion state is invalid.
-
-    """
-    if (
-        isinstance(generation, dict)
-        and generation.get("version") == "diffstory.generation.v2"
-    ):
-        from .narrative_manifest import validate_persisted_generation
-
-        validate_persisted_generation(report, generation)
-        return
-    required_fields = {
-        "schema",
-        "origin",
-        "verification",
-        "provider",
-        "model",
-        "base_sha",
-        "head_sha",
-        "usage",
-        "expected_groups",
-        "completed_groups",
-        "expected_changes",
-        "covered_changes",
-        "expected_chunks",
-        "chunk_coverage",
-        "errors",
-    }
-    if (
-        not isinstance(generation, dict)
-        or generation.keys() != required_fields
-    ):
-        msg = "Invalid generated narration manifest"
-        raise ValueError(msg)
-
-    has_generated_provenance = (
-        generation.get("schema") == "diffstory.generation.v1"
-        and generation.get("origin") == "model_generated"
-        and generation.get("verification") == "unverified"
-    )
-    if not has_generated_provenance:
-        msg = "Invalid generated narration provenance"
-        raise ValueError(msg)
-
-    meta = report.get("meta", {})
-    revisions_match = generation.get("base_sha") == meta.get(
-        "base_sha",
-    ) and generation.get("head_sha") == meta.get("head_sha")
-    if not revisions_match:
-        msg = "Generated narration belongs to different revisions"
-        raise ValueError(msg)
-
-    provider = generation.get("provider")
-    model = generation.get("model")
-    if (
-        not isinstance(provider, str)
-        or not provider
-        or len(provider) > MAX_PROVIDER_NAME_CHARS
-        or not isinstance(model, str)
-        or not model
-        or len(model) > MAX_MODEL_NAME_CHARS
-    ):
-        msg = "Invalid generated narration provider metadata"
-        raise ValueError(msg)
-
-    expected_groups = _generation_ids(generation, "expected_groups")
-    completed_groups = _generation_ids(generation, "completed_groups")
-    expected_changes = _generation_ids(generation, "expected_changes")
-    covered_changes = _generation_ids(generation, "covered_changes")
-    expected_chunks = _generation_ids(generation, "expected_chunks")
-
-    report_groups = [group["id"] for group in report.get("groups", [])]
-    report_changes = [change["id"] for change in report.get("changes", [])]
-    if set(expected_groups) != set(report_groups) or set(
-        completed_groups,
-    ) != set(report_groups):
-        msg = "Generated narration does not cover every report group"
-        raise ValueError(msg)
-    _validate_group_order(report_groups, report.get("groups", []))
-    if expected_changes != report_changes or set(covered_changes) != set(
-        report_changes,
-    ):
-        msg = "Generated narration does not cover every report change"
-        raise ValueError(msg)
-
-    GenerationUsage.model_validate(generation.get("usage"))
-
-    groups_by_id = {group["id"]: group for group in report.get("groups", [])}
-    changes_by_id = {
-        change["id"]: change for change in report.get("changes", [])
-    }
-    _validate_chunk_coverage(
-        generation,
-        expected_chunks,
-        groups_by_id,
-        changes_by_id,
-    )
-
-    if generation.get("errors") != []:
-        msg = "A completed generated report cannot contain generation errors"
-        raise ValueError(msg)
-
-
-def validate_generated_report(report: dict) -> None:
-    """
-    Require a generated report to retain provenance and complete evidence.
-
-    Args:
-        report: Report carrying a generated narrative and generation manifest.
-
-    Raises:
-        ValueError: If generation metadata, document narration, provenance
-            labels, evidence IDs, or source-bound passages are incomplete.
-
-    """
-    generation = report.get("generation")
-    if (
-        isinstance(generation, dict)
-        and generation.get("version") == "diffstory.generation.v2"
-    ):
-        from .narrative_manifest import validate_v2_report
-
-        validate_v2_report(report)
-        return
-    validate_generation(report, generation)
-    validate_document(report.get("document"), generated=True)
-    changes = {change["id"]: change for change in report["changes"]}
-    for group in report["groups"]:
-        narrative = group.get("narrative", {})
-        if narrative.get("provenance") != "model-generated · unverified":
-            msg = "Generated report lost its model-generated provenance label"
-            raise ValueError(msg)
-        refs = narrative.get("evidence_change_ids")
-        if (
-            not isinstance(refs, list)
-            or len(refs) != len(set(refs))
-            or set(refs) != set(group["change_ids"])
-        ):
-            msg = "Generated step does not cover its expected changes"
-            raise ValueError(msg)
-        passages = narrative.get("passages")
-        if not isinstance(passages, list) or not passages:
-            msg = "Generated step is missing source-bound passages"
-            raise ValueError(msg)
-        validate_passages(passages, group, changes)
-        covered = {
-            change_id
-            for passage in passages
-            for change_id in passage["change_ids"]
-        }
-        if covered != set(group["change_ids"]):
-            msg = "Generated passages do not cover every change in the group"
-            raise ValueError(msg)
-
-
-def _apply_document_annotations(
-    annotations: dict,
-    result: dict,
-    *,
-    generated: bool,
-) -> None:
-    """
-    Validate and copy document-level narration into a report.
-
-    Args:
-        annotations: Annotation document containing optional preamble, lead,
-            and closing fields.
-        result: Deep-copied report being annotated.
-        generated: Whether the annotation source is a model provider.
-
-    Raises:
-        ValueError: If document fields are invalid or generated narration omits
-            its required preamble, opening, or closing.
-    """
-    if "document" in annotations or generated:
-        document = validate_document(
-            annotations.get("document"), generated=generated
-        )
+def _apply_document_annotations(annotations: dict, result: dict) -> None:
+    """Validate and copy optional human-authored document prose."""
+    if "document" in annotations:
+        document = validate_document(annotations["document"])
         result["document"] = document.model_dump(exclude_unset=True)
 
 
-def _step_evidence_ids(
-    step: dict,
-    group_id: str,
-    group: dict,
-    *,
-    generated: bool,
-) -> list[str]:
-    """
-    Validate evidence IDs for one narrative step.
-
-    Args:
-        step: Authored or generated narrative step.
-        group_id: Report group identified by the step.
-        group: Report group whose changed IDs are valid evidence.
-        generated: Whether the annotation source is a model provider.
-
-    Returns:
-        Valid evidence IDs in the authored order.
-
-    Raises:
-        ValueError: If evidence is empty, duplicated, outside the group, or
-            incomplete for generated narration.
-    """
+def _step_evidence_ids(step: dict, group_id: str, group: dict) -> list[str]:
+    """Validate one authored step's evidence IDs against its report group."""
     evidence_ids = step.get("evidence_change_ids", [])
     if (
         not isinstance(evidence_ids, list)
@@ -3371,26 +2973,11 @@ def _step_evidence_ids(
     ):
         msg = f"Narrative evidence is missing or outside its group: {group_id}"
         raise ValueError(msg)
-    if generated and set(evidence_ids) != set(group["change_ids"]):
-        msg = (
-            "Generated narrative step does not cite every change in group "
-            f"{group_id}"
-        )
-        raise ValueError(msg)
     return evidence_ids
 
 
 def _apply_step_fields(step: dict, group: dict) -> None:
-    """
-    Validate and apply scalar and list-based narrative fields.
-
-    Args:
-        step: Authored or generated narrative step.
-        group: Report group whose narrative mapping is updated.
-
-    Raises:
-        ValueError: If prose, questions, or invariants violate their limits.
-    """
+    """Validate and apply scalar and list-based authored narrative fields."""
     scalar_fields = ("intent", "why_now", "takeaway", "transition")
     list_fields = ("invariants", "questions")
     for field in scalar_fields:
@@ -3419,43 +3006,12 @@ def _apply_step_passages(
     step: dict,
     group: dict,
     changes: Mapping[str, dict],
-    *,
-    generated: bool,
-    group_id: str,
 ) -> None:
-    """
-    Validate source passages and apply their evidence links.
-
-    Args:
-        step: Authored or generated narrative step.
-        group: Report group whose passage list is updated.
-        changes: Report changes indexed by ID.
-        generated: Whether every generated step must cite every group change.
-        group_id: Report group ID used to identify validation failures.
-
-    Raises:
-        ValueError: If generated passage coverage is missing or incomplete.
-    """
-    passages = step.get("passages")
-    if generated and (not isinstance(passages, list) or not passages):
-        msg = f"Generated narrative step is missing source-bound passages: {group_id}"
-        raise ValueError(msg)
+    """Validate and apply authored source passages when the field is present."""
     if "passages" not in step:
         return
-
+    passages = step["passages"]
     validate_passages(passages, group, changes)
-    if generated:
-        covered = {
-            change_id
-            for passage in passages
-            for change_id in passage["change_ids"]
-        }
-        if covered != set(group["change_ids"]):
-            msg = (
-                "Generated passages do not cover every change in group "
-                f"{group_id}"
-            )
-            raise ValueError(msg)
     group["narrative"]["passages"] = copy.deepcopy(passages)
 
 
@@ -3463,25 +3019,8 @@ def _apply_annotation_step(
     step: dict,
     groups: Mapping[str, dict],
     changes: Mapping[str, dict],
-    *,
-    generated: bool,
 ) -> str:
-    """
-    Validate and apply one narrative step to its report group.
-
-    Args:
-        step: Authored or generated narrative step.
-        groups: Report groups indexed by ID.
-        changes: Report changes indexed by ID.
-        generated: Whether the annotation source is a model provider.
-
-    Returns:
-        The report group ID covered by this step.
-
-    Raises:
-        ValueError: If the step references an unknown group or contains invalid
-            evidence or narrative fields.
-    """
+    """Validate and apply one human-authored step to its report group."""
     if not isinstance(step, dict):
         msg = "Invalid narrative step"
         raise ValueError(msg)
@@ -3490,20 +3029,9 @@ def _apply_annotation_step(
         msg = f"Unknown narrative group: {group_id}"
         raise ValueError(msg)
     group = groups[group_id]
-    evidence_ids = _step_evidence_ids(
-        step,
-        group_id,
-        group,
-        generated=generated,
-    )
+    evidence_ids = _step_evidence_ids(step, group_id, group)
     _apply_step_fields(step, group)
-    _apply_step_passages(
-        step,
-        group,
-        changes,
-        generated=generated,
-        group_id=group_id,
-    )
+    _apply_step_passages(step, group, changes)
 
     if "title" in step:
         title = step["title"]
@@ -3513,9 +3041,7 @@ def _apply_annotation_step(
         group["title"] = title
 
     group["narrative"]["provenance"] = (
-        "model-generated · unverified"
-        if generated
-        else "authored interpretation, linked to source; "
+        "authored interpretation, linked to source; "
         "not machine-verified semantics"
     )
     group["narrative"]["evidence_change_ids"] = copy.deepcopy(evidence_ids)
@@ -3557,47 +3083,17 @@ def _apply_annotation_steps(
     steps: list,
     groups: dict[str, dict],
     changes: Mapping[str, dict],
-    *,
-    generated: bool,
     report_groups: list[dict],
 ) -> None:
-    """
-    Apply validated steps, enforce generated coverage, and set story order.
-
-    Args:
-        steps: Narrative steps in requested story order.
-        groups: Report groups indexed by ID.
-        changes: Report changes indexed by ID.
-        generated: Whether every report group must have one generated step.
-        report_groups: Existing groups used for dependency-order validation.
-
-    Raises:
-        ValueError: If generated narration duplicates or omits a group.
-    """
-    seen_groups: set[str] = set()
-    step_order = []
-    for step in steps:
-        if isinstance(step, dict):
-            group_id = step.get("group_id")
-            if generated and group_id in seen_groups:
-                msg = f"Duplicate generated narrative step: {group_id}"
-                raise ValueError(msg)
-        group_id = _apply_annotation_step(
-            step,
-            groups,
-            changes,
-            generated=generated,
-        )
-        seen_groups.add(group_id)
-        step_order.append(group_id)
-
-    if generated and seen_groups != set(groups):
-        msg = (
-            "Generated narration must include exactly one step for every "
-            "report group"
-        )
-        raise ValueError(msg)
-    if steps and len(step_order) == len(groups) and seen_groups == set(groups):
+    """Apply authored steps and update story order when it is complete."""
+    step_order = [
+        _apply_annotation_step(step, groups, changes) for step in steps
+    ]
+    if (
+        steps
+        and len(step_order) == len(groups)
+        and set(step_order) == set(groups)
+    ):
         ordered_groups = _order_annotated_groups(
             groups,
             step_order,
@@ -3607,33 +3103,18 @@ def _apply_annotation_steps(
 
 
 def apply_annotations(report: dict, annotations: dict) -> dict:
-    """
-    Apply revision-bound narrative annotations without replacing report facts.
-
-    Args:
-        report: Deterministic report to annotate.
-        annotations: Authored or generated ``diffstory.annotations.v1`` data.
-
-    Returns:
-        A deep-copied report with validated narrative fields applied.
-
-    Raises:
-        ValueError: If schema, revisions, provenance, group coverage, evidence,
-            or passage ranges do not match the report.
-
-    """
-    if annotations.get("schema") == "diffstory.annotations.v2":
-        from .narrative_manifest import apply_v2_annotations
-
-        return apply_v2_annotations(report, annotations)
-    if "narrative_v2" in report or (
-        isinstance(annotations.get("generation"), dict)
-        and "version" in annotations["generation"]
-    ):
-        msg = "Mismatched annotation and generation schemas"
+    """Apply human-authored annotations to their matching compiler report."""
+    if report.get("schema") != SCHEMA:
+        msg = "Annotations require a compiler report"
+        raise ValueError(msg)
+    if "generation" in report or "narrative_v2" in report:
+        msg = "Generated report formats are not compiler annotation inputs"
         raise ValueError(msg)
     if annotations.get("schema") != "diffstory.annotations.v1":
         msg = "Expected diffstory.annotations.v1"
+        raise ValueError(msg)
+    if "generation" in annotations or "narrative_v2" in annotations:
+        msg = "Generated annotation formats are not supported"
         raise ValueError(msg)
     if annotations.get("head_sha") != report["meta"].get("head_sha"):
         msg = "Narrative belongs to a different head revision"
@@ -3642,35 +3123,14 @@ def apply_annotations(report: dict, annotations: dict) -> dict:
         msg = "Narrative belongs to a different base revision"
         raise ValueError(msg)
 
-    generated = "generation" in annotations
-    if "generation" in report and not generated:
-        msg = (
-            "Reapplying annotations to a generated report requires its "
-            "generation manifest"
-        )
-        raise ValueError(
-            msg,
-        )
     result = copy.deepcopy(report)
     groups = {group["id"]: group for group in result["groups"]}
     changes = {change["id"]: change for change in result["changes"]}
-    if generated:
-        validate_generation(report, annotations["generation"])
-        result["generation"] = copy.deepcopy(annotations["generation"])
-
-    _apply_document_annotations(annotations, result, generated=generated)
+    _apply_document_annotations(annotations, result)
 
     steps = annotations.get("steps", [])
     if not isinstance(steps, list):
         msg = "Narrative steps must be a list"
         raise ValueError(msg)
-    _apply_annotation_steps(
-        steps,
-        groups,
-        changes,
-        generated=generated,
-        report_groups=result["groups"],
-    )
-    if generated:
-        validate_generated_report(result)
+    _apply_annotation_steps(steps, groups, changes, result["groups"])
     return result

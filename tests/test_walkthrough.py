@@ -15,8 +15,10 @@ from diffstory.compact_packet import canonical_bytes
 from diffstory.compact_packet import packet_identity
 from diffstory.render import render
 from diffstory.walkthrough import WalkthroughNarrator
+from diffstory.walkthrough import apply_walkthrough_annotations
 from diffstory.walkthrough import validate_story
 from diffstory.walkthrough import validate_walkthrough
+from diffstory.walkthrough import walkthrough_annotations
 
 
 def fixture_story(packet: dict) -> dict:
@@ -286,6 +288,39 @@ class ResponsesFixtureProvider(FixtureProvider):
 class WalkthroughTests(unittest.TestCase):
     """Protect source links, exact coverage, and complete-state boundaries."""
 
+    def test_public_annotation_application_rejects_retired_report_markers(
+        self,
+    ) -> None:
+        """Unsupported compiler markers must not be projected into a new report."""
+        compiler_report = compile_snapshot(snap({}, {"a.py": "x = 1\n"}))
+        generated = WalkthroughNarrator(FixtureProvider()).generate(
+            compiler_report
+        )
+        annotations = walkthrough_annotations(generated)
+
+        applied = apply_walkthrough_annotations(compiler_report, annotations)
+        self.assertEqual(applied["schema"], "diffstory.report.v2")
+        for invalid_report in (None, [], {"schema": "diffstory.report.v0"}):
+            with (
+                self.subTest(invalid_report=invalid_report),
+                self.assertRaises(ValueError),
+            ):
+                build_packet(invalid_report)
+
+        markers = [
+            {"storage_version": "diffstory.report-storage.v1"},
+            {"artifact_kind": "stored-report"},
+            {"root": {}, "tables": {}},
+            {"generation": {"version": "diffstory.generation.v1"}},
+            {"narrative_v2": {"schema": "diffstory.presentation.v2"}},
+        ]
+        for marker in markers:
+            with self.subTest(marker=marker):
+                old_report = copy.deepcopy(compiler_report)
+                old_report.update(marker)
+                with self.assertRaises(ValueError):
+                    apply_walkthrough_annotations(old_report, annotations)
+
     def test_demo_generates_and_reloads_in_one_request(self) -> None:
         """The bundled multi-file demo must not trigger per-group writing calls."""
         cases = [
@@ -356,10 +391,10 @@ class WalkthroughTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         validate_story(packet, story)
 
-    def test_new_report_cannot_omit_its_preamble_but_archived_report_reloads(
+    def test_only_current_generation_and_story_contract_are_accepted(
         self,
     ) -> None:
-        """New v3 stories add editorial fields while archived v1/v2 still load."""
+        """Archived markers and stories without current editorial fields fail."""
         report = WalkthroughNarrator(FixtureProvider()).generate(
             compile_snapshot(snap({}, {"a.py": "x = 1\n"}))
         )
@@ -371,33 +406,32 @@ class WalkthroughTests(unittest.TestCase):
             report["story"]["quick_summary"]["before"],
             "The earlier version has the supplied prior behavior.",
         )
-        cases = [
-            ("diffstory.generation.walkthrough.v1", True),
-            ("diffstory.generation.walkthrough.v2", True),
-            ("diffstory.generation.walkthrough.v3", False),
-        ]
-        for version, archived in cases:
+        for version in (
+            "diffstory.generation.walkthrough.v1",
+            "diffstory.generation.walkthrough.v2",
+        ):
             with self.subTest(version=version):
                 saved = copy.deepcopy(report)
                 saved["generation"]["version"] = version
                 if version.endswith("v1"):
                     saved["story"].pop("preamble")
-                if archived:
-                    for field in (
-                        "quick_summary",
-                        "impact",
-                        "route",
-                        "author_reported_checks",
-                        "review_checks",
-                    ):
-                        saved["story"].pop(field)
-                    html = render(saved)
-                    self.assertIn(saved["story"]["introduction"], html)
-                else:
-                    broken = copy.deepcopy(saved)
-                    broken["story"].pop("quick_summary")
-                    with self.assertRaises(ValueError):
-                        validate_walkthrough(broken)
+                for field in (
+                    "quick_summary",
+                    "impact",
+                    "route",
+                    "author_reported_checks",
+                    "review_checks",
+                ):
+                    saved["story"].pop(field)
+                with self.assertRaises(ValueError):
+                    validate_walkthrough(saved)
+                with self.assertRaises(ValueError):
+                    render(saved)
+
+        current = copy.deepcopy(report)
+        current["story"].pop("quick_summary")
+        with self.assertRaises(ValueError):
+            validate_walkthrough(current)
 
     def test_editorial_checks_are_exact_and_passage_grounded(self) -> None:
         """Reports must not invent author quotes, references, or test relevance."""

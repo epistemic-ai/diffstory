@@ -37,10 +37,11 @@ Pydantic validates source evidence and narration data. Build and browser-test to
 The reader keeps each explanation close to the source, with original line
 numbers. File diffs open by default. **Before definition** and **After
 definition** show the supplied code; **Compare function versions** opens the
-separate, generated comparison. Older reports retain their **Read definition**
-control. Code identifiers, paths, commands, and literal values use inline code
-styling. Long blocks expand where you are reading, at most 160 display rows
-per action. Code scrolls with the document.
+separate, generated comparison. Current compiler reports can also use
+**Read definition** to switch between a diff and its supplied source. Code
+identifiers, paths, commands, and literal values use inline code styling. Long
+blocks expand where you are reading, at most 160 display rows per action. Code
+scrolls with the document.
 
 **Contents** searches sections and symbols without filtering the document away. Reader options collapse expanded code or download the analysis JSON.
 
@@ -63,8 +64,7 @@ File diffs keep the original Git or GitHub patch and its line grouping.
 function moving between files while changing just one line. It helps explain
 the edit without replacing the PR's patch. See the
 [moved-function example](docs/ARCHITECTURE.md#original-patch-and-function-comparison).
-If an original patch is unavailable, the reader says so. Older saved inputs
-that contain only source text show a labeled **Source comparison**.
+If an original patch is unavailable, the reader says so.
 
 Snapshots must include `file_evidence` with an explicit source state for both revisions of each file, plus one `patches` record per file. A patch record contains the original Git/GitHub patch or null when unavailable. The Git and GitHub commands supply these records. Older snapshots that omit them are rejected; capture them again with the current command.
 
@@ -74,7 +74,7 @@ Every compilation writes standalone HTML plus an adjacent `.report.json`. Binary
 
 Python functions, async functions, classes, and assignments are compared using the standard-library AST. Pairing distinguishes identical ASTs, declaration renames, edited move candidates, ordinary edits, additions, removals, and unresolved counterparts. Literals, internal names, defaults, decorators, and string whitespace are not erased to obtain a convenient match.
 
-Static calls, references, import aliases, and test references form a dependency graph. Strongly connected components handle cycles; deterministic priorities produce a reproducible baseline order. Narrated reports may choose a different story order while keeping prerequisites ahead of their dependents. This is a comprehension heuristic, not a proof of an optimal order.
+Static calls, references, import aliases, and test references form a dependency graph. Strongly connected components handle cycles; deterministic priorities produce a reproducible baseline order. A generated walkthrough can arrange concepts in a different order. Compiler groups and dependencies are evidence and ordering hints; validation does not require a concept to appear after its prerequisites. This is a comprehension heuristic, not a proof of an optimal order.
 
 Other languages, newer Python syntax unsupported by your interpreter, and unclassified module-level code remain available as textual hunks. Classes are atomic units. Dynamic dispatch, reflection, unchanged external callers, and whole-program behavior are not fully resolved.
 
@@ -85,118 +85,95 @@ Other languages, newer Python syntax unsupported by your interpreter, and unclas
 The CLI creates deterministic baseline explanations. Domain-specific prose is a separate, revision-bound annotation layer. The bundled synthetic walkthrough includes authored annotations to demonstrate the intended reading experience.
 
 ```bash
-diffstory evidence walkthrough.report.json --out narrative-evidence.json
+diffstory evidence compiler.report.json --out narrative-evidence.json
 # Write annotations.json from the documented evidence schema.
-diffstory render walkthrough.report.json \
+diffstory render compiler.report.json \
   --annotations annotations.json --out narrated.html
 ```
 
-Evidence packets contain source code. Send them only to an approved model or environment. The manual annotation workflow makes no provider call and needs no API key. Annotation validation locks revisions and evidence IDs; it cannot establish that every prose claim is true. See [the annotation contract](docs/ARCHITECTURE.md#annotation-handoff).
+Evidence packets contain source code. Send them only to an approved model or environment. The manual annotation workflow makes no provider call and needs no API key. Annotation validation locks revisions and evidence IDs; it cannot establish that every prose claim is true. See [the annotation contract](docs/ARCHITECTURE.md#annotation-handoff-and-current-walkthrough).
 
-### Opt in to model narration
+### Optional model-written walkthrough
 
-The `git` and `github` commands accept `--narrate` to generate candidate annotations. By default, `--provider openai` calls the OpenAI Responses API with [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol). This is a separate API integration; a ChatGPT subscription does not supply an API key. Set `OPENAI_API_KEY` with your credential manager, or select another environment variable with `--api-key-env`. Diffstory never accepts the key as a command argument or writes it to generated files.
-
-```bash
-diffstory github 'OWNER/REPO#NUMBER' \
-  --narrate \
-  --out walkthrough.html
-```
-
-To use your signed-in Codex CLI account instead, install and sign in to the
-[Codex CLI](https://developers.openai.com/codex/cli) with `codex login`, then
-select `--provider codex`:
-
-```bash
-diffstory github 'OWNER/REPO#NUMBER' \
-  --narrate \
-  --provider codex \
-  --out walkthrough.html
-```
-
-This route runs `codex exec` with the Codex CLI's saved sign-in and default
-model. You can pass `--model MODEL_ID` for a supported Codex model. Known
-overrides (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and `gpt-5.3-codex`)
-use their published context and output capacities; the CLI default is packed
-against a conservative 400,000-token context bound. Unknown overrides are
-rejected before source transfer until capacity metadata is available. This
-route does not need an OpenAI API key; access and usage follow the signed-in
-ChatGPT or workspace account. The CLI receives only the prepared evidence
-request, runs from a temporary directory with read-only access, and has local
-shell, browser, app, and plugin tools disabled. See the [Codex non-interactive
-mode documentation](https://developers.openai.com/codex/non-interactive-mode)
-for how `codex exec` uses saved authentication and structured output.
-
-Codex CLI does not expose a per-call output-token cap. Diffstory lets Codex
-complete each request, validates its structured response, and records the
-input, cached input, and output token counts reported by the CLI.
-
-Before the first model request, Diffstory displays the destination, PR revisions, source scope, and planned request count. It asks for confirmation. Use `--yes` only when you have already approved that transfer, such as in an automation job. Without `--narrate`, GitHub ingestion still reads the PR over the network but no model request is made.
-
-Narration packs bounded evidence chunks to fit the selected model's context and uses multi-level summaries for larger changes. Long source lines are split into slices without dropping source text. After a successful run, the CLI prints provider-reported input tokens, cached input tokens, and output tokens; these totals are also stored in the annotations and report. `--max-source-bytes` can lower the hard 64 MB cap on captured source across both revisions. Excess source is rejected before narration, and the GitHub reader stops fetching files once the configured cap is exceeded.
-
-In the default v2 architecture, there are no run-wide token, call-count, or elapsed-time ceilings. Each individual provider call has a 15-minute timeout to prevent a stalled request from hanging indefinitely; a run may make as many calls as its source requires.
-
-In default v2, independent narration tasks run concurrently. The default limit is four active tasks. Set `--concurrency N` to a positive integer to change the limit.
-
-In default v2, Diffstory saves validated narration results as checkpoints by default. The default directory is `Path(out).with_suffix('.narration-cache')`; for `walkthrough.html`, this is `walkthrough.narration-cache/`. Use `--cache-dir PATH` to choose another directory or `--no-cache` to disable persistent checkpoints. These options are mutually exclusive.
-
-A default v2 checkpoint is reused only when the run matches: the exact base and head revisions, report source and pull-request context, provider and model, prepared prompt and schema, output reservation, and validation version. Diffstory excludes only the report's `captured_at` timestamp from this identity. It validates each saved result again before reuse. Progress reports the current stage, active calls, completed and planned tasks, reused results, provider calls, and elapsed time. A reused-result count is separate from current provider calls and provider-reported cached input tokens.
-
-### Opt-in walkthrough architecture
-
-The default architecture remains v2. To use the bounded, flat walkthrough
-architecture, select it explicitly:
+The `git`, `github`, and `snapshot` commands accept `--narrate`. Diffstory
+builds a bounded packet from the supplied source, then asks OpenAI Responses or
+the signed-in Codex CLI to write source-linked explanations. OpenAI is the
+default provider. It uses the OpenAI API key from `OPENAI_API_KEY` (or the
+variable selected by `--api-key-env`); a ChatGPT subscription does not provide
+an API key. Codex uses `codex exec` and saved CLI sign-in. Use `--provider
+codex` to select it. Both providers receive only the prepared evidence request.
+OpenAI currently supports `gpt-6.1-sol`. Codex accepts the known-capacity
+models `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and `gpt-5.3-codex`.
+Unknown Codex overrides are rejected before source transfer.
 
 ```bash
-diffstory github 'OWNER/REPO#NUMBER' \
-  --narrate \
-  --architecture walkthrough \
-  --out walkthrough.html
+diffstory github 'OWNER/REPO#NUMBER' --narrate --out walkthrough.html
+diffstory git --repo . --base BASE --head HEAD --narrate --out walkthrough.html
+diffstory snapshot input.snapshot.json --narrate --yes --out walkthrough.html
 ```
 
-Walkthrough mode allows at most 12 provider attempts across writers and the
-editor, including retries; each request can be attempted at most twice. It
-allows 1 to 4 concurrent calls, rejects higher concurrency, and applies one
-240-second deadline to local preparation and generation. Interactive
-confirmation wait does not use the budget. The shared 1 MiB response-byte
-limit counts canonical JSON response bytes before validation, including
-responses that fail validation and accepted cached results. The separate 1 MiB
-saved-story limit remains in force.
+Before the first model request, Diffstory displays the provider destination,
+revision scope, and planned request count, then asks for consent. `--yes`
+skips that prompt and means the source transfer was approved in advance. No
+model request occurs without `--narrate`. The aggregate source limit defaults
+to 64,000,000 bytes across both revisions; `--max-source-bytes` can lower it.
 
-If a request or limit fails, walkthrough mode stops submitting new work, lets
-active calls finish, and does not write new output files. It retains
-attempts, measured usage, response bytes, and accepted-result digests in its
-durable run state. The default state directory is
-`Path(out).with_suffix('.narration-state')`; set `--state-dir PATH` to choose a
-different one. Resume with the same state directory to retain the original
-attempts and deadline. A resume does not start a new 240-second period. Use
-`--fresh-state NEW_DIRECTORY` only to start a new budget in a new directory;
-the old state stays in place. Incompatible run-state versions are rejected;
-use a new state directory instead of reusing an unknown accounting format.
+The writer receives each source buffer once in the packet. Passages cite the
+exact revision and inclusive source lines. Every compiler change and changed
+diff region must be accounted for by at least one passage. Complete supplied
+diffs remain in the report for inspection. Compiler groups and dependencies
+guide preparation, but the writer can organize the story around concepts and
+the validator does not enforce prerequisite order.
 
-Payload caching is separate from run state. The default cache directory is
-`Path(out).with_suffix('.narration-cache')`; use `--cache-dir PATH` to choose
-another directory or `--no-cache` to disable cached result payloads. Disabling
-the cache does not disable durable attempt and deadline state. Cache results
-are revalidated before reuse. If a durable run already accepted a result for a
-request, resume accepts only that result digest; a changed cache result is
-rejected. A cache hit counts against the response-byte budget once per run, and
-reusing that exact result on resume does not charge it again. With Codex's
-unresolved default model, the cache is disabled; pass an explicit `--model` to
-enable it.
+The walkthrough uses a small or parallel writing pass and at most one
+editorial request. It allows at most 12 attempts, including retries, up to four
+concurrent calls, a 240-second preparation-and-generation deadline, a 1 MiB
+total response-byte budget per run, and a separate 1 MiB saved-annotation
+limit. Confirmation time is not part of the deadline. If a limit or request
+fails, Diffstory does not promote new report or HTML outputs.
 
-In default v2, the CLI proceeds without persistent checkpoints when `--provider codex` uses the unresolved default model. Set `--model MODEL_ID` to enable them. Diffstory rejects `--cache-dir` when Codex has no explicit model. If a stage fails, default v2 stops submitting tasks, waits for active calls to finish, and keeps valid checkpoints so a later run can reuse them.
+Run attempts and the original deadline are recorded in a durable state
+directory. By default it is the output path with `.narration-state` in place of
+the file suffix. `--state-dir` selects an existing or new location;
+`--fresh-state NEW_DIRECTORY` starts a new budget while retaining the old
+state. Payload caching is separate. Its default is the output path with
+`.narration-cache` in place of the suffix. Use `--cache-dir` to select a
+location or `--no-cache` to disable payload reuse. Turning off the cache does
+not turn off attempt state. Cached results are bound to prepared requests and
+revalidated before use. Codex's unresolved default model disables the cache;
+an explicit supported `--model` enables it.
 
-Successful runs write HTML, `.report.json`, and candidate `.annotations.json` files. Each generated passage is tied to a change ID and checked against its group and source range. The generated report preserves its provider/model, revisions, measured usage, and chunk coverage, and displays a visible **model-generated · unverified** warning. It does not validate whether prose is true.
+The CLI prints provider-reported input, cached input, and output token totals.
+The report and candidate annotation export record provider, model, revisions,
+usage, request counts, and cache counts. They do not store credentials. A
+successful run writes HTML, `.report.json`, and `.annotations.json`; the
+annotation export contains the story and metadata but no source packet.
 
-Generated narration follows ASD-STE100 writing principles as a strong guide and keeps a natural reading rhythm. A required **Before the code** section introduces the whole change to a reader who is new to the system. It starts with a plain-language sentence about the supported goal and context. If no goal was supplied, it describes what the evidence shows without guessing at motivation.
+The report uses `diffstory.report.v2`; the optional annotation export uses
+`diffstory.annotations.walkthrough.v1`. Compiler reports use
+`diffstory.report.v1`, and manual annotations use `diffstory.annotations.v1`.
+Use `diffstory evidence REPORT.json --out evidence.json` to export the compact
+source packet without making a provider call. Use `diffstory render REPORT.json
+--annotations ANNOTATIONS.json --out narrated.html` to apply manual or saved
+walkthrough annotations to matching compiler source.
 
-The preamble then explains the system's purpose, concrete inputs, basic operation, outputs, and the roles of its main parts, in plain language and before technical details. It can use the project name and relevant class names with simple roles. It describes supported before-and-after behavior conceptually. File paths, function names, and implementation details stay in the walkthrough. It explains necessary technical terms the first time they appear, including in the reading path. It does not list files, tour the code, or add unrelated review questions.
+Generated narration requires a **Before the code** preamble. It first explains
+the system's purpose, inputs, operation, outputs, and main roles in simple
+English. It gives a source-grounded overview before file or function details.
+The writing follows ASD-STE100 principles as a guide, keeps the natural rhythm
+of prose, defines necessary jargon at first use, and puts code names, paths,
+commands, and literal values in backticks. The preamble has separate 4,000
+character limits for prose and complete fenced sketches. Structural checks
+enforce fields, citations, coverage, and size. They do not prove that prose is
+true, that behavior is correct, or that tests ran. Generated prose is labeled
+**model-generated · unverified**.
 
-A compact sketch or flow chart is optional when it clarifies a supported relationship or decision. No diagram is required. Use about 200 to 450 words when the evidence supports that length, and less for a small change. The preamble can reach about one page. Prose has a 4,000-character limit. Complete fenced sketches have a separate 4,000-character allowance, including their fences. The schema and validators check required fields and structural limits. They do not check prose quality or whether an explanation is accurate. Generated prose remains unverified.
-
-The OpenAI API request sets `store: false`, but this is not a zero-retention promise. OpenAI's API data controls, abuse-monitoring retention, organization settings, and applicable exceptions govern what the API retains; check the current [OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data) before sending confidential source. The API calls are documented in the [Responses API](https://developers.openai.com/api/docs/guides/structured-outputs) documentation. Codex CLI runs follow the signed-in ChatGPT or workspace account's current data and retention controls.
+The reader is a self-contained HTML page. It does not send report data over the
+network. Source links open GitHub only when a reader clicks them. OpenAI
+requests set `store: false`; this is not a zero-retention promise. Review the
+[OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data)
+before sending confidential source. Codex CLI runs follow the signed-in
+account's current data and retention controls.
 
 ## Develop and verify
 
@@ -212,6 +189,7 @@ uv run --locked python examples/make_demo.py
 uv run --locked python scripts/check_release.py
 uv run --locked python -m playwright install chromium
 uv run --locked python tests/browser_smoke.py
+uv run --locked python tests/browser_walkthrough.py
 uv build
 uv run --locked twine check dist/*
 ```
@@ -226,6 +204,6 @@ The analyzer is read-only and the reader does not contact external services. Exp
 
 ## Status and license
 
-**0.3.0 · alpha.** Usable for local review and experimentation; not a substitute for tests or human review. Automatic model narration, whole-repository indexing, statement-level extraction matching, and verified test-artifact ingestion remain future work.
+**0.3.0 · alpha.** Usable for local review and experimentation; not a substitute for tests or human review. Diffstory supports local change analysis and optional bounded model-written walkthroughs. Whole-repository indexing, statement-level extraction matching, and verified test-artifact ingestion are not supported.
 
 Software and original synthetic examples: [MIT](LICENSE). Epistemic AI trademarks and the supplied logo have separate terms in [NOTICE](NOTICE) and [Branding](docs/BRANDING.md). No font files are bundled.

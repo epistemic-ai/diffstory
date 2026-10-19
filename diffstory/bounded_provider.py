@@ -15,15 +15,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .compact_packet import canonical_bytes
-from .narrative import MAX_RESPONSE_BYTES
-from .narrative import CodexCLIProvider
-from .narrative import OpenAIResponsesProvider
-from .narrative import ProviderResponseError
-from .narrative import _ProcessRequest
-from .narrative import _run_bounded_subprocess
+from .providers import MAX_RESPONSE_BYTES
+from .providers import CodexCLIProvider
+from .providers import OpenAIResponsesProvider
+from .providers import ProviderResponseError
+from .providers import _ProcessRequest
+from .providers import _run_bounded_subprocess
 
 if TYPE_CHECKING:
-    from .narrative import NarrativeProvider
+    from .providers import NarrativeProvider
 
 
 def complete_bounded(

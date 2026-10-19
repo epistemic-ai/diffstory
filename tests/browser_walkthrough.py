@@ -34,6 +34,22 @@ def source_path_index(report: dict) -> dict[str, str]:
     }
 
 
+def embed_report_data(html: str, report: dict) -> str:
+    """Replace one embedded report payload for reader startup rejection checks."""
+    marker = '<script type="application/json" id="report-data">'
+    start = html.index(marker) + len(marker)
+    end = html.index("</script>", start)
+    payload = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+    payload = (
+        payload.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    return html[:start] + payload + html[end:]
+
+
 def passage_for_regions(
     passage_id: str,
     text: str,
@@ -1301,10 +1317,10 @@ class BrowserWalkthroughTests(unittest.TestCase):
         finally:
             grouped.close()
 
-    def test_archived_v2_story_does_not_invent_opening_or_author_results(
+    def test_archived_v2_story_is_rejected_by_render_validation(
         self,
     ) -> None:
-        """Older flat stories stay readable without fabricated v3 claims."""
+        """A retired flat-story generation marker is rejected by the renderer."""
         archived = copy.deepcopy(self.feature_report)
         for field in (
             "quick_summary",
@@ -1317,21 +1333,72 @@ class BrowserWalkthroughTests(unittest.TestCase):
         archived["generation"]["version"] = (
             "diffstory.generation.walkthrough.v2"
         )
-        self.page.set_content(render(archived), wait_until="load")
-        self.page.locator(".story-section").wait_for()
-        opening = self.page.locator(".walkthrough-opening")
-        self.assertEqual(opening.locator(".quick-summary").count(), 0)
-        self.assertEqual(opening.locator(".walkthrough-impact").count(), 0)
-        self.assertEqual(opening.locator(".reading-route").count(), 0)
-        self.assertIn("No results were extracted", opening.inner_text())
-        self.assertNotIn(
-            "no author-reported checks exist", opening.inner_text().casefold()
-        )
-        self.assertIn("0 test runs", opening.inner_text().casefold())
-        self.assertIn(
-            "archived story",
-            self.page.locator(".review-checks").inner_text().casefold(),
-        )
+        with self.assertRaises(ValueError):
+            render(archived)
+
+    def test_reader_startup_rejects_unsupported_report_formats(self) -> None:
+        """The browser refuses unknown and retired data instead of falling back."""
+        cases = [
+            (
+                "unknown schema",
+                {"schema": "diffstory.report.v99"},
+                "Unsupported embedded report schema",
+            ),
+            (
+                "shared envelope",
+                {
+                    "schema": "diffstory.report.v1",
+                    "storage_version": "diffstory.report-storage.v1",
+                    "artifact_kind": "report",
+                    "root": {},
+                    "tables": {},
+                },
+                "Unsupported shared report envelope",
+            ),
+            (
+                "compiler generation marker",
+                {
+                    "schema": "diffstory.report.v1",
+                    "generation": {"version": "diffstory.generation.v1"},
+                },
+                "Unsupported generated fields in compiler report",
+            ),
+            (
+                "compiler narrative marker",
+                {
+                    "schema": "diffstory.report.v1",
+                    "narrative_v2": {"version": "diffstory.presentation.v2"},
+                },
+                "Unsupported generated fields in compiler report",
+            ),
+            (
+                "missing flat generation",
+                {"schema": "diffstory.report.v2"},
+                "Unsupported walkthrough generation version",
+            ),
+            (
+                "archived flat generation",
+                {
+                    "schema": "diffstory.report.v2",
+                    "generation": {
+                        "version": "diffstory.generation.walkthrough.v2"
+                    },
+                },
+                "Unsupported walkthrough generation version",
+            ),
+        ]
+        for label, report, expected in cases:
+            with self.subTest(label=label):
+                self.errors.clear()
+                self.page.set_content(
+                    embed_report_data(self.html, report),
+                    wait_until="load",
+                )
+                self.assertTrue(self.errors, "reader startup must fail")
+                self.assertIn(expected, self.errors[-1])
+                self.assertEqual(
+                    self.page.locator(".story-section").count(), 0
+                )
 
     def test_flat_diff_blocks_show_only_available_before_and_after_definitions(
         self,

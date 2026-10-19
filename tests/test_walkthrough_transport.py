@@ -13,8 +13,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from diffstory.narrative import CodexCLIProvider
-from diffstory.narrative import OpenAIResponsesProvider
+from diffstory.providers import CodexCLIProvider
+from diffstory.providers import OpenAIResponsesProvider
 from diffstory.walkthrough_runtime import RunLimitError
 from diffstory.walkthrough_runtime import RunLimits
 from diffstory.walkthrough_runtime import WalkthroughRuntime
@@ -103,7 +103,7 @@ class WalkthroughTransportTests(unittest.TestCase):
             fixture_source = (
                 "import json\n"
                 "from pathlib import Path\n"
-                "from diffstory import narrative\n"
+                "from diffstory import providers\n"
                 f"REQUEST_PATH = {str(request_path)!r}\n"
                 f"RESPONSE_BYTES = {response_bytes!r}\n"
                 "def fixture_post(api_key, body, timeout, *, response_byte_limit):\n"
@@ -111,7 +111,7 @@ class WalkthroughTransportTests(unittest.TestCase):
                 "               'timeout': timeout, 'response_byte_limit': response_byte_limit}\n"
                 "    Path(REQUEST_PATH).write_text(json.dumps(request), encoding='utf-8')\n"
                 "    return RESPONSE_BYTES\n"
-                "narrative._post_openai_request = fixture_post\n"
+                "providers._post_openai_request = fixture_post\n"
             )
             (root / "sitecustomize.py").write_text(
                 fixture_source,

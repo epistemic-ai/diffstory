@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
 
-    from .narrative import NarrativeProvider
+    from .providers import NarrativeProvider
 
 SMALL_PACKET_BYTES = 80_000
 DEFAULT_WRITERS = 4

@@ -1,69 +1,70 @@
 # Verification for 0.3.0
 
-Checks executed locally on September 24, 2026, using Python 3.13.5,
-Node.js 22.16.0, Playwright 1.57.0, and system Chromium.
+Local verification completed on October 19, 2026. It used Python 3.13.5,
+project-pinned Ruff 0.16.10, Twine 7.0.0, Playwright 1.63.0, and Chromium
+launched through Playwright.
 
-| Check | Actual result |
-|---|---|
-| Python unit and integration suite | 81 tests passed |
-| Headless browser suite | 69 assertions passed |
-| JavaScript parse check | `node --check` passed |
-| GitHub configuration YAML | All YAML parsed |
-| Public-input guard | Passed on the prepared public file set |
-| Publishing helper | Tested against a fake GitHub CLI and real local Git repositories; create/push/remote-SHA verification succeeded without a network request |
-| Helper retry | Refuses an existing local Git history |
-| Packaging | Wheel and source distribution built with the installed setuptools backend |
-| Fresh wheel install | Offline install in an isolated virtual environment succeeded; `pip check` passed |
-| Installed rendering | Packaged CLI reproduced the public demo HTML byte-for-byte |
-| Package contents | HTML/CSS/JavaScript/SVG assets and license metadata present; no font files or private demo inputs included |
+| Check | Command or method | Result |
+|---|---|---|
+| Python suite | `.venv/bin/python -B -m unittest discover -s tests -q` | 248 tests passed |
+| Ruff lint | `uv run --locked ruff check .` | Passed; all checks passed |
+| Ruff format | `uv run --locked ruff format --check .` | Passed; 50 files already formatted |
+| JavaScript syntax | `node --check diffstory/assets/app.js` | Passed |
+| Public release inputs | `.venv/bin/python -B scripts/check_release.py` | Passed; 76 public files checked |
+| Flat reader browser suite | `env PYTHONPATH=.:tests .venv/bin/python -B tests/browser_walkthrough.py` | 26 tests passed |
+| Browser smoke suite | `env PYTHONPATH=.:tests .venv/bin/python -B tests/browser_smoke.py` | 143 assertions passed; no JavaScript errors or runtime network requests |
+| Demo freshness | Regenerated the demo and compared its four checked-in artifacts with current generator and renderer output | All four matched exactly |
+| Offline walkthrough probes | Synthetic fixture provider, without a live model | Demo: 1 call over 7,449 source bytes. Larger synthetic change: 6 calls over 3,623,872 source bytes. |
 
-The browser checks cover desktop, 390px mobile, and 320px narrow layouts;
-continuous prose/code sections; keyboard contents navigation; inline code/diff
-switching; lazy rendering and incremental expansion; all 802 lines of a large
-synthetic definition; 800 added and 800 removed diff rows; and source/test
-disclosures. No page JavaScript errors or runtime network requests occurred in
-the demo test. Screenshots are in `reader/`.
+Ruff 0.16.10 passed lint and format checks. Use these locked project commands
+to reproduce the checks:
 
-The installed CLI and source checkout use the same parser, templates and embedded
-brand asset. The release ZIP contains the reviewed source file set and a
-SHA-256 manifest. Run `python scripts/check_release.py --manifest` to verify it.
+```sh
+uv run --locked ruff --version
+uv run --locked ruff check .
+uv run --locked ruff format --check .
+```
 
-## Not claimed by these results
+The local lint run used the cached pinned tool; the commands above are the
+project-managed reproduction commands.
 
-The repository has not been created or pushed by this preparation session.
-The available GitHub connector has no repository-creation operation, and the
-local environment has no authenticated GitHub CLI. The publication helper is
-ready for a user-authorized local run.
+The browser checks used the public synthetic demo and synthetic test inputs.
+Playwright's Chromium launcher needed approved process permission on macOS.
+No private report or private browser artifact was inspected. The smoke suite
+checks the packaged reader's interaction, layout, safe display, and offline
+behavior. These checks do not test source repositories analyzed by Diffstory.
 
-GitHub-hosted CI, other Python versions in the CI matrix, public package-registry
-publication, and a comprehensive security audit have not been performed here.
-The normal release instructions include `python -m build` and `twine check`;
-the build frontend and Twine were not available in this offline environment, so
-packaging was tested through the installed build backend and direct metadata /
-installation checks instead.
+An offline package build passed after the source and README updates. Twine 7.0.0
+accepted both the wheel and source archive. The archive audit found 111 members;
+all 23 current Python and asset files were byte-identical in both archives, and
+the current README and docs matched the source archive. Retired modules and
+test/harness files, and private workflow state, were absent. A CLI loaded from
+the extracted wheel in a temporary working directory reproduced the public
+demo HTML exactly. This was not a fresh pip installation.
 
-Tests above validate Diffstory itself, not the tests in a repository being
-analyzed. The synthetic example's test definitions are source evidence; its
-report correctly records zero test runs verified by the analyzer.
+No fresh GitHub Actions result for this cleanup is included here. No package
+registry publication or comprehensive security audit was performed. The local
+release-input check is a defense-in-depth guard, not a complete secret or
+security audit.
 
-## Human review for generated narration
+## Human review for generated walkthroughs
 
-The model-backed generation path is opt-in and is not exercised by the offline
-test suite. Before accepting a provider, model, or prompt change, generate a
-walkthrough with each changed provider from the synthetic fixture and from a
-source snapshot approved for that use. Review every generated passage beside
-its rendered code. Score each dimension from 0 to 2: 0 means incorrect or
-missing, 1 means partly useful or too vague, and 2 means accurate and useful.
+The offline fixtures exercise request structure, citations, coverage, and safe
+rendering. They do not establish model prose quality, source semantics, or
+provider latency. This cleanup did not change prompts or transports, and no
+live provider run was made.
 
-| Dimension | Review question |
-|---|---|
-| Evidence fidelity | Does each prose claim follow from its cited change and visible source range? |
-| Coverage | Does every expected group and change have a useful explanation, without unsupported steps? |
-| Coherence | Do the opening, sections, transitions, and closing form a clear walkthrough? |
-| Uncertainty | Does the prose distinguish static references from executed tests or verified behavior? |
-| Reading order | Do explanations follow the compiler's dependency order and explain why the next group follows? |
+For a future provider or prompt change, review generated passages beside their
+cited source. Check that:
 
-Reject a candidate for any invented test result, unsupported behavior claim, or
-prose citation that does not support the claim, regardless of the total score.
-This review assesses readability and evidence fidelity; it does not certify
-the model's prose as true.
+- Each claim follows from its cited revision and original source lines.
+- Every compiler change and changed region has a useful explanation; related
+  concepts may share a passage.
+- The story order and transitions help a reader follow the change. Compiler
+  groups and dependency edges are hints; validation does not enforce
+  prerequisite order.
+- The prose separates author-reported intent and static evidence from executed
+  tests or verified behavior. It must not invent test results.
+
+Structural validation checks shapes, citations, coverage, and size. It does not
+prove that generated prose is true or that repository tests ran.

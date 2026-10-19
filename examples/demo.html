@@ -315,24 +315,6 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
 .brand-credit { color: var(--muted); }
 @media (max-width: 560px) { .edition { display: none; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
-
-/* Typed narrative details keep the existing continuous reading column. */
-.v2-detail { margin-top: 24px; margin-bottom: 28px; }
-.v2-field, .v2-observation, .v2-question, .v2-statement { margin: 0 0 16px; }
-.v2-label { display: block; color: var(--muted); font: 11px/1.6 var(--sans); margin-bottom: 5px; overflow-wrap: anywhere; }
-.v2-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-.v2-source-links { padding-left: 17px; margin: 8px 0 17px; font: 11px/1.7 var(--sans); overflow-wrap: anywhere; }
-.v2-source-links li { margin-bottom: 4px; }
-.v2-inherited, .v2-claim, .v2-limitation { border-left: 2px solid var(--line); padding-left: 15px; margin: 13px 0; }
-.v2-limitation, .v2-question { background: #fff8eb; padding: 12px 15px; }
-.v2-terms h3, .v2-term h4 { font: 600 14px/1.6 var(--sans); margin: 16px 0 8px; }
-.v2-title-support { margin-bottom: 20px; }
-.v2-source { max-width: var(--code-width); margin: 12px auto; scroll-margin-top: 85px; }
-.v2-source>summary { cursor: pointer; color: var(--accent); font: 11px/1.8 var(--sans); overflow-wrap: anywhere; }
-.v2-source .code-block { margin: 10px 0 20px; }
-.v2-context, .v2-catalog { margin: 30px 0; }
-.v2-catalog h2, .v2-context h2 { margin-bottom: 18px; }
-.exact-code .code-text { min-height: 1.95em; }
 </style>
 </head>
 <body>
@@ -393,109 +375,30 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
 <script>'use strict';
 (() => {
   // The report is inert data, never repository code to execute. All prose/source is escaped.
-  const SHARED_TABLES = [
-    'results', 'plans', 'evidence_refs', 'source_targets', 'resolved_citations',
-    'urls', 'runs', 'invocations', 'requests', 'producers', 'receipts', 'readers',
-    'inherited_provenance'
-  ];
-  const testMetricsEnabled = window.__DIFFSTORY_TEST_METRICS__ === true;
-  const readerMetrics = {
-    embeddedJSONBytes: null,
-    jsonParseMs: null,
-    indexBuildMs: null,
-    sectionProjectionRenderMs: 0,
-    sectionProjectionCount: 0,
-    contextProjectionRenderMs: 0,
-    contextProjectionCount: 0,
-    citationProjectionRenderMs: 0,
-    citationProjectionCount: 0,
-    sourceDecodeRenderMs: 0,
-    sourceDecodeRenderCount: 0,
-    resultCount: 0,
-    referenceCount: 0,
-    readerResultCount: 0,
-    readerReferenceCount: 0,
-    storageResultRecordCount: null,
-    storageReferenceCount: null,
-    maxOwnedSectionProjections: 0,
-    heapAfterParseBytes: null,
-    heapAfterIndexBytes: null,
-    heapAfterRenderBytes: null
-  };
-  const metricNow = () => testMetricsEnabled ? performance.now() : 0;
-  const heapBytes = () => {
-    const bytes = performance.memory?.usedJSHeapSize;
-    return Number.isFinite(bytes) ? Math.round(bytes) : null;
-  };
-  function publishReaderMetrics() {
-    if (!testMetricsEnabled) return;
-    window.__DIFFSTORY_READER_METRICS__ = {
-      ...readerMetrics,
-      heapCurrentBytes: heapBytes()
-    };
-  }
   const reportDataElement = document.getElementById('report-data');
-  let embeddedJSON = reportDataElement.textContent;
-  if (testMetricsEnabled) {
-    readerMetrics.embeddedJSONBytes = new TextEncoder().encode(embeddedJSON).byteLength;
+  let parsedReport = JSON.parse(reportDataElement.textContent);
+  if (!parsedReport || typeof parsedReport !== 'object' || Array.isArray(parsedReport)) {
+    throw new Error('Unsupported embedded report schema');
   }
-  const parseStarted = metricNow();
-  let parsedEnvelope = JSON.parse(embeddedJSON);
-  if (testMetricsEnabled) {
-    readerMetrics.jsonParseMs = Number((metricNow() - parseStarted).toFixed(3));
-    readerMetrics.heapAfterParseBytes = heapBytes();
+  const owns = field => Object.prototype.hasOwnProperty.call(parsedReport, field);
+  if (owns('storage_version') || owns('artifact_kind') || (owns('root') && owns('tables'))) {
+    throw new Error('Unsupported shared report envelope');
   }
-  const indexBuildStarted = metricNow();
-  const storageVersion = parsedEnvelope?.storage_version;
-  const sharedMode = storageVersion === 'diffstory.report-storage.v1';
-
-  function indexSharedEnvelope(envelope) {
-    if (
-      envelope.artifact_kind !== 'report'
-      || !envelope.root || typeof envelope.root !== 'object'
-      || Array.isArray(envelope.root)
-      || envelope.root.shape !== 'report'
-      || !envelope.root.base_report || typeof envelope.root.base_report !== 'object'
-      || Array.isArray(envelope.root.base_report)
-      || !envelope.root.generation || typeof envelope.root.generation !== 'object'
-      || Array.isArray(envelope.root.generation)
-      || !envelope.tables || typeof envelope.tables !== 'object'
-      || Array.isArray(envelope.tables)
-    ) throw new Error('Invalid shared report envelope');
-    const tableNames = Object.keys(envelope.tables).sort();
-    if (tableNames.join('\u0000') !== [...SHARED_TABLES].sort().join('\u0000')) {
-      throw new Error('Invalid shared report table set');
-    }
-    const indexes = Object.create(null);
-    for (const table of SHARED_TABLES) {
-      const rows = envelope.tables[table];
-      if (!Array.isArray(rows)) throw new Error(`Invalid shared ${table} table`);
-      const index = new Map();
-      for (const entry of rows) {
-        if (
-          !entry || typeof entry !== 'object' || Array.isArray(entry)
-          || typeof entry.id !== 'string' || typeof entry.kind !== 'string'
-          || !entry.record || typeof entry.record !== 'object' || Array.isArray(entry.record)
-          || index.has(entry.id)
-        ) throw new Error(`Invalid or duplicate shared ${table} row`);
-        index.set(entry.id, entry);
-      }
-      indexes[table] = index;
-    }
-    return {root: envelope.root, indexes};
+  const reportSchema = parsedReport.schema;
+  const flatMode = reportSchema === 'diffstory.report.v2';
+  const compilerMode = reportSchema === 'diffstory.report.v1';
+  if (!flatMode && !compilerMode) throw new Error('Unsupported embedded report schema');
+  if (compilerMode && (owns('generation') || owns('narrative_v2'))) {
+    throw new Error('Unsupported generated fields in compiler report');
   }
-
-  if (
-    typeof storageVersion === 'string'
-    && storageVersion.startsWith('diffstory.report-storage.')
-    && !sharedMode
-  ) {
-    throw new Error('Unsupported embedded report storage version');
+  if (flatMode && (
+    owns('narrative_v2')
+    || parsedReport.generation?.version !== 'diffstory.generation.walkthrough.v3'
+  )) {
+    throw new Error('Unsupported walkthrough generation version');
   }
-  const sharedGraph = sharedMode ? indexSharedEnvelope(parsedEnvelope) : null;
-  const flatMode = parsedEnvelope?.schema === 'diffstory.report.v2';
-  // Adapt flat saved data to the existing reader at display time. Source text
-  // stays in one store; definitions and original diff rows resolve lazily.
+  // Project flat saved data for display. Source text stays in one store;
+  // definitions and original diff rows resolve lazily.
   function projectWalkthrough(report) {
     const packet = report.packet;
     const sources = new Map(packet.sources.map(source => [source.id, source]));
@@ -578,8 +481,18 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
         narration: 'Source-linked model prose is unverified. Structural validation checks references and coverage.'},
       flatDefinition: definition};
   }
-  const R = sharedMode ? sharedGraph.root.base_report : flatMode ? projectWalkthrough(parsedEnvelope) : parsedEnvelope;
-  const generation = sharedMode ? sharedGraph.root.generation : R.generation;
+  const R = flatMode ? projectWalkthrough(parsedReport) : parsedReport;
+  const generation = R.generation;
+  const flatStory = flatMode ? parsedReport.story : null;
+  const flatPassages = new Map();
+  if (flatMode) {
+    for (const group of R.groups) {
+      for (const passage of group.narrative.passages || []) {
+        if (typeof passage.id === 'string') flatPassages.set(passage.id, {passage, group});
+      }
+    }
+  }
+  parsedReport = null;
   const $ = (selector, parent = document) => parent.querySelector(selector);
   const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
   const esc = value => String(value ?? '').replace(/[&<>"'\r]/g, c => ({
@@ -664,17 +577,8 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
     .replace(/\*\*([^*\n]+)\*\*/g, '$1');
   const prose = value => String(value ?? '').split(/\n\s*\n/).filter(Boolean)
     .map(p => `<p>${inline(p)}</p>`).join('');
-  const G = new Map(R.groups.map(g => [g.id, g]));
+  const G = new Map(R.groups.map(group => [group.id, group]));
   const C = new Map(R.changes.map(c => [c.id, c]));
-  const flatStory = flatMode ? parsedEnvelope.story : null;
-  const flatPassages = new Map();
-  if (flatMode) {
-    for (const group of R.groups) {
-      for (const passage of group.narrative.passages || []) {
-        if (typeof passage.id === 'string') flatPassages.set(passage.id, {passage, group});
-      }
-    }
-  }
   function passageAnchor(id) {
     const value = String(id ?? '');
     let encoded = '';
@@ -698,599 +602,6 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
   const PREVIEW_HEAD = 19;
   const PREVIEW_TAIL = 5;
   const CHUNK = 160;
-
-  // The backend seals this presentation against source and generation. The
-  // shared reader below resolves only the storage schema's declared pointers.
-  // Compiler metadata is never walked for objects that happen to contain $ref.
-  const refKey = ref => {
-    if (ref.kind === 'statement') return JSON.stringify([
-      ref.kind, ref.producer_item_key, ref.result_digest,
-      ref.statement_path.field, ref.statement_path.index, ref.statement_digest
-    ]);
-    if (ref.kind === 'source_slice') return JSON.stringify([
-      ref.kind, refKey(ref.source), ref.byte_start, ref.byte_end, ref.content_digest
-    ]);
-    return JSON.stringify([ref.span_id, ref.unit_key, ref.group_key, ref.side,
-      ref.path, ref.byte_start, ref.byte_end, ref.line_start, ref.line_end, ref.content_digest]);
-  };
-  const claimKey = ref => JSON.stringify([ref.unit_key, ref.observation_id]);
-
-  function copyJSON(value) {
-    if (Array.isArray(value)) return value.map(copyJSON);
-    if (!value || typeof value !== 'object') return value;
-    const output = {};
-    for (const key of Object.keys(value)) output[key] = copyJSON(value[key]);
-    return output;
-  }
-
-  function requiredArray(record, field, label = field) {
-    if (!Array.isArray(record?.[field])) throw new Error(`Invalid shared ${label} array`);
-    return record[field];
-  }
-
-  function optionalArray(record, field, label = field) {
-    if (!Object.prototype.hasOwnProperty.call(record || {}, field)) return [];
-    return requiredArray(record, field, label);
-  }
-
-  function setStatementDefaults(statement) {
-    for (const field of ['claims', 'citations', 'basis', 'uncertainty']) {
-      if (!Object.prototype.hasOwnProperty.call(statement, field)) statement[field] = [];
-      else if (!Array.isArray(statement[field])) throw new Error(`Invalid shared statement ${field}`);
-    }
-    for (const field of ['effect', 'author_context_digest']) {
-      if (!Object.prototype.hasOwnProperty.call(statement, field)) statement[field] = null;
-    }
-    return statement;
-  }
-
-  function countStatementReferences(statement) {
-    return optionalArray(statement, 'citations').length
-      + optionalArray(statement, 'basis').length;
-  }
-
-  function countRecordReferences(table, entry) {
-    const record = entry.record;
-    let count = 0;
-    const countStatements = (field, definitions = false) => {
-      for (const value of optionalArray(record, field)) {
-        count += countStatementReferences(definitions ? value.definition : value);
-      }
-    };
-    if (table === 'results') {
-      if (entry.kind === 'detail') {
-        for (const family of ['explanations', 'observations', 'questions']) {
-          for (const item of optionalArray(record, family)) count += optionalArray(item, 'citations').length;
-        }
-      } else if (entry.kind === 'planning_card') {
-        countStatements('abstraction');
-        countStatements('terminology', true);
-      } else if (entry.kind === 'section') {
-        if (record.title) count += countStatementReferences(record.title);
-        for (const field of ['orientation', 'synthesis', 'transition']) countStatements(field);
-        countStatements('terminology', true);
-      } else if (entry.kind === 'document') {
-        for (const field of ['preamble', 'lead', 'closing']) countStatements(field);
-        countStatements('terminology', true);
-      }
-    } else if (table === 'evidence_refs' && entry.kind === 'source_slice_ref') {
-      count += 1;
-    } else if (table === 'resolved_citations') {
-      count += 3;
-    } else if (table === 'producers') {
-      count += 2 + optionalArray(record, 'requests').length;
-    } else if (table === 'readers') {
-      count += 1;
-      const sectionField = record.shape === 'presentation' ? 'sections' : 'steps';
-      for (const section of optionalArray(record, sectionField)) {
-        count += 1 + optionalArray(section, 'details').length;
-      }
-      count += optionalArray(record, 'context_details').length;
-      count += optionalArray(record, 'citations').length;
-      count += optionalArray(record, 'support_provenance').length;
-    } else if (table === 'inherited_provenance') {
-      count += 3;
-    }
-    return count;
-  }
-
-  function countStorageReferences(graph) {
-    let count = 1; // root.reader
-    const generation = graph.root.generation;
-    for (const field of ['run', 'plan', 'document']) if (generation[field]) count += 1;
-    for (const field of ['details', 'planning', 'sections', 'producers', 'receipts']) {
-      count += optionalArray(generation, field).length;
-    }
-    for (const table of SHARED_TABLES) {
-      for (const entry of graph.indexes[table].values()) count += countRecordReferences(table, entry);
-    }
-    return count;
-  }
-
-  function createSharedReader(graph) {
-    function entryFor(table, pointer, allowedKinds, label) {
-      const kinds = Array.isArray(allowedKinds) ? allowedKinds : [allowedKinds];
-      if (
-        !pointer || typeof pointer !== 'object' || Array.isArray(pointer)
-        || Object.keys(pointer).length !== 2
-        || typeof pointer.$ref !== 'string' || typeof pointer.kind !== 'string'
-        || !kinds.includes(pointer.kind)
-      ) throw new Error(`Invalid shared ${label} selector`);
-      const entry = graph.indexes[table]?.get(pointer.$ref);
-      if (!entry || entry.kind !== pointer.kind || !kinds.includes(entry.kind)) {
-        throw new Error(`Missing or wrong-kind shared ${label} selector`);
-      }
-      return entry;
-    }
-
-    function evidence(pointer, allowedKinds) {
-      const entry = entryFor('evidence_refs', pointer, allowedKinds, 'evidence reference');
-      if (entry.kind === 'source_slice_ref') {
-        const value = copyJSON(entry.record);
-        value.source = evidence(entry.record.source, 'span_ref');
-        return value;
-      }
-      return entry.record;
-    }
-
-    function prepareStatement(value) {
-      setStatementDefaults(value);
-      return value;
-    }
-
-    function materializeStatement(raw) {
-      return prepareStatement(copyJSON(raw));
-    }
-
-    function materializeResult(pointer, expectedKind) {
-      const entry = entryFor('results', pointer, expectedKind, 'result');
-      const value = copyJSON(entry.record);
-      if (entry.kind === 'detail') {
-        for (const family of ['explanations', 'observations', 'questions']) {
-          for (const item of requiredArray(value, family, `detail ${family}`)) {
-            requiredArray(item, 'citations', 'detail citations');
-          }
-        }
-        return value;
-      }
-
-      if (!Object.prototype.hasOwnProperty.call(value, 'terminology')) value.terminology = [];
-      else if (!Array.isArray(value.terminology)) throw new Error('Invalid shared result terminology');
-      const visitStatements = field => {
-        for (const statement of requiredArray(value, field, `result ${field}`)) {
-          prepareStatement(statement);
-        }
-      };
-      if (entry.kind === 'planning_card') {
-        visitStatements('abstraction');
-      } else if (entry.kind === 'section') {
-        value.title = prepareStatement(value.title);
-        for (const field of ['orientation', 'synthesis', 'transition']) visitStatements(field);
-      } else if (entry.kind === 'document') {
-        for (const field of ['preamble', 'lead', 'closing']) visitStatements(field);
-      }
-      for (const term of value.terminology) term.definition = prepareStatement(term.definition);
-      return value;
-    }
-
-    const readerEntry = entryFor('readers', graph.root.reader, 'reader', 'reader root');
-    const readerRecord = readerEntry.record;
-    if (readerRecord.shape !== 'presentation') throw new Error('Shared report has no presentation reader');
-    const sections = requiredArray(readerRecord, 'sections', 'reader sections');
-    const contextDetails = requiredArray(readerRecord, 'context_details', 'reader context details');
-    const citationPointers = requiredArray(readerRecord, 'citations', 'reader citations');
-    const provenancePointers = requiredArray(readerRecord, 'support_provenance', 'reader provenance');
-
-    function rawInheritedStatement(provenance) {
-      const reference = provenance.reference;
-      const resultEntry = entryFor(
-        'results', provenance.record.result,
-        ['planning_card', 'section', 'document'], 'inherited result'
-      );
-      const path = reference.statement_path;
-      const field = path?.field;
-      const index = path?.index === undefined ? 0 : path.index;
-      if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) {
-        throw new Error('Invalid shared inherited statement index');
-      }
-      const allowed = {
-        planning_card: ['abstraction', 'terminology'],
-        section: ['title', 'orientation', 'synthesis', 'transition', 'terminology'],
-        document: ['preamble', 'lead', 'closing', 'terminology']
-      }[resultEntry.kind];
-      if (!path || !allowed.includes(field)) throw new Error('Invalid shared inherited statement path');
-      if (field === 'title') {
-        if (resultEntry.kind !== 'section' || index !== 0) throw new Error('Invalid shared title selector');
-        return resultEntry.record.title;
-      }
-      if (field === 'terminology') {
-        const terms = optionalArray(resultEntry.record, 'terminology');
-        if (!terms[index] || !terms[index].definition) throw new Error('Missing shared inherited term definition');
-        return terms[index].definition;
-      }
-      const statements = requiredArray(resultEntry.record, field, 'inherited statement family');
-      if (!statements[index]) throw new Error('Missing shared inherited statement');
-      return statements[index];
-    }
-
-    function materializeInherited(provenance) {
-      const value = copyJSON(provenance.record);
-      value.reference = provenance.reference;
-      value.statement = materializeStatement(rawInheritedStatement(provenance));
-      const receipt = entryFor('receipts', provenance.record.receipt, 'receipt', 'inherited receipt');
-      value.receipt = receipt.record;
-      delete value.result;
-      return value;
-    }
-
-    if (testMetricsEnabled) {
-      const readerResultCount = 1 + sections.length + contextDetails.length
-        + sections.reduce((total, section) => total + requiredArray(section, 'details', 'reader section details').length, 0);
-      const readerReferenceCount = 1 + 1 + sections.reduce(
-        (total, section) => total + 1 + requiredArray(section, 'details', 'reader section details').length,
-        contextDetails.length + citationPointers.length + provenancePointers.length
-      );
-      readerMetrics.resultCount = readerResultCount;
-      readerMetrics.referenceCount = readerReferenceCount;
-      readerMetrics.readerResultCount = readerResultCount;
-      readerMetrics.readerReferenceCount = readerReferenceCount;
-      readerMetrics.storageResultRecordCount = graph.indexes.results.size;
-      readerMetrics.storageReferenceCount = countStorageReferences(graph);
-    }
-
-    return {
-      shared: true,
-      record: readerRecord,
-      document: () => materializeResult(readerRecord.document, 'document'),
-      sectionRows: () => sections,
-      sectionProjection: section => ({
-        group_id: section.group_id,
-        group_key: section.group_key,
-        number: section.number,
-        next_id: section.next_id,
-        prose: materializeResult(section.prose, 'section'),
-        details: requiredArray(section, 'details', 'reader section details')
-          .map(pointer => materializeResult(pointer, 'detail'))
-      }),
-      contextRows: () => contextDetails,
-      materializeDetail: pointer => materializeResult(pointer, 'detail'),
-      *detailRecords() {
-        for (const section of sections) {
-          for (const pointer of requiredArray(section, 'details', 'reader section details')) {
-            yield entryFor('results', pointer, 'detail', 'detail').record;
-          }
-        }
-        for (const pointer of contextDetails) yield entryFor('results', pointer, 'detail', 'context detail').record;
-      },
-      *citationValues() {
-        for (const pointer of citationPointers) {
-          const entry = entryFor('resolved_citations', pointer, 'resolved_citation', 'citation');
-          const value = copyJSON(entry.record);
-          value.reference = evidence(entry.record.reference, ['span_ref', 'source_slice_ref']);
-          const target = entryFor('source_targets', entry.record.source_target, 'source_target', 'citation source target');
-          Object.assign(value, copyJSON(target.record));
-          const url = entryFor('urls', entry.record.url, 'url', 'citation URL');
-          value.url = url.record.value;
-          yield value;
-        }
-      },
-      *provenanceEntries() {
-        for (const pointer of provenancePointers) {
-          const entry = entryFor('inherited_provenance', pointer, 'inherited_provenance', 'provenance');
-          yield {
-            pointer,
-            record: entry.record,
-            reference: evidence(entry.record.reference, 'statement_ref')
-          };
-        }
-      },
-      evidence,
-      rawInheritedStatement,
-      materializeInherited,
-      sectionCount: sections.length,
-      contextCount: contextDetails.length,
-      citationCount: citationPointers.length
-    };
-  }
-
-  function createExpandedReader(value) {
-    return {
-      shared: false,
-      document: () => value.document,
-      sectionRows: () => value.sections,
-      sectionProjection: section => section,
-      contextRows: () => value.context_details,
-      materializeDetail: detail => detail,
-      *detailRecords() {
-        for (const section of value.sections) yield* section.details;
-        yield* value.context_details;
-      },
-      *citationValues() { yield* value.citations; },
-      *provenanceEntries() {
-        for (const record of value.support_provenance) yield {record, reference: record.reference};
-      },
-      evidence: ref => ref,
-      rawInheritedStatement: provenance => provenance.record.statement,
-      materializeInherited: provenance => provenance.record,
-      sectionCount: value.sections.length,
-      contextCount: value.context_details.length,
-      citationCount: value.citations.length
-    };
-  }
-
-  // Legacy annotations never enter the typed branch by a label or matching field name.
-  const V2 = !sharedMode && generation?.version === 'diffstory.generation.v2'
-    && R.narrative_v2?.version === 'diffstory.presentation.v2' ? R.narrative_v2 : null;
-  const Reader = V2 ? createExpandedReader(V2) : sharedGraph ? createSharedReader(sharedGraph) : null;
-  const typedDocument = Reader ? Reader.document() : null;
-  parsedEnvelope = null;
-  embeddedJSON = null;
-  const citations = new Map(), observations = new Map(), inherited = new Map();
-  const citationCatalog = [];
-  const unitSources = new Map(), inheritedEndpoints = new Map(), fragmentData = new Map();
-  const fragments = new Map((Reader ? R.source_evidence.fragments : []).map(f => [f.key, f]));
-  function citationForLogical(logical) {
-    const citation = citations.get(refKey(logical));
-    if (!citation) throw new Error('Missing shared resolved citation');
-    return citation;
-  }
-  function directEndpoints(statement) {
-    const found = new Map();
-    const addLogical = logical => {
-      const citation = citationForLogical(logical);
-      found.set(citation.key, citation);
-    };
-    const add = ref => addLogical(Reader.evidence(ref, ['span_ref', 'source_slice_ref']));
-    for (const ref of optionalArray(statement, 'citations')) add(ref);
-    for (const ref of optionalArray(statement, 'claims')) {
-      const observation = observations.get(claimKey(ref));
-      if (!observation) throw new Error('Missing shared claim observation');
-      for (const citation of optionalArray(observation, 'citations')) add(citation);
-    }
-    for (const ref of optionalArray(statement, 'basis')) {
-      const logical = Reader.evidence(ref, ['source_slice_ref', 'statement_ref']);
-      if (logical.kind === 'source_slice') addLogical(logical);
-    }
-    return found;
-  }
-  if (Reader) {
-    for (const citation of Reader.citationValues()) {
-      citationCatalog.push(citation);
-      citations.set(refKey(citation.reference), citation);
-      const unit = (citation.reference.source || citation.reference).unit_key;
-      if (!unitSources.has(unit)) unitSources.set(unit, []);
-      unitSources.get(unit).push(citation);
-    }
-    for (const detail of Reader.detailRecords()) {
-      for (const observation of requiredArray(detail, 'observations', 'detail observations')) {
-        observations.set(claimKey({unit_key: detail.unit_key, observation_id: observation.id}), observation);
-      }
-    }
-    for (const provenance of Reader.provenanceEntries()) inherited.set(refKey(provenance.reference), provenance);
-    // One iterative DAG walk, shared by all displayed statements. Keep every branch.
-    for (const root of inherited.keys()) {
-      const stack = [[root, false]];
-      while (stack.length) {
-        const [key, ready] = stack.pop();
-        if (inheritedEndpoints.has(key)) continue;
-        const provenance = inherited.get(key);
-        if (!provenance) throw new Error('Missing shared inherited statement');
-        const statement = Reader.rawInheritedStatement(provenance);
-        const children = optionalArray(statement, 'basis').map(ref => Reader.evidence(ref, ['source_slice_ref', 'statement_ref']))
-          .filter(ref => ref.kind === 'statement').map(refKey);
-        if (!ready) {
-          stack.push([key, true]);
-          for (const child of children) if (!inheritedEndpoints.has(child)) stack.push([child, false]);
-        } else {
-          const endpoints = directEndpoints(statement);
-          for (const child of children) {
-            const endpointsById = inheritedEndpoints.get(child);
-            if (!endpointsById) throw new Error('Missing shared inherited endpoint branch');
-            for (const [id, citation] of endpointsById) endpoints.set(id, citation);
-          }
-          inheritedEndpoints.set(key, endpoints);
-        }
-      }
-    }
-  }
-  readerMetrics.indexBuildMs = testMetricsEnabled ? Number((metricNow() - indexBuildStarted).toFixed(3)) : null;
-  if (testMetricsEnabled) {
-    if (Reader && !Reader.shared) {
-      const sectionRows = Reader.sectionRows();
-      const detailCount = sectionRows.reduce((total, section) => total + section.details.length, 0)
-        + Reader.contextCount;
-      readerMetrics.resultCount = 1 + sectionRows.length + detailCount;
-      readerMetrics.referenceCount = 2 + sectionRows.reduce(
-        (total, section) => total + 1 + section.details.length,
-        Reader.contextCount + Reader.citationCount + inherited.size
-      );
-      readerMetrics.readerResultCount = readerMetrics.resultCount;
-      readerMetrics.readerReferenceCount = readerMetrics.referenceCount;
-    }
-    readerMetrics.heapAfterIndexBytes = heapBytes();
-  }
-  publishReaderMetrics();
-  const sideLabel = side => side === 'base' ? 'Base' : 'Head';
-  function citationLabel(c) {
-    return `${sideLabel(c.side)} · ${c.path} · L${c.line_start}–${c.line_end} · bytes ${c.byte_start}–${c.byte_end} (end excluded)${c.byte_start === c.byte_end ? ' · Empty supplied fragment' : ''}`;
-  }
-  function sourceLinks(values, inheritedSource = false) {
-    if (!values.length) return '';
-    return `<ul class="v2-source-links">${values.map(c => `<li><a href="#source-${c.key}" data-citation="${c.key}" data-consumption="${c.consumption}">${inheritedSource ? 'Inherited · ' : ''}${c.consumption === 'source_slice' ? 'Exact source slice' : 'Direct source'} · ${esc(citationLabel(c))}</a></li>`).join('')}</ul>`;
-  }
-  const refsHTML = refs => sourceLinks(refs.map(ref => {
-    const logical = Reader.evidence(ref, ['span_ref', 'source_slice_ref']);
-    return citationForLogical(logical);
-  }));
-  const kindLabels = {
-    implementation_claim: 'Source-linked interpretation · unverified',
-    author_motivation: 'Author-reported motivation · not implementation evidence',
-    editorial: 'Reading guidance · not implementation evidence',
-    uncertainty: 'Uncertainty · not implementation evidence'
-  };
-  const typedText = (text, field) => `<div class="v2-text" data-field="${field}">${inline(text)}</div>`;
-  function statementBody(s) {
-    const effect = s.effect ?? null;
-    return `${typedText(s.text, 'text')}${effect !== null ? `<div class="v2-field"><span class="v2-label">Supported effect · unverified</span>${typedText(effect, 'effect')}</div>` : ''}${(s.uncertainty || []).map(text => `<div class="v2-field"><span class="v2-label">Uncertainty</span>${typedText(text, 'uncertainty')}</div>`).join('')}`;
-  }
-  function statementSupport(s) {
-    const claims = (s.claims || []).map(ref => {
-      const o = observations.get(claimKey(ref));
-      if (!o) throw new Error('Missing shared claim observation');
-      return `<div class="v2-claim"><span class="v2-label">Supporting observation</span>${typedText(o.text, 'observation')}${refsHTML(o.citations)}</div>`;
-    }).join('');
-    const basis = (s.basis || []).map(ref => {
-      const logical = Reader.evidence(ref, ['source_slice_ref', 'statement_ref']);
-      if (logical.kind === 'source_slice') {
-        return sourceLinks([citationForLogical(logical)]);
-      }
-      const key = refKey(logical), entry = inherited.get(key);
-      if (!entry) throw new Error('Missing shared inherited statement');
-      const provenance = Reader.materializeInherited(entry);
-      const endpoints = inheritedEndpoints.get(key);
-      if (!endpoints) throw new Error('Missing shared inherited endpoint branch');
-      return `<div class="v2-inherited" data-inherited="${provenance.key}"><span class="v2-label">Inherited statement · ${esc(kindLabels[provenance.statement.kind])}</span>${statementBody(provenance.statement)}${sourceLinks([...endpoints.values()], true)}${!endpoints.size ? '<p class="v2-label">No implementation source endpoints in this inherited statement.</p>' : ''}</div>`;
-    }).join('');
-    return `${refsHTML(s.citations || [])}${claims}${basis}`;
-  }
-  function statementHTML(s) {
-    return `<div class="v2-statement" data-kind="${s.kind}"><span class="v2-label">${kindLabels[s.kind]}</span>${statementBody(s)}${statementSupport(s)}</div>`;
-  }
-  const statementsHTML = statements => statements.map(statementHTML).join('');
-  function termsHTML(terms) {
-    const values = terms || [];
-    return values.length ? `<div class="v2-terms"><h3>Terms used here</h3>${values.map(t => `<div class="v2-term"><h4>${inline(t.term)}</h4>${statementHTML(t.definition)}</div>`).join('')}</div>` : '';
-  }
-  function detailHTML(d) {
-    const explanations = d.explanations.map(e => `<div class="v2-explanation">${['before', 'after', 'effect', 'uncertainty'].map(field => `<div class="v2-field"><span class="v2-label">${{before: 'Before', after: 'After', effect: 'Effect · interpretation', uncertainty: 'Uncertainty'}[field]}</span>${typedText(e[field], field)}</div>`).join('')}${refsHTML(e.citations)}${e.limitations.map(l => `<div class="v2-limitation"><span class="v2-label">Evidence limitation · ${esc(sideLabel(l.side))} · ${esc(l.path)}</span>${typedText(l.reason.replace(/_/g, ' '), 'reason')}<span class="v2-label">${esc(l.code.replace(/_/g, ' '))} · This limit does not establish absence or behavior.</span></div>`).join('')}</div>`).join('');
-    const observed = d.observations.map(o => `<div class="v2-observation" id="observation-${d.unit_key}-${o.id}"><span class="v2-label">Source-linked observation · unverified</span>${typedText(o.text, 'observation')}${refsHTML(o.citations)}</div>`).join('');
-    const questions = d.questions.map(q => `<div class="v2-question"><span class="v2-label">Open question · not implementation evidence</span>${typedText(q.text, 'question')}${refsHTML(q.citations)}</div>`).join('');
-    const empty = !d.explanations.length && !d.observations.length && !d.questions.length;
-    return `<article class="v2-detail prose" data-detail="${d.unit_key}">${empty ? `<p class="v2-context-ack">Supplied context was retained; no change explanation was required for this evidence.</p>${sourceLinks(unitSources.get(d.unit_key) || [])}` : explanations + observed + questions}</article>`;
-  }
-  function typedSectionHTML(section) {
-    const g = G.get(section.group_id), p = section.prose;
-    if (!g) throw new Error('Missing compiler group for shared reader section');
-    const prerequisites = g.prerequisites.length ? `<p class="v2-label">Compiler prerequisites: ${g.prerequisites.map(id => `<a href="#${id}">${inline(G.get(id).title)}</a>`).join(', ')}</p>` : '';
-    return `<section class="story-section" id="${g.id}" data-story-section="${g.id}" aria-labelledby="heading-${g.id}"><header class="section-heading"><span class="section-number">${String(section.number).padStart(2, '0')}</span><h2 id="heading-${g.id}">${inline(p.title.text)}<a class="section-anchor" href="#${g.id}" aria-label="Link to ${esc(plainInline(p.title.text))}">#</a></h2></header><div class="prose v2-title-support"><span class="v2-label">Heading · ${kindLabels[p.title.kind]}</span>${(p.title.effect ?? null) !== null ? typedText(p.title.effect, 'effect') : ''}${(p.title.uncertainty || []).map(t => typedText(t, 'uncertainty')).join('')}${statementSupport(p.title)}${prerequisites}</div><div class="section-context">${statementsHTML(p.orientation)}</div>${section.details.map(detailHTML).join('')}<div class="prose">${statementsHTML(p.synthesis)}${termsHTML(p.terminology)}</div>${g.change_ids.map(id => blockHTML([id], {view: 'diff'})).join('')}<div class="section-end">${statementsHTML(p.transition)}</div></section>`;
-  }
-  function measuredSectionHTML(section) {
-    const started = metricNow();
-    const html = typedSectionHTML(section);
-    if (testMetricsEnabled) {
-      readerMetrics.sectionProjectionRenderMs += metricNow() - started;
-      readerMetrics.sectionProjectionCount += 1;
-    }
-    return html;
-  }
-  function sourceBlockHTML(c) {
-    const id = `block-${++blockCounter}`;
-    blocks.set(id, {id, citation: c, expanded: false, loaded: 0, materialized: false});
-    return `<details class="v2-source" id="source-${c.key}"><summary>${c.consumption === 'source_slice' ? 'Exact source slice' : 'Direct source'} · ${esc(citationLabel(c))}</summary><figure class="code-block exact-code" id="${id}" data-block="${id}" data-citation="${c.key}" data-fragment="${esc(c.fragment_key)}" data-side="${c.side}" data-byte-start="${c.byte_start}" data-byte-end="${c.byte_end}"><figcaption class="code-header">${esc(sideLabel(c.side))} · ${esc(c.path)}</figcaption><div class="code-body"><div class="lazy-shell"><button data-load-preview="${id}">Load cited source ↓</button></div></div><div class="code-footer">${link(c.url, `${sideLabel(c.side)} source`, 'code-source-link')}</div></figure></details>`;
-  }
-  function typedStoryHTML() {
-    const sections = Reader.sectionRows().map(section => measuredSectionHTML(Reader.sectionProjection(section))).join('');
-    const context = Reader.contextCount
-      ? `<section class="v2-context"><div class="prose"><h2>Retained source context</h2></div>${[...Reader.contextRows()].map(detail => detailHTML(Reader.materializeDetail(detail))).join('')}</section>`
-      : '';
-    const citationsHTML = citationCatalog.map(sourceBlockHTML).join('');
-    return `<section class="preamble"><h2>Before the code</h2><div class="preamble-body">${statementsHTML(typedDocument.preamble)}${termsHTML(typedDocument.terminology)}</div></section>${sections}${context}<section class="v2-catalog"><div class="prose"><h2>Source references</h2><p>Each excerpt uses the named revision and exact byte range. Open it to inspect the source, then load the full supplied fragment if needed.</p></div>${citationsHTML}</section>`;
-  }
-  function appendSharedTypedStory() {
-    const story = $('#story');
-    story.insertAdjacentHTML('beforeend', `<section class="preamble"><h2>Before the code</h2><div class="preamble-body">${statementsHTML(typedDocument.preamble)}${termsHTML(typedDocument.terminology)}</div></section>`);
-    for (const row of Reader.sectionRows()) {
-      const started = metricNow();
-      let projection = Reader.sectionProjection(row);
-      const html = typedSectionHTML(projection);
-      story.insertAdjacentHTML('beforeend', html);
-      projection = null;
-      if (testMetricsEnabled) {
-        readerMetrics.sectionProjectionRenderMs += metricNow() - started;
-        readerMetrics.sectionProjectionCount += 1;
-        readerMetrics.maxOwnedSectionProjections = Math.max(readerMetrics.maxOwnedSectionProjections, 1);
-      }
-    }
-    if (Reader.contextCount) {
-      const context = document.createElement('section');
-      context.className = 'v2-context';
-      const heading = document.createElement('div');
-      heading.className = 'prose';
-      heading.innerHTML = '<h2>Retained source context</h2>';
-      context.append(heading);
-      for (const pointer of Reader.contextRows()) {
-        const started = metricNow();
-        let projection = Reader.materializeDetail(pointer);
-        context.insertAdjacentHTML('beforeend', detailHTML(projection));
-        projection = null;
-        if (testMetricsEnabled) {
-          readerMetrics.contextProjectionRenderMs += metricNow() - started;
-          readerMetrics.contextProjectionCount += 1;
-        }
-      }
-      story.append(context);
-    }
-    const catalog = document.createElement('section');
-    catalog.className = 'v2-catalog';
-    const introduction = document.createElement('div');
-    introduction.className = 'prose';
-    introduction.innerHTML = '<h2>Source references</h2><p>Each excerpt uses the named revision and exact byte range. Open it to inspect the source, then load the full supplied fragment if needed.</p>';
-    catalog.append(introduction);
-    for (const citation of citationCatalog) {
-      const started = metricNow();
-      catalog.insertAdjacentHTML('beforeend', sourceBlockHTML(citation));
-      if (testMetricsEnabled) {
-        readerMetrics.citationProjectionRenderMs += metricNow() - started;
-        readerMetrics.citationProjectionCount += 1;
-      }
-    }
-    story.append(catalog);
-  }
-  function sourceData(c) {
-    if (!fragmentData.has(c.fragment_key)) {
-      const fragment = fragments.get(c.fragment_key);
-      const bytes = new TextEncoder().encode(fragment.text), starts = [0];
-      // CRLF is one delimiter. LS and PS are ordinary source characters.
-      for (let i = 0; i < bytes.length; i++) {
-        if (bytes[i] === 13) { if (bytes[i + 1] === 10) i++; starts.push(i + 1); }
-        else if (bytes[i] === 10) starts.push(i + 1);
-      }
-      if (starts.at(-1) === bytes.length) starts.pop();
-      fragmentData.set(c.fragment_key, {fragment, bytes, starts});
-    }
-    return fragmentData.get(c.fragment_key);
-  }
-  function exactRows(c, full = false) {
-    const {fragment, bytes, starts} = sourceData(c);
-    const start = full ? 0 : c.byte_start, end = full ? bytes.length : c.byte_end;
-    let lo = 0, hi = starts.length;
-    while (lo < hi) { const mid = (lo + hi) >>> 1; if (starts[mid] <= start) lo = mid + 1; else hi = mid; }
-    const rows = [], decoder = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true});
-    for (let i = Math.max(0, lo - 1); i < starts.length && starts[i] < end; i++) {
-      rows.push({type: 'line', new: fragment.start_line + i,
-        text: decoder.decode(bytes.subarray(Math.max(start, starts[i]), Math.min(end, starts[i + 1] ?? bytes.length)))});
-    }
-    return rows;
-  }
-  function paintSourceBlock(spec) {
-    const started = metricNow();
-    const element = document.getElementById(spec.id), c = spec.citation;
-    const selected = exactRows(c, spec.expanded);
-    const shown = spec.expanded ? selected.slice(0, spec.loaded) : selected.length <= PREVIEW_LIMIT ? selected
-      : [...selected.slice(0, PREVIEW_HEAD), {type: 'gap', text: `… ${selected.length - PREVIEW_HEAD - PREVIEW_TAIL} cited lines folded`}, ...selected.slice(-PREVIEW_TAIL)];
-    const empty = sourceData(c).bytes.length === 0;
-    const load = empty ? '' : spec.expanded ? (spec.loaded < selected.length ? `<button class="load-bar" data-expand="${spec.id}">Load next ${Math.min(CHUNK, selected.length - spec.loaded)} source lines</button>` : '')
-      : `<button class="load-bar" data-expand="${spec.id}">Read full supplied ${sideLabel(c.side).toLowerCase()} source · loaded in chunks</button>`;
-    $('.code-body', element).innerHTML = `${empty ? '<p class="code-note v2-empty-source">Empty supplied fragment (0 bytes). This does not establish whether the whole file or its counterpart is empty.</p>' : ''}<div class="code-region" tabindex="0" role="region" aria-label="${esc(sideLabel(c.side) + ' ' + c.path)}"><div class="code-lines">${rowsHTML(shown, false)}</div></div>${load}`;
-    $('.code-footer', element).innerHTML = `<span class="code-location">${esc(citationLabel(c))}</span>${spec.expanded ? `<button class="text-button" data-collapse="${spec.id}">Return to cited excerpt</button>` : ''}${link(c.url, `${sideLabel(c.side)} source`, 'code-source-link')}`;
-    spec.materialized = true; element.dataset.loaded = 'true';
-    element.dataset.sourceView = spec.expanded ? 'full' : 'excerpt';
-    if (testMetricsEnabled) {
-      readerMetrics.sourceDecodeRenderMs += metricNow() - started;
-      readerMetrics.sourceDecodeRenderCount += 1;
-      publishReaderMetrics();
-    }
-  }
 
   function classification(c) {
     const fileStatus = {
@@ -1442,7 +753,6 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
     return output;
   }
   function allRows(spec) {
-    if (spec.citation) return exactRows(spec.citation, true);
     if (spec.cache[spec.view]) return spec.cache[spec.view];
     let rows = [];
     if (spec.raw) rows = diffRows(spec.raw.hunks);
@@ -1711,7 +1021,6 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
     element.dataset.view = spec.view;
   }
   function paintBlock(spec) {
-    if (spec.citation) { paintSourceBlock(spec); return; }
     const element = document.getElementById(spec.id);
     if (!element) return;
     spec.materialized = true;
@@ -1977,9 +1286,6 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
   function reviewChecksHTML() {
     if (!flatMode || !flatStory) return '';
     const checks = flatStory.review_checks;
-    if (!Array.isArray(checks)) {
-      return '<section class="review-checks"><h2>Review checks</h2><p>No structured review checks are available for this archived story.</p></section>';
-    }
     if (!checks.length) {
       return '<section class="review-checks"><h2>Review checks</h2><p>No open review checks were recorded in this story.</p></section>';
     }
@@ -1999,15 +1305,15 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
     const title = m.title || 'Read the change, one idea at a time';
     document.title = `Diffstory · ${m.number ? '#' + m.number : plainInline(title)} · Reader`;
     const lead = doc.lead || 'Read the change in one continuous thread: the idea, its code, then what follows from it. Source stays close to the explanation.';
-    const provider = Reader ? generation.request_configuration.name : generation?.provider;
-    const model = Reader ? generation.request_configuration.model : generation?.model;
+    const provider = generation?.provider;
+    const model = generation?.model;
     const generationNotice = generation
       ? `<p class="generation-notice" role="status"><strong>Model-generated narration · unverified.</strong> Provider: ${esc(provider)} · model: ${esc(model)}. Check every claim against the linked source.</p>` : '';
-    $('#documentHeader').innerHTML = `<div class="document-kicker">${link(m.url, m.repository || 'Local repository') || esc(m.repository || 'Local repository')}<span class="kicker-dot">/</span><span>${m.number ? 'PR ' + m.number : m.input === 'synthetic example' ? 'SYNTHETIC EXAMPLE' : 'COMMITTED COMPARISON'}</span></div><h1>${inline(title)}</h1>${Reader ? `<div class="lead">${statementsHTML(typedDocument.lead)}</div>` : `<p class="lead">${inline(lead)}</p>`}${generationNotice}<div class="document-meta"><span>${R.groups.length} sections</span><span class="sep">·</span><span>${R.stats.supplied_paths} source paths</span><span class="sep">·</span><span class="revisions">${esc((m.base_sha || 'base').slice(0, 7))} → ${esc((m.head_sha || 'head').slice(0, 7))}</span></div><p class="document-scope">${m.input === 'synthetic example' ? 'Original synthetic example. No private repository source.' : m.scope === 'selected excerpts' ? 'Selected source excerpts, not the complete PR.' : 'Committed, changed-file snapshot.'} <a href="#evidence">Evidence & scope</a></p><div class="header-rule"></div>`;
+    $('#documentHeader').innerHTML = `<div class="document-kicker">${link(m.url, m.repository || 'Local repository') || esc(m.repository || 'Local repository')}<span class="kicker-dot">/</span><span>${m.number ? 'PR ' + m.number : m.input === 'synthetic example' ? 'SYNTHETIC EXAMPLE' : 'COMMITTED COMPARISON'}</span></div><h1>${inline(title)}</h1><p class="lead">${inline(lead)}</p>${generationNotice}<div class="document-meta"><span>${R.groups.length} sections</span><span class="sep">·</span><span>${R.stats.supplied_paths} source paths</span><span class="sep">·</span><span class="revisions">${esc((m.base_sha || 'base').slice(0, 7))} → ${esc((m.head_sha || 'head').slice(0, 7))}</span></div><p class="document-scope">${m.input === 'synthetic example' ? 'Original synthetic example. No private repository source.' : m.scope === 'selected excerpts' ? 'Selected source excerpts, not the complete PR.' : 'Committed, changed-file snapshot.'} <a href="#evidence">Evidence & scope</a></p><div class="header-rule"></div>`;
   }
   function buildFooter() {
     const closing = R.document?.closing || 'The definitions, their callers, and the available tests are now in one reading path. Structural matches and test references guide review; they do not substitute for execution evidence.';
-    $('#documentFooter').innerHTML = `<div class="closing"><span class="closing-label">The shape of the change</span>${Reader ? statementsHTML(typedDocument.closing) : inline(closing)}</div>${reviewChecksHTML()}<details id="source-hunks" class="appendix" data-appendix="raw"><summary>Original source hunks</summary><div class="appendix-content"></div></details><details id="evidence" class="appendix" data-appendix="evidence"><summary>Evidence, revisions & scope</summary><div class="appendix-content"></div></details><div class="bottom-line"><span>Diffstory 0.3 · by Epistemic AI · stored locally</span><a href="#top">Back to top ↑</a></div>`;
+    $('#documentFooter').innerHTML = `<div class="closing"><span class="closing-label">The shape of the change</span>${inline(closing)}</div>${reviewChecksHTML()}<details id="source-hunks" class="appendix" data-appendix="raw"><summary>Original source hunks</summary><div class="appendix-content"></div></details><details id="evidence" class="appendix" data-appendix="evidence"><summary>Evidence, revisions & scope</summary><div class="appendix-content"></div></details><div class="bottom-line"><span>Diffstory 0.3 · by Epistemic AI · stored locally</span><a href="#top">Back to top ↑</a></div>`;
   }
   function normalizedSearch(value) {
     return plainInline(String(value ?? '')).replace(/\s+/g, ' ').trim().toLowerCase();
@@ -2164,7 +1470,7 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
   window.addEventListener('hashchange', () => navigateTo(location.hash, false));
   window.addEventListener('popstate', () => navigateTo(location.hash || '#top', false));
 
-  function sharedDownloadParts(scriptJSON) {
+  function embeddedReportJSONParts(scriptJSON) {
     const replacements = new Map([
       ['\\u0026', '&'], ['\\u003c', '<'], ['\\u003e', '>'],
       ['\\u2028', '\u2028'], ['\\u2029', '\u2029']
@@ -2191,7 +1497,7 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
     return parts;
   }
   function download(name, value, rawJSON = false) {
-    const parts = rawJSON ? sharedDownloadParts(value) : [JSON.stringify(value, null, 2)];
+    const parts = rawJSON ? embeddedReportJSONParts(value) : [JSON.stringify(value, null, 2)];
     const blob = new Blob(parts, {type: 'application/json'});
     const url = URL.createObjectURL(blob), a = document.createElement('a');
     a.href = url; a.download = name; a.click();
@@ -2235,7 +1541,7 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
       closePopovers(); if (active) navigateTo('#' + active, false); return;
     }
     if (button.id === 'downloadReport') {
-      if (sharedMode || flatMode) download('diffstory-report.json', reportDataElement.textContent, true);
+      if (flatMode) download('diffstory-report.json', reportDataElement.textContent, true);
       else download('diffstory-report.json', R);
       closePopovers(); return;
     }
@@ -2249,13 +1555,8 @@ h2:hover .section-anchor, .section-anchor:focus-visible { opacity: 1; }
   });
 
   buildHeader();
-  if (Reader?.shared) appendSharedTypedStory();
-  else $('#story').innerHTML = Reader ? typedStoryHTML() : `${preambleHTML()}${walkthroughOpeningHTML()}${R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>'}`;
+  $('#story').innerHTML = `${preambleHTML()}${walkthroughOpeningHTML()}${R.groups.length ? R.groups.map(sectionHTML).join('') : '<div class="prose"><p>No changed units in this committed comparison.</p></div>'}`;
   buildFooter(); contents(); observeBlocks(); updateScroll();
-  if (testMetricsEnabled) {
-    readerMetrics.heapAfterRenderBytes = heapBytes();
-    publishReaderMetrics();
-  }
   if (location.hash) requestAnimationFrame(() => navigateTo(location.hash, false));
 })();
 </script>

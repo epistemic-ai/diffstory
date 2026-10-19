@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from diffstory.compact_packet import canonical_bytes
 from diffstory.compact_packet import digest
-from diffstory.narrative import ProviderResponseError
+from diffstory.providers import ProviderResponseError
 from diffstory.walkthrough_runtime import RunLimitError
 from diffstory.walkthrough_runtime import RunLimits
 from diffstory.walkthrough_runtime import WalkthroughRuntime

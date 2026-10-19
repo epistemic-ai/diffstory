@@ -244,6 +244,46 @@ class CompactPacketTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_packet(packet)
 
+    def test_packet_schema_owns_primitive_constraints(self) -> None:
+        """Strict packet models reject primitive errors before relationships."""
+        original = build_packet(
+            compile_snapshot(snap({}, {"a.py": "value = 1\n"}))
+        )
+        cases = [
+            (
+                "source ID",
+                lambda packet: packet["sources"][0].update(id="bad"),
+            ),
+            (
+                "diff tag",
+                lambda packet: packet["diffs"][0]["hunks"][0]["rows"][
+                    0
+                ].update(tag="other"),
+            ),
+            (
+                "diff origin",
+                lambda packet: packet["diffs"][0].update(diff_origin="other"),
+            ),
+            (
+                "patch status",
+                lambda packet: packet["diffs"][0].update(
+                    patch_status="generated"
+                ),
+            ),
+            (
+                "hunk start type",
+                lambda packet: packet["diffs"][0]["hunks"][0].update(
+                    old_start=True
+                ),
+            ),
+        ]
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                packet = copy.deepcopy(original)
+                mutate(packet)
+                with self.assertRaises(ValueError):
+                    validate_packet(packet)
+
 
 if __name__ == "__main__":
     unittest.main()

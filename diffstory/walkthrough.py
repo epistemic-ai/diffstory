@@ -44,12 +44,10 @@ from .writing import WHOLE_STORY_INSTRUCTION
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from .narrative import NarrativeProvider
+    from .providers import NarrativeProvider
     from .walkthrough_plan import WalkthroughPlan
 
 REPORT_VERSION = "diffstory.report.v2"
-LEGACY_GENERATION_VERSION = "diffstory.generation.walkthrough.v1"
-PREAMBLE_GENERATION_VERSION = "diffstory.generation.walkthrough.v2"
 GENERATION_VERSION = "diffstory.generation.walkthrough.v3"
 MAX_ANNOTATION_BYTES = 1_048_576
 DEFAULT_DEADLINE = 240.0
@@ -141,44 +139,6 @@ class Section(StrictModel):
     passages: list[Passage] = Field(min_length=1, max_length=2_000)
 
 
-class LegacyStory(StrictModel):
-    """Read an archived flat story from before the required conceptual preamble.
-
-    Attributes:
-        introduction: Whole-change overview, at most 8,000 characters.
-        closing: Closing implications and uncertainty, at most 6,000 characters.
-        sections: One or more concept sections in reading order.
-    """
-
-    introduction: str = Field(min_length=1, max_length=8_000)
-    closing: str = Field(min_length=1, max_length=6_000)
-    sections: list[Section] = Field(min_length=1, max_length=2_000)
-
-
-class PreambleStory(LegacyStory):
-    """Introduce the system and concepts before the source-linked reading path.
-
-    Attributes:
-        preamble: Required project/concept orientation. At most 4,000 prose
-            characters plus 4,000 characters of complete fenced sketches.
-        introduction: Short high-level lead inherited from LegacyStory.
-        closing: Implications and uncertainty inherited from LegacyStory.
-        sections: Ordered source-linked concepts inherited from LegacyStory.
-    """
-
-    preamble: str = Field(
-        min_length=1,
-        max_length=MAX_PREAMBLE_TOTAL_CHARS,
-        description=PREAMBLE_INSTRUCTION,
-    )
-
-    @field_validator("preamble")
-    @classmethod
-    def bounded_preamble(cls, value: str) -> str:
-        """Preserve paragraphs/sketches and reuse the reader's separate limits."""
-        return DocumentNarrative.bounded_preamble(value)
-
-
 PassageReference = Annotated[str, Field(min_length=1, max_length=80)]
 AuthorExcerpt = Annotated[str, Field(min_length=1, max_length=600)]
 
@@ -254,10 +214,15 @@ class ReviewCheck(StrictModel):
     test_ids: list[str] = Field(max_length=4)
 
 
-class Story(PreambleStory):
+class Story(StrictModel):
     """Store a v3 source-linked story with compact opening and review guidance.
 
     Attributes:
+        introduction: Short high-level lead, at most 8,000 characters.
+        closing: Closing implications and uncertainty, at most 6,000 characters.
+        sections: Ordered source-linked concepts in reading order.
+        preamble: Required project/concept orientation with separate prose and
+            sketch allowances.
         quick_summary: Concrete before/after outcome linked to one to four
             final passages.
         impact: Evidence-backed practical impact, or None when not established.
@@ -269,21 +234,48 @@ class Story(PreambleStory):
             and, when relevant, static test IDs.
     """
 
+    introduction: str = Field(min_length=1, max_length=8_000)
+    closing: str = Field(min_length=1, max_length=6_000)
+    sections: list[Section] = Field(min_length=1, max_length=2_000)
+    preamble: str = Field(
+        min_length=1,
+        max_length=MAX_PREAMBLE_TOTAL_CHARS,
+        description=PREAMBLE_INSTRUCTION,
+    )
     quick_summary: QuickSummary
     impact: Impact | None
     route: list[ReadingRoute] = Field(min_length=1, max_length=3)
     author_reported_checks: list[AuthorExcerpt] = Field(max_length=4)
     review_checks: list[ReviewCheck] = Field(max_length=5)
 
+    @field_validator("preamble")
+    @classmethod
+    def bounded_preamble(cls, value: str) -> str:
+        """Preserve paragraphs/sketches and reuse the reader's separate limits."""
+        return DocumentNarrative.bounded_preamble(value)
+
 
 class Generation(StrictModel):
-    """Store bounded provider metadata and usage without production history."""
+    """Record bounded provider identity and usage without production history.
 
-    version: Literal[
-        "diffstory.generation.walkthrough.v1",
-        "diffstory.generation.walkthrough.v2",
-        "diffstory.generation.walkthrough.v3",
-    ]
+    Attributes:
+        version: Always ``diffstory.generation.walkthrough.v3``.
+        state: Always ``complete``; incomplete runs do not produce reports.
+        provider: Nonblank provider name, at most 200 characters.
+        model: Nonblank model identity, at most 200 characters.
+        destination: Nonblank provider destination, at most 1,000 characters.
+        base_sha: Exact base revision used by the source packet.
+        head_sha: Exact head revision used by the source packet.
+        evidence_digest: SHA256 identity of the canonical validated packet.
+        usage: Nonnegative provider token and call totals. Cached input tokens
+            cannot exceed input tokens; unreported calls cannot exceed calls.
+        writing_requests: Planned writing requests, from 1 through 8.
+        editorial_requests: Editorial request count, either 0 or 1.
+        cache_hits: Reused request results, from 0 through 12.
+        new_requests: Newly submitted request count, from 0 through 12.
+    """
+
+    version: Literal["diffstory.generation.walkthrough.v3"]
     state: Literal["complete"]
     provider: str = Field(min_length=1, max_length=200)
     model: str = Field(min_length=1, max_length=200)
@@ -301,19 +293,12 @@ class Generation(StrictModel):
 def validate_story(
     packet: dict,
     value: dict,
-    *,
-    version: str = GENERATION_VERSION,
-    legacy: bool | None = None,
 ) -> dict:
     """Validate direct citations, changed-region coverage, and prose bounds.
 
     Args:
         packet: Validated source packet for the exact compared revisions.
         value: Untrusted parsed model output.
-        version: Generation marker selecting the archived v1, preamble v2, or
-            current v3 story contract.
-        legacy: Compatibility alias for the former boolean choice. True selects
-            v1; False selects the former preamble v2.
 
     Returns:
         Detached, schema-validated story data. Structural acceptance does not
@@ -325,29 +310,16 @@ def validate_story(
     if len(canonical_bytes(value)) > MAX_ANNOTATION_BYTES:
         msg = "Model annotation data exceeds the 1 MiB limit"
         raise ValueError(msg)
-    if legacy is not None:
-        version = (
-            LEGACY_GENERATION_VERSION
-            if legacy
-            else PREAMBLE_GENERATION_VERSION
-        )
-    models = {
-        LEGACY_GENERATION_VERSION: LegacyStory,
-        PREAMBLE_GENERATION_VERSION: PreambleStory,
-        GENERATION_VERSION: Story,
-    }
     try:
-        model = models[version]
-    except KeyError:
-        msg = "Unsupported walkthrough story version"
-        raise ValueError(msg) from None
-    story = model.model_validate(value).model_dump()
+        story = Story.model_validate(value).model_dump()
+    except ValueError as error:
+        msg = "Invalid walkthrough story"
+        raise ValueError(msg) from error
     validate_sections(packet, story["sections"])
     if not story["introduction"].strip() or not story["closing"].strip():
         msg = "Story requires nonblank introduction and closing"
         raise ValueError(msg)
-    if version == GENERATION_VERSION:
-        validate_editorial_fields(packet, story)
+    validate_editorial_fields(packet, story)
     return story
 
 
@@ -578,8 +550,18 @@ def validate_walkthrough(report: dict) -> None:
     Args:
         report: Untrusted decoded diffstory.report.v2 artifact.
 
+    Returns:
+        ``None`` when the complete flat report passes validation.
+
     Raises:
-        ValueError: If schema, revisions, coverage, citations, or state fail.
+        ValueError: If schema, primitive fields, revisions, coverage,
+            citations, usage, or state fail.
+
+    Preconditions:
+        ``report`` is parsed data and may be untrusted.
+    Postconditions:
+        The packet, story coverage, source citations, generation metadata, and
+        annotation byte limit agree. The report is not modified.
 
     Essential behavior:
         Checks source and story without replaying production proofs or sessions.
@@ -595,11 +577,7 @@ def validate_walkthrough(report: dict) -> None:
     validate_packet(packet)
     generation = report["generation"]
     metadata = Generation.model_validate(generation)
-    validate_story(
-        packet,
-        report["story"],
-        version=metadata.version,
-    )
+    validate_story(packet, report["story"])
     if generation.get("evidence_digest") != packet_identity(packet):
         msg = "Walkthrough evidence binding mismatch"
         raise ValueError(msg)
@@ -822,6 +800,9 @@ class WalkthroughNarrator:
         Essential behavior:
             Each prepared plan is one-use. Call ``prepare`` again before a retry;
             durable state still retains the earlier attempts and deadline.
+            The assembled report receives one complete validation pass before
+            it is returned, so its immediate caller can reuse that result
+            locally without persisting a trust flag.
         """
         started = time.monotonic() - self.timings.get("preparation_seconds", 0)
         from .walkthrough_plan import EDITOR_SYSTEM

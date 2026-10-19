@@ -117,7 +117,7 @@ class OfflineProvider:
     """
 
     name = "offline-fixture"
-    model = "structural-v2"
+    model = "structural-walkthrough-v1"
     destination = "fixture://local-only"
     context_tokens = 1_050_000
     max_output_tokens = 128_000
@@ -321,8 +321,8 @@ def run(args: argparse.Namespace) -> dict:
     compilation = time.monotonic() - started
     provider = OfflineProvider()
     if args.live:
-        from diffstory.narrative import CodexCLIProvider
-        from diffstory.narrative import OpenAIResponsesProvider
+        from diffstory.providers import CodexCLIProvider
+        from diffstory.providers import OpenAIResponsesProvider
 
         if (
             args.provider == "openai"

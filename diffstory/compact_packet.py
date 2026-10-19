@@ -10,7 +10,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import re
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
@@ -22,8 +21,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 PACKET_VERSION = "diffstory.packet.v1"
-IDENTIFIER = re.compile(r"[0-9a-f]{16}\Z")
-REVISION = re.compile(r"[0-9a-f]{7,64}\Z")
 
 
 class SourceIndex(dict[str, dict]):
@@ -291,13 +288,7 @@ def _project_hunks(hunks: list[dict]) -> list[dict]:
 def _validate_original_patch(diff: dict, sources: SourceIndex) -> None:
     """Require original-patch metadata and verify any captured alignment."""
     status = diff["patch_status"]
-    origin = diff["diff_origin"]
     patch = diff["original_patch"]
-    _require(
-        origin in {"git", "github"}
-        and status in {"captured", "unavailable", "unbound"},
-        "Original patch status is missing or invalid",
-    )
     if status in {"unavailable", "unbound"}:
         _require(
             not diff["hunks"]
@@ -414,8 +405,7 @@ def _validate_diff_coverage(
         starts = _hunk_starts(diff, hunk)
         _require(
             all(
-                type(starts[s]) is int
-                and cursor[s] <= starts[s] <= origins[s] + len(buffers[s])
+                cursor[s] <= starts[s] <= origins[s] + len(buffers[s])
                 for s in cursor
             ),
             "Invalid diff hunk ordering",
@@ -457,7 +447,8 @@ def build_packet(report: dict) -> dict:
     """Project compiler evidence without copying source into changes or diffs.
 
     Args:
-        report: A compiled diffstory.report.v1 with source_evidence.
+        report: Decoded report data. It must be a current
+            ``diffstory.report.v1`` compiler report with source evidence.
 
     Returns:
         A validated packet. Every supplied changed diff row remains present;
@@ -465,11 +456,37 @@ def build_packet(report: dict) -> dict:
         definitions remain available through change references.
 
     Raises:
-        ValueError: If revisions or compiler source bindings are incomplete.
+        ValueError: If the value is not a current compiler report, it contains
+            retired report markers, or revisions/source bindings are incomplete.
+
+    Preconditions:
+        ``report`` is untrusted decoded data. Current compiler reports may
+        carry manual authored annotations, but must not contain retired
+        generation or storage markers.
+    Postconditions:
+        The returned packet passes ``validate_packet``. The input report is not
+        modified; retired root markers are rejected before projection.
+
+    Essential behavior:
+        Source buffers remain in one packet source list. Changes and diff rows
+        refer to those buffers instead of copying source text.
     """
     _require(
-        report.get("schema") == "diffstory.report.v1",
+        type(report) is dict and report.get("schema") == "diffstory.report.v1",
         "Compact packet requires a compiler report",
+    )
+    _require(
+        not any(
+            key in report
+            for key in (
+                "generation",
+                "narrative_v2",
+                "storage_version",
+                "artifact_kind",
+            )
+        )
+        and not ("root" in report and "tables" in report),
+        "Unsupported compiler report format",
     )
     meta = copy.deepcopy(report["meta"])
     _require(
@@ -662,17 +679,31 @@ def _validate_function_comparison(change: dict, sources: SourceIndex) -> None:
 
 
 def validate_packet(packet: dict) -> None:  # noqa: C901, PLR0912 # Keep the direct source, diff, and accounting boundary together.
-    """Validate a persisted packet without reconstructing generation history.
+    """Validate packet schema and source-to-diff relationships.
 
     Args:
-        packet: Untrusted parsed packet mapping.
+        packet: Untrusted decoded packet. Strict Pydantic models check field
+            types, primitive ranges, identifiers, revisions, and closed record
+            shapes before relational checks run.
+
+    Returns:
+        ``None`` when the packet is internally consistent.
 
     Raises:
-        ValueError: If source digests, revisions, references, or accounting fail.
+        ValueError: If schema or primitive fields are invalid, or if source
+            digests, revisions, references, availability, or accounting fail.
+
+    Preconditions:
+        The value is a decoded JSON-like mapping. It may be untrusted.
+    Postconditions:
+        All citations resolve to supplied source and exact revisions; source
+        buffers match their digests; complete diffs, file availability, and
+        changed-region accounting agree. The packet is not modified.
 
     Essential behavior:
         Recomputes changed-hunk membership from the complete supplied diffs;
-        deleting a region while retaining its diff is rejected.
+        deleting a region while retaining its diff is rejected. Pydantic owns
+        primitive checks; this function owns cross-record invariants.
     """
     Packet.model_validate(packet)
     sources = source_index(packet)
@@ -692,23 +723,8 @@ def validate_packet(packet: dict) -> None:  # noqa: C901, PLR0912 # Keep the dir
     }
     for source in sources.values():
         _require(
-            isinstance(source["id"], str)
-            and IDENTIFIER.fullmatch(source["id"]) is not None,
-            "Invalid source identifier",
-        )
-        _require(
-            isinstance(source["revision"], str)
-            and REVISION.fullmatch(source["revision"]) is not None,
-            "Invalid pinned source revision",
-        )
-        _require(source["side"] in {"base", "head"}, "Invalid source side")
-        _require(
             source["revision"] == packet["meta"][f"{source['side']}_sha"],
             "Source revision mismatch",
-        )
-        _require(
-            type(source["start_line"]) is int and source["start_line"] > 0,
-            "Invalid source origin",
         )
         _require(
             hashlib.sha256(source["text"].encode()).hexdigest()
@@ -718,11 +734,6 @@ def validate_packet(packet: dict) -> None:  # noqa: C901, PLR0912 # Keep the dir
     changes = {c["id"]: c for c in packet["changes"]}
     _require(len(changes) == len(packet["changes"]), "Duplicate change IDs")
     for change in changes.values():
-        _require(
-            isinstance(change["id"], str)
-            and IDENTIFIER.fullmatch(change["id"]) is not None,
-            "Invalid compiler change identifier",
-        )
         for field in ("before", "after"):
             if change[field]:
                 resolve_citation(change[field], sources)
@@ -733,29 +744,16 @@ def validate_packet(packet: dict) -> None:  # noqa: C901, PLR0912 # Keep the dir
                 )
         _validate_function_comparison(change, sources)
     for test in packet.get("analysis", {}).get("tests", []):
-        _require(
-            isinstance(test["id"], str)
-            and IDENTIFIER.fullmatch(test["id"]) is not None,
-            "Invalid static test identifier",
-        )
         resolve_citation(test["source"], sources)
     expected = {}
     diff_ids = set()
     for diff in packet["diffs"]:
-        _require(
-            isinstance(diff["id"], str)
-            and IDENTIFIER.fullmatch(diff["id"]) is not None,
-            "Invalid diff identifier",
-        )
         _require(diff["id"] not in diff_ids, "Duplicate diff IDs")
         diff_ids.add(diff["id"])
         for index, hunk in enumerate(diff["hunks"]):
             changed = False
             for row in hunk["rows"]:
                 tag = row["tag"]
-                _require(
-                    tag in {"add", "delete", "context"}, "Invalid diff row tag"
-                )
                 _require(
                     (row["old"] is None) == (tag == "add")
                     and (row["new"] is None) == (tag == "delete"),

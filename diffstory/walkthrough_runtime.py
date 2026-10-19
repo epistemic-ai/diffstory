@@ -24,7 +24,7 @@ from .usage import RunUsage
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from .narrative import NarrativeProvider
+    from .providers import NarrativeProvider
 
 RUN_VERSION = "diffstory.walkthrough-run.v2"
 CACHE_VERSION = "diffstory.walkthrough-cache.v1"
