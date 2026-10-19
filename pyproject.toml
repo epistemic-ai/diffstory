@@ -26,10 +26,17 @@ dependencies = ["pydantic>=2.11,<3"]
 [dependency-groups]
 dev = [
   "build>=1.6.1,<2",
+  "coverage>=7.10,<8",
   "playwright>=1.63.0,<2",
   "ruff==0.16.10",
   "twine>=7.0.0,<8",
 ]
+
+[tool.coverage.run]
+source = ["diffstory"]
+relative_files = true
+patch = ["subprocess"]
+parallel = true
 
 [project.urls]
 Homepage = "https://www.epistemic.ai"

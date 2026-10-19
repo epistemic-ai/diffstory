@@ -8,6 +8,8 @@ A local-first literate code-review reader by [Epistemic AI](https://www.epistemi
 
 [Explore the demo](examples/demo.html) · [Architecture](docs/ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
+[![Python test coverage](https://github.com/epistemic-ai/diffstory/raw/python-coverage-comment-action-data/badge.svg)](https://github.com/epistemic-ai/diffstory/tree/python-coverage-comment-action-data)
+
 ![Diffstory's single-page reader](docs/reader/desktop.png)
 
 ## Try it
