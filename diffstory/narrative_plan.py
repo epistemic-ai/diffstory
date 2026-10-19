@@ -754,7 +754,7 @@ def _unit(  # noqa: PLR0913 # Keep explicit evidence, serializer, and capacity i
     )
 
 
-def _unit_digest(  # noqa: PLR0913 # Same identity inputs as the unit constructor.
+def _unit_digest(  # noqa: PLR0913, PLR0917 # Same identity inputs as the unit constructor.
     group_key: str | None,
     change_key: str | None,
     classification: Classification | None,
@@ -1689,7 +1689,7 @@ class _CitationScopeOwner:
         "scope_ref",
     )
 
-    def __init__(  # noqa: PLR0913 # The owner captures the complete local binding.
+    def __init__(  # noqa: PLR0913, PLR0917 # The owner captures the complete local binding.
         self,
         token: object,
         scope: CitationResolutionScope,

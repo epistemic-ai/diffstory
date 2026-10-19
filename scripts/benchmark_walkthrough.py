@@ -244,7 +244,7 @@ def code_identity() -> dict:
         for path in files
         if path.is_file()
     }
-    result = subprocess.run(  # noqa: S603 # Fixed read-only command with no source-derived arguments.
+    result = subprocess.run(
         ["git", "rev-parse", "HEAD"],  # noqa: S607 # Resolve the user's installed Git.
         cwd=ROOT,
         check=True,

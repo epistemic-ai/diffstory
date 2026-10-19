@@ -1556,8 +1556,7 @@ def _write_session_stream(
         "HTML": "render_output_too_large",
     }
     try:
-        for chunk in chunks:
-            stream.write(chunk)
+        stream.writelines(chunks)
     except ValueError as error:
         if str(error) != error_codes[output_name]:
             raise

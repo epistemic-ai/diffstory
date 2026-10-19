@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -198,6 +199,67 @@ class PublicationTests(unittest.TestCase):
         (self.root / "LICENSE").write_text("Some license")
         with self.assertRaisesRegex(ValueError, "manifest"):
             checker.check(self.root, verify=True)
+
+    def test_local_workflow_state_is_omitted_without_scanning(self) -> None:
+        """Exclude the exact root-local workflow directory from release inputs."""
+        private_directory = self.root / ".goal.narration-state"
+        private_directory.mkdir()
+        (private_directory / "private.md").write_text("ghp_" + "Z" * 36)
+
+        count = checker.check(self.root, write=True)
+        manifest = json.loads((self.root / "PUBLICATION.json").read_text())
+        paths = {entry["path"] for entry in manifest["files"]}
+        self.assertNotIn(".goal.narration-state/private.md", paths)
+        self.assertEqual(checker.check(self.root, verify=True), count)
+
+    def test_manifest_cannot_include_local_workflow_state(self) -> None:
+        """Reject an explicit manifest entry for excluded local workflow state."""
+        private_directory = self.root / ".goal.narration-state"
+        private_directory.mkdir()
+        private_bytes = b"local state"
+        (private_directory / "private.md").write_bytes(private_bytes)
+        checker.check(self.root, write=True)
+        manifest_path = self.root / "PUBLICATION.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"].append(
+            {
+                "path": ".goal.narration-state/private.md",
+                "sha256": hashlib.sha256(private_bytes).hexdigest(),
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "exact current file set"):
+            checker.check(self.root, verify=True)
+
+    def test_unknown_root_directory_remains_unrecognized(self) -> None:
+        """Reject directories outside the public release tree allowlist."""
+        (self.root / "unreviewed-state").mkdir()
+        with self.assertRaisesRegex(
+            ValueError, "Unrecognized release directory"
+        ):
+            checker.check(self.root)
+
+    def test_local_workflow_state_symlink_remains_rejected(self) -> None:
+        """Reject a symlink before applying the root-local directory exclusion."""
+        (self.root / ".goal.narration-state").symlink_to(
+            self.root / "examples", target_is_directory=True
+        )
+        with self.assertRaisesRegex(ValueError, "Symlinks"):
+            checker.check(self.root)
+
+    def test_local_workflow_state_name_as_file_remains_rejected(self) -> None:
+        """Reject a regular file with the private directory's reserved name."""
+        (self.root / ".goal.narration-state").write_text("not a directory")
+        with self.assertRaisesRegex(ValueError, "Unrecognized release file"):
+            checker.check(self.root)
+
+    def test_nested_workflow_state_name_is_not_excluded(self) -> None:
+        """Apply the private-state exclusion only at the publication root."""
+        nested = self.root / "docs" / ".goal.narration-state"
+        nested.mkdir(parents=True)
+        note = nested / "review.md"
+        note.write_text("This nested directory follows normal public rules.")
+        self.assertIn(note, checker.publication_files(self.root))
 
     def test_private_marker_is_rejected(self) -> None:
         """Reject a private prototype marker in candidate text."""

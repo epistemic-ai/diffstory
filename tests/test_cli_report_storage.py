@@ -289,8 +289,10 @@ class CliReportStorageTests(unittest.TestCase):
             ),
             (
                 "escaped discriminator",
-                b'{"artifact_kind":"report","storage\\u005fversion":'
-                b'"diffstory\\u002ereport-storage.v1","root":',
+                (
+                    b'{"artifact_kind":"report","storage\\u005fversion":'
+                    b'"diffstory\\u002ereport-storage.v1","root":'
+                ),
             ),
             (
                 "wrong kind",

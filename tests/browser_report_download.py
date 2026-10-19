@@ -450,9 +450,11 @@ class BrowserReportDownloadTests(unittest.TestCase):
         page.on("pageerror", lambda error: page_errors.append(str(error)))
         page.on(
             "console",
-            lambda message: console_errors.append(message.text)
-            if message.type == "error"
-            else None,
+            lambda message: (
+                console_errors.append(message.text)
+                if message.type == "error"
+                else None
+            ),
         )
         page.goto(html_path.as_uri(), wait_until="load", timeout=10_000)
         return page, context, requests, page_errors, console_errors

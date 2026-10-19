@@ -775,7 +775,7 @@ def install_measurement_hooks(  # noqa: PLR0915 # Keep the mapped instrumentatio
                 "canonical_bytes",
                 measurements,
                 "canonicalization",
-                output_bytes=lambda value: len(value),
+                output_bytes=len,
             )
     _instrument_method(
         stack,
@@ -783,7 +783,7 @@ def install_measurement_hooks(  # noqa: PLR0915 # Keep the mapped instrumentatio
         "canonical_bytes",
         measurements,
         "canonicalization",
-        output_bytes=lambda value: len(value),
+        output_bytes=len,
     )
     _instrument_digest_hooks(
         stack, measurements, trace_streams=trace_digest_streams
@@ -830,8 +830,9 @@ def install_measurement_hooks(  # noqa: PLR0915 # Keep the mapped instrumentatio
                 "build_ledger_index",
                 measurements,
                 "ledger.index_build",
-                records=lambda ledger, **_kwargs: len(ledger.units)
-                + len(ledger.spans),
+                records=lambda ledger, **_kwargs: (
+                    len(ledger.units) + len(ledger.spans)
+                ),
             )
     _instrument_method(
         stack,
@@ -1196,9 +1197,9 @@ def install_measurement_hooks(  # noqa: PLR0915 # Keep the mapped instrumentatio
                     "cli.reload.json_parse",
                     cli_json.loads,
                     records=lambda *_args, **_kwargs: 1,
-                    input_characters=lambda value, **_kwargs: len(value)
-                    if isinstance(value, str)
-                    else 0,
+                    input_characters=lambda value, **_kwargs: (
+                        len(value) if isinstance(value, str) else 0
+                    ),
                 ),
             ),
         )
@@ -1218,7 +1219,7 @@ def install_measurement_hooks(  # noqa: PLR0915 # Keep the mapped instrumentatio
         measurements,
         "cli.reload.read_decode_validate",
         records=lambda *_args, **_kwargs: 1,
-        output_bytes=lambda value: len(value),
+        output_bytes=len,
     )
     _instrument_method(
         stack,
@@ -1248,7 +1249,7 @@ def install_measurement_hooks(  # noqa: PLR0915 # Keep the mapped instrumentatio
                     "render.json_serialize",
                     render_json.dumps,
                     records=lambda *_args, **_kwargs: 1,
-                    output_characters=lambda value: len(value),
+                    output_characters=len,
                 ),
             ),
         )
@@ -1260,7 +1261,7 @@ def install_measurement_hooks(  # noqa: PLR0915 # Keep the mapped instrumentatio
         measurements,
         "render.html_assembly",
         records=lambda *_args, **_kwargs: 1,
-        output_characters=lambda value: len(value),
+        output_characters=len,
     )
     _instrument_method(
         stack,
@@ -1269,7 +1270,7 @@ def install_measurement_hooks(  # noqa: PLR0915 # Keep the mapped instrumentatio
         measurements,
         "render.html_assembly",
         records=lambda *_args, **_kwargs: 1,
-        output_characters=lambda value: len(value),
+        output_characters=len,
     )
     _instrument_method(
         stack,
@@ -1310,7 +1311,7 @@ def install_measurement_hooks(  # noqa: PLR0915 # Keep the mapped instrumentatio
         measurements,
         "compat.render",
         records=lambda *_args, **_kwargs: 1,
-        output_characters=lambda value: len(value),
+        output_characters=len,
     )
 
 
@@ -4737,12 +4738,16 @@ def _result_markdown(value: dict, command: str) -> str:
         f"    {command}",
         "",
         f"Parent exit code: {value['parent_exit_code']}.",
-        f"Timing rows: {value['timing_sample_count']} "
-        f"({value['timing_attempted_child_count']} child runs); callback rows: "
-        f"{value['callback_sample_count']} "
-        f"({value['callback_attempted_child_count']} child runs).",
-        f"Counts: {', '.join(str(item) for item in value['counts'])}; "
-        f"repeats per timing group: {value['repeats']}.",
+        (
+            f"Timing rows: {value['timing_sample_count']} "
+            f"({value['timing_attempted_child_count']} child runs); callback rows: "
+            f"{value['callback_sample_count']} "
+            f"({value['callback_attempted_child_count']} child runs)."
+        ),
+        (
+            f"Counts: {', '.join(str(item) for item in value['counts'])}; "
+            f"repeats per timing group: {value['repeats']}."
+        ),
         "Process RSS is the fresh child process high-water mark. It is not per-phase memory.",
         "",
         "## Source hashes",

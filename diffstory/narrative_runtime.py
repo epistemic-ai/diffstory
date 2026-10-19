@@ -3697,7 +3697,7 @@ class ArtifactRuntime(GenerationRuntime):
             return "cancelled"
         return "generic"
 
-    def _diagnose(  # noqa: PLR0913 # One safe telemetry record.
+    def _diagnose(  # noqa: PLR0913, PLR0917 # One safe telemetry record.
         self,
         state: LineageState,
         node: RecoveryNode,

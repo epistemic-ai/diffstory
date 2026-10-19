@@ -474,7 +474,7 @@ class GitHubTransportTests(unittest.TestCase):
 
     def test_uses_merge_base_not_tip(self) -> None:
         """Use the pull request merge base rather than the current base tip."""
-        fake, paths = self.fake()
+        fake, _paths = self.fake()
         with patch("diffstory.ingest.GitHubClient.get", new=fake):
             s = from_github("org/repo#1")
         self.assertEqual(s["meta"]["base_sha"], "d" * 40)

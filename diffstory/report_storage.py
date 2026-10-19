@@ -2482,7 +2482,7 @@ class ReportRecordGraph(ReportStorageView):
             }
         _read_root_generation_shape(root)
         _check_graph_and_addresses(root, builder.records)
-        memo, _typed_records, validation_counts = _validate_table_records(
+        _memo, _typed_records, validation_counts = _validate_table_records(
             root, builder.records
         )
         _verify_storage_addresses(builder.records)
@@ -3116,7 +3116,7 @@ class _ArenaRecordReader:
         "_tables",
     )
 
-    def __init__(  # noqa: PLR0913 # The reader binds both exact arena digest witnesses.
+    def __init__(  # noqa: PLR0913, PLR0917 # The reader binds both exact arena digest witnesses.
         self,
         token: object,
         owner_token: object,
@@ -4704,9 +4704,10 @@ class _RecordArena:
                         logical_record,
                         references=logical_locations,
                         indexes=builder.records,
-                        logical_lookup=lambda table,
-                        target_id: _record_logical_chunks(
-                            table, target_id, builder.records
+                        logical_lookup=lambda table, target_id: (
+                            _record_logical_chunks(
+                                table, target_id, builder.records
+                            )
                         ),
                     ),
                 )
@@ -6435,7 +6436,7 @@ def _validate_shared_relationships(  # noqa: C901, PLR0912, PLR0913, PLR0915 # O
         _fail("reader_context_mismatch")
 
     for pointer in reader["support_provenance"]:
-        provenance_id, provenance = _relationship_record_at(
+        _provenance_id, provenance = _relationship_record_at(
             indexes,
             "inherited_provenance",
             pointer,
@@ -7001,7 +7002,7 @@ def parse_report_storage(raw_bytes: bytes | str) -> ReportStorageView:
     envelope, raw = _strict_json_load(raw_bytes)
     artifact_kind, root, indexes = _validate_envelope_shape(envelope)
     _check_graph_and_addresses(root, indexes)
-    memo, typed_records, validation_counts = _validate_table_records(
+    _memo, typed_records, validation_counts = _validate_table_records(
         root, indexes
     )
     _verify_storage_addresses(indexes)
@@ -7204,7 +7205,7 @@ def _measurement_record(
     return record, locations
 
 
-def _record_size(  # noqa: PLR0913 # Carries the memoized sizing context without global state.
+def _record_size(  # noqa: PLR0913, PLR0917 # Carries the memoized sizing context without global state.
     table: str,
     identifier: str,
     view: ReportStorageView,

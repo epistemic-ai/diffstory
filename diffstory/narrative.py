@@ -589,7 +589,7 @@ def _post_openai_request(
         timeout if timeout is not None else PROVIDER_CALL_TIMEOUT_SECONDS
     )
     try:
-        request = Request(  # noqa: S310  # This is a fixed HTTPS endpoint.
+        request = Request(
             OPENAI_URL,
             data=body,
             method="POST",

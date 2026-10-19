@@ -898,7 +898,7 @@ class ProductionInputs:
             fragments=tuple(reversed(fragments)),
         )
 
-    def prose_item(  # noqa: PLR0913 # Explicit trusted material, producers and budgets.
+    def prose_item(  # noqa: PLR0913, PLR0917 # Explicit trusted material, producers and budgets.
         self,
         kind: str,
         subject: str,
@@ -1447,11 +1447,13 @@ class StageInputs:
                 },
                 output,
             ),
-            "allowance": lambda handles: 64
-            + sum(
-                self.items[h.key].output_tokens
-                + (0 if self.stage == "detail" else 1)
-                for h in handles
+            "allowance": lambda handles: (
+                64
+                + sum(
+                    self.items[h.key].output_tokens
+                    + (0 if self.stage == "detail" else 1)
+                    for h in handles
+                )
             ),
             "capacity": self.transport.capacity,
             "limits": self.transport.limits,
@@ -2776,7 +2778,7 @@ def validate_production(  # noqa: PLR0915 # Preserve one full ordered offline pr
     return expected
 
 
-def _accept_production_stages(  # noqa: PLR0913
+def _accept_production_stages(  # noqa: PLR0913, PLR0917 # Preserve explicit stage dependencies.
     inputs: ProductionInputs,
     plan: StoryPlan,
     planning_by_subject: Mapping[str, object],

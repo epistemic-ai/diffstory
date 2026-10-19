@@ -570,9 +570,11 @@ def check_page(  # noqa: C901, PLR0913, PLR0915 # Keep one browser page's fideli
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.on(
         "console",
-        lambda message: console_errors.append(message.text)
-        if message.type == "error"
-        else None,
+        lambda message: (
+            console_errors.append(message.text)
+            if message.type == "error"
+            else None
+        ),
     )
     page.on("request", lambda request: requests.append(request.url))
     page.set_content(html, wait_until="domcontentloaded")

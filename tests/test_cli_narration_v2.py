@@ -150,9 +150,11 @@ class DefaultCliProcessTests(unittest.TestCase):
                         sys.executable,
                         "-B",
                         "-c",
-                        "import sys\nsys.path[:0] = sys.argv[1:3]\n"
-                        "from test_cli_narration_v2 import run_fixture_cli_process\n"
-                        "run_fixture_cli_process(sys.argv[3], sys.argv[4:])",
+                        (
+                            "import sys\nsys.path[:0] = sys.argv[1:3]\n"
+                            "from test_cli_narration_v2 import run_fixture_cli_process\n"
+                            "run_fixture_cli_process(sys.argv[3], sys.argv[4:])"
+                        ),
                         str(project),
                         str(project / "tests"),
                         mode,

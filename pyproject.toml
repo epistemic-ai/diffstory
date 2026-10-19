@@ -60,6 +60,8 @@ ignore = [
   "D212", # Conflicts with D213.
   "E501", # Long prose, comments, and embedded examples need manual wrapping.
   "TRY004", # Schema validation consistently reports malformed data as ValueError.
+  "CPY001", # The project license is centralized; per-file headers are not required.
+  "PLC0415", # Local imports preserve deferred and cycle-sensitive loading.
 ]
 
 [tool.ruff.lint.pydocstyle]

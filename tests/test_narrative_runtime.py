@@ -595,8 +595,7 @@ except KeyboardInterrupt:
                     runtime.run_stage(
                         "chunks",
                         [
-                            lambda selected_runtime=runtime,
-                            selected_send=send: (
+                            lambda selected_runtime=runtime, selected_send=send: (
                                 selected_runtime.call(
                                     schema_name, selected_send
                                 )
@@ -1841,7 +1840,7 @@ class ArtifactRuntimeTests(unittest.TestCase):
         self,
     ) -> None:
         """Changed bytes, dishonest bounds and incompatible retries never send."""
-        invocation, registry, results = fixture_v2(1)
+        invocation, registry, _results = fixture_v2(1)
         for variant in (
             "digest",
             "input",

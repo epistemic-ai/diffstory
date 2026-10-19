@@ -186,7 +186,7 @@ class RequestConfiguration(Contract):
         return semantic_digest("diffstory.transport.v2", value)
 
 
-def serialize_request(  # noqa: PLR0913 # Exact adapter serialization signature.
+def serialize_request(  # noqa: PLR0913, PLR0917 # Exact adapter serialization signature.
     configuration: RequestConfiguration,
     system: str,
     data: dict,

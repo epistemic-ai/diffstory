@@ -752,9 +752,11 @@ def _metric_page(  # noqa: C901, PLR0912, PLR0915 # One measured page has one se
     page.on("pageerror", lambda error: page_errors.append(str(error)))
     page.on(
         "console",
-        lambda message: console_errors.append(message.text)
-        if message.type == "error"
-        else None,
+        lambda message: (
+            console_errors.append(message.text)
+            if message.type == "error"
+            else None
+        ),
     )
     page.set_content(metric_html, wait_until="domcontentloaded")
     page.locator(".story-section").first.wait_for(state="visible")

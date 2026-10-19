@@ -1314,20 +1314,26 @@ def _narrative(group: dict, changes: Sequence[dict]) -> dict:
         )
 
     questions = [
-        "Are observable outputs, exceptions and calling conventions preserved "
-        "or intentionally changed?",
+        (
+            "Are observable outputs, exceptions and calling conventions preserved "
+            "or intentionally changed?"
+        ),
     ]
     invariants = [
         "Check the expected inputs, outputs and failure cases against both revisions.",
     ]
     if kinds <= {"moved", "source_only"}:
         invariants = [
-            "The compared ASTs are identical, including literals, signatures "
-            "and decorators.",
+            (
+                "The compared ASTs are identical, including literals, signatures "
+                "and decorators."
+            ),
         ]
         questions = [
-            "Do imported globals, relative imports, initialization order or "
-            "serialization depend on the previous module location?",
+            (
+                "Do imported globals, relative imports, initialization order or "
+                "serialization depend on the previous module location?"
+            ),
         ]
     if kinds & {"moved_renamed", "renamed"}:
         invariants.append(
@@ -1341,21 +1347,29 @@ def _narrative(group: dict, changes: Sequence[dict]) -> dict:
         )
     if theme == "wiring":
         invariants = [
-            "Each imported symbol must resolve at the new module path in the "
-            "deployed build.",
+            (
+                "Each imported symbol must resolve at the new module path in the "
+                "deployed build."
+            ),
         ]
         questions = [
-            "Are old import paths intentionally retired or still needed by "
-            "callers outside these changed files?",
+            (
+                "Are old import paths intentionally retired or still needed by "
+                "callers outside these changed files?"
+            ),
         ]
     if theme == "tests":
         invariants = [
-            "Assertions should express the intended contract, not merely repeat "
-            "the implementation.",
+            (
+                "Assertions should express the intended contract, not merely repeat "
+                "the implementation."
+            ),
         ]
         questions = [
-            "Do these assertions exercise the changed behavior, including "
-            "negative and boundary cases?",
+            (
+                "Do these assertions exercise the changed behavior, including "
+                "negative and boundary cases?"
+            ),
         ]
 
     before_paths = {
@@ -1570,7 +1584,7 @@ def _source_evidence(source: PreparedSnapshot) -> dict:
     }
 
 
-def _append_change(  # noqa: PLR0913  # Each mutable index and evidence input is explicit.
+def _append_change(  # noqa: PLR0913, PLR0917  # Each mutable index and evidence input is explicit.
     changes: list[dict],
     covered_lines: dict[str, set[int]],
     symbol_to_change: dict[str, str],
@@ -2400,7 +2414,7 @@ def _build_group_dependencies(
     )
 
 
-def _order_groups(  # noqa: PLR0913  # Ordering uses distinct source and dependency indexes.
+def _order_groups(  # noqa: PLR0913, PLR0917  # Ordering uses distinct source and dependency indexes.
     groups: dict,
     prerequisites: Mapping[str, AbstractSet[str]],
     symbol_edges: Sequence[dict],

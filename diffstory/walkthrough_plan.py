@@ -476,8 +476,8 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
     totals = [base] * len(bins)
     weighted = sorted(
         units.values(),
-        key=lambda unit: -sum(
-            sizes[field][key] for field in fields for key in unit[field]
+        key=lambda unit: (
+            -sum(sizes[field][key] for field in fields for key in unit[field])
         ),
     )
     for unit in weighted:

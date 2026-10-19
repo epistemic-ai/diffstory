@@ -3532,7 +3532,7 @@ def _stage_production_inputs(
     return inputs
 
 
-def _cached_stage_witness(  # noqa: PLR0913 # Keep exact owners and both stack-local witness maps explicit.
+def _cached_stage_witness(  # noqa: PLR0913, PLR0917 # Keep exact owners and both stack-local witness maps explicit.
     stage: object,
     captured_input: _CapturedInput,
     checked_inputs: object,
