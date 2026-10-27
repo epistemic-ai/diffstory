@@ -158,13 +158,18 @@ fields that need source context use existing group and change IDs.
 ```
 
 The manual `preamble` is optional. In generated narration, **Before the code**
-is required. It introduces the system's purpose, concrete inputs, operation,
-outputs, and the roles of its main parts before implementation details. It
-starts with a plain sentence about supplied context. If the author did not give
-a goal, it describes what the evidence shows without guessing at motivation.
-It can name relevant classes with simple, source-grounded roles. It defines
-necessary technical terms when they first appear. It does not list files, give
-a code tour, or add unrelated review questions.
+is required. It introduces the system's purpose and motivates the change with
+one or two concrete examples early in the preamble. Each example follows a
+specific task or input through the earlier and changed behavior, where the
+evidence establishes those outcomes, and explains why the difference matters.
+Examples come from supplied source or tests; in parallel narration, writers
+include them in their orientations for the editor. Constructed illustrations
+are labeled as such, and unknown behavior is stated rather than invented.
+The preamble explains basic concepts through the examples before describing
+the general mechanism. It uses conceptual roles instead of implementation
+names, defines necessary technical terms, and leaves the code tour to the
+source-linked passages. It does not invent project background or reported
+incidents.
 
 The preamble follows ASD-STE100 principles as a strong guide while keeping a
 natural reading rhythm and exact technical terms. The prose limit is 4,000

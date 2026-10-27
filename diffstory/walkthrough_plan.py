@@ -50,6 +50,10 @@ PART_SYSTEM = EVIDENCE_SYSTEM + (
     " Also supply a short orientation explaining the project or subsystem's "
     "purpose and the basic concepts needed to understand this part. Ground "
     "it in supplied source, rather than guessing missing project background. "
+    "Include a concise motivating example for the preamble: a specific task "
+    "or input, the problem or earlier result, and the changed result where "
+    "the evidence establishes it. Derive it from supplied source or tests; "
+    "label constructed illustrations and identify any unknown outcome. "
     "Introduce the role and plain-English concept before implementation "
     "names in the detailed passages. You see one part of a larger changeset; "
     "other parts may contain definitions or earlier implementations absent "
@@ -120,8 +124,8 @@ class WritingPart(StrictModel):
     """Return at most eight concept sections with prose stored only here.
 
     Attributes:
-        orientation: Source-grounded project/subsystem purpose and basic
-            concepts for the editor, at most 1,200 characters.
+        orientation: Source-grounded project/subsystem purpose, basic concepts,
+            and a motivating example for the editor, at most 1,200 characters.
         sections: Source-linked concepts for exactly the assigned changes and
             regions, without introduction, closing, or production history.
     """
@@ -131,7 +135,9 @@ class WritingPart(StrictModel):
         max_length=ORIENTATION_CHARS,
         description=(
             "Explain this project's or subsystem's purpose and its basic "
-            "concepts in plain English, using supplied source only. Give the "
+            "concepts in plain English, using supplied source only. Include a "
+            "concise motivating example with a specific task or input and "
+            "evidence-supported outcomes; label constructed illustrations. Give the "
             "editor enough context to introduce an unfamiliar reader."
         ),
     )
