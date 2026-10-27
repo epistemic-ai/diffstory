@@ -233,6 +233,50 @@ class CliWalkthroughTests(unittest.TestCase):
             self.assertFalse((root / "story.html").exists())
             self.assertFalse((root / "story.report.json").exists())
 
+    def test_default_model_is_resolved_before_consent(self) -> None:
+        """An omitted model must select Terra and accept caching for either provider."""
+        cases = [
+            ("openai", "gpt-6.1-terra"),
+            ("codex", "gpt-6.1-terra"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "input.json"
+            snapshot.write_text(json.dumps(snap({}, {"a.py": "x = 1\n"})))
+            for provider, expected_model in cases:
+                output = io.StringIO()
+                errors = io.StringIO()
+                with (
+                    self.subTest(provider=provider),
+                    patch(
+                        "diffstory.cli.OpenAIResponsesProvider.require_credentials"
+                    ),
+                    patch(
+                        "diffstory.cli.CodexCLIProvider.require_credentials"
+                    ),
+                    patch("diffstory.cli.sys.stdin", io.StringIO("")),
+                    contextlib.redirect_stdout(output),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    result = main(
+                        [
+                            "snapshot",
+                            str(snapshot),
+                            "--narrate",
+                            "--provider",
+                            provider,
+                            "--cache-dir",
+                            str(root / provider / "cache"),
+                            "--out",
+                            str(root / f"{provider}.html"),
+                        ]
+                    )
+                    self.assertEqual(result, 2)
+                    self.assertIn(
+                        f"model: {expected_model}", output.getvalue()
+                    )
+                    self.assertIn("Source was not sent", errors.getvalue())
+
     def test_capacity_preflight_stops_before_provider_request(self) -> None:
         """An oversized prepared request fails before calling the provider."""
         with tempfile.TemporaryDirectory() as directory:

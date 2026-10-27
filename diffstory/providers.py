@@ -35,15 +35,16 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
-# Fixed endpoint and current default model used by the OpenAI adapter.
+# Fixed endpoint and default narration model.
 OPENAI_URL = "https://api.openai.com/v1/responses"
-OPENAI_MODEL = "gpt-6.1-sol"
+DEFAULT_MODEL = "gpt-6.1-terra"
+OPENAI_MODEL = DEFAULT_MODEL
 
 # Token capacities used to keep prepared requests within provider limits.
 MODEL_CONTEXT_TOKENS = 1_050_000
 MODEL_MAX_OUTPUT_TOKENS = 128_000
-CODEX_DEFAULT_CONTEXT_TOKENS = 400_000
 CODEX_MODEL_CAPACITIES = {
+    "gpt-6.1-terra": (1_050_000, 128_000),
     "gpt-6-astra": (1_050_000, 128_000),
     "gpt-6.1-sol": (1_050_000, 128_000),
     "gpt-6-luna": (1_050_000, 128_000),
@@ -756,7 +757,7 @@ class CodexCLIProvider:
     Attributes:
         name: Stable provider ID, always ``"codex"``.
         consent_name: User-facing service name, always ``"Codex"``.
-        model: Selected known model ID or the CLI default label.
+        model: Selected known model ID, defaulting to GPT-6.1 Terra.
         destination: User-facing description of the account-authenticated CLI.
         context_tokens: Input capacity for the selected known model.
         max_output_tokens: Output token ceiling for the selected model.
@@ -769,9 +770,9 @@ class CodexCLIProvider:
 
     name = "codex"
     consent_name = "Codex"
-    model = "Codex CLI default"
+    model = DEFAULT_MODEL
     destination = "Codex CLI using its saved account sign-in"
-    context_tokens = CODEX_DEFAULT_CONTEXT_TOKENS
+    context_tokens = MODEL_CONTEXT_TOKENS
     max_output_tokens = MODEL_MAX_OUTPUT_TOKENS
     # Reserve space for Codex's own agent instructions and output-schema framing.
     input_overhead_bytes = 8_192
@@ -806,28 +807,29 @@ class CodexCLIProvider:
         Configure the Codex CLI executable and optional model override.
 
         Args:
-            model: Optional supported model ID passed through to ``codex exec``.
+            model: Supported model ID passed through to ``codex exec``;
+                ``None`` selects the default narration model.
             executable: CLI command name or path to invoke.
 
         Raises:
             ValueError: If an override has no known model capacity metadata.
 
         """
+        model = self.model if model is None else model
         self._requested_model = model
         self._executable = executable
-        if model:
-            capacity = CODEX_MODEL_CAPACITIES.get(model)
-            if capacity is None:
-                supported = ", ".join(sorted(CODEX_MODEL_CAPACITIES))
-                msg = (
-                    f"Codex model {model!r} has no known context capacity; "
-                    f"supported overrides: {supported}"
-                )
-                raise ValueError(
-                    msg,
-                )
-            self.context_tokens, self.max_output_tokens = capacity
-            self.model = model
+        capacity = CODEX_MODEL_CAPACITIES.get(model)
+        if capacity is None:
+            supported = ", ".join(sorted(CODEX_MODEL_CAPACITIES))
+            msg = (
+                f"Codex model {model!r} has no known context capacity; "
+                f"supported overrides: {supported}"
+            )
+            raise ValueError(
+                msg,
+            )
+        self.context_tokens, self.max_output_tokens = capacity
+        self.model = model
 
     def require_credentials(self) -> None:
         """

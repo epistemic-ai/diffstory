@@ -60,10 +60,11 @@ diffstory git --repo /path/to/your/project \
   --base main --head HEAD --narrate --out walkthrough.html
 ```
 
-OpenAI is the default provider and uses `OPENAI_API_KEY`. To use a saved Codex
-CLI login, add `--provider codex`. Before it sends source, Diffstory shows the
-provider and revision scope, then asks for approval. It sends source only when
-you request `--narrate`.
+Both providers use `gpt-6.1-terra` by default. OpenAI is the default provider
+and uses `OPENAI_API_KEY`. To use a saved Codex CLI login, add
+`--provider codex`. Before it sends source, Diffstory shows the provider and
+revision scope, then asks for approval. It sends source only when you request
+`--narrate`.
 
 ## What the walkthrough shows
 
