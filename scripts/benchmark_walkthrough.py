@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT))
 from diffstory.analysis import compile_snapshot  # noqa: E402
 from diffstory.compact_packet import canonical_bytes  # noqa: E402
 from diffstory.compact_packet import digest  # noqa: E402
+from diffstory.providers import DEFAULT_MODEL  # noqa: E402
 from diffstory.render import render  # noqa: E402
 from diffstory.walkthrough import WalkthroughError  # noqa: E402
 from diffstory.walkthrough import WalkthroughNarrator  # noqa: E402
@@ -413,7 +414,7 @@ def main() -> int:
     parser.add_argument(
         "--provider", choices=["codex", "openai"], default="codex"
     )
-    parser.add_argument("--model", default="gpt-6.1-sol")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--output-dir",
         type=Path,

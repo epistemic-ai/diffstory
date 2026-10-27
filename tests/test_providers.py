@@ -87,7 +87,7 @@ class OpenAIProviderTests(unittest.TestCase):
         body = provider.prepare("system text", {"x": "é"}, "schema", schema, 7)
         request = json.loads(body)
 
-        self.assertEqual(request["model"], "gpt-6.1-sol")
+        self.assertEqual(request["model"], "gpt-6.1-terra")
         self.assertIs(type(request["store"]), bool)
         self.assertFalse(request["store"])
         self.assertEqual(request["max_output_tokens"], 7)
@@ -301,7 +301,7 @@ class CodexProviderTests(unittest.TestCase):
             "required": ["summary"],
             "additionalProperties": False,
         }
-        provider = CodexCLIProvider(model="gpt-6.1-sol")
+        provider = CodexCLIProvider()
         body = provider.prepare(
             "Summarize evidence.", {"source": "value"}, "summary", schema, 100
         )
@@ -370,6 +370,9 @@ class CodexProviderTests(unittest.TestCase):
             reply = provider.complete_reply(body, 7)
 
         command = launch["command"]
+        self.assertEqual(
+            command[command.index("--model") + 1], "gpt-6.1-terra"
+        )
         disabled_tools = [
             command[index + 1]
             for index, argument in enumerate(command[:-1])

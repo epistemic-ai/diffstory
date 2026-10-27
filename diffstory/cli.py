@@ -21,6 +21,7 @@ from .ingest import from_git
 from .ingest import from_github
 from .models import MAX_SNAPSHOT_SOURCE_BYTES
 from .providers import CODEX_MODEL_CAPACITIES
+from .providers import DEFAULT_MODEL
 from .providers import OPENAI_MODEL
 from .providers import CodexCLIProvider
 from .providers import NarrativeProvider
@@ -191,8 +192,10 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model",
         help=(
-            "Optional model override (OpenAI: gpt-6.1-sol; Codex: "
-            "gpt-6-astra, gpt-6.1-sol, gpt-6-luna, or gpt-5.3-codex)"
+            f"Optional model override (default: {DEFAULT_MODEL}; "
+            f"OpenAI: {OPENAI_MODEL}; Codex: "
+            + ", ".join(CODEX_MODEL_CAPACITIES)
+            + ")"
         ),
     )
     parser.add_argument(
@@ -441,26 +444,7 @@ def _checkpoint_directory(args: argparse.Namespace) -> Path | None:
         The requested or default checkpoint path, or ``None`` when caching is
         disabled.
 
-    Raises:
-        ValueError: If Codex uses its unresolved default model with an explicit
-            checkpoint directory.
-
-    Side Effects:
-        Prints a notice when Codex's unresolved default model disables caching.
-
     """
-    if args.provider == "codex" and args.model is None:
-        if args.cache_dir is not None:
-            msg = (
-                "--cache-dir requires --model when using the Codex CLI default"
-            )
-            raise CliError(msg)
-        if not args.no_cache:
-            print(
-                "Narration cache disabled: Codex uses its unresolved default "
-                "model; pass --model to enable caching."
-            )
-        return None
     if args.no_cache:
         return None
     if args.cache_dir is not None:

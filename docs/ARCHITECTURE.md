@@ -202,9 +202,10 @@ prose or claim that repository tests ran.
 OpenAI Responses is the default provider; `--provider codex` selects the
 signed-in Codex CLI. OpenAI uses an API key from `OPENAI_API_KEY` by default,
 or the environment variable named by `--api-key-env`. Codex uses `codex exec`
-and saved CLI sign-in. OpenAI currently supports `gpt-6.1-sol`; Codex accepts
-the known-capacity overrides `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and
-`gpt-5.3-codex`. Unknown Codex overrides are rejected before source transfer.
+and saved CLI sign-in. Both providers default to `gpt-6.1-terra`. OpenAI
+currently supports that model; Codex also accepts the known-capacity overrides
+`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and `gpt-5.3-codex`. Unknown Codex
+overrides are rejected before source transfer.
 Before sending source, the CLI displays the provider destination, revision
 scope, and planned request count, then asks for consent.
 `--yes` skips the prompt when the user has already approved that transfer. The
@@ -226,8 +227,8 @@ requires a new path and retains old state. Payload cache data is separate: by
 default it replaces the output suffix with `.narration-cache`. `--cache-dir`
 selects a path and `--no-cache` disables payload reuse without disabling run
 state. Cache entries are bound to prepared requests and revalidated before
-reuse. The unresolved Codex default model disables persistent caching; choose
-an explicit supported `--model` to enable it.
+reuse. Codex passes the selected model explicitly to the CLI, including the
+default, so persistent caching also works without a `--model` override.
 
 ### Supported command flow
 
