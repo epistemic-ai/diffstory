@@ -190,6 +190,23 @@ organize the explanation around concepts and combine related changes. Compiler
 groups and dependency edges are evidence and ordering hints. Validation checks
 references and coverage; it does not enforce compiler prerequisite order.
 
+Small changesets use one complete writing request when it fits. Larger
+changesets use up to eight writers and one editor. A source unit that exceeds
+one writer's input budget is divided at complete changed-hunk or source-only
+definition boundaries. A hunk is never cut into smaller pieces. Each assigned
+region belongs to exactly one writer; a change that spans several hunks can
+appear in more than one writer's assignment.
+
+Partitioned writers receive `diffstory.writing-evidence.v2` projections. Each
+source ID has at most one contiguous excerpt per request, with exact original
+line numbers and line endings. Writers can cite only supplied excerpt lines.
+Complete associated definitions are included when they fit; otherwise the
+request identifies their partial or missing coverage. Selected hunks retain
+their `original_index`. The final packet keeps full source, all original
+hunks, and the complete original patch. An indivisible unit that cannot fit
+is rejected before transfer with its path, ranges, estimated size, available
+capacity, and a supported way to continue without narration.
+
 A successful generated report records provider, model, destination, exact
 revisions, evidence digest, usage, writing and editorial request counts, and
 cache counts. It contains no credentials. The renderer labels model prose
@@ -211,6 +228,17 @@ scope, and planned request count, then asks for consent.
 `--yes` skips the prompt when the user has already approved that transfer. The
 source cap defaults to 64,000,000 bytes across both revisions and can be
 lowered with `--max-source-bytes`.
+
+Complete requests use the installed `tiktoken` model mapping to estimate input
+tokens from serialized text. Instructions, schemas, fixed framing margins, and
+the output reserve remain part of the capacity check. Unknown model mappings
+or unavailable vocabularies use the conservative one-byte-per-token fallback.
+In `tiktoken` 0.14, this fallback applies to the GPT-6 models, including Terra.
+These local estimates are separate from provider-reported token usage. The
+editor's unseen prose still has a conservative byte-based preflight bound.
+Per-record token counts guide packing. A conservative byte bound or a count
+of the complete candidate request determines whether a unit or batch fits;
+an optimistic record estimate cannot bypass subdivision.
 
 The generation runtime allows at most 12 provider attempts including retries,
 four concurrent calls, and 240 seconds for preparation and generation. It
