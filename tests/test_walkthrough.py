@@ -177,7 +177,7 @@ class FixtureProvider:
                     "route": [
                         {
                             "kind": "mechanism",
-                            "passage_ids": ids or ["p-missing"],
+                            "passage_ids": ids[:4] or ["p-missing"],
                         }
                     ],
                     "author_reported_checks": [],

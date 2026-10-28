@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import TypeVar
@@ -12,6 +13,8 @@ from .compact_packet import canonical_bytes
 from .compact_packet import packet_identity
 from .compact_packet import source_index
 from .models import StrictModel
+from .source_lines import split_source_lines
+from .usage import count_input_tokens
 from .usage import estimate_input
 from .walkthrough import DOCUMENT_SYSTEM
 from .walkthrough import EVIDENCE_SYSTEM
@@ -25,6 +28,7 @@ from .walkthrough import validate_story
 from .walkthrough_runtime import provider_identity
 from .writing import ASD_STYLE_INSTRUCTION
 from .writing import PREAMBLE_INSTRUCTION
+from .writing_evidence import WritingEvidence
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -54,6 +58,14 @@ PART_SYSTEM = EVIDENCE_SYSTEM + (
     "or input, the problem or earlier result, and the changed result where "
     "the evidence establishes it. Derive it from supplied source or tests; "
     "label constructed illustrations and identify any unknown outcome. "
+    "For partitioned evidence, source buffers can be exact contiguous "
+    "excerpts with original line numbers. The full source and original patch "
+    "remain in the final report. A diff hunk's original_index is its index "
+    "in the original patch, "
+    "not its position in the supplied list. Definition references retain "
+    "their full bounds; definition_coverage states whether that definition "
+    "is fully, partly, or not supplied. Cite only lines in supplied buffers "
+    "and do not infer missing definition behavior. "
     "Introduce the role and plain-English concept before implementation "
     "names in the detailed passages. You see one part of a larger changeset; "
     "other parts may contain definitions or earlier implementations absent "
@@ -235,11 +247,40 @@ def check_capacity(provider: NarrativeProvider, body: bytes) -> None:
     Raises:
         WalkthroughError: If input plus output reserve exceeds capacity.
     """
-    check_capacity_bytes(provider, len(body))
+    if (
+        provider.max_output_tokens < OUTPUT_TOKENS
+        or estimate_input(
+            body,
+            model=provider.model,
+            overhead_bytes=provider.input_overhead_bytes,
+        )
+        + _output_reserve(provider)
+        > provider.context_tokens
+    ):
+        msg = "Walkthrough request exceeds the selected provider's context/output capacity"
+        raise WalkthroughError(msg)
+
+
+def _output_reserve(provider: NarrativeProvider) -> int:
+    """Reserve the enforced API output cap or the CLI's full output allowance."""
+    return (
+        OUTPUT_TOKENS
+        if provider.name == "openai"
+        else provider.max_output_tokens
+    )
+
+
+def _fits(provider: NarrativeProvider, body: bytes) -> bool:
+    """Check a completed candidate locally without transferring its source."""
+    try:
+        check_capacity(provider, body)
+    except WalkthroughError:
+        return False
+    return True
 
 
 def check_capacity_bytes(provider: NarrativeProvider, wire_bytes: int) -> None:
-    """Reject a request size that exceeds conservative capacity.
+    """Reject an unseen request's conservative byte-based upper bound.
 
     Args:
         provider: Adapter exposing context and output capacities.
@@ -250,20 +291,16 @@ def check_capacity_bytes(provider: NarrativeProvider, wire_bytes: int) -> None:
             provider output reserve and framing margin.
 
     Essential behavior:
-        Applies the same conservative byte-to-token estimate used by packing.
+        Unseen editor prose has no text to tokenize. Each possible UTF-8 byte
+        remains one reserved token; actual complete requests use model tokens.
     """
-    reserve = (
-        OUTPUT_TOKENS
-        if provider.name == "openai"
-        else provider.max_output_tokens
-    )
     if (
         type(wire_bytes) is not int
         or wire_bytes < 0
         or provider.max_output_tokens < OUTPUT_TOKENS
         or estimate_input(b"", overhead_bytes=provider.input_overhead_bytes)
         + wire_bytes
-        + reserve
+        + _output_reserve(provider)
         > provider.context_tokens
     ):
         msg = "Walkthrough request exceeds the selected provider's context/output capacity"
@@ -312,6 +349,23 @@ def _wire_size(value: dict, provider: NarrativeProvider) -> int:
     return len(raw) + (
         raw.count(b'"') + raw.count(b"\\") if provider.name == "openai" else 0
     )
+
+
+def _input_size(value: dict, provider: NarrativeProvider) -> int:
+    """Estimate one serialized record's tokens without repeated batch encoding.
+
+    Args:
+        value: A complete source, change, region, or diff record.
+        provider: Adapter whose nested-string escaping and model are selected.
+
+    Returns:
+        Local model tokens or a safe byte fallback. Final assembled requests
+        are checked independently to account for token boundaries and framing.
+    """
+    raw = canonical_bytes(value)
+    if provider.name == "openai":
+        raw = json.dumps(raw.decode(), ensure_ascii=False)[1:-1].encode()
+    return count_input_tokens(raw, model=provider.model)
 
 
 def _editor_data(packet: dict, writers: list[dict]) -> dict:
@@ -364,17 +418,161 @@ def _editor_bound(
     return bound
 
 
+def _part_data(fixed: dict, records: dict, batch: dict) -> dict:
+    """Select complete records in packet order for one normal writer batch."""
+    return {
+        **fixed,
+        **{
+            field: [
+                record
+                for key, record in records[field].items()
+                if key in batch[field]
+            ]
+            for field in records
+        },
+    }
+
+
+def _part_request(
+    provider: NarrativeProvider, data: dict, schema: dict
+) -> WriterRequest:
+    """Serialize one candidate part; the caller must check its capacity."""
+    body = provider.prepare(
+        PART_SYSTEM, data, "walkthrough_part", schema, OUTPUT_TOKENS
+    )
+    return WriterRequest(body, data)
+
+
+def _unit_error(
+    provider: NarrativeProvider, request: WriterRequest
+) -> WalkthroughError:
+    """Describe the source and actual serialized size of an indivisible atom."""
+    evidence = request.evidence
+    paths = sorted({source["path"] for source in evidence["sources"]})
+    regions = ", ".join(
+        f"hunk {region['hunk']}" if region["diff_id"] else region["id"]
+        for region in evidence["regions"]
+    )
+    ranges = ", ".join(
+        f"{source['side']} lines {source['start_line']}-"
+        f"{source['start_line'] + len(split_source_lines(source['text'])) - 1}"
+        for source in evidence["sources"]
+    )
+    tokens = estimate_input(
+        request.body,
+        model=provider.model,
+        overhead_bytes=provider.input_overhead_bytes,
+    )
+    available = provider.context_tokens - _output_reserve(provider)
+    return WalkthroughError(
+        f"Cannot narrate {', '.join(paths)} ({regions}; {ranges}): "
+        f"the complete unit needs {tokens:,} estimated input tokens "
+        f"({len(request.body):,} serialized bytes), but {available:,} are "
+        "available after reserving output. No hunk was split and no source "
+        "was sent. Review without narration or divide the change into "
+        "smaller pull requests."
+    )
+
+
+def _region_atoms(regions: list[dict]) -> list[list[dict]]:
+    """Keep unmapped hunks with a neighboring region that has a change ID.
+
+    Args:
+        regions: Complete changed regions of one source unit in packet order.
+
+    Returns:
+        Whole-hunk or source-only atoms, each with at least one mapped change.
+
+    Raises:
+        WalkthroughError: If no region can support a standalone writer passage.
+    """
+    atoms, pending = [], []
+    for region in regions:
+        pending.append(region)
+        if region["change_ids"]:
+            atoms.append(pending)
+            pending = []
+    if not atoms:
+        msg = "Changed source has no mapped change for a standalone writer; no source was sent"
+        raise WalkthroughError(msg)
+    if pending:
+        atoms[-1].extend(pending)
+    return atoms
+
+
+def _split_unit(
+    provider: NarrativeProvider,
+    projection: WritingEvidence,
+    regions: list[dict],
+    schema: dict,
+    max_parts: int,
+) -> list[WriterRequest]:
+    """Partition a large unit at complete changed-hunk or definition boundaries.
+
+    Args:
+        provider: Selected adapter and its input/output limits.
+        projection: Index of the untouched complete source packet.
+        regions: This unit's changed regions, in original packet order.
+        schema: Structured-output schema for each writer.
+        max_parts: Remaining writer slots after reserving other source units.
+
+    Returns:
+        Capacity-checked requests, each with one contiguous slice per source ID.
+        Every input region belongs to exactly one request. Complete associated
+        definitions are added as context only when the expanded request fits.
+
+    Raises:
+        WalkthroughError: If a whole hunk, definition, or required shared
+            metadata cannot fit, or the existing writer limit is exhausted.
+    """
+    atoms = _region_atoms(regions)
+
+    def finish(assigned: list[dict], request: WriterRequest) -> WriterRequest:
+        """Prefer complete definitions without making a fitting part fail."""
+        expanded = _part_request(
+            provider,
+            projection.project(assigned, include_definitions=True),
+            schema,
+        )
+        return expanded if _fits(provider, expanded.body) else request
+
+    parts, assigned = [], []
+    current = None
+    for atom in atoms:
+        candidate = assigned + atom
+        trial = _part_request(provider, projection.project(candidate), schema)
+        if _fits(provider, trial.body):
+            assigned, current = candidate, trial
+            continue
+        if current is not None:
+            parts.append(finish(assigned, current))
+            assigned = []
+            trial = _part_request(provider, projection.project(atom), schema)
+        if not _fits(provider, trial.body) or not trial.evidence["changes"]:
+            raise _unit_error(provider, trial)
+        if len(parts) >= max_parts:
+            msg = "Complete source exceeds the eight-writer plan limit; no source was sent"
+            raise WalkthroughError(msg)
+        assigned, current = atom, trial
+    if current is not None:
+        parts.append(finish(assigned, current))
+    if len(parts) > max_parts:
+        msg = "Complete source exceeds the eight-writer plan limit; no source was sent"
+        raise WalkthroughError(msg)
+    return parts
+
+
 def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan:  # noqa: C901, PLR0912, PLR0915 # Keep incremental packing and its one-time final serialization in one pass.
-    """Pack source-coherent parts without serializing growing candidate batches.
+    """Pack complete units, subdividing only units that cannot fit a writer.
 
     Args:
         packet: Validated full changeset packet, retaining all source and edits.
         provider: Adapter with explicit capacity metadata.
 
     Returns:
-        One complete request for small changesets, or four to eight writers
-        for multi-file complex changesets and a preflighted editorial envelope.
-        A changeset with only one coherent unit can use one complete request.
+        One complete request for fitting small changesets, or at most eight
+        writers with a preflighted editorial envelope. Oversized units become
+        separate writer requests at whole hunk or definition boundaries.
 
     Raises:
         WalkthroughError: If complete source units cannot fit at most eight
@@ -393,29 +591,34 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
     }
     sizes = {
         field: {
-            key: _wire_size(record, provider) + 1
+            key: _input_size(record, provider) + 1
             for key, record in values.items()
         }
         for field, values in records.items()
     }
-    estimated = sum(sum(values.values()) for values in sizes.values())
+    estimated = sum(
+        _wire_size(record, provider)
+        for values in records.values()
+        for record in values.values()
+    )
     complete = {**packet, "meta": meta}
     if estimated <= SMALL_PACKET_BYTES:
-        body = _prepare(
-            provider,
+        body = provider.prepare(
             DOCUMENT_SYSTEM,
             complete,
             "walkthrough",
             Story.model_json_schema(),
+            OUTPUT_TOKENS,
         )
-        return WalkthroughPlan(
-            packet=packet,
-            writers=(WriterRequest(body, packet),),
-            single=True,
-            provider=binding,
-            evidence_digest=identity,
-            editorial_bound_bytes=0,
-        )
+        if _fits(provider, body):
+            return WalkthroughPlan(
+                packet=packet,
+                writers=(WriterRequest(body, packet),),
+                single=True,
+                provider=binding,
+                evidence_digest=identity,
+                editorial_bound_bytes=0,
+            )
     sources = source_index(packet)
     units = {}
     for region in packet["regions"]:
@@ -441,52 +644,93 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
                 if ref
             )
     if len(units) == 1:
-        body = _prepare(
-            provider,
+        body = provider.prepare(
             DOCUMENT_SYSTEM,
             complete,
             "walkthrough",
             Story.model_json_schema(),
+            OUTPUT_TOKENS,
         )
-        return WalkthroughPlan(
-            packet=packet,
-            writers=(WriterRequest(body, packet),),
-            single=True,
-            provider=binding,
-            evidence_digest=identity,
-            editorial_bound_bytes=0,
-        )
+        if _fits(provider, body):
+            return WalkthroughPlan(
+                packet=packet,
+                writers=(WriterRequest(body, packet),),
+                single=True,
+                provider=binding,
+                evidence_digest=identity,
+                editorial_bound_bytes=0,
+            )
     fixed = {k: v for k, v in complete.items() if k not in fields}
     fixed["version"] = "diffstory.writing-evidence.v1"
     empty_data = {**fixed, **{field: [] for field in fields}}
     schema = WritingPart.model_json_schema()
-    base = len(
-        provider.prepare(
-            PART_SYSTEM, empty_data, "walkthrough_part", schema, OUTPUT_TOKENS
+    empty_request = _part_request(provider, empty_data, schema)
+    if not _fits(provider, empty_request.body):
+        tokens = estimate_input(
+            empty_request.body,
+            model=provider.model,
+            overhead_bytes=provider.input_overhead_bytes,
         )
-    )
-    reserve = (
-        OUTPUT_TOKENS
-        if provider.name == "openai"
-        else provider.max_output_tokens
-    )
+        available = provider.context_tokens - _output_reserve(provider)
+        msg = (
+            f"Writing instructions, schema and shared metadata need {tokens:,} "
+            f"estimated input tokens, but {available:,} are available. "
+            "Reduce the supplied author context or divide the change into "
+            "smaller pull requests. No source was sent."
+        )
+        raise WalkthroughError(msg)
+    base = count_input_tokens(empty_request.body, model=provider.model)
     capacity = (
         provider.context_tokens
-        - reserve
+        - _output_reserve(provider)
         - estimate_input(b"", overhead_bytes=provider.input_overhead_bytes)
     )
-    bins = [
-        {field: set() for field in fields}
-        for _ in range(min(DEFAULT_WRITERS, len(units)))
-    ]
-    totals = [base] * len(bins)
     weighted = sorted(
         units.values(),
         key=lambda unit: (
             -sum(sizes[field][key] for field in fields for key in unit[field])
         ),
     )
+    normal, oversized = [], []
     for unit in weighted:
+        size = base + sum(
+            sizes[field][key] for field in fields for key in unit[field]
+        )
+        (normal if size <= capacity else oversized).append(unit)
+    split_requests = []
+    projection = WritingEvidence(packet) if oversized else None
+    for index, unit in enumerate(oversized):
+        remaining = len(oversized) - index - 1 + bool(normal)
+        slots = MAX_WRITERS - len(split_requests) - remaining
+        if slots <= 0:
+            msg = "Complete source exceeds the eight-writer plan limit; no source was sent"
+            raise WalkthroughError(msg)
+        request = _part_request(
+            provider, _part_data(fixed, records, unit), schema
+        )
+        if _fits(provider, request.body):
+            split_requests.append(request)
+        else:
+            split_requests.extend(
+                _split_unit(
+                    provider,
+                    projection,
+                    [
+                        region
+                        for region in packet["regions"]
+                        if region["id"] in unit["regions"]
+                    ],
+                    schema,
+                    slots,
+                )
+            )
+    normal_slots = MAX_WRITERS - len(split_requests)
+    bins = [
+        {field: set() for field in fields}
+        for _ in range(min(DEFAULT_WRITERS, len(normal), normal_slots))
+    ]
+    totals = [base] * len(bins)
+    for unit in normal:
         options = [
             (
                 totals[index]
@@ -503,7 +747,7 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
             (total, index) for total, index in options if total <= capacity
         ]
         if not fitting:
-            if len(bins) >= MAX_WRITERS:
+            if len(bins) >= normal_slots:
                 msg = "Complete source exceeds the eight-writer plan limit; no source was sent"
                 raise WalkthroughError(msg)
             bins.append({field: set() for field in fields})
@@ -512,9 +756,6 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
             total = base + sum(
                 sizes[field][key] for field in fields for key in unit[field]
             )
-            if total > capacity:
-                msg = "A complete source unit exceeds provider capacity; no changed region was dropped"
-                raise WalkthroughError(msg)
         else:
             total, index = min(fitting)
         for field in fields:
@@ -524,21 +765,12 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
     for batch in bins:
         if not batch["regions"]:
             continue
-        data = {
-            **fixed,
-            **{
-                field: [
-                    record
-                    for key, record in records[field].items()
-                    if key in batch[field]
-                ]
-                for field in fields
-            },
-        }
+        data = _part_data(fixed, records, batch)
         body = _prepare(
             provider, PART_SYSTEM, data, "walkthrough_part", schema
         )
         requests.append(WriterRequest(body, data))
+    requests.extend(split_requests)
     bound = _editor_bound(packet, provider, len(requests))
     return WalkthroughPlan(
         packet=packet,

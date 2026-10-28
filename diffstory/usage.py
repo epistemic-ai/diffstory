@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import TYPE_CHECKING
 from typing import Any
+
+if TYPE_CHECKING:
+    from tiktoken import Encoding
 
 INPUT_FRAMING_MARGIN = 1024
 
@@ -95,19 +100,85 @@ class ModelCapacity:
         )
 
 
-def estimate_input(request_body: bytes, *, overhead_bytes: int = 0) -> int:
+@lru_cache(maxsize=16)
+def _model_encoder(model: str) -> Encoding | None:
+    """Load a locally supported model encoding or retain the byte fallback.
+
+    Args:
+        model: Provider model identifier used by ``tiktoken``'s model registry.
+
+    Returns:
+        The locally available encoding, or ``None`` for an unknown model or an
+        unavailable public vocabulary file. Failures are cached so repeated
+        requests do not repeatedly try to load missing encodings.
+    """
+    try:
+        import tiktoken
+
+        return tiktoken.encoding_for_model(model)
+    except Exception:  # noqa: BLE001 # Unknown models and unavailable vocabularies use bytes.
+        return None
+
+
+def count_input_tokens(
+    request_body: bytes, *, model: str | None = None
+) -> int:
+    """Count body tokens locally when the selected model has a known encoding.
+
+    The result counts serialized request text only. It does not include message
+    framing, provider overhead, or output tokens. Token counts are estimates of
+    body text, not provider-reported usage.
+
+    Args:
+        request_body: UTF-8 serialized provider request.
+        model: Model ID supported by the installed ``tiktoken`` registry; an
+            unknown or omitted model uses the UTF-8 byte length.
+
+    Returns:
+        The ordinary-text token count, or UTF-8 byte count when the model is
+        unknown, the vocabulary cannot load, or the request is not valid UTF-8.
+
+    Raises:
+        TypeError: If ``request_body`` is not bytes.
+    """
+    if not isinstance(request_body, bytes):
+        msg = "The serialized provider request must be bytes"
+        raise TypeError(msg)
+    try:
+        text = request_body.decode("utf-8")
+    except UnicodeDecodeError:
+        return len(request_body)
+    if model is None:
+        return len(request_body)
+    encoder = _model_encoder(model)
+    if encoder is None:
+        return len(request_body)
+    try:
+        return len(encoder.encode_ordinary(text))
+    except Exception:  # noqa: BLE001 # Tokenizer failures retain the safe byte estimate.
+        return len(request_body)
+
+
+def estimate_input(
+    request_body: bytes,
+    *,
+    overhead_bytes: int = 0,
+    model: str | None = None,
+) -> int:
     """
     Estimate a conservative input-token bound from serialized request size.
 
-    The estimate treats each UTF-8 byte as a token and adds framing margin; it
-    is intended for request packing, not as provider-reported usage.
+    Uses a locally available model tokenizer for UTF-8 bodies and otherwise
+    treats each byte as a token. It adds the existing framing margin and is
+    intended for request packing, not as provider-reported usage.
 
     Args:
         request_body: Serialized provider request.
         overhead_bytes: Additional provider-specific framing bytes to reserve.
+        model: Model ID used for local tokenization when recognized.
 
     Returns:
-        The byte-based upper bound, including fixed and caller-provided margins.
+        The estimated body tokens plus fixed framing and caller-provided margins.
 
     Raises:
         TypeError: If ``request_body`` is not bytes.
@@ -120,7 +191,11 @@ def estimate_input(request_body: bytes, *, overhead_bytes: int = 0) -> int:
     if type(overhead_bytes) is not int or overhead_bytes < 0:
         msg = "Input overhead must be a non-negative integer"
         raise ValueError(msg)
-    return len(request_body) + INPUT_FRAMING_MARGIN + overhead_bytes
+    return (
+        count_input_tokens(request_body, model=model)
+        + INPUT_FRAMING_MARGIN
+        + overhead_bytes
+    )
 
 
 class RunUsage:
