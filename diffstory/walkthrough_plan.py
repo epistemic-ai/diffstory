@@ -468,8 +468,8 @@ def _unit_error(
         f"Cannot narrate {', '.join(paths)} ({regions}; {ranges}): "
         f"the complete unit needs {tokens:,} estimated input tokens "
         f"({len(request.body):,} serialized bytes), but {available:,} are "
-        "available after reserving output. No hunk was split and no source "
-        "was sent. Review without narration or divide the change into "
+        "available after reserving output. The indivisible unit was kept "
+        "intact and no source was sent. Review without narration or divide the change into "
         "smaller pull requests."
     )
 
@@ -596,10 +596,15 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
         }
         for field, values in records.items()
     }
+    wire_sizes = {
+        field: {
+            key: _wire_size(record, provider) + 1
+            for key, record in values.items()
+        }
+        for field, values in records.items()
+    }
     estimated = sum(
-        _wire_size(record, provider)
-        for values in records.values()
-        for record in values.values()
+        sum(values.values()) - len(values) for values in wire_sizes.values()
     )
     complete = {**packet, "meta": meta}
     if estimated <= SMALL_PACKET_BYTES:
@@ -680,6 +685,7 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
         )
         raise WalkthroughError(msg)
     base = count_input_tokens(empty_request.body, model=provider.model)
+    base_wire = len(empty_request.body)
     capacity = (
         provider.context_tokens
         - _output_reserve(provider)
@@ -696,7 +702,23 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
         size = base + sum(
             sizes[field][key] for field in fields for key in unit[field]
         )
-        (normal if size <= capacity else oversized).append(unit)
+        wire_bound = base_wire + sum(
+            wire_sizes[field][key] for field in fields for key in unit[field]
+        )
+        # Isolated token counts are packing hints, not an additive upper bound.
+        # Only a conservative byte bound or the whole request can admit a unit.
+        if size <= capacity and (
+            wire_bound <= capacity
+            or _fits(
+                provider,
+                _part_request(
+                    provider, _part_data(fixed, records, unit), schema
+                ).body,
+            )
+        ):
+            normal.append(unit)
+        else:
+            oversized.append(unit)
     split_requests = []
     projection = WritingEvidence(packet) if oversized else None
     for index, unit in enumerate(oversized):
@@ -730,6 +752,7 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
         for _ in range(min(DEFAULT_WRITERS, len(normal), normal_slots))
     ]
     totals = [base] * len(bins)
+    wire_totals = [base_wire] * len(bins)
     for unit in normal:
         options = [
             (
@@ -740,27 +763,48 @@ def prepare_plan(packet: dict, provider: NarrativeProvider) -> WalkthroughPlan: 
                     for key in unit[field] - batch[field]
                 ),
                 index,
+                wire_totals[index]
+                + sum(
+                    wire_sizes[field][key]
+                    for field in fields
+                    for key in unit[field] - batch[field]
+                ),
             )
             for index, batch in enumerate(bins)
         ]
-        fitting = [
-            (total, index) for total, index in options if total <= capacity
-        ]
-        if not fitting:
+        fitting = sorted(option for option in options if option[0] <= capacity)
+        for hint, index, wire_bound in fitting:
+            total = hint
+            if wire_bound <= capacity:
+                break
+            candidate = {
+                field: bins[index][field] | unit[field] for field in fields
+            }
+            request = _part_request(
+                provider, _part_data(fixed, records, candidate), schema
+            )
+            if _fits(provider, request.body):
+                break
+        else:
             if len(bins) >= normal_slots:
                 msg = "Complete source exceeds the eight-writer plan limit; no source was sent"
                 raise WalkthroughError(msg)
             bins.append({field: set() for field in fields})
             totals.append(base)
+            wire_totals.append(base_wire)
             index = len(bins) - 1
             total = base + sum(
                 sizes[field][key] for field in fields for key in unit[field]
             )
-        else:
-            total, index = min(fitting)
+            wire_bound = base_wire + sum(
+                wire_sizes[field][key]
+                for field in fields
+                for key in unit[field]
+            )
         for field in fields:
             bins[index][field].update(unit[field])
         totals[index] = total
+        wire_totals[index] = wire_bound
     requests = []
     for batch in bins:
         if not batch["regions"]:

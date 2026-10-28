@@ -236,6 +236,9 @@ or unavailable vocabularies use the conservative one-byte-per-token fallback.
 In `tiktoken` 0.14, this fallback applies to the GPT-6 models, including Terra.
 These local estimates are separate from provider-reported token usage. The
 editor's unseen prose still has a conservative byte-based preflight bound.
+Per-record token counts guide packing. A conservative byte bound or a count
+of the complete candidate request determines whether a unit or batch fits;
+an optimistic record estimate cannot bypass subdivision.
 
 The generation runtime allows at most 12 provider attempts including retries,
 four concurrent calls, and 240 seconds for preparation and generation. It

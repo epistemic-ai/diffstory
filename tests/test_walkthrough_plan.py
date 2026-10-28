@@ -152,25 +152,110 @@ class WalkthroughPlanTests(unittest.TestCase):
                 provider=provider,
             )
 
-    def test_indivisible_hunk_reports_size_without_sending_source(
+    def test_indivisible_units_report_size_without_sending_source(
         self,
     ) -> None:
-        """A genuinely oversized hunk must fail with a usable local diagnostic."""
-        cases = [("huge.py", "# " + "x" * 400_000 + "\nvalue = 1\n")]
-        for path, text in cases:
+        """Whole hunks and source-only ranges must fail with usable diagnostics."""
+        text = "x" * 400_000
+        cases = [
+            (
+                {},
+                {"huge.py": "# " + text + "\nvalue = 1\n"},
+                "huge.py",
+                "hunk 0",
+            ),
+            (
+                {"huge.txt": text + "\n"},
+                {"huge.txt": text + "\r\n"},
+                "huge.txt",
+                "change-",
+            ),
+        ]
+        for before, after, path, region in cases:
             with self.subTest(path=path):
                 provider = FixtureProvider()
                 provider.context_tokens = 400_000
-                compiled = compile_snapshot(snap({}, {path: text}))
+                snapshot = snap(before, after)
+                if region == "change-":
+                    snapshot["patches"][0]["patch"] = None
+                compiled = compile_snapshot(snapshot)
                 with self.assertRaisesRegex(
                     ValueError,
-                    r"huge\.py.*hunk 0.*estimated input tokens.*available",
+                    r"complete unit.*estimated input tokens.*available",
                 ) as raised:
                     WalkthroughNarrator(provider).generate(compiled)
-                self.assertIn("No hunk was split", str(raised.exception))
+                self.assertIn(path, str(raised.exception))
+                self.assertIn(region, str(raised.exception))
+                self.assertIn("unit was kept intact", str(raised.exception))
                 self.assertIn(
                     "Review without narration", str(raised.exception)
                 )
+                self.assertEqual(provider.calls, 0)
+
+    def test_underestimated_unit_still_reaches_whole_hunk_subdivision(
+        self,
+    ) -> None:
+        """An optimistic packing hint must not bypass oversized-unit recovery."""
+        before, after = large_module()
+        compiled = compile_snapshot(
+            snap({"large.py": before}, {"large.py": after})
+        )
+        cases = [1]
+        for isolated_record_tokens in cases:
+            with (
+                self.subTest(isolated_record_tokens=isolated_record_tokens),
+                patch(
+                    "diffstory.walkthrough_plan._input_size",
+                    return_value=isolated_record_tokens,
+                ),
+            ):
+                provider = FixtureProvider()
+                provider.context_tokens = 400_000
+                plan = WalkthroughNarrator(provider).prepare(compiled)
+                self.assertGreater(len(plan.writers), 1)
+                self.assertTrue(
+                    all(
+                        writer.evidence["version"]
+                        == "diffstory.writing-evidence.v2"
+                        for writer in plan.writers
+                    )
+                )
+                for writer in plan.writers:
+                    check_capacity(provider, writer.body)
+                self.assertEqual(provider.calls, 0)
+
+    def test_underestimated_batches_are_repacked_before_the_final_guard(
+        self,
+    ) -> None:
+        """Individually fitting units must not produce oversized combined batches."""
+        before, after = {}, {}
+        for index in range(10):
+            source = (
+                f"def f{index}():\n    # " + "x" * 30_000 + "\n    return 1\n"
+            )
+            before[f"m{index}.py"] = source
+            after[f"m{index}.py"] = source.replace("return 1", "return 2")
+        compiled = compile_snapshot(snap(before, after))
+        cases = [1]
+        for isolated_record_tokens in cases:
+            with (
+                self.subTest(isolated_record_tokens=isolated_record_tokens),
+                patch(
+                    "diffstory.walkthrough_plan._input_size",
+                    return_value=isolated_record_tokens,
+                ),
+            ):
+                provider = FixtureProvider()
+                provider.context_tokens = 400_000
+                plan = WalkthroughNarrator(provider).prepare(compiled)
+                self.assertGreater(len(plan.writers), 4)
+                self.assertLessEqual(len(plan.writers), 8)
+                for writer in plan.writers:
+                    self.assertEqual(
+                        writer.evidence["version"],
+                        "diffstory.writing-evidence.v1",
+                    )
+                    check_capacity(provider, writer.body)
                 self.assertEqual(provider.calls, 0)
 
     def test_subdivision_cannot_exceed_the_writer_limit(self) -> None:
