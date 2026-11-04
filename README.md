@@ -50,6 +50,19 @@ Replace `OWNER/REPO#123` with a pull request. For a private repository, set
 set and can fall back to the signed-in GitHub CLI account. Public pull requests
 can be read without credentials.
 
+The `git`, `github`, and `snapshot` commands exclude test files by default.
+Add `--include-tests` to include tests in the report and optional narration:
+
+```bash
+diffstory github 'OWNER/REPO#123' --include-tests --out pr.html
+```
+
+This includes files under `test/`, `tests/`, or `__tests__/`, `conftest.py`,
+and common names such as `test_value.py`, `value_test.go`, and `value.spec.js`.
+Filtered reports show a scope warning and the number of excluded files.
+To restore tests omitted from a saved snapshot, capture the input again with
+`--include-tests`.
+
 ## Optional model-written explanations
 
 Add `--narrate` to a local or GitHub command to ask for source-linked

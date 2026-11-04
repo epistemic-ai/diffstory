@@ -28,6 +28,7 @@ from .providers import NarrativeProvider
 from .providers import OpenAIResponsesProvider
 from .render import _render_prevalidated
 from .render import validate_report
+from .source_selection import without_test_files
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -170,11 +171,16 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
         parser: Argument parser for the Git or GitHub source command.
 
     Side Effects:
-        Adds source-limit, narration, provider, model, confirmation,
+        Adds test selection, source-limit, narration, provider, model, confirmation,
         annotation, concurrency, and mutually exclusive cache options directly
         to ``parser``.
 
     """
+    parser.add_argument(
+        "--include-tests",
+        action="store_true",
+        help="Include test files in analysis and narration (excluded by default)",
+    )
     parser.add_argument(
         "--max-source-bytes",
         type=int,
@@ -397,6 +403,7 @@ def _load_snapshot(args: argparse.Namespace) -> dict | None:
             two_dot=args.two_dot,
             max_files=args.max_files,
             max_source_bytes=args.max_source_bytes,
+            include_tests=args.include_tests,
         )
     if args.command == "github":
         return from_github(
@@ -404,9 +411,11 @@ def _load_snapshot(args: argparse.Namespace) -> dict | None:
             token_env=args.token_env,
             max_files=args.max_files,
             max_source_bytes=args.max_source_bytes,
+            include_tests=args.include_tests,
         )
     if args.command == "snapshot":
-        return read_json(args.input)
+        snapshot = read_json(args.input)
+        return snapshot if args.include_tests else without_test_files(snapshot)
     return None
 
 
@@ -531,6 +540,9 @@ def _generate_walkthrough(
     """
     from .walkthrough import WalkthroughNarrator
 
+    if not report["changes"] and report["meta"].get("excluded_test_files"):
+        msg = "No changes remain after excluding test files. Rerun with --include-tests to narrate tests."
+        raise CliError(msg)
     provider = _create_provider(args)
     state = _recovery_directory(args)
     if args.fresh_state is not None and state.exists():

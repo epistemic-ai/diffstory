@@ -34,6 +34,8 @@ from .models import SourceFragment
 from .models import StrictModel
 from .models import SuppliedFile
 from .models import UnavailableFile
+from .source_selection import is_test_path
+from .source_selection import record_test_exclusions
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -321,6 +323,7 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
     two_dot: bool = False,
     max_files: int = MAX_FILES,
     max_source_bytes: int = MAX_SNAPSHOT_SOURCE_BYTES,
+    include_tests: bool = False,
 ) -> dict:
     """
     Build a source snapshot from committed objects at two Git revisions.
@@ -337,6 +340,8 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
             merge base.
         max_files: Maximum number of changed paths to accept.
         max_source_bytes: Maximum aggregate source bytes to inspect.
+        include_tests: Include recognized test files; excluded before content
+            and patch reads by default. File-list limits still cover all paths.
 
     Returns:
         A ``diffstory.snapshot.v1`` mapping with metadata, source fragments,
@@ -382,6 +387,11 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
         raise ValueError(
             msg,
         )
+    total = len(items)
+    if not include_tests:
+        items = [
+            (status, path) for status, path in items if not is_test_path(path)
+        ]
     fragments, warnings = [], []
     file_evidence = []
     source_bytes = 0
@@ -467,7 +477,7 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
             "Untracked and uncommitted edits are excluded."
         ),
     }
-    return {
+    snapshot = {
         "schema": "diffstory.snapshot.v1",
         "meta": meta,
         "fragments": [
@@ -477,6 +487,7 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
         "patches": patches,
         "warnings": warnings,
     }
+    return record_test_exclusions(snapshot, total - len(items), total)
 
 
 def _git_patches(
@@ -911,12 +922,14 @@ def _list_github_files(
     return files
 
 
-def _github_file_tasks(
+def _github_file_tasks(  # noqa: PLR0913 # Pinned source sides and explicit selection are independent inputs.
     files: Iterable[dict],
     repo: str,
     head_repo: str,
     base: str,
     head: str,
+    *,
+    include_tests: bool,
 ) -> _GitHubFilePlan:
     """Plan pinned content reads and initial evidence for each changed file.
 
@@ -926,6 +939,8 @@ def _github_file_tasks(
         head_repo: Repository containing the head revision.
         base: Effective merge-base commit ID.
         head: Head commit ID.
+        include_tests: Include test-only comparisons instead of skipping them.
+            Renames between test and production paths retain both sides.
 
     Returns:
         Named tasks and comparison records in changed-file order.
@@ -937,7 +952,7 @@ def _github_file_tasks(
     evidence = []
     # Each changed file has one comparison record and at most two source reads.
     # Copies and renames use their old base path and new head path.
-    for index, file_info in enumerate(files):
+    for file_info in files:
         path, status = file_info["filename"], file_info["status"]
         old_path = path
         if status in {"renamed", "copied"}:
@@ -945,6 +960,9 @@ def _github_file_tasks(
             if not isinstance(old_path, str) or not old_path:
                 msg = f"GitHub {status} file record requires previous_filename"
                 raise ValueError(msg)
+        if not include_tests and is_test_path(path) and is_test_path(old_path):
+            continue
+        index = len(evidence)
         record = FileEvidence(
             base=AbsentFile(path=path)
             if status == "added"
@@ -1019,9 +1037,10 @@ def from_github(
     token_env: str = GITHUB_AUTH_ENV,
     max_files: int = MAX_FILES,
     max_source_bytes: int = MAX_SNAPSHOT_SOURCE_BYTES,
+    include_tests: bool = False,
 ) -> dict:
     """
-    Fetch a complete, size-bounded pull request snapshot from GitHub.
+    Fetch a size-bounded pull request snapshot with explicit file selection.
 
     The pull request's merge base defines the base revision. Changed-file pages
     are verified before the snapshot is returned, and files are fetched from
@@ -1032,6 +1051,8 @@ def from_github(
         token_env: Environment variable used before the signed-in ``gh`` token.
         max_files: Maximum changed-file count to accept.
         max_source_bytes: Maximum aggregate source bytes to inspect.
+        include_tests: Include recognized test files; excluded before content
+            reads by default. File-list limits still cover all changed paths.
 
     Returns:
         A ``diffstory.snapshot.v1`` mapping with source fragments, metadata,
@@ -1065,7 +1086,9 @@ def from_github(
         pr.get("changed_files"),
     )
     head_repo = (pr.get("head", {}).get("repo") or {}).get("full_name") or repo
-    plan = _github_file_tasks(files, repo, head_repo, base, head)
+    plan = _github_file_tasks(
+        files, repo, head_repo, base, head, include_tests=include_tests
+    )
     source = _read_github_tasks(
         api,
         plan,
@@ -1074,11 +1097,13 @@ def from_github(
 
     # The files API provides GitHub's patch for each file. Keep it verbatim;
     # an omitted patch remains unavailable instead of becoming a Python diff.
+    selected = {record.head.path for record in source.file_evidence}
     patches = [
         FilePatch(
             path=item["filename"], origin="github", patch=item.get("patch")
         ).model_dump()
         for item in files
+        if item["filename"] in selected
     ]
     if (
         sum(len((item["patch"] or "").encode("utf-8")) for item in patches)
@@ -1107,7 +1132,7 @@ def from_github(
         "scope": "changed files",
         "input": "GitHub REST",
         "comparison": "merge-base to head",
-        "changed_files": len(files),
+        "changed_files": len(source.file_evidence),
         "source_bytes": source.source_bytes,
         "additions": pr.get("additions"),
         "deletions": pr.get("deletions"),
@@ -1120,7 +1145,7 @@ def from_github(
             "No test run was executed or verified by this compiler."
         ),
     }
-    return {
+    snapshot = {
         "schema": "diffstory.snapshot.v1",
         "meta": meta,
         "fragments": [
@@ -1133,3 +1158,6 @@ def from_github(
         "patches": patches,
         "warnings": source.warnings,
     }
+    return record_test_exclusions(
+        snapshot, len(files) - len(source.file_evidence), len(files)
+    )

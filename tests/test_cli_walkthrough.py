@@ -19,6 +19,83 @@ from diffstory.walkthrough import validate_walkthrough
 class CliWalkthroughTests(unittest.TestCase):
     """Keep the source-to-reader command and saved artifacts interoperable."""
 
+    def test_default_test_selection_and_opt_in_reach_narration_and_saved_input(
+        self,
+    ) -> None:
+        """Tests must be absent from provider input and exports unless requested."""
+        source = "def f():\n    return 1\n"
+        captured = snap({}, {"app.py": source, "tests/test_app.py": source})
+        cases = [(False, {"app.py"}), (True, {"app.py", "tests/test_app.py"})]
+        for include_tests, expected in cases:
+            with (
+                self.subTest(include_tests=include_tests),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                input_path = root / "input.json"
+                input_path.write_text(json.dumps(captured))
+                provider = FixtureProvider()
+                args = [
+                    "snapshot",
+                    str(input_path),
+                    "--narrate",
+                    "--yes",
+                    "--out",
+                    str(root / "story.html"),
+                    "--save-snapshot",
+                    str(root / "selected.json"),
+                ]
+                if include_tests:
+                    args.append("--include-tests")
+                with (
+                    patch(
+                        "diffstory.cli._create_provider", return_value=provider
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(main(args), 0)
+                report = json.loads((root / "story.report.json").read_text())
+                self.assertEqual(
+                    {item["path"] for item in report["packet"]["sources"]},
+                    expected,
+                )
+                saved = json.loads((root / "selected.json").read_text())
+                self.assertEqual(
+                    {item["path"] for item in saved["fragments"]}, expected
+                )
+                self.assertEqual(json.loads(input_path.read_text()), captured)
+
+    def test_test_only_narration_explains_opt_in_before_provider_setup(
+        self,
+    ) -> None:
+        """An empty selected comparison must explain how to include its tests."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "input.json"
+            snapshot.write_text(
+                json.dumps(snap({}, {"tests/test_value.py": "value = 1\n"}))
+            )
+            errors = io.StringIO()
+            with (
+                patch("diffstory.cli._create_provider") as provider,
+                contextlib.redirect_stderr(errors),
+            ):
+                self.assertEqual(
+                    main(
+                        [
+                            "snapshot",
+                            str(snapshot),
+                            "--narrate",
+                            "--out",
+                            str(root / "story.html"),
+                        ]
+                    ),
+                    2,
+                )
+            provider.assert_not_called()
+            self.assertIn("--include-tests", errors.getvalue())
+            self.assertFalse((root / "story.html").exists())
+
     def test_snapshot_generates_and_reloads_flat_report(self) -> None:
         """Narration must save a valid flat report and reload without provider work."""
         source = "def f():\n    return 1\n"

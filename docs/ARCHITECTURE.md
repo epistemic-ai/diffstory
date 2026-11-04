@@ -74,6 +74,28 @@ Module environment differences are deliberately not erased. Renaming a reference
 
 ## Snapshot shape
 
+The `git`, `github`, and `snapshot` CLI commands exclude recognized test files
+by default; `--include-tests` retains them. Test paths include the `test`,
+`tests`, and `__tests__` directories, `conftest.py`, names starting with
+`test_`, and names ending in `_test`, `_spec`, `.test`, or `.spec` before the
+extension. The compiler and source selection share this classifier.
+
+Git and GitHub selection happens before reading file contents and retaining
+patches. GitHub still validates the complete advertised changed-file list,
+and `--max-files` continues to bound that list before selection. GitHub copies
+and renames with a production path on either side retain both sides. Saved
+snapshot input is checked for primitive fields and byte bounds before
+filtering; retained source still passes the normal compiler evidence checks.
+Direct `compile_snapshot` calls compile the explicit input without filtering.
+
+Filtered snapshots retain full coverage for each supplied file, but mark the
+overall scope as `selected excerpts`. Their metadata counts selected
+`changed_files`, the original `total_changed_files`, and `excluded_test_files`,
+with a visible warning explaining the opt-in. A test-only input can produce an
+empty deterministic report; narration asks the caller to use `--include-tests`.
+Saved snapshots contain the selected evidence, so excluded tests require a
+fresh capture to restore. Rendering an existing report does not filter it.
+
 ```json
 {
   "schema": "diffstory.snapshot.v1",
