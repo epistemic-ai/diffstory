@@ -780,6 +780,41 @@ class WalkthroughNarrator:
         self.prepare(report)
         return self.generate_prepared()
 
+    def prepared_run_identity(self) -> str:
+        """Identify the prepared evidence, requests, provider, and run limits.
+
+        Returns:
+            The same SHA256 identity used to bind durable runtime budgets.
+
+        Raises:
+            WalkthroughError: If no plan has been prepared or it was consumed.
+
+        Preconditions:
+            ``prepare`` returned a plan that has not yet been consumed.
+        Postconditions:
+            The plan remains available for generation without any state writes.
+        """
+        from .walkthrough_plan import EDITOR_SYSTEM
+        from .walkthrough_plan import Editorial
+
+        if self._prepared is None:
+            msg = "Prepare a walkthrough before generation"
+            raise WalkthroughError(msg)
+        plan = self._prepared
+        return digest(
+            {
+                "evidence": plan.evidence_digest,
+                "provider": plan.provider,
+                "writers": [
+                    request_key(writer.body, plan.provider)
+                    for writer in plan.writers
+                ],
+                "editor_system": EDITOR_SYSTEM,
+                "editor_schema": Editorial.model_json_schema(),
+                "limits": asdict(self.limits),
+            }
+        )
+
     def generate_prepared(self) -> dict:
         """Execute the approved plan, sharing budgets across writers and editor.
 
@@ -812,9 +847,7 @@ class WalkthroughNarrator:
         from .walkthrough_plan import editorial_input
         from .walkthrough_plan import validate_part
 
-        if self._prepared is None:
-            msg = "Prepare a walkthrough before generation"
-            raise WalkthroughError(msg)
+        run_identity = self.prepared_run_identity()
         plan = copy.deepcopy(self._prepared)
         self._prepared = None
         packet = plan.packet
@@ -824,19 +857,6 @@ class WalkthroughNarrator:
         ):
             msg = "Prepared walkthrough evidence or provider configuration changed"
             raise WalkthroughError(msg)
-        run_identity = digest(
-            {
-                "evidence": plan.evidence_digest,
-                "provider": plan.provider,
-                "writers": [
-                    request_key(writer.body, plan.provider)
-                    for writer in plan.writers
-                ],
-                "editor_system": EDITOR_SYSTEM,
-                "editor_schema": Editorial.model_json_schema(),
-                "limits": asdict(self.limits),
-            }
-        )
         self.timings["preparation_seconds"] = time.monotonic() - started
         runtime = WalkthroughRuntime(
             self.provider,

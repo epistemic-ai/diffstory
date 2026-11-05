@@ -240,7 +240,7 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
     state_group.add_argument(
         "--state-dir",
         type=Path,
-        help="Durable attempt budget directory (default: <out>.narration-state)",
+        help="Exact attempt budget directory (default: <out>.narration-state/<plan-identity>)",
     )
     state_group.add_argument(
         "--fresh-state",
@@ -486,13 +486,52 @@ def _checkpoint_directory(args: argparse.Namespace) -> Path | None:
     return Path(args.out).with_suffix(".narration-cache")
 
 
-def _recovery_directory(args: argparse.Namespace) -> Path:
-    """Select durable state without any automatic reset or fallback."""
+def _recovery_directory(args: argparse.Namespace, identity: str) -> Path:
+    """Select exact-plan state while retaining matching legacy run budgets.
+
+    Args:
+        args: Parsed output path and optional explicit state directory.
+        identity: SHA256 identity of the prepared narration plan and limits.
+
+    Returns:
+        The explicit directory, a matching legacy directory, or a plan-specific
+        child of the default state root. No files are changed.
+
+    Raises:
+        CliError: If legacy state cannot be identified within its byte bound.
+
+    Preconditions:
+        ``identity`` comes from the narrator's prepared run identity.
+    Postconditions:
+        Repeating the same plan selects the same budgets. Different plans can
+        share an output path without resetting or overwriting earlier state.
+    """
+    from .walkthrough_runtime import MAX_RECORD_BYTES
+
     if args.fresh_state is not None:
         return args.fresh_state
     if args.state_dir is not None:
         return args.state_dir
-    return Path(args.out).with_suffix(".narration-state")
+    root = Path(args.out).with_suffix(".narration-state")
+    legacy = root / "run.json"
+    if legacy.exists():
+        try:
+            saved = read_json(str(legacy), max_bytes=MAX_RECORD_BYTES)
+            saved_identity = saved.get("identity")
+            if (
+                not isinstance(saved_identity, str)
+                or len(saved_identity) != len(identity)
+                or any(c not in "0123456789abcdef" for c in saved_identity)
+            ):
+                raise ValueError  # noqa: TRY301 # Reject unidentifiable legacy budgets.
+        except (ValueError, TypeError):
+            msg = (
+                "Narration run state is corrupt; spent attempts were not reset"
+            )
+            raise CliError(msg) from None
+        if saved_identity == identity:
+            return root
+    return root / identity
 
 
 def _confirm_source_transfer(
@@ -569,17 +608,17 @@ def _generate_walkthrough(
         msg = "No changes remain after excluding test files. Rerun with --include-tests to narrate tests."
         raise CliError(msg)
     provider = _create_provider(args)
-    state = _recovery_directory(args)
-    if args.fresh_state is not None and state.exists():
-        msg = "--fresh-state requires a new directory; existing budgets are retained"
-        raise CliError(msg)
     narrator = WalkthroughNarrator(
         provider,
         concurrency=args.concurrency,
-        state_dir=state,
         cache_dir=_checkpoint_directory(args),
     )
     plan = narrator.prepare(report)
+    state = _recovery_directory(args, narrator.prepared_run_identity())
+    if args.fresh_state is not None and state.exists():
+        msg = "--fresh-state requires a new directory; existing budgets are retained"
+        raise CliError(msg)
+    narrator.state_dir = state
     print(f"Provider: {provider.name} · model: {provider.model}")
     print(f"Destination: {provider.destination}")
     print(

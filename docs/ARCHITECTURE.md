@@ -275,10 +275,15 @@ provider-reported input, cached input, and output token totals. These counts do
 not show that the generated explanation is correct.
 
 Run attempts and the original deadline are stored durably. The default state
-path replaces the output suffix with `.narration-state`; `--state-dir` selects
-a path. Resume uses the recorded attempt budget and deadline. `--fresh-state`
-requires a new path and retains old state. Payload cache data is separate: by
-default it replaces the output suffix with `.narration-cache`. `--cache-dir`
+root replaces the output suffix with `.narration-state`. Each exact plan uses
+a child directory named by its runtime identity, which binds source evidence,
+prepared requests, provider, and limits. Different PRs or updated inputs can
+share one output path. Matching legacy `run.json` files at the state root are
+still resumed there, preserving spent attempts and deadlines; unidentifiable
+legacy state is rejected. `--state-dir` selects an exact directory without
+automatic subdivision. Resume uses the recorded attempt budget and deadline.
+`--fresh-state` requires a new path and retains old state. Payload cache data
+is separate: by default it replaces the output suffix with `.narration-cache`. `--cache-dir`
 selects a path and `--no-cache` disables payload reuse without disabling run
 state. Cache entries are bound to prepared requests and revalidated before
 reuse. Codex passes the selected model explicitly to the CLI, including the

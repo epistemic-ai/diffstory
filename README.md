@@ -55,6 +55,11 @@ The explicit `diffstory github 'OWNER/REPO#123'` form has the same defaults.
 Use `--out pr.html` to choose another output file, or `--no-narrate` to build a
 basic report without a model call.
 
+Different PRs and changed inputs keep separate budgets under
+`walkthrough.narration-state/`, so they can use the same output filename.
+Retrying an identical plan keeps its spent attempts and original deadline.
+Use `--fresh-state NEW_DIRECTORY` to intentionally start a new budget.
+
 For a private repository, set
 `GITHUB_TOKEN` or sign in with `gh auth login`. Diffstory uses the token when
 set and can fall back to the signed-in GitHub CLI account. Public pull requests
