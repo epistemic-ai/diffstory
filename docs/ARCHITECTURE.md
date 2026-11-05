@@ -201,7 +201,10 @@ optional. Generated prose puts identifiers, paths, commands, and literal
 values in backticks. Manual annotations may be partial. Their revision and ID
 checks do not prove that a prose claim is true.
 
-The `git`, `github`, and `snapshot` commands accept `--narrate`. The current
+GitHub PR commands prepare narration by default; `--no-narrate` selects a
+basic report. The `git` and `snapshot` commands require `--narrate` to prepare
+model-written explanations. Supplying `--annotations` reapplies saved prose
+without generation. The current
 flat report uses `diffstory.report.v2`; its source packet uses
 `diffstory.packet.v1`; its annotation export uses
 `diffstory.annotations.walkthrough.v1`. The packet stores each source buffer
@@ -238,12 +241,13 @@ prose or claim that repository tests ran.
 
 ### Provider consent, limits, and state
 
-OpenAI Responses is the default provider; `--provider codex` selects the
-signed-in Codex CLI. OpenAI uses an API key from `OPENAI_API_KEY` by default,
+The CLI defaults to the signed-in Codex CLI and `gpt-6.1-sol`;
+`--provider openai` selects OpenAI Responses. OpenAI uses an API key from
+`OPENAI_API_KEY` by default,
 or the environment variable named by `--api-key-env`. Codex uses `codex exec`
-and saved CLI sign-in. Both providers default to `gpt-6.1-terra`. OpenAI
-currently supports that model; Codex also accepts the known-capacity overrides
-`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`, and `gpt-5.3-codex`. Unknown Codex
+and saved CLI sign-in. OpenAI defaults to and currently supports
+`gpt-6.1-terra`; Codex also accepts the known-capacity overrides
+`gpt-6.1-terra`, `gpt-6-astra`, `gpt-6-luna`, and `gpt-5.3-codex`. Unknown Codex
 overrides are rejected before source transfer.
 Before sending source, the CLI displays the provider destination, revision
 scope, and planned request count, then asks for consent.
@@ -286,8 +290,12 @@ default, so persistent caching also works without a `--model` override.
 # Compile local changes and write HTML plus a .report.json file.
 diffstory git --repo . --base BASE --head HEAD --out walkthrough.html
 
-# Read a pull request. Add --narrate only to send its prepared source to a provider.
-diffstory github 'OWNER/REPO#NUMBER' --narrate --out walkthrough.html
+# Read a pull request with Codex/Sol narration after source-transfer consent.
+# The explicit github subcommand is optional; output defaults to walkthrough.html.
+diffstory 'OWNER/REPO#NUMBER'
+
+# Read a pull request without model narration.
+diffstory 'OWNER/REPO#NUMBER' --no-narrate
 
 # Compile a saved diffstory.snapshot.v1 input.
 diffstory snapshot input.snapshot.json --out walkthrough.html

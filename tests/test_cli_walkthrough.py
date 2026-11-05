@@ -311,20 +311,21 @@ class CliWalkthroughTests(unittest.TestCase):
             self.assertFalse((root / "story.report.json").exists())
 
     def test_default_model_is_resolved_before_consent(self) -> None:
-        """An omitted model must select Terra and accept caching for either provider."""
+        """CLI model defaults and overrides must be resolved before consent."""
         cases = [
-            ("openai", "gpt-6.1-terra"),
-            ("codex", "gpt-6.1-terra"),
+            ("openai", None, "gpt-6.1-terra"),
+            ("codex", None, "gpt-6.1-sol"),
+            ("codex", "gpt-6.1-terra", "gpt-6.1-terra"),
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             snapshot = root / "input.json"
             snapshot.write_text(json.dumps(snap({}, {"a.py": "x = 1\n"})))
-            for provider, expected_model in cases:
+            for provider, override, expected_model in cases:
                 output = io.StringIO()
                 errors = io.StringIO()
                 with (
-                    self.subTest(provider=provider),
+                    self.subTest(provider=provider, override=override),
                     patch(
                         "diffstory.cli.OpenAIResponsesProvider.require_credentials"
                     ),
@@ -335,19 +336,20 @@ class CliWalkthroughTests(unittest.TestCase):
                     contextlib.redirect_stdout(output),
                     contextlib.redirect_stderr(errors),
                 ):
-                    result = main(
-                        [
-                            "snapshot",
-                            str(snapshot),
-                            "--narrate",
-                            "--provider",
-                            provider,
-                            "--cache-dir",
-                            str(root / provider / "cache"),
-                            "--out",
-                            str(root / f"{provider}.html"),
-                        ]
-                    )
+                    arguments = [
+                        "snapshot",
+                        str(snapshot),
+                        "--narrate",
+                        "--provider",
+                        provider,
+                        "--cache-dir",
+                        str(root / provider / "cache"),
+                        "--out",
+                        str(root / f"{provider}.html"),
+                    ]
+                    if override:
+                        arguments.extend(["--model", override])
+                    result = main(arguments)
                     self.assertEqual(result, 2)
                     self.assertIn(
                         f"model: {expected_model}", output.getvalue()

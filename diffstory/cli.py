@@ -19,9 +19,9 @@ from .analysis import compile_snapshot
 from .analysis import evidence_packet
 from .ingest import from_git
 from .ingest import from_github
+from .ingest import parse_pr
 from .models import MAX_SNAPSHOT_SOURCE_BYTES
 from .providers import CODEX_MODEL_CAPACITIES
-from .providers import DEFAULT_MODEL
 from .providers import OPENAI_MODEL
 from .providers import CodexCLIProvider
 from .providers import NarrativeProvider
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 MAX_INPUT_BYTES = 80_000_000
 MAX_REPORT_BYTES = 256_000_000
 MAX_HTML_BYTES = 256_000_000
+DEFAULT_CODEX_MODEL = "gpt-6.1-sol"
 
 
 class CliError(ValueError):
@@ -187,18 +188,29 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
         default=MAX_SNAPSHOT_SOURCE_BYTES,
         help="Aggregate source limit across both revisions (default: 64000000; may be lowered)",
     )
-    parser.add_argument(
+    narration_group = parser.add_mutually_exclusive_group()
+    narration_group.add_argument(
         "--narrate",
         action="store_true",
-        help="Generate model-written source explanations (sends PR source to the selected provider)",
+        default=None,
+        help="Generate model-written source explanations (default for GitHub; requires source-transfer confirmation)",
+    )
+    narration_group.add_argument(
+        "--no-narrate",
+        action="store_false",
+        dest="narrate",
+        help="Build a basic report without a model call",
     )
     parser.add_argument(
-        "--provider", choices=["openai", "codex"], default="openai"
+        "--provider",
+        choices=["openai", "codex"],
+        default="codex",
+        help="Narration provider (default: codex)",
     )
     parser.add_argument(
         "--model",
         help=(
-            f"Optional model override (default: {DEFAULT_MODEL}; "
+            f"Optional model override (Codex default: {DEFAULT_CODEX_MODEL}; "
             f"OpenAI: {OPENAI_MODEL}; Codex: "
             + ", ".join(CODEX_MODEL_CAPACITIES)
             + ")"
@@ -267,6 +279,11 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="diffstory",
         description=(
             "Compile a semantic code walkthrough. Repository code is never executed."
+        ),
+        epilog=(
+            "Shortcut: diffstory 'OWNER/REPO#123' (or a GitHub PR URL) "
+            "narrates with Codex/Sol and writes walkthrough.html. "
+            "Source transfer requires confirmation; --no-narrate builds a basic report."
         ),
     )
     parser.add_argument(
@@ -364,8 +381,16 @@ def _build_parser() -> argparse.ArgumentParser:
         snapshot_parser,
         render_parser,
     ):
+        is_github = command_parser is github_parser
         command_parser.add_argument(
-            "--out", required=True, help="Output .html file"
+            "--out",
+            required=not is_github,
+            default="walkthrough.html" if is_github else None,
+            help=(
+                "Output .html file (default: walkthrough.html)"
+                if is_github
+                else "Output .html file"
+            ),
         )
         command_parser.add_argument(
             "--annotations",
@@ -587,7 +612,7 @@ def _create_provider(args: argparse.Namespace) -> NarrativeProvider:
         provider = (
             OpenAIResponsesProvider(token_env=args.api_key_env)
             if args.provider == "openai"
-            else CodexCLIProvider(model=args.model)
+            else CodexCLIProvider(model=args.model or DEFAULT_CODEX_MODEL)
         )
         provider.require_credentials()
     except Exception:  # noqa: BLE001 # Adapter setup can contain credential text.
@@ -1032,7 +1057,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     """
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments:
+        try:
+            parse_pr(arguments[0])
+        except ValueError:
+            pass
+        else:
+            arguments.insert(0, "github")
+    args = parser.parse_args(arguments)
+    if args.command in {"git", "github", "snapshot"} and args.narrate is None:
+        args.narrate = args.command == "github" and not args.annotations
 
     try:
         _validate_command_options(args)
