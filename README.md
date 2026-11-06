@@ -42,33 +42,65 @@ committed revisions; it does not include uncommitted changes. Open
 ## Read a GitHub pull request
 
 ```bash
-diffstory github 'OWNER/REPO#123' --out pr.html
+diffstory 'OWNER/REPO#123'
 ```
 
-Replace `OWNER/REPO#123` with a pull request. For a private repository, set
+Replace `OWNER/REPO#123` with a pull request, or use its GitHub URL. This prepares
+model-written explanations with Codex and `gpt-6.1-sol`, asks before sending
+source, and writes `walkthrough.html`. Use your saved Codex CLI sign-in, or sign
+in with `codex login`. From a source checkout, run
+`uv run diffstory 'OWNER/REPO#123'`.
+
+The explicit `diffstory github 'OWNER/REPO#123'` form has the same defaults.
+Use `--out pr.html` to choose another output file, or `--no-narrate` to build a
+basic report without a model call.
+
+Different PRs and changed inputs keep separate budgets under
+`walkthrough.narration-state/`, so they can use the same output filename.
+Retrying an identical plan keeps its spent attempts and original deadline.
+Use `--fresh-state NEW_DIRECTORY` to intentionally start a new budget.
+New runs budget four minutes per writer wave and another four minutes for an
+editor when needed. The preview shows the total before confirmation;
+`--timeout-seconds` can override it, up to 2,160 seconds. Each provider call
+still has a four-minute maximum.
+
+For a private repository, set
 `GITHUB_TOKEN` or sign in with `gh auth login`. Diffstory uses the token when
 set and can fall back to the signed-in GitHub CLI account. Public pull requests
 can be read without credentials.
 
-## Optional model-written explanations
+The `git`, `github`, and `snapshot` commands exclude test files by default.
+Add `--include-tests` to include tests in the report and narration:
 
-Add `--narrate` to a local or GitHub command to ask for source-linked
-explanations:
+```bash
+diffstory 'OWNER/REPO#123' --include-tests
+```
+
+This includes files under `test/`, `tests/`, or `__tests__/`, `conftest.py`,
+and common names such as `test_value.py`, `value_test.go`, and `value.spec.js`.
+Filtered reports show a scope warning and the number of excluded files.
+To restore tests omitted from a saved snapshot, capture the input again with
+`--include-tests`.
+
+## Model-written explanations
+
+GitHub PR commands prepare narration by default. Local Git and saved snapshot
+commands build basic reports unless you add `--narrate`:
 
 ```bash
 diffstory git --repo /path/to/your/project \
   --base main --head HEAD --narrate --out walkthrough.html
 ```
 
-Both providers use `gpt-6.1-terra` by default. OpenAI is the default provider
-and uses `OPENAI_API_KEY`. To use a saved Codex CLI login, add
-`--provider codex`. Before it sends source, Diffstory shows the provider and
-revision scope, then asks for approval. It sends source only when you request
-`--narrate`.
+The CLI uses Codex and `gpt-6.1-sol` by default. Use `--model` to select another
+supported Codex model. To use the OpenAI API with `gpt-6.1-terra`, add
+`--provider openai` and set `OPENAI_API_KEY`. Before it sends source, Diffstory
+shows the provider and revision scope, then asks for approval. `--yes` skips
+that prompt when you have already approved the transfer.
 
 ## What the walkthrough shows
 
-Without `--narrate`, Diffstory builds a basic walkthrough locally. It compares
+In basic-report mode, Diffstory builds the walkthrough locally. It compares
 Python code structurally and keeps other languages as text. Original Git
 patches stay intact. A separate function comparison can help explain
 definitions that moved or changed. The reader keeps original line numbers

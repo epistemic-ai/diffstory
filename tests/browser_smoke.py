@@ -31,7 +31,9 @@ from diffstory.analysis import (  # noqa: E402, I001
     compile_snapshot,
 )
 from diffstory.render import render  # noqa: E402
+from diffstory.walkthrough import WalkthroughNarrator  # noqa: E402
 from test_analysis import snap  # noqa: E402
+from test_walkthrough import FixtureProvider  # noqa: E402
 
 
 def check_story_sections(
@@ -479,6 +481,53 @@ def check_file_evidence(  # noqa: PLR0915 # One public fixture matrix binds rend
     proof_page.close()
 
 
+def check_embedded_carriage_returns(browser: Browser, check: Callable) -> None:
+    """Keep flat reader row text and line numbers aligned with Git evidence.
+
+    Args:
+        browser: Open Chromium instance.
+        check: Assertion callback that counts successful checks.
+
+    Postconditions:
+        Embedded and EOF CR remain inside their original numbered rows, CRLF
+        remains one terminator, and no script error or network request occurs.
+    """
+    cases = [
+        ("<doc>\nleft\rright\n</doc>\n", ["<doc>", "left\rright", "</doc>"]),
+        ("terminal\r", ["terminal\r"]),
+        ("one\r\r\ntwo\r\n", ["one\r", "two"]),
+    ]
+    proof_page = browser.new_page(viewport={"width": 1280, "height": 900})
+    errors, requests = [], []
+    proof_page.on("pageerror", lambda error: errors.append(str(error)))
+    proof_page.on("request", lambda request: requests.append(request.url))
+    try:
+        for source, expected in cases:
+            compiler = compile_snapshot(snap({}, {"sample.xml": source}))
+            report = WalkthroughNarrator(FixtureProvider()).generate(compiler)
+            proof_page.set_content(
+                render(report), wait_until="domcontentloaded"
+            )
+            block = proof_page.locator(".code-block").first
+            block.scroll_into_view_if_needed()
+            expect(block.locator(".code-line")).to_have_count(len(expected))
+            actual = block.locator(".code-line").evaluate_all(
+                "nodes => nodes.map(node => [[...node.querySelectorAll('.line-no')].at(-1).textContent, node.querySelector('.code-text').textContent])"
+            )
+            check(
+                actual
+                == [
+                    [str(index), text]
+                    for index, text in enumerate(expected, 1)
+                ],
+                "CR source retains original row text and Git line numbers",
+            )
+        check(not errors, "CR reader has no JavaScript errors")
+        check(not requests, "CR reader makes no network requests")
+    finally:
+        proof_page.close()
+
+
 def check_authored_preamble(
     browser: Browser, check: Callable, smoke_report: dict
 ) -> None:
@@ -860,6 +909,7 @@ def main() -> None:  # noqa: PLR0915  # Sequential reader interactions share pag
         check_section_completeness_guard(browser, check)
         smoke_report = file_evidence_report()
         check_file_evidence(browser, check, smoke_report)
+        check_embedded_carriage_returns(browser, check)
         check_authored_preamble(browser, check, smoke_report)
         check_decision_flowchart(browser, check, smoke_report)
 

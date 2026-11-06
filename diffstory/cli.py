@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,15 +20,18 @@ from .analysis import compile_snapshot
 from .analysis import evidence_packet
 from .ingest import from_git
 from .ingest import from_github
+from .ingest import parse_pr
 from .models import MAX_SNAPSHOT_SOURCE_BYTES
 from .providers import CODEX_MODEL_CAPACITIES
-from .providers import DEFAULT_MODEL
 from .providers import OPENAI_MODEL
 from .providers import CodexCLIProvider
 from .providers import NarrativeProvider
 from .providers import OpenAIResponsesProvider
 from .render import _render_prevalidated
 from .render import validate_report
+from .source_selection import without_test_files
+from .walkthrough_runtime import MAX_CALL_SECONDS
+from .walkthrough_runtime import MAX_SECONDS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -35,9 +39,13 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import BinaryIO
 
+    from .walkthrough import WalkthroughNarrator
+    from .walkthrough_plan import WalkthroughPlan
+
 MAX_INPUT_BYTES = 80_000_000
 MAX_REPORT_BYTES = 256_000_000
 MAX_HTML_BYTES = 256_000_000
+DEFAULT_CODEX_MODEL = "gpt-6.1-sol"
 
 
 class CliError(ValueError):
@@ -170,29 +178,45 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
         parser: Argument parser for the Git or GitHub source command.
 
     Side Effects:
-        Adds source-limit, narration, provider, model, confirmation,
+        Adds test selection, source-limit, narration, provider, model, confirmation,
         annotation, concurrency, and mutually exclusive cache options directly
         to ``parser``.
 
     """
+    parser.add_argument(
+        "--include-tests",
+        action="store_true",
+        help="Include test files in analysis and narration (excluded by default)",
+    )
     parser.add_argument(
         "--max-source-bytes",
         type=int,
         default=MAX_SNAPSHOT_SOURCE_BYTES,
         help="Aggregate source limit across both revisions (default: 64000000; may be lowered)",
     )
-    parser.add_argument(
+    narration_group = parser.add_mutually_exclusive_group()
+    narration_group.add_argument(
         "--narrate",
         action="store_true",
-        help="Generate model-written source explanations (sends PR source to the selected provider)",
+        default=None,
+        help="Generate model-written source explanations (default for GitHub; requires source-transfer confirmation)",
+    )
+    narration_group.add_argument(
+        "--no-narrate",
+        action="store_false",
+        dest="narrate",
+        help="Build a basic report without a model call",
     )
     parser.add_argument(
-        "--provider", choices=["openai", "codex"], default="openai"
+        "--provider",
+        choices=["openai", "codex"],
+        default="codex",
+        help="Narration provider (default: codex)",
     )
     parser.add_argument(
         "--model",
         help=(
-            f"Optional model override (default: {DEFAULT_MODEL}; "
+            f"Optional model override (Codex default: {DEFAULT_CODEX_MODEL}; "
             f"OpenAI: {OPENAI_MODEL}; Codex: "
             + ", ".join(CODEX_MODEL_CAPACITIES)
             + ")"
@@ -218,11 +242,16 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
         default=4,
         help="Maximum concurrent narration tasks (default: 4)",
     )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=_positive_integer,
+        help="Total narration deadline (default: 240 seconds per planned writer wave and editor stage; maximum: 2160)",
+    )
     state_group = parser.add_mutually_exclusive_group()
     state_group.add_argument(
         "--state-dir",
         type=Path,
-        help="Durable attempt budget directory (default: <out>.narration-state)",
+        help="Exact attempt budget directory (default: <out>.narration-state/<plan-identity>)",
     )
     state_group.add_argument(
         "--fresh-state",
@@ -261,6 +290,11 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="diffstory",
         description=(
             "Compile a semantic code walkthrough. Repository code is never executed."
+        ),
+        epilog=(
+            "Shortcut: diffstory 'OWNER/REPO#123' (or a GitHub PR URL) "
+            "narrates with Codex/Sol and writes walkthrough.html. "
+            "Source transfer requires confirmation; --no-narrate builds a basic report."
         ),
     )
     parser.add_argument(
@@ -358,8 +392,16 @@ def _build_parser() -> argparse.ArgumentParser:
         snapshot_parser,
         render_parser,
     ):
+        is_github = command_parser is github_parser
         command_parser.add_argument(
-            "--out", required=True, help="Output .html file"
+            "--out",
+            required=not is_github,
+            default="walkthrough.html" if is_github else None,
+            help=(
+                "Output .html file (default: walkthrough.html)"
+                if is_github
+                else "Output .html file"
+            ),
         )
         command_parser.add_argument(
             "--annotations",
@@ -397,6 +439,7 @@ def _load_snapshot(args: argparse.Namespace) -> dict | None:
             two_dot=args.two_dot,
             max_files=args.max_files,
             max_source_bytes=args.max_source_bytes,
+            include_tests=args.include_tests,
         )
     if args.command == "github":
         return from_github(
@@ -404,9 +447,11 @@ def _load_snapshot(args: argparse.Namespace) -> dict | None:
             token_env=args.token_env,
             max_files=args.max_files,
             max_source_bytes=args.max_source_bytes,
+            include_tests=args.include_tests,
         )
     if args.command == "snapshot":
-        return read_json(args.input)
+        snapshot = read_json(args.input)
+        return snapshot if args.include_tests else without_test_files(snapshot)
     return None
 
 
@@ -452,13 +497,97 @@ def _checkpoint_directory(args: argparse.Namespace) -> Path | None:
     return Path(args.out).with_suffix(".narration-cache")
 
 
-def _recovery_directory(args: argparse.Namespace) -> Path:
-    """Select durable state without any automatic reset or fallback."""
+def _recovery_directory(args: argparse.Namespace, identity: str) -> Path:
+    """Select exact-plan state while retaining matching legacy run budgets.
+
+    Args:
+        args: Parsed output path and optional explicit state directory.
+        identity: SHA256 identity of the prepared narration plan and limits.
+
+    Returns:
+        The explicit directory, a matching legacy directory, or a plan-specific
+        child of the default state root. No files are changed.
+
+    Raises:
+        CliError: If legacy state cannot be identified within its byte bound.
+
+    Preconditions:
+        ``identity`` comes from the narrator's prepared run identity.
+    Postconditions:
+        Repeating the same plan selects the same budgets. Different plans can
+        share an output path without resetting or overwriting earlier state.
+    """
+    from .walkthrough_runtime import MAX_RECORD_BYTES
+
     if args.fresh_state is not None:
         return args.fresh_state
     if args.state_dir is not None:
         return args.state_dir
-    return Path(args.out).with_suffix(".narration-state")
+    root = Path(args.out).with_suffix(".narration-state")
+    legacy = root / "run.json"
+    if legacy.exists():
+        try:
+            saved = read_json(str(legacy), max_bytes=MAX_RECORD_BYTES)
+            saved_identity = saved.get("identity")
+            if (
+                not isinstance(saved_identity, str)
+                or len(saved_identity) != len(identity)
+                or any(c not in "0123456789abcdef" for c in saved_identity)
+            ):
+                raise ValueError  # noqa: TRY301 # Reject unidentifiable legacy budgets.
+        except (ValueError, TypeError):
+            msg = (
+                "Narration run state is corrupt; spent attempts were not reset"
+            )
+            raise CliError(msg) from None
+        if saved_identity == identity:
+            return root
+    return root / identity
+
+
+def _narration_state(
+    args: argparse.Namespace,
+    narrator: WalkthroughNarrator,
+    plan: WalkthroughPlan,
+) -> Path:
+    """Select a finite plan deadline without renewing an older run's budgets.
+
+    Args:
+        args: Parsed output, state, concurrency, and optional timeout settings.
+        narrator: Narrator with one prepared plan, before any source transfer.
+        plan: That narrator's prepared writing and editorial requests.
+
+    Returns:
+        The exact state directory after resolving the narrator's total limit.
+
+    Postconditions:
+        A matching earlier 240-second run keeps its original limits and state.
+        New runs get 240 seconds per writer wave and editorial stage, unless
+        the user supplies a bounded total override. No state file is changed.
+    """
+    from .walkthrough_runtime import MAX_RECORD_BYTES
+
+    if args.timeout_seconds is None and args.fresh_state is None:
+        earlier_identity = narrator.prepared_run_identity()
+        earlier_state = _recovery_directory(args, earlier_identity)
+        record_path = earlier_state / "run.json"
+        if record_path.exists():
+            record = read_json(str(record_path), max_bytes=MAX_RECORD_BYTES)
+            if record.get("identity") == earlier_identity:
+                return earlier_state
+            if args.state_dir is None:
+                msg = "Narration state does not match its directory; existing budgets were retained. Use --fresh-state NEW_DIRECTORY for a deliberate new run."
+                raise CliError(msg)
+    seconds = float(
+        args.timeout_seconds
+        or MAX_CALL_SECONDS
+        * (
+            math.ceil(len(plan.writers) / narrator.limits.concurrency)
+            + int(not plan.single)
+        )
+    )
+    narrator.limits = replace(narrator.limits, seconds=seconds)
+    return _recovery_directory(args, narrator.prepared_run_identity())
 
 
 def _confirm_source_transfer(
@@ -520,7 +649,7 @@ def _generate_walkthrough(
 
     Raises:
         ValueError: If consent, capacity, or output validation fails.
-        TimeoutError: If narration exceeds its four-minute deadline.
+        TimeoutError: If narration exceeds its selected total deadline.
 
     Preconditions:
         ``report`` is a compiler report that passed the loader's validation;
@@ -531,25 +660,29 @@ def _generate_walkthrough(
     """
     from .walkthrough import WalkthroughNarrator
 
-    provider = _create_provider(args)
-    state = _recovery_directory(args)
-    if args.fresh_state is not None and state.exists():
-        msg = "--fresh-state requires a new directory; existing budgets are retained"
+    if not report["changes"] and report["meta"].get("excluded_test_files"):
+        msg = "No changes remain after excluding test files. Rerun with --include-tests to narrate tests."
         raise CliError(msg)
+    provider = _create_provider(args)
     narrator = WalkthroughNarrator(
         provider,
+        deadline_seconds=float(args.timeout_seconds or MAX_CALL_SECONDS),
         concurrency=args.concurrency,
-        state_dir=state,
         cache_dir=_checkpoint_directory(args),
     )
     plan = narrator.prepare(report)
+    state = _narration_state(args, narrator, plan)
+    if args.fresh_state is not None and state.exists():
+        msg = "--fresh-state requires a new directory; existing budgets are retained"
+        raise CliError(msg)
+    narrator.state_dir = state
     print(f"Provider: {provider.name} · model: {provider.model}")
     print(f"Destination: {provider.destination}")
     print(
         f"Walkthrough: {len(plan.writers)} writing + {int(not plan.single)} editorial requests · {len(plan.packet['regions'])} changed regions · {sum(len(writer.body) for writer in plan.writers):,} prepared writing bytes"
     )
     print(
-        "Limits: 12 total attempts · 4 concurrent calls · 240 seconds · 1 MiB model annotations"
+        f"Limits: {narrator.limits.requests} total attempts · {narrator.limits.concurrency} concurrent calls · {narrator.limits.seconds:g} seconds total · {MAX_CALL_SECONDS:g} seconds per call · 1 MiB model annotations"
     )
     _confirm_source_transfer(assume_yes=args.yes, provider=provider)
     generated = narrator.generate_prepared()
@@ -575,7 +708,7 @@ def _create_provider(args: argparse.Namespace) -> NarrativeProvider:
         provider = (
             OpenAIResponsesProvider(token_env=args.api_key_env)
             if args.provider == "openai"
-            else CodexCLIProvider(model=args.model)
+            else CodexCLIProvider(model=args.model or DEFAULT_CODEX_MODEL)
         )
         provider.require_credentials()
     except Exception:  # noqa: BLE001 # Adapter setup can contain credential text.
@@ -870,6 +1003,13 @@ def _export_evidence(args: argparse.Namespace) -> int:
 def _validate_command_options(args: argparse.Namespace) -> None:
     """Reject conflicting source-generation and annotation options."""
     uses_repository_source = args.command in {"git", "github", "snapshot"}
+    if (
+        uses_repository_source
+        and args.timeout_seconds is not None
+        and args.timeout_seconds > MAX_SECONDS
+    ):
+        msg = "--timeout-seconds must be at most 2160"
+        raise CliError(msg)
     if uses_repository_source and args.narrate and args.annotations:
         msg = "Use --narrate or --annotations, not both"
         raise CliError(msg)
@@ -1020,7 +1160,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     """
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments:
+        try:
+            parse_pr(arguments[0])
+        except ValueError:
+            pass
+        else:
+            arguments.insert(0, "github")
+    args = parser.parse_args(arguments)
+    if args.command in {"git", "github", "snapshot"} and args.narrate is None:
+        args.narrate = args.command == "github" and not args.annotations
 
     try:
         _validate_command_options(args)

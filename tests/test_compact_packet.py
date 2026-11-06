@@ -69,7 +69,8 @@ class CompactPacketTests(unittest.TestCase):
         """Unicode separators and CRLF must not shift original source lines."""
         cases = [
             ("x = 'one\u2028two'\r\ny = 2\r\n", 2, "y = 2\r\n"),
-            ("x = 1\ry = 2\r", 2, "y = 2\r"),
+            ("x = 1\ry = 2\r", 1, "x = 1\ry = 2\r"),
+            ("x = 1\nvalue = 'a\rb'\ny = 2\n", 3, "y = 2\n"),
         ]
         for source, line, expected in cases:
             with self.subTest(source=source):

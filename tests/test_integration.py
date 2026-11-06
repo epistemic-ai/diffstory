@@ -130,6 +130,44 @@ class GitIntegrationTests(unittest.TestCase):
             self.assertEqual(raw["diff_origin"], "git")
             self.assertNotIn("uncommitted content", raw["original_patch"])
 
+    def test_test_selection_precedes_source_reads_and_preserves_opt_in(
+        self,
+    ) -> None:
+        """Excluded tests must not consume source limits or appear in patches."""
+        path = self.root / "tests" / "test_large.py"
+        path.parent.mkdir()
+        path.write_text("# " + "x" * 10_000 + "\nvalue = 1\n")
+        self.git("add", "tests/test_large.py")
+        self.git("commit", "-qm", "add test fixture")
+        head = self.git("rev-parse", "HEAD").strip()
+        cases = [(False, False), (True, True)]
+        for include_tests, contains_test in cases:
+            with self.subTest(include_tests=include_tests):
+                options = {"include_tests": True} if include_tests else {}
+                snapshot = from_git(str(self.root), self.base, head, **options)
+                self.assertEqual(
+                    "tests/test_large.py"
+                    in {item["path"] for item in snapshot["fragments"]},
+                    contains_test,
+                )
+                self.assertEqual(
+                    "tests/test_large.py"
+                    in {item["path"] for item in snapshot["patches"]},
+                    contains_test,
+                )
+        selected = from_git(
+            str(self.root), self.base, head, max_source_bytes=1_000
+        )
+        self.assertEqual(selected["meta"]["excluded_test_files"], 1)
+        with self.assertRaisesRegex(ValueError, "max-source-bytes"):
+            from_git(
+                str(self.root),
+                self.base,
+                head,
+                include_tests=True,
+                max_source_bytes=1_000,
+            )
+
     def test_git_patch_capture_enforces_the_aggregate_byte_limit(self) -> None:
         """Reject combined Git patches that exceed the cap after source capture."""
         for name, source in (("a.txt", "x = 1\n"), ("b.txt", "y = 1\n")):
@@ -479,6 +517,75 @@ class GitHubTransportTests(unittest.TestCase):
             s = from_github("org/repo#1")
         self.assertEqual(s["meta"]["base_sha"], "d" * 40)
         self.assertEqual(s["meta"]["requested_base_sha"], "a" * 40)
+
+    def test_default_selection_skips_test_reads_and_preserves_rename_sides(
+        self,
+    ) -> None:
+        """Only wholly test comparisons may disappear before source retrieval."""
+        rows = [
+            {
+                "filename": "tests/test_value.py",
+                "status": "added",
+                "patch": "@@ -0,0 +1 @@\n+x=1\n",
+            },
+            {"filename": "app.py", "status": "added"},
+            {
+                "filename": "feature.py",
+                "previous_filename": "tests/old.py",
+                "status": "renamed",
+            },
+            {
+                "filename": "tests/new.py",
+                "previous_filename": "old_feature.py",
+                "status": "renamed",
+            },
+        ]
+        cases = [(False, 5, 3), (True, 6, 4)]
+        for include_tests, reads, retained in cases:
+            with self.subTest(include_tests=include_tests):
+                fake, paths = self.fake(file_records=rows)
+                options = {"include_tests": True} if include_tests else {}
+                with patch("diffstory.ingest.GitHubClient.get", new=fake):
+                    snapshot = from_github(
+                        "org/repo#1", max_source_bytes=reads * 4, **options
+                    )
+                self.assertEqual(
+                    len([path for path in paths if "/contents/" in path]),
+                    reads,
+                )
+                self.assertEqual(len(snapshot["file_evidence"]), retained)
+                self.assertEqual(len(snapshot["patches"]), retained)
+                self.assertEqual(
+                    any(
+                        "/contents/tests/test_value.py?" in path
+                        for path in paths
+                    ),
+                    include_tests,
+                )
+                self.assertTrue(
+                    any("/contents/tests/old.py?" in path for path in paths)
+                )
+                self.assertTrue(
+                    any("/contents/old_feature.py?" in path for path in paths)
+                )
+                compile_snapshot(snapshot)
+
+    def test_excluded_files_do_not_hide_incomplete_github_inventory(
+        self,
+    ) -> None:
+        """Selection must not accept a truncated list as a complete comparison."""
+        fake, _ = self.fake(
+            file_records=[
+                {"filename": "tests/test_value.py", "status": "added"},
+                {"filename": "app.py", "status": "added"},
+            ],
+            returned=1,
+        )
+        with (
+            patch("diffstory.ingest.GitHubClient.get", new=fake),
+            self.assertRaisesRegex(ValueError, "complete file list"),
+        ):
+            from_github("org/repo#1")
 
     def test_ingest_maps_github_file_status_to_evidence(self) -> None:
         """Each file status must keep its base and head evidence paths."""
