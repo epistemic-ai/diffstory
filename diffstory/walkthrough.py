@@ -31,6 +31,7 @@ from .packet_schema import (
     Revision,  # noqa: TC001 # Pydantic resolves this alias at runtime.
 )
 from .usage import RunUsage
+from .walkthrough_runtime import DEFAULT_SECONDS
 from .walkthrough_runtime import MAX_REQUESTS
 from .walkthrough_runtime import RunDeadlineError
 from .walkthrough_runtime import RunLimits
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
 REPORT_VERSION = "diffstory.report.v2"
 GENERATION_VERSION = "diffstory.generation.walkthrough.v3"
 MAX_ANNOTATION_BYTES = 1_048_576
-DEFAULT_DEADLINE = 240.0
+DEFAULT_DEADLINE = DEFAULT_SECONDS
 OUTPUT_TOKENS = 12_000
 EVIDENCE_SYSTEM = (
     "Write a useful, source-linked walkthrough of this changeset using only "
@@ -705,8 +706,9 @@ class WalkthroughNarrator:
 
         Args:
             provider: Structured-output adapter with explicit model capacities.
-            deadline_seconds: Finite number greater than zero and at most 240.
-                Booleans are rejected.
+            deadline_seconds: Finite number greater than zero and at most 2160.
+                Defaults to 240. Booleans are rejected. Each provider call
+                remains bounded to at most 240 seconds.
             concurrency: Integer from 1 through 4. Booleans are rejected.
             max_requests: Integer from 1 through 12. Booleans are rejected.
             state_dir: Durable run-state directory, or ``None`` for an

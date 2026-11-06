@@ -57,16 +57,24 @@ def _read_hunks(patch: str) -> list[dict]:
         current["rows"].append(
             {
                 "tag": {" ": "context", "+": "add", "-": "delete"}[line[0]],
-                "text": line[1:],
+                "text": raw[1:],
             }
         )
     return hunks
 
 
+def _row_matches_source(text: str, source_line: str) -> bool:
+    """Allow CRLF display normalization while retaining every bare CR byte."""
+    content = source_line.removesuffix("\n")
+    return text == content or (
+        source_line.endswith("\r\n") and text == content.removesuffix("\r")
+    )
+
+
 def _bind_hunk(
     hunk: dict, old_lines: list[str], new_lines: list[str]
 ) -> list[str]:
-    """Check each row against its pinned file and attach original line numbers."""
+    """Bind exact row bytes to LF-delimited source, then normalize CRLF for display."""
     old_number = hunk["old_start"]
     new_number = hunk["new_start"]
     old_count = new_count = 0
@@ -78,7 +86,9 @@ def _bind_hunk(
         if tag != "add":
             _require(
                 1 <= old_number <= len(old_lines)
-                and old_lines[old_number - 1] == row["text"],
+                and _row_matches_source(
+                    row["text"], old_lines[old_number - 1]
+                ),
                 "Original patch row disagrees with the earlier source",
             )
             old_number += 1
@@ -86,12 +96,23 @@ def _bind_hunk(
         if tag != "delete":
             _require(
                 1 <= new_number <= len(new_lines)
-                and new_lines[new_number - 1] == row["text"],
+                and _row_matches_source(
+                    row["text"], new_lines[new_number - 1]
+                ),
                 "Original patch row disagrees with the later source",
             )
-            result.append(row["text"])
+            if tag == "context":
+                _require(
+                    old_lines[old_number - 2] == new_lines[new_number - 1],
+                    "Original patch context line endings disagree with source",
+                )
+            source_line = new_lines[new_number - 1]
+            result.append(source_line)
             new_number += 1
             new_count += 1
+        else:
+            source_line = old_lines[old_number - 2]
+        row["text"] = split_source_lines(source_line)[0]
     _require(
         (old_count, new_count) == (hunk["old_count"], hunk["new_count"]),
         "Original patch hunk is incomplete",
@@ -106,8 +127,8 @@ def parse_file_patch(patch: str, before: str, after: str) -> list[dict]:
     produces ``after`` also catches a patch that stops before its last change.
     No-newline markers stay in the retained patch text; they are not code rows.
     """
-    old_lines = split_source_lines(before)
-    new_lines = split_source_lines(after)
+    old_lines = split_source_lines(before, keepends=True)
+    new_lines = split_source_lines(after, keepends=True)
     hunks = _read_hunks(patch)
 
     result: list[str] = []

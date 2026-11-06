@@ -59,6 +59,10 @@ Different PRs and changed inputs keep separate budgets under
 `walkthrough.narration-state/`, so they can use the same output filename.
 Retrying an identical plan keeps its spent attempts and original deadline.
 Use `--fresh-state NEW_DIRECTORY` to intentionally start a new budget.
+New runs budget four minutes per writer wave and another four minutes for an
+editor when needed. The preview shows the total before confirmation;
+`--timeout-seconds` can override it, up to 2,160 seconds. Each provider call
+still has a four-minute maximum.
 
 For a private repository, set
 `GITHUB_TOKEN` or sign in with `gh auth login`. Diffstory uses the token when

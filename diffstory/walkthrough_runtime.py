@@ -30,7 +30,9 @@ RUN_VERSION = "diffstory.walkthrough-run.v2"
 CACHE_VERSION = "diffstory.walkthrough-cache.v1"
 ATTEMPTS_PER_REQUEST = 2
 MAX_RECORD_BYTES = 65_536
-MAX_SECONDS = 240.0
+DEFAULT_SECONDS = 240.0
+MAX_CALL_SECONDS = 240.0
+MAX_SECONDS = 2160.0
 MAX_REQUESTS = 12
 REQUEST_KEY_LENGTH = 64
 
@@ -50,7 +52,7 @@ class RunLimits:
     Attributes:
         requests: Total provider attempts including failed calls, at most 12.
         concurrency: Simultaneous calls, at most four.
-        seconds: Narration deadline including local preparation, at most 240.
+        seconds: Total deadline including local preparation, at most 2160.
         annotation_bytes: Cumulative canonical JSON bytes of decoded model
             responses, at most 1 MiB. Fresh responses count per attempt,
             including rejected results. A newly accepted cached result counts
@@ -59,7 +61,7 @@ class RunLimits:
 
     requests: int = MAX_REQUESTS
     concurrency: int = 4
-    seconds: float = MAX_SECONDS
+    seconds: float = DEFAULT_SECONDS
     annotation_bytes: int = 1_048_576
 
     def __post_init__(self) -> None:
@@ -77,7 +79,7 @@ class RunLimits:
             or not math.isfinite(self.seconds)
             or not 0 < self.seconds <= MAX_SECONDS
         ):
-            msg = "Narration deadline must be greater than zero and at most 240 seconds"
+            msg = "Narration deadline must be greater than zero and at most 2160 seconds"
             raise RunLimitError(msg)
 
 
@@ -341,7 +343,7 @@ class WalkthroughRuntime:
             self.record["deadline_at"] - time.time(),
         )
         if value <= 0:
-            msg = "Narration exceeded its four-minute run deadline"
+            msg = f"Narration exceeded its {self.limits.seconds:g}-second run deadline; existing budgets were retained. Use --fresh-state NEW_DIRECTORY for a deliberate new run."
             raise RunDeadlineError(msg)
         return value
 
@@ -369,7 +371,7 @@ class WalkthroughRuntime:
             self.record["usage"]["calls"] += 1
             self.record["usage"]["unreported_calls"] += 1
             self._save()
-            return min(remaining, self.remaining())
+            return min(MAX_CALL_SECONDS, remaining, self.remaining())
 
     def _usage(self, usage: dict | None) -> None:
         """Keep measured tokens from failed as well as successful provider calls."""
@@ -479,6 +481,7 @@ class WalkthroughRuntime:
                 response, usage = self._send(body, timeout)
             except Exception as error:  # noqa: BLE001 # Provider failures must not expose untrusted payloads.
                 self._usage(getattr(error, "usage", None))
+                self.remaining()
                 if getattr(error, "category", None) in {
                     "auth",
                     "authentication",

@@ -469,6 +469,11 @@ def extract(
             status="text_only",
             note="Text-only evidence; no Python AST classification.",
         )
+    if "\r" in source_text.replace("\r\n", ""):
+        return ExtractionResult(
+            status="text_only",
+            note="Text-only evidence: Python treats bare CR as a newline, which differs from Git line coordinates.",
+        )
 
     try:
         tree = ast.parse(source_text, filename=path, type_comments=True)

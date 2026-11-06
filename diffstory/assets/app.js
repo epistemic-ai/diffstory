@@ -32,8 +32,8 @@
     function lines(id) {
       if (!lineCache.has(id)) {
         const text = sources.get(id).text;
-        const value = text ? text.split(/\r\n|\r|\n/) : [];
-        if (value.length && /[\r\n]$/.test(text)) value.pop();
+        const value = text ? text.split(/\r\n|\n/) : [];
+        if (value.length && /\n$/.test(text)) value.pop();
         lineCache.set(id, value);
       }
       return lineCache.get(id);

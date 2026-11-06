@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,12 +30,17 @@ from .providers import OpenAIResponsesProvider
 from .render import _render_prevalidated
 from .render import validate_report
 from .source_selection import without_test_files
+from .walkthrough_runtime import MAX_CALL_SECONDS
+from .walkthrough_runtime import MAX_SECONDS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Sequence
     from typing import BinaryIO
+
+    from .walkthrough import WalkthroughNarrator
+    from .walkthrough_plan import WalkthroughPlan
 
 MAX_INPUT_BYTES = 80_000_000
 MAX_REPORT_BYTES = 256_000_000
@@ -235,6 +241,11 @@ def _add_narration_arguments(parser: argparse.ArgumentParser) -> None:
         type=_positive_integer,
         default=4,
         help="Maximum concurrent narration tasks (default: 4)",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=_positive_integer,
+        help="Total narration deadline (default: 240 seconds per planned writer wave and editor stage; maximum: 2160)",
     )
     state_group = parser.add_mutually_exclusive_group()
     state_group.add_argument(
@@ -534,6 +545,51 @@ def _recovery_directory(args: argparse.Namespace, identity: str) -> Path:
     return root / identity
 
 
+def _narration_state(
+    args: argparse.Namespace,
+    narrator: WalkthroughNarrator,
+    plan: WalkthroughPlan,
+) -> Path:
+    """Select a finite plan deadline without renewing an older run's budgets.
+
+    Args:
+        args: Parsed output, state, concurrency, and optional timeout settings.
+        narrator: Narrator with one prepared plan, before any source transfer.
+        plan: That narrator's prepared writing and editorial requests.
+
+    Returns:
+        The exact state directory after resolving the narrator's total limit.
+
+    Postconditions:
+        A matching earlier 240-second run keeps its original limits and state.
+        New runs get 240 seconds per writer wave and editorial stage, unless
+        the user supplies a bounded total override. No state file is changed.
+    """
+    from .walkthrough_runtime import MAX_RECORD_BYTES
+
+    if args.timeout_seconds is None and args.fresh_state is None:
+        earlier_identity = narrator.prepared_run_identity()
+        earlier_state = _recovery_directory(args, earlier_identity)
+        record_path = earlier_state / "run.json"
+        if record_path.exists():
+            record = read_json(str(record_path), max_bytes=MAX_RECORD_BYTES)
+            if record.get("identity") == earlier_identity:
+                return earlier_state
+            if args.state_dir is None:
+                msg = "Narration state does not match its directory; existing budgets were retained. Use --fresh-state NEW_DIRECTORY for a deliberate new run."
+                raise CliError(msg)
+    seconds = float(
+        args.timeout_seconds
+        or MAX_CALL_SECONDS
+        * (
+            math.ceil(len(plan.writers) / narrator.limits.concurrency)
+            + int(not plan.single)
+        )
+    )
+    narrator.limits = replace(narrator.limits, seconds=seconds)
+    return _recovery_directory(args, narrator.prepared_run_identity())
+
+
 def _confirm_source_transfer(
     *,
     assume_yes: bool,
@@ -593,7 +649,7 @@ def _generate_walkthrough(
 
     Raises:
         ValueError: If consent, capacity, or output validation fails.
-        TimeoutError: If narration exceeds its four-minute deadline.
+        TimeoutError: If narration exceeds its selected total deadline.
 
     Preconditions:
         ``report`` is a compiler report that passed the loader's validation;
@@ -610,11 +666,12 @@ def _generate_walkthrough(
     provider = _create_provider(args)
     narrator = WalkthroughNarrator(
         provider,
+        deadline_seconds=float(args.timeout_seconds or MAX_CALL_SECONDS),
         concurrency=args.concurrency,
         cache_dir=_checkpoint_directory(args),
     )
     plan = narrator.prepare(report)
-    state = _recovery_directory(args, narrator.prepared_run_identity())
+    state = _narration_state(args, narrator, plan)
     if args.fresh_state is not None and state.exists():
         msg = "--fresh-state requires a new directory; existing budgets are retained"
         raise CliError(msg)
@@ -625,7 +682,7 @@ def _generate_walkthrough(
         f"Walkthrough: {len(plan.writers)} writing + {int(not plan.single)} editorial requests · {len(plan.packet['regions'])} changed regions · {sum(len(writer.body) for writer in plan.writers):,} prepared writing bytes"
     )
     print(
-        "Limits: 12 total attempts · 4 concurrent calls · 240 seconds · 1 MiB model annotations"
+        f"Limits: {narrator.limits.requests} total attempts · {narrator.limits.concurrency} concurrent calls · {narrator.limits.seconds:g} seconds total · {MAX_CALL_SECONDS:g} seconds per call · 1 MiB model annotations"
     )
     _confirm_source_transfer(assume_yes=args.yes, provider=provider)
     generated = narrator.generate_prepared()
@@ -946,6 +1003,13 @@ def _export_evidence(args: argparse.Namespace) -> int:
 def _validate_command_options(args: argparse.Namespace) -> None:
     """Reject conflicting source-generation and annotation options."""
     uses_repository_source = args.command in {"git", "github", "snapshot"}
+    if (
+        uses_repository_source
+        and args.timeout_seconds is not None
+        and args.timeout_seconds > MAX_SECONDS
+    ):
+        msg = "--timeout-seconds must be at most 2160"
+        raise CliError(msg)
     if uses_repository_source and args.narrate and args.annotations:
         msg = "Use --narrate or --annotations, not both"
         raise CliError(msg)

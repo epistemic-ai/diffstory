@@ -24,6 +24,12 @@ We keep that text and its line grouping. We check the rows against
 the captured file versions; we do not run another diff algorithm to replace
 Git's or GitHub's choices. An incomplete or mismatched patch is rejected.
 
+Source coordinates follow Git: LF ends a line, CRLF is one terminator, and a
+bare CR stays inside its original line. Source buffers and original patches
+retain their exact bytes. Python with bare CR uses text evidence because the
+Python parser counts those characters as newlines; AST locations would point
+to the wrong Git lines. LF and CRLF Python retain structural analysis.
+
 The **function comparison** is an extra view. It compares the earlier and
 later versions of a matched function, even when they are in different files.
 It is generated from source and labeled separately. It does not replace the
@@ -266,8 +272,13 @@ Per-record token counts guide packing. A conservative byte bound or a count
 of the complete candidate request determines whether a unit or batch fits;
 an optimistic record estimate cannot bypass subdivision.
 
-The generation runtime allows at most 12 provider attempts including retries,
-four concurrent calls, and 240 seconds for preparation and generation. It
+The generation runtime allows at most 12 provider attempts including retries
+and four concurrent calls. Each provider call is bounded to 240 seconds. New
+CLI runs allow 240 seconds per planned writer wave, plus 240 seconds for the
+editor when needed: four parallel writers and editing get 480 seconds total.
+`--timeout-seconds` can select a different finite total, at most 2,160 seconds.
+Preparation, writer waves, retries, editing, validation, and cleanup share one
+deadline; no phase renews it. Library callers still default to 240 seconds. It
 allows 1 MiB of total canonical response bytes per run and a separate 1 MiB
 saved-annotation limit. Interactive consent wait is outside the deadline. A
 failed request or limit does not produce a complete report. The CLI prints
@@ -282,6 +293,9 @@ share one output path. Matching legacy `run.json` files at the state root are
 still resumed there, preserving spent attempts and deadlines; unidentifiable
 legacy state is rejected. `--state-dir` selects an exact directory without
 automatic subdivision. Resume uses the recorded attempt budget and deadline.
+Matching runs created with the earlier 240-second default retain that limit;
+the new policy does not grant them a fresh budget. An expired run requires an
+intentional `--fresh-state` path to start again, with validated cache reuse.
 `--fresh-state` requires a new path and retains old state. Payload cache data
 is separate: by default it replaces the output suffix with `.narration-cache`. `--cache-dir`
 selects a path and `--no-cache` disables payload reuse without disabling run
