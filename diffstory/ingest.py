@@ -375,27 +375,23 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
         head_sha,
         "--",
     ).split(b"\0")
-    items = [
-        (names[index].decode(), names[index + 1].decode("utf-8"))
-        for index in range(0, len(names) - 1, 2)
-    ]
-    if len(items) > max_files:
+    total = (len(names) - 1) // 2
+    if total > max_files:
         msg = (
-            f"{len(items)} changed files exceeds --max-files {max_files}; "
+            f"{total} changed files exceeds --max-files {max_files}; "
             "no partial report was written"
         )
         raise ValueError(
             msg,
         )
-    total = len(items)
-    if not include_tests:
-        items = [
-            (status, path) for status, path in items if not is_test_path(path)
-        ]
     fragments, warnings = [], []
     file_evidence = []
     source_bytes = 0
-    for status, path in items:
+    for index in range(0, len(names) - 1, 2):
+        status = names[index].decode()
+        path = names[index + 1].decode("utf-8")
+        if not include_tests and is_test_path(path):
+            continue
         evidence_record = FileEvidence(
             base=AbsentFile(path=path)
             if status == "A"
@@ -469,7 +465,7 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
         "scope": "changed files",
         "input": "local git",
         "comparison": "two-dot" if two_dot else "merge-base to head",
-        "changed_files": len(items),
+        "changed_files": len(file_evidence),
         "source_bytes": source_bytes,
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "description": (
@@ -487,7 +483,7 @@ def from_git(  # noqa: PLR0913  # Revision selectors and separate source caps ar
         "patches": patches,
         "warnings": warnings,
     }
-    return record_test_exclusions(snapshot, total - len(items), total)
+    return record_test_exclusions(snapshot, total - len(file_evidence), total)
 
 
 def _git_patches(
