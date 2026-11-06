@@ -104,7 +104,7 @@ def without_test_files(snapshot: dict) -> dict:
     ]
     result.setdefault("meta", {})["source_bytes"] = sum(
         len(fragment["text"].encode("utf-8"))
-        for fragment in result["fragments"]
+        for fragment in result.get("fragments", [])
     )
     result.setdefault("warnings", [])
     return record_test_exclusions(
