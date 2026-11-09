@@ -1,7 +1,10 @@
 """Keep original file patches distinct from generated function comparisons."""
 
 import copy
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import test_integration
@@ -9,12 +12,124 @@ from test_analysis import snap
 
 from diffstory.analysis import compile_snapshot
 from diffstory.compact_packet import build_packet
+from diffstory.compact_packet import resolve_citation
+from diffstory.compact_packet import source_index
 from diffstory.compact_packet import validate_packet
 from diffstory.ingest import from_github
 
 
 class OriginalPatchTests(unittest.TestCase):
     """Exercise original alignment, missing patches and the moved-function view."""
+
+    def test_git_carriage_returns_keep_source_bytes_and_line_coordinates(
+        self,
+    ) -> None:
+        """Embedded and terminal CR must agree with real Git, including CRLF."""
+        cases = [
+            (
+                "added.xml",
+                "",
+                "<doc>\nleft\rright\rmore\n</doc>\n",
+                3,
+                "</doc>\n",
+            ),
+            (
+                "changed.xml",
+                "one\nold\rtext\n",
+                "one\nnew\rtext\n",
+                2,
+                "new\rtext\n",
+            ),
+            ("terminal.txt", "old\r", "new\r", 1, "new\r"),
+            ("terminal.txt", "same\nx\r", "same\nz\r", 2, "z\r"),
+            ("repeated.txt", "old\r\r\n", "new\r\r\n", 1, "new\r\r\n"),
+            (
+                "legacy.py",
+                "def f():\r    return 1\r",
+                "def f():\r    return 2\r",
+                1,
+                "def f():\r    return 2\r",
+            ),
+            (
+                "windows.py",
+                "def f():\r\n    return 1\r\n",
+                "def f():\r\n    return 2\r\n",
+                2,
+                "    return 2\r\n",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename, before, after, last_line, expected in cases:
+                with self.subTest(filename=filename, after=after):
+                    old = root / "before"
+                    new = root / "after"
+                    old.write_bytes(before.encode())
+                    new.write_bytes(after.encode())
+                    process = subprocess.run(
+                        [
+                            "git",
+                            "-c",
+                            "core.autocrlf=false",
+                            "-c",
+                            "core.attributesfile=/dev/null",
+                            "diff",
+                            "--no-index",
+                            "--no-color",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--text",
+                            "--",
+                            str(old),
+                            str(new),
+                        ],
+                        check=False,
+                        capture_output=True,
+                        cwd=root,
+                    )
+                    self.assertEqual(process.returncode, 1)
+                    original = process.stdout.decode()
+                    captured = snap({filename: before}, {filename: after})
+                    captured["patches"][0]["patch"] = original
+                    report = compile_snapshot(captured)
+                    packet = build_packet(report)
+                    validate_packet(packet)
+                    self.assertEqual(
+                        packet["diffs"][0]["original_patch"], original
+                    )
+                    head = next(
+                        source
+                        for source in packet["sources"]
+                        if source["side"] == "head"
+                    )
+                    self.assertEqual(head["text"], after)
+                    ref = {
+                        "source_id": head["id"],
+                        "revision": head["revision"],
+                        "start": last_line,
+                        "end": last_line,
+                    }
+                    self.assertEqual(
+                        resolve_citation(ref, source_index(packet)), expected
+                    )
+                    if filename == "windows.py":
+                        captured["patches"][0]["patch"] = original.replace(
+                            "\r", ""
+                        )
+                        validate_packet(
+                            build_packet(compile_snapshot(captured))
+                        )
+                        captured["patches"][0]["patch"] = original.replace(
+                            "return 2", "return 99"
+                        )
+                    else:
+                        captured["patches"][0]["patch"] = original.replace(
+                            "\r", ""
+                        )
+                    with self.assertRaisesRegex(
+                        ValueError, "could not be verified"
+                    ):
+                        compile_snapshot(captured)
 
     def test_repeated_lines_keep_the_original_deleted_occurrence(self) -> None:
         """A second alignment must not invent an edit to another identical line."""

@@ -99,6 +99,64 @@ class RuntimeProvider:
 class WalkthroughRuntimeTests(unittest.TestCase):
     """Prevent silent overspending, deadline extension, and invalid cache reuse."""
 
+    def test_total_deadlines_are_finite_bounded_numbers(self) -> None:
+        """Longer totals must reject booleans, nonfinite values, and unbounded overrides."""
+        for seconds, accepted in (
+            (0.5, True),
+            (240, True),
+            (2160, True),
+            (True, False),
+            (False, False),
+            (float("nan"), False),
+            (float("inf"), False),
+            (0, False),
+            (-1, False),
+            (2161, False),
+        ):
+            with self.subTest(seconds=seconds):
+                if accepted:
+                    self.assertEqual(
+                        RunLimits(seconds=seconds).seconds, seconds
+                    )
+                else:
+                    with self.assertRaises(RunLimitError):
+                        RunLimits(seconds=seconds)
+
+    def test_longer_total_deadline_keeps_each_call_under_four_minutes(
+        self,
+    ) -> None:
+        """A multi-stage budget must not lengthen any individual provider call."""
+        for seconds in (480, 720, 2160):
+            provider = RuntimeProvider()
+            with (
+                self.subTest(seconds=seconds),
+                patch.object(
+                    provider,
+                    "complete",
+                    return_value=({"accepted": True}, None),
+                ) as send,
+                WalkthroughRuntime(
+                    provider, "input", limits=RunLimits(seconds=seconds)
+                ) as runtime,
+            ):
+                runtime.call(b"request", accept)
+                self.assertLessEqual(send.call_args.args[1], 240)
+                runtime.finish()
+
+    def test_expired_provider_failure_keeps_the_deadline_diagnostic(
+        self,
+    ) -> None:
+        """A failed transport must not hide an already exhausted total deadline."""
+        provider = RuntimeProvider("always", delay=0.06)
+        with (
+            self.assertRaisesRegex(RunLimitError, "run deadline"),
+            WalkthroughRuntime(
+                provider, "input", limits=RunLimits(seconds=0.03)
+            ) as runtime,
+        ):
+            runtime.call(b"request", accept)
+        self.assertEqual(provider.calls, 1)
+
     def test_concurrent_retries_share_one_budget(self) -> None:
         """Parallel failures must not each acquire an independent retry allowance."""
         maximum = 6

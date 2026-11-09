@@ -24,6 +24,19 @@ from diffstory.render import render
 from diffstory.source_lines import split_source_lines
 
 
+def _synthetic_patch(before: str, after: str) -> str:
+    """Keep source bytes and EOF markers in a test-only unified patch."""
+    result = []
+    for row in unified_diff(
+        split_source_lines(before, keepends=True),
+        split_source_lines(after, keepends=True),
+    ):
+        result.append(row)
+        if not row.endswith("\n"):
+            result.append("\n\\ No newline at end of file\n")
+    return "".join(result)
+
+
 def snap(
     before: dict[str, str],
     after: dict[str, str],
@@ -83,15 +96,8 @@ def snap(
             {
                 "path": path,
                 "origin": "github",
-                "patch": "\n".join(
-                    row.rstrip("\r\n")
-                    for row in unified_diff(
-                        split_source_lines(
-                            before.get(path, ""), keepends=True
-                        ),
-                        split_source_lines(after.get(path, ""), keepends=True),
-                        lineterm="",
-                    )
+                "patch": _synthetic_patch(
+                    before.get(path, ""), after.get(path, "")
                 )
                 if all(
                     side["state"] == "absent" or side.get("coverage") == "full"
@@ -2100,10 +2106,37 @@ class SourceEvidenceTests(unittest.TestCase):
 class PhysicalSourceAnalysisTests(unittest.TestCase):
     """Use physical source coordinates for extraction, excerpts, and display."""
 
+    def test_bare_cr_python_uses_text_evidence_without_false_ast_coordinates(
+        self,
+    ) -> None:
+        """Python's universal-newline locations must never become wrong Git links."""
+        cases = [
+            "def f():\r    return 1\r",
+            "def f():\n    value = '''a\rb'''\n    return 1\n",
+        ]
+        for before in cases:
+            with self.subTest(before=before):
+                after = before.replace("return 1", "return 2")
+                report = compile_snapshot(
+                    snap({"a.py": before}, {"a.py": after})
+                )
+                self.assertTrue(
+                    any("bare CR" in note for note in report["notes"])
+                )
+                self.assertFalse(
+                    any(
+                        change["kind"] == "modified"
+                        for change in report["changes"]
+                    )
+                )
+                self.assertEqual(
+                    report["raw_files"][0]["patch_status"], "captured"
+                )
+
     def test_unicode_string_keeps_modified_function_and_return(self) -> None:
         """Legal string characters must not remove the final function line."""
         for separator in ("\u2028", "\u2029", "\x85", "\v", "\f"):
-            for eol in ("\n", "\r\n", "\r"):
+            for eol in ("\n", "\r\n"):
                 with self.subTest(separator=separator, eol=eol):
                     before = eol.join(
                         (
@@ -2135,8 +2168,8 @@ class PhysicalSourceAnalysisTests(unittest.TestCase):
                     )
 
     def test_partial_adjacent_and_overlapping_unicode_excerpts(self) -> None:
-        """Only CR and LF reserve lines in partial source fragments."""
-        for eol in ("\n", "\r\n", "\r"):
+        """Only LF and CRLF reserve lines in partial source fragments."""
+        for eol in ("\n", "\r\n"):
             source = snap(
                 {"x.py": "value = 'a\u2028b'" + eol},
                 {},

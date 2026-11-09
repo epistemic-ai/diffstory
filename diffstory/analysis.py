@@ -38,6 +38,7 @@ from .models import StrictModel
 from .models import validate_document
 from .patches import parse_file_patch
 from .source_lines import split_source_lines
+from .source_selection import is_test_path
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -138,26 +139,6 @@ def module_name(path: str) -> str:
     """
     p = path.removesuffix(".py")
     return p.replace("/", ".").removesuffix(".__init__")
-
-
-def is_test_path(path: str) -> bool:
-    """
-    Return whether a path follows the repository's test-file conventions.
-
-    Args:
-        path: Repository-relative path to classify.
-
-    Returns:
-        ``True`` for files inside a ``tests`` directory or named as a test;
-        otherwise ``False``.
-
-    """
-    p = PurePosixPath(path)
-    return (
-        "tests" in p.parts
-        or p.name.startswith("test_")
-        or p.name.endswith("_test.py")
-    )
 
 
 def _name(node: ast.AST, fallback: str) -> str:
@@ -487,6 +468,11 @@ def extract(
         return ExtractionResult(
             status="text_only",
             note="Text-only evidence; no Python AST classification.",
+        )
+    if "\r" in source_text.replace("\r\n", ""):
+        return ExtractionResult(
+            status="text_only",
+            note="Text-only evidence: Python treats bare CR as a newline, which differs from Git line coordinates.",
         )
 
     try:
